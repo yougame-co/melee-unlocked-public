@@ -1,0 +1,67 @@
+backups/
+/runtime/
+reports/
+build/
+*.log
+__pycache__/
+dependencies/
+
+/port/generated/*
+!/port/generated/hle_decls.h
+!/port/generated/guest_symbols.h
+/port/generated_playback/
+/build-review/
+/melee/
+/slippi/
+shadercache/
+replays/
+
+/port-settings.ini
+/port-settings.ini.tmp
+
+# Streamline runtime binaries are copied from the SDK zip; keep headers/libs/docs only
+/port/third_party/streamline/bin/
+
+# Packaged releases (tools/package_release.py)
+/release/
+
+# Port run-time user data (memory card, Slippi user folder)
+/User/
+/melee_port.log
+
+# Private working notes, never published
+HANDOFF_*.md
+NOTE_FOR_*.md
+
+# Discord webhook URL for release announcements (secret, never commit)
+discord-webhook.txt
+.discord-webhook
+
+# Per-agent and per-feature build directories
+build-*/
+*-build.err
+
+# Cygwin/MSYS crash dumps, written into whatever directory the shell was in
+*.stackdump
+
+# Vanilla (no Gecko) translated game, the reference for the native build
+/port/generated_vanilla/
+# v0.7 generated translation (regenerate with port/recomp/recomp.py) and local user data
+/port/generated_07/
+/CosmeticMods/
+/VideoBackgrounds/
+/port-settings.ini.bak
+/Lab/
+
+# Launcher social identity / ephemeral presence and service database.
+**/lobby-profile.json
+**/lobby-game-status.json*
+**/lobby.sqlite3*
+/Mods/
+/run-current-reports/
+/run-stage-skins/
+/tools/current_report_*.py
+/port/third_party/ngx/include/
+/port/third_party/ngx/lib/
+/port/third_party/mod_tools/7zr.exe
+/port/third_party/mod_tools/xdelta3.exe

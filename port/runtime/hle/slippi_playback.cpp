@@ -1,0 +1,335 @@
+// Port of the playback half of Dolphin's CEXISlippi (mode "normal", rollback display off, no
+// fast-forward, no seeking): enough to replay a file frame-exact and record it again.
+// SPDX-License-Identifier: GPL-2.0-or-later
+#ifdef YOUGAME_AGENT_TEST_HOOK
+#include "yougame_agent_paths.h"
+#endif
+#include "slippi_playback.h"
+#include "slippi_playback_legacy.h"
+#include "exi_slippi.h"
+#include "host.h"
+#include "replay_control.h"
+// Which replay code list this build was translated against. A playback build has exactly one
+// translated into it; a replay from a different Slippi version carries a different list, whose
+// code caves this build never compiled. Those would run as writes nothing was built against and
+// the replay would drift apart from the original without ever failing, which is the one kind of
+// wrong a player cannot see. The build passes the values it used; zero means none, which is
+// equally worth saying.
+#ifndef MELEE_PLAYBACK_GCT_BASE
+#define MELEE_PLAYBACK_GCT_BASE 0u
+#endif
+#ifndef MELEE_PLAYBACK_GCT_SIZE
+#define MELEE_PLAYBACK_GCT_SIZE 0u
+#endif
+#include "slippilib/SlippiGame.h"
+#include <nlohmann/json.hpp>
+#include <algorithm>
+#include <climits>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <unordered_map>
+
+namespace slippi::playback {
+namespace {
+std::string g_path;
+std::unique_ptr<Slippi::SlippiGame> g_game;
+bool g_loaded_once = false, g_finished = false;
+int32_t g_current_frame = Slippi::GAME_FIRST_FRAME;
+std::vector<uint8_t> g_gecko_list;
+uint32_t g_gecko_list_addr = 0;
+enum : uint8_t { FRAME_RESP_WAIT = 0, FRAME_RESP_CONTINUE = 1, FRAME_RESP_TERMINATE = 2, FRAME_RESP_FASTFORWARD = 3 };
+
+void append_u32(std::vector<uint8_t>& q, uint32_t v) { for (int i = 3; i >= 0; --i) q.push_back((uint8_t)(v >> (8 * i))); }
+void append_u16(std::vector<uint8_t>& q, uint16_t v) { q.push_back((uint8_t)(v >> 8)); q.push_back((uint8_t)v); }
+void append_f32(std::vector<uint8_t>& q, float f) { uint32_t v; std::memcpy(&v, &f, 4); append_u32(q, v); }
+
+// Semver "a.b.c" >= "x.y.z"
+bool version_at_least(const std::string& v, int a, int b, int c) {
+  int x = 0, y = 0, z = 0;
+  std::sscanf(v.c_str(), "%d.%d.%d", &x, &y, &z);
+  if (x != a) return x > a;
+  if (y != b) return y > b;
+  return z >= c;
+}
+
+// Dolphin's denylist: injections that do not affect gameplay (from the Sys/Slippi/InjectionLists
+// files, later-numbered files winning) plus a fixed backward-compatibility set.
+std::unordered_map<uint32_t, bool> build_denylist_in(const std::string& sys_dir) {
+  std::unordered_map<uint32_t, bool> deny = {
+      {0x802fef88, true}, {0x8006c5d8, true}, {0x8016d30c, true}, {0x8016e9b4, true},
+      {0x802f6690, true}, {0x802F71E0, true}, {0x80071960, true}, {0x800CC818, true}, {0x8008A478, true},
+  };
+  std::filesystem::path dir = std::filesystem::path(sys_dir) / "Slippi" / "InjectionLists";
+  std::vector<std::pair<int, std::filesystem::path>> files;
+  std::error_code ec;
+  for (auto& e : std::filesystem::directory_iterator(dir, ec)) {
+    if (!e.is_regular_file()) continue;
+    std::string stem = e.path().stem().string();
+    size_t us = stem.find_last_of('_');
+    int num = 0;
+    if (us != std::string::npos) num = std::atoi(stem.substr(us + 1).c_str());
+    files.push_back({num, e.path()});
+  }
+  std::stable_sort(files.begin(), files.end(), [](auto& a, auto& b) { return a.first < b.first; });
+  for (auto& [num, path] : files) {
+    std::ifstream f(path);
+    std::string contents((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto res = nlohmann::json::parse(contents, nullptr, false);
+    if (res.is_discarded() || !res.is_object() || !res.count("Details") || !res["Details"].is_array()) { host::log("playback: injection list %s malformed", path.string().c_str()); continue; }
+    for (auto& inj : res["Details"]) {
+      if (!inj.is_object()) continue;
+      std::string tags = inj.count("Tags") && inj["Tags"].is_string() ? inj["Tags"].get<std::string>() : "";
+      std::string addr = inj.count("InjectionAddress") && inj["InjectionAddress"].is_string() ? inj["InjectionAddress"].get<std::string>() : "";
+      if (addr.empty()) continue;
+      deny[(uint32_t)std::strtoul(addr.c_str(), nullptr, 16)] = tags.find("[affects-gameplay]") == std::string::npos;
+    }
+  }
+  deny[0x8038add0] = true;   // Online/Core/PreventFileAlarms/PreventMusicAlarm.asm (rollback display off)
+  deny[0x80023FFC] = true;   // Online/Core/PreventFileAlarms/MuteMusic.asm
+  // Older Melee Unlocked recordings exposed these PC-only, host-gated hooks in their Gecko list.
+  // The playback executable already has its own gated translations; accepting the recorded C2s as
+  // ordinary replay codes would make them unconditional. New recordings terminate before them.
+  deny[0x802F9A3C] = true;   // Port: PAL Stock Icons
+  deny[0x802F84C8] = true;   // Port: PAL Stock Icons, hide lost stocks
+  deny[0x8002A104] = true;   // Port: No Screen Shake
+  return deny;
+}
+std::unordered_map<uint32_t, bool> build_denylist() { return build_denylist_in(host::options.sys_dir); }
+
+void prepare_gecko_list() {
+  g_gecko_list.clear();
+  auto* settings = g_game->GetSettings();
+  if (settings->geckoCodes.empty()) {
+    g_gecko_list.assign(LEGACY_CODELIST, LEGACY_CODELIST + sizeof LEGACY_CODELIST);
+    host::log("playback: replay has no stored codes; serving the legacy list (%zu bytes)", g_gecko_list.size());
+    return;
+  }
+  auto denylist = build_denylist();
+  const std::vector<uint8_t>& source = settings->geckoCodes;
+  size_t idx = 0, kept = 0, dropped = 0;
+  while (idx + 8 <= source.size()) {
+    // A recording can deliberately end its public code list before its fixed-size event ends.
+    // Do not scan bytes after that terminator as more codes.
+    if (source[idx] == 0xF0 || source[idx] == 0xFF || source[idx] == 0xE0) break;
+    uint8_t type = source[idx] & 0xFE;
+    uint32_t address = ((uint32_t)source[idx] << 24 | (uint32_t)source[idx + 1] << 16 | (uint32_t)source[idx + 2] << 8 | source[idx + 3]);
+    address = (address & 0x01FFFFFF) | 0x80000000;
+    size_t len = 8;
+    if (type == 0xC0 || type == 0xC2) { uint32_t lines = (uint32_t)source[idx + 4] << 24 | (uint32_t)source[idx + 5] << 16 | (uint32_t)source[idx + 6] << 8 | source[idx + 7]; len = 8 + (size_t)lines * 8; }
+    else if (type == 0x08) len = 16;
+    else if (type == 0x06) { uint32_t bytes = (uint32_t)source[idx + 4] << 24 | (uint32_t)source[idx + 5] << 16 | (uint32_t)source[idx + 6] << 8 | source[idx + 7]; len = 8 + ((bytes + 7) & ~7u); }
+    if (idx + len > source.size()) break;
+    auto it = denylist.find(address);
+    if (it != denylist.end() && it->second) { ++dropped; idx += len; continue; }
+    g_gecko_list.insert(g_gecko_list.end(), source.begin() + idx, source.begin() + idx + len);
+    ++kept; idx += len;
+  }
+  g_gecko_list.insert(g_gecko_list.end(), {0xFF, 0, 0, 0, 0, 0, 0, 0});
+  host::log("playback: gecko list from the replay: %zu codes kept, %zu denylisted, %zu bytes", kept, dropped, g_gecko_list.size());
+  // The recompiler bakes this list (see recomp.py --extra-gct) so its caves run as translated code.
+  std::string dump = host::options.replay_dir + "/gecko_list.bin";
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  FILE* dump_file = yougame::agent_paths::output(dump, true);
+#else
+  FILE* dump_file = std::fopen(dump.c_str(), "wb");
+#endif
+  if (FILE* f = dump_file) { std::fwrite(g_gecko_list.data(), 1, g_gecko_list.size(), f); std::fclose(f); host::log("playback: served code list written to %s", dump.c_str()); }
+}
+
+void character_frame_data(const Slippi::FrameData* frame, uint8_t port, bool follower, std::vector<uint8_t>& q) {
+  const auto& source = follower ? frame->followers : frame->players;
+  auto it = source.find(port);
+  if (it == source.end()) { q.insert(q.end(), 52, 0); return; }
+  const Slippi::PlayerFrameData& d = it->second;
+  append_u32(q, d.randomSeed);
+  append_f32(q, d.joystickX); append_f32(q, d.joystickY); append_f32(q, d.cstickX); append_f32(q, d.cstickY); append_f32(q, d.trigger);
+  append_u32(q, d.buttons);
+  append_f32(q, d.locationX); append_f32(q, d.locationY); append_f32(q, d.facingDirection);
+  append_u32(q, d.animation);
+  q.push_back(d.joystickXRaw); q.push_back(d.joystickYRaw);
+  append_f32(q, d.percent);
+  q.push_back(d.cstickXRaw); q.push_back(d.cstickYRaw);
+}
+
+// The viewer's jump back (host/replay_control.h). This engine keeps no state a jump of seconds
+// could return to: the online savestates hold what a rollback of a few frames needs (Slippi's
+// memory regions), not the host's side of the console (disc reads in flight, the sound driver,
+// alarms). So the match is started again, the way the game takes the next replay of a queue: the
+// frame request is answered "terminate", the waiting scene asks whether a file is ready, and the
+// same file is. The viewer then runs unseen and unpaced up to the target frame. The copy being
+// recorded is only a part and is not kept; the pass that reaches the end writes the whole one.
+bool g_restart = false;
+bool restart_match() {
+  g_restart = true;
+  slippi::discard_current_replay("the viewer started the match again for a jump back");
+  return true;
+}
+}  // namespace
+
+void set_replay(const std::string& path) {
+  g_path = path;
+  replay_control::set_replay_path(path);
+  host::set_replay_viewing(!path.empty());
+}
+
+std::vector<KeptCode> gameplay_codes(const std::vector<uint8_t>& source, const std::string& sys_dir, size_t* dropped) {
+  std::vector<KeptCode> kept;
+  auto denylist = build_denylist_in(sys_dir);
+  size_t idx = 0, n_dropped = 0;
+  while (idx + 8 <= source.size()) {
+    uint8_t type = source[idx] & 0xFE;
+    uint32_t address = ((uint32_t)source[idx] << 24 | (uint32_t)source[idx + 1] << 16 | (uint32_t)source[idx + 2] << 8 | source[idx + 3]);
+    address = (address & 0x01FFFFFF) | 0x80000000;
+    size_t len = 8;
+    uint32_t word = (uint32_t)source[idx + 4] << 24 | (uint32_t)source[idx + 5] << 16 | (uint32_t)source[idx + 6] << 8 | source[idx + 7];
+    if (type == 0xC0 || type == 0xC2) len = 8 + (size_t)word * 8;
+    else if (type == 0x08) len = 16;
+    else if (type == 0x06) len = 8 + ((word + 7) & ~7u);
+    if (idx + len > source.size()) break;
+    auto it = denylist.find(address);
+    if (it != denylist.end() && it->second) { ++n_dropped; idx += len; continue; }
+    kept.push_back({address, type, std::vector<uint8_t>(source.begin() + idx, source.begin() + idx + len)});
+    idx += len;
+  }
+  if (dropped) *dropped = n_dropped;
+  return kept;
+}
+bool enabled() { return !g_path.empty(); }
+
+void prepare_is_file_ready(std::vector<uint8_t>& q) {
+  q.clear();
+  if (g_restart && g_game) {   // the same replay again, for a jump back (see restart_match)
+    g_restart = false;
+    host::log("playback: starting the match again for a jump back");
+    q.push_back(1);
+    return;
+  }
+  if (!enabled() || g_loaded_once) {
+    q.push_back(0);
+    if (g_loaded_once && !g_finished) {
+      g_finished = true;
+      replay_control::end();
+      host::log("playback: replay finished; exiting");
+      host::set_replay_viewing(false);
+      host::request_exit(0);
+    }
+    return;
+  }
+  g_game = Slippi::SlippiGame::FromFile(g_path);
+  g_loaded_once = true;
+  if (!g_game) { host::log("playback: cannot open replay %s", g_path.c_str()); q.push_back(0); host::request_exit(2); return; }
+  host::log("playback: loaded %s (version %s, last frame %d)", g_path.c_str(), g_game->GetVersionString().c_str(), g_game->GetLatestIndex());
+  // A match played on a mod: its stage is not in the standard game, and the game would wait on a
+  // blank screen for a stage that never loads.
+  if (const uint16_t stage = g_game->GetSettings()->stage; stage > 85) {
+    host::log("playback: this replay was recorded with a mod (stage %u is not in the standard game); it needs that mod to play", (unsigned)stage);
+    q.push_back(0);
+    host::request_exit(3);
+    return;
+  }
+  q.push_back(1);
+}
+
+void prepare_game_info(const uint8_t*, std::vector<uint8_t>& q) {
+  q.clear();
+  if (!g_game) return;
+  if (!g_game->AreSettingsLoaded()) { q.push_back(0); return; }
+  q.push_back(1);
+  Slippi::GameSettings* settings = g_game->GetSettings();
+  append_u32(q, settings->randomSeed);
+  std::array<uint32_t, Slippi::GAME_INFO_HEADER_SIZE> header = settings->header;
+  for (int i = 0; i < 4; ++i) {
+    if (!g_game->DoesPlayerExist((int8_t)i)) continue;
+    uint8_t ext = settings->players[(uint8_t)i].characterId;
+    if (ext != 0x12 && ext != 0x13) continue;   // Sheik/Zelda: overwrite the character in the header
+    int pos = 24 + 9 * i;
+    header[pos] &= 0x00FFFFFF; header[pos] |= (uint32_t)ext << 24;
+  }
+  for (int i = 0; i < Slippi::GAME_INFO_HEADER_SIZE; ++i) append_u32(q, header[i]);
+  for (int i = 0; i < Slippi::UCF_TOGGLE_SIZE; ++i) append_u32(q, settings->ucfToggles[i]);
+  for (int i = 0; i < 4; ++i) { auto player = settings->players[(uint8_t)i]; for (int j = 0; j < Slippi::NAMETAG_SIZE; ++j) append_u16(q, player.nametag[j]); }
+  q.push_back(settings->isPAL);
+  auto version = g_game->GetVersion();
+  bool preload_ps = version[0] > 1 || (version[0] == 1 && version[1] > 2);
+  q.push_back(preload_ps ? 1 : 0);
+  q.push_back(settings->isFrozenPS);
+  q.push_back(0);   // shouldResync
+  for (int i = 0; i < 4; ++i) { auto& name = settings->players[(uint8_t)i].displayName; q.insert(q.end(), name.begin(), name.end()); }
+  prepare_gecko_list();
+  append_u32(q, (uint32_t)g_gecko_list.size());
+  g_current_frame = Slippi::GAME_FIRST_FRAME;
+  // The match starts (or starts again for a jump back): the viewer's controls take this range.
+  replay_control::Engine engine;
+  engine.restart = restart_match;
+  replay_control::begin(Slippi::GAME_FIRST_FRAME, g_game->GetLatestIndex(), engine);
+}
+
+void prepare_gecko_codes(std::vector<uint8_t>& q) { q.assign(g_gecko_list.begin(), g_gecko_list.end()); }
+
+void note_gecko_list_dma(uint32_t addr, uint32_t size) {
+  if (g_gecko_list_addr == addr) return;
+  g_gecko_list_addr = addr;
+  host::log("playback: game placed the replay code list at %08X (%u bytes)", addr, size);
+  // A playback build has one replay code list translated into it. A replay from a different Slippi
+  // version carries a different list, whose code caves this build never translated: they would run
+  // as writes nothing was compiled against and the replay would drift apart from the original
+  // without ever failing. Say so, because silent divergence is the one failure a player cannot see.
+  //
+  // Only the address is worth checking. Replays from one Slippi version carry lists of slightly
+  // different sizes (5728 and 5632 bytes were both seen from 3.19.1, because the denylist drops a
+  // different number of injections per game), and a 5632-byte replay plays back on a build made
+  // from a 5728-byte one with zero mismatches over 25126 player-frames. What actually matters is
+  // whether the caves are where this build translated them.
+  if (MELEE_PLAYBACK_GCT_SIZE == 0u) {
+    host::log("playback: WARNING no replay code list is translated into this build, so this replay will"
+              " diverge. Rebuild with --extra-gct <list> --extra-gct-base %08X.", addr);
+  } else if (addr != MELEE_PLAYBACK_GCT_BASE) {
+    host::log("playback: WARNING this replay installs its code at %08X, but this build translated a"
+              " list at %08X, so those caves are not compiled in and this replay will diverge.",
+              addr, (unsigned)MELEE_PLAYBACK_GCT_BASE);
+  }
+}
+
+void prepare_frame_data(const uint8_t* payload, std::vector<uint8_t>& q) {
+  q.clear();
+  if (!g_game) return;
+  int32_t frame = (int32_t)((uint32_t)payload[0] << 24 | (uint32_t)payload[1] << 16 | (uint32_t)payload[2] << 8 | payload[3]);
+  bool complete = g_game->IsProcessingComplete();
+  bool found = g_game->DoesFrameExist(frame);
+  bool fully = false;
+  if (found) {
+    Slippi::FrameData* f = g_game->GetFrame(frame);
+    bool finalized = true;
+    if (version_at_least(g_game->GetVersionString(), 3, 7, 0)) finalized = g_game->GetLastFinalizedFrame() >= frame;
+    fully = f->inputsFullyFetched && finalized;
+  }
+  bool ready = found && (complete || fully);
+  if (!ready) { q.push_back(complete ? FRAME_RESP_TERMINATE : FRAME_RESP_WAIT); if (complete) host::log("playback: game terminates on frame %d", frame); return; }
+  // The viewer's controls, before the frame is handed to the game: this is where a pause holds,
+  // where slow motion and fast forward are paced, and where a jump back ends this pass of the match.
+  {
+    replay_control::Gate gate = replay_control::gate(frame);
+    if (gate == replay_control::Gate::GoBack) gate = replay_control::go_back();
+    if (gate == replay_control::Gate::Restart) { q.push_back(FRAME_RESP_TERMINATE); return; }
+  }
+  g_current_frame = frame;
+  q.push_back(FRAME_RESP_CONTINUE);
+  Slippi::FrameData* f = g_game->GetFrame(frame);
+  q.push_back(0);   // rollback code
+  q.push_back(f->randomSeedExists ? 1 : 0);
+  append_u32(q, f->randomSeed);
+  for (uint8_t port = 0; port < 4; ++port) { character_frame_data(f, port, false, q); character_frame_data(f, port, true, q); }
+}
+
+void prepare_is_stock_steal(const uint8_t* payload, std::vector<uint8_t>& q) {
+  q.clear();
+  if (!g_game) return;
+  int32_t frame = (int32_t)((uint32_t)payload[0] << 24 | (uint32_t)payload[1] << 16 | (uint32_t)payload[2] << 8 | payload[3]);
+  uint8_t player = payload[4];
+  if (!g_game->DoesFrameExist(frame)) { q.push_back(0); return; }
+  q.push_back(g_game->GetFrame(frame)->players.count(player) ? 1 : 0);
+}
+}  // namespace slippi::playback

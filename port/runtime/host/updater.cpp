@@ -1,0 +1,923 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "updater.h"
+#include "host.h"
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <tlhelp32.h>
+#include <bcrypt.h>
+#include <winhttp.h>
+#include <nlohmann/json.hpp>
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <filesystem>
+#include <iterator>
+#include <mutex>
+#include <sstream>
+#include <thread>
+#include <vector>
+// The update zip is read here, not by tar.exe: Wine and Proton have no tar.exe, so every update
+// there failed with "unexpected contents". stb_image's inflate, kept private to this file.
+#define STB_IMAGE_STATIC
+#define STBI_ONLY_PNG
+#define STBI_NO_STDIO
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb/stb_image.h"
+
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "bcrypt.lib")
+
+namespace host::updater {
+namespace {
+// The release list rather than /releases/latest: that endpoint skips pre-releases (betas).
+const char* REPO_API = "https://api.github.com/repos/hero88go/melee-unlocked/releases?per_page=100";
+std::atomic<State> g_state{State::Idle};
+std::mutex g_mutex;
+std::string g_current, g_latest, g_zip_url, g_message, g_zip_path, g_zip_digest;
+size_t g_zip_size = 0;
+std::thread g_thread;
+// `*_digest`: the SHA-256 GitHub lists for the asset (lowercase hex), empty when the release has none.
+struct Download { Release release; std::string root_name, legacy_url, experimental_url, legacy_digest, experimental_digest;
+                  size_t legacy_size = 0, experimental_size = 0; };
+std::vector<Download> g_releases;
+std::atomic<RollbackState> g_rollback_state{RollbackState::Idle};
+std::string g_rollback_message, g_rollback_folder;
+std::thread g_rollback_thread;
+
+std::wstring widen(const std::string& s) {
+  int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+  std::wstring w(n, 0);
+  if (n) MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
+  return w;
+}
+std::string utf8(const std::wstring& w) {
+  int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+  std::string s(n, 0);
+  if (n) WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), n, nullptr, nullptr);
+  return s;
+}
+void set_message(const std::string& m) { std::lock_guard<std::mutex> lk(g_mutex); g_message = m; }
+
+std::string sha256_hex(const std::string& data) {
+  BCRYPT_ALG_HANDLE algorithm = nullptr; BCRYPT_HASH_HANDLE hash = nullptr;
+  unsigned char digest[32]{};
+  bool ok = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0 &&
+            BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0) >= 0;
+  for (size_t at = 0; ok && at < data.size(); at += 1u << 30) {
+    const ULONG part = (ULONG)std::min<size_t>(data.size() - at, 1u << 30);
+    ok = BCryptHashData(hash, (PUCHAR)data.data() + at, part, 0) >= 0;
+  }
+  ok = ok && BCryptFinishHash(hash, digest, sizeof digest, 0) >= 0;
+  if (hash) BCryptDestroyHash(hash);
+  if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+  if (!ok) return {};
+  static const char* hex = "0123456789abcdef";
+  std::string out;
+  for (unsigned char b : digest) { out += hex[b >> 4]; out += hex[b & 15]; }
+  return out;
+}
+// GitHub's "digest" for a release asset ("sha256:<hex>"), as lowercase hex; empty if absent or another kind.
+std::string asset_digest(const nlohmann::json& asset) {
+  const auto digest = asset.find("digest");
+  if (digest == asset.end() || !digest->is_string()) return {};
+  std::string value = digest->get<std::string>();
+  if (value.rfind("sha256:", 0) != 0 || value.size() != 7 + 64) return {};
+  value.erase(0, 7);
+  for (char& c : value) {
+    if (c >= 'A' && c <= 'F') c = char(c - 'A' + 'a');
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return {};
+  }
+  return value;
+}
+// A download that does not match the digest the release lists is refused (size alone cannot tell a
+// damaged archive of the same length). Releases without a listed digest keep the size check only.
+bool digest_matches(const std::string& body, const std::string& digest) {
+  return digest.empty() || sha256_hex(body) == digest;
+}
+
+// "Downloading update... 45% (110 of 241 MB)": the release zip is a few hundred MB, and a line that
+// never moved read as an update stuck after Yes.
+void download_progress(const char* what, size_t got, size_t total) {
+  const auto mb = [](size_t bytes) { return std::to_string((bytes + (1u << 19)) >> 20); };
+  if (total) set_message(std::string(what) + " " + std::to_string(got * 100 / total) + "% (" + mb(got) + " of " + mb(total) + " MB)");
+  else set_message(std::string(what) + " " + mb(got) + " MB");
+}
+
+// GET with redirects (GitHub release assets redirect to a CDN). Returns the body. `progress` names
+// the download in the status line ("Downloading update..."); null for the small API requests.
+bool http_get(const std::string& url, std::string* out, int* status, const char* progress = nullptr) {
+  std::wstring wurl = widen(url);
+  URL_COMPONENTS uc{}; uc.dwStructSize = sizeof uc;
+  wchar_t host[256]{}, path[4096]{}, extra[1024]{};
+  uc.lpszHostName = host; uc.dwHostNameLength = 256; uc.lpszUrlPath = path; uc.dwUrlPathLength = 4096;
+  uc.lpszExtraInfo = extra; uc.dwExtraInfoLength = 1024;
+  if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) return false;
+  HINTERNET session = WinHttpOpen(L"MeleeUnlocked updater", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+  if (!session) return false;
+  WinHttpSetTimeouts(session, 8000, 8000, 30000, 120000);
+  bool ok = false;
+  HINTERNET conn = WinHttpConnect(session, host, uc.nPort, 0);
+  if (conn) {
+    const std::wstring request_path = std::wstring(path, uc.dwUrlPathLength) + std::wstring(extra, uc.dwExtraInfoLength);
+    HINTERNET req = WinHttpOpenRequest(conn, L"GET", request_path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+    if (req) {
+      // Redirects are followed (release assets move to a CDN), but never from HTTPS down to HTTP.
+      DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
+      WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof redirect);
+      if (WinHttpSendRequest(req, L"User-Agent: MeleeUnlocked\r\nAccept: application/vnd.github+json\r\n", (DWORD)-1, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(req, nullptr)) {
+        DWORD code = 0, size = sizeof code;
+        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &code, &size, WINHTTP_NO_HEADER_INDEX);
+        if (status) *status = (int)code;
+        std::string body;
+        DWORD expected = 0, expected_size = sizeof expected;
+        bool have_length = WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &expected, &expected_size, WINHTTP_NO_HEADER_INDEX) != FALSE;
+        bool complete = false;
+        if (have_length) body.reserve(expected);
+        // One 1 MiB buffer, read until the response ends: asking for what is available first
+        // handed back a few KB per call, and each call allocated a fresh chunk.
+        std::vector<char> chunk(1u << 20);
+        ULONGLONG shown = 0;
+        for (;;) {
+          DWORD got = 0;
+          if (!WinHttpReadData(req, chunk.data(), (DWORD)chunk.size(), &got)) break;
+          if (!got) { complete = true; break; }
+          body.append(chunk.data(), got);
+          if (progress && GetTickCount64() - shown >= 250) { shown = GetTickCount64(); download_progress(progress, body.size(), have_length ? expected : 0); }
+        }
+        ok = complete && (!have_length || body.size() == expected);
+        if (out && ok) *out = std::move(body);
+      }
+      WinHttpCloseHandle(req);
+    }
+    WinHttpCloseHandle(conn);
+  }
+  WinHttpCloseHandle(session);
+  return ok;
+}
+
+// "0.1.2-beta" -> (0,1,2); pre-release suffixes are ignored for ordering.
+bool newer(const std::string& a, const std::string& b) {
+  int x[3] = {0, 0, 0}, y[3] = {0, 0, 0};
+  std::sscanf(a.c_str(), "%d.%d.%d", &x[0], &x[1], &x[2]);
+  std::sscanf(b.c_str(), "%d.%d.%d", &y[0], &y[1], &y[2]);
+  for (int i = 0; i < 3; ++i) if (x[i] != y[i]) return x[i] > y[i];
+  return false;
+}
+
+void join() { if (g_thread.joinable()) g_thread.join(); }
+bool safe_version(const std::string& s) {
+  if (s.empty() || s.size() > 60 || s.find("..") != std::string::npos) return false;
+  for (char c : s) if (!(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
+                    !(c >= '0' && c <= '9') && c != '.' && c != '-' && c != '_') return false;
+  return true;
+}
+bool release_url(const std::string& url) {
+  return url.rfind("https://github.com/Hero88go/melee-unlocked/releases/download/", 0) == 0 ||
+         url.rfind("https://github.com/hero88go/melee-unlocked/releases/download/", 0) == 0;
+}
+void rollback_message(const std::string& s) { std::lock_guard<std::mutex> lk(g_mutex); g_rollback_message = s; }
+// The release download for this platform: the Windows zip, or the Linux archive beside it.
+#ifdef _WIN32
+constexpr const char* kPlatformAsset = "-win64.zip";
+#else
+constexpr const char* kPlatformAsset = "-linux-x86_64.tar.gz";
+#endif
+bool valid_install(const std::filesystem::path& p, bool experimental) {
+  std::error_code ec;
+#ifndef _WIN32
+  (void)experimental;
+  return std::filesystem::is_regular_file(p / "melee_source", ec) &&
+         std::filesystem::is_regular_file(p / "Sys" / "codehandler.bin", ec);
+#endif
+  return std::filesystem::is_regular_file(p / "melee_port.exe", ec) &&
+         std::filesystem::is_regular_file(p / "Sys" / "codehandler.bin", ec) &&
+         (!experimental || std::filesystem::is_regular_file(p / "melee_port_dlss5.exe", ec));
+}
+// tar for the Linux .tar.gz (through the compat layer); zips are read in process below.
+bool tar_paths_safe(const std::filesystem::path& zip, const std::string& root) {
+  std::wstring cmd = L"tar.exe -tf \"" + zip.wstring() + L"\"";
+  SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
+  HANDLE rd = nullptr, wr = nullptr;
+  if (!CreatePipe(&rd, &wr, &sa, 0)) return false;
+  SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+  STARTUPINFOW si{}; si.cb = sizeof si; si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdOutput = wr; si.hStdError = wr; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  PROCESS_INFORMATION pi{};
+  const BOOL started = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+                                       nullptr, nullptr, &si, &pi);
+  CloseHandle(wr);
+  if (!started) { CloseHandle(rd); return false; }
+  std::string listing; char buf[4096]; DWORD got = 0;
+  while (ReadFile(rd, buf, sizeof buf, &got, nullptr) && got) {
+    listing.append(buf, got);
+    if (listing.size() > 4 * 1024 * 1024) break;
+  }
+  CloseHandle(rd);
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
+  CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+  if (code != 0 || listing.empty() || listing.size() > 4 * 1024 * 1024) return false;
+  size_t pos = 0;
+  while (pos < listing.size()) {
+    const size_t end = listing.find('\n', pos);
+    std::string path = listing.substr(pos, end == std::string::npos ? end : end - pos);
+    if (!path.empty() && path.back() == '\r') path.pop_back();
+    if (path != root && path != root + "/" && path.rfind(root + "/", 0) != 0) return false;
+    if (path.find('\\') != std::string::npos || path.find(':') != std::string::npos) return false;
+    size_t start = 0;
+    while (start < path.size()) {
+      const size_t slash = path.find('/', start);
+      const std::string part = path.substr(start, slash == std::string::npos ? slash : slash - start);
+      if (part == ".." || part == ".") return false;
+      if (slash == std::string::npos) break;
+      start = slash + 1;
+    }
+    if (end == std::string::npos) break;
+    pos = end + 1;
+  }
+  return true;
+}
+bool tar_unpack(const std::filesystem::path& zip, const std::filesystem::path& dest) {
+  std::wstring cmd = L"tar.exe -xf \"" + zip.wstring() + L"\" -C \"" + dest.wstring() + L"\"";
+  STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
+  if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                      dest.wstring().c_str(), &si, &pi)) return false;
+  WaitForSingleObject(pi.hProcess, INFINITE);
+  DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
+  CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+  return code == 0;
+}
+// A zip's central directory: name, method, sizes, CRC and where each entry's data starts.
+struct ZipEntry { std::string name; uint16_t method = 0; uint32_t crc = 0; uint64_t packed = 0, size = 0, local = 0; };
+static uint32_t rd16(const unsigned char* p) { return p[0] | (p[1] << 8); }
+static uint32_t rd32(const unsigned char* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
+static uint32_t crc32_of(const unsigned char* data, size_t n) {
+  static uint32_t table[256] = {};
+  if (!table[1]) for (uint32_t i = 0; i < 256; ++i) { uint32_t c = i; for (int k = 0; k < 8; ++k) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1; table[i] = c; }
+  uint32_t c = 0xFFFFFFFFu;
+  for (size_t i = 0; i < n; ++i) c = table[(c ^ data[i]) & 0xFF] ^ (c >> 8);
+  return c ^ 0xFFFFFFFFu;
+}
+bool zip_entries(const std::filesystem::path& zip, std::vector<ZipEntry>& out) {
+  out.clear();
+  std::ifstream f(zip, std::ios::binary);
+  if (!f) return false;
+  f.seekg(0, std::ios::end);
+  const uint64_t total = (uint64_t)f.tellg();
+  if (total < 22) return false;
+  const uint64_t tail = std::min<uint64_t>(total, 22 + 65535);
+  std::vector<unsigned char> t((size_t)tail);
+  f.seekg((std::streamoff)(total - tail)); f.read((char*)t.data(), (std::streamsize)tail);
+  if (!f) return false;
+  size_t eocd = std::string::npos;
+  for (size_t i = tail - 22 + 1; i-- > 0;) if (rd32(&t[i]) == 0x06054b50u) { eocd = i; break; }
+  if (eocd == std::string::npos) return false;
+  const uint32_t count = rd16(&t[eocd + 10]), dir_size = rd32(&t[eocd + 12]), dir_at = rd32(&t[eocd + 16]);
+  if (count == 0xFFFF || dir_size == 0xFFFFFFFFu || dir_at == 0xFFFFFFFFu) return false;   // zip64: not what releases are
+  if ((uint64_t)dir_at + dir_size > total || dir_size > 64u * 1024 * 1024) return false;
+  std::vector<unsigned char> d(dir_size);
+  f.seekg(dir_at); f.read((char*)d.data(), dir_size);
+  if (!f) return false;
+  size_t at = 0;
+  for (uint32_t i = 0; i < count; ++i) {
+    if (at + 46 > d.size() || rd32(&d[at]) != 0x02014b50u) return false;
+    ZipEntry e;
+    e.method = (uint16_t)rd16(&d[at + 10]); e.crc = rd32(&d[at + 16]);
+    e.packed = rd32(&d[at + 20]); e.size = rd32(&d[at + 24]); e.local = rd32(&d[at + 42]);
+    const uint32_t name_len = rd16(&d[at + 28]), extra = rd16(&d[at + 30]), comment = rd16(&d[at + 32]);
+    if (at + 46 + name_len > d.size()) return false;
+    e.name.assign((const char*)&d[at + 46], name_len);
+    at += 46 + name_len + extra + comment;
+    out.push_back(std::move(e));
+  }
+  return true;
+}
+// Every entry inside the release folder `root`; none absolute, with a drive, a backslash or "..".
+bool zip_paths_safe(const std::vector<ZipEntry>& entries, const std::string& root) {
+  if (entries.empty()) return false;
+  for (const ZipEntry& e : entries) {
+    const std::string& path = e.name;
+    if (path != root && path != root + "/" && path.rfind(root + "/", 0) != 0) return false;
+    if (path.find('\\') != std::string::npos || path.find(':') != std::string::npos) return false;
+    size_t start = 0;
+    while (start < path.size()) {
+      const size_t slash = path.find('/', start);
+      const std::string part = path.substr(start, slash == std::string::npos ? slash : slash - start);
+      if (part == ".." || part == ".") return false;
+      if (slash == std::string::npos) break;
+      start = slash + 1;
+    }
+  }
+  return true;
+}
+bool is_zip(const std::filesystem::path& p) { return p.extension() == ".zip"; }
+bool archive_paths_safe(const std::filesystem::path& zip, const std::string& root) {
+  if (!is_zip(zip)) return tar_paths_safe(zip, root);
+  std::vector<ZipEntry> entries;
+  return zip_entries(zip, entries) && zip_paths_safe(entries, root);
+}
+// Unpacks every entry under `dest` (stored or deflated, CRC checked). Callers check the paths first.
+bool unpack_zip(const std::filesystem::path& zip, const std::filesystem::path& dest) {
+  if (!is_zip(zip)) return tar_unpack(zip, dest);
+  std::vector<ZipEntry> entries;
+  if (!zip_entries(zip, entries)) return false;
+  std::ifstream f(zip, std::ios::binary);
+  if (!f) return false;
+  std::vector<unsigned char> packed, data;
+  for (const ZipEntry& e : entries) {
+    if (e.name.find("..") != std::string::npos || e.name.find(':') != std::string::npos || e.name.find('\\') != std::string::npos ||
+        (!e.name.empty() && e.name[0] == '/')) return false;
+    const std::filesystem::path target = dest / std::filesystem::u8path(e.name);
+    std::error_code ec;
+    if (!e.name.empty() && e.name.back() == '/') { std::filesystem::create_directories(target, ec); if (ec) return false; continue; }
+    if (e.size > 1024ull * 1024 * 1024 || e.packed > 1024ull * 1024 * 1024) return false;
+    unsigned char lh[30];
+    f.seekg((std::streamoff)e.local); f.read((char*)lh, 30);
+    if (!f || rd32(lh) != 0x04034b50u) return false;
+    f.seekg((std::streamoff)(e.local + 30 + rd16(lh + 26) + rd16(lh + 28)));
+    packed.resize((size_t)e.packed);
+    if (e.packed) f.read((char*)packed.data(), (std::streamsize)e.packed);
+    if (!f) return false;
+    data.resize((size_t)e.size);
+    if (e.method == 0) {
+      if (e.packed != e.size) return false;
+      data = packed;
+    } else if (e.method == 8) {
+      // stb's inflate looks a few bytes past the end of the stream; without padding it calls a stream
+      // that ends exactly there (zlib's own output) a bad huffman code.
+      packed.resize(packed.size() + 16, 0);
+      if (e.size && stbi_zlib_decode_noheader_buffer((char*)data.data(), (int)e.size, (const char*)packed.data(), (int)packed.size()) != (int)e.size)
+        return false;
+    } else {
+      return false;
+    }
+    if (crc32_of(data.data(), data.size()) != e.crc) return false;
+    std::filesystem::create_directories(target.parent_path(), ec);
+    std::ofstream o(target, std::ios::binary | std::ios::trunc);
+    if (data.size()) o.write((const char*)data.data(), (std::streamsize)data.size());
+    o.close();
+    if (!o) return false;
+  }
+  return true;
+}
+// A name from an archive that stays inside the folder it is unpacked to: relative, forward slashes,
+// no drive, no "." or ".." part.
+bool relative_inside(const std::string& path) {
+  if (path.empty() || path[0] == '/' || path.find('\\') != std::string::npos || path.find(':') != std::string::npos) return false;
+  size_t start = 0;
+  while (start < path.size()) {
+    const size_t slash = path.find('/', start);
+    const std::string part = path.substr(start, slash == std::string::npos ? slash : slash - start);
+    if (part == ".." || part == ".") return false;
+    if (slash == std::string::npos) break;
+    start = slash + 1;
+  }
+  return true;
+}
+// A .tar.gz read in process (one gzip member, plain and GNU long-name tar entries), for downloads
+// that must unpack where there is no tar.exe: Wine, Proton and some Windows installs.
+bool unpack_tar_gz(const std::filesystem::path& archive, const std::filesystem::path& dest) {
+  std::ifstream f(archive, std::ios::binary);
+  if (!f) return false;
+  std::vector<unsigned char> gz((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  if (gz.size() < 18 || gz[0] != 0x1f || gz[1] != 0x8b || gz[2] != 8) return false;
+  const unsigned flags = gz[3];
+  size_t at = 10;
+  if (flags & 4) { if (at + 2 > gz.size()) return false; at += 2 + rd16(&gz[at]); }
+  if (flags & 8) { while (at < gz.size() && gz[at]) ++at; ++at; }
+  if (flags & 16) { while (at < gz.size() && gz[at]) ++at; ++at; }
+  if (flags & 2) at += 2;
+  if (at + 8 > gz.size()) return false;
+  const uint32_t crc = rd32(&gz[gz.size() - 8]), size = rd32(&gz[gz.size() - 4]);
+  if (size > 1536u * 1024 * 1024) return false;
+  std::vector<unsigned char> tar(size);
+  gz.resize(gz.size() - 8);
+  gz.insert(gz.end(), 16, 0);   // stb's inflate reads a few bytes past the stream (see unpack_zip)
+  if (size && stbi_zlib_decode_noheader_buffer((char*)tar.data(), (int)size, (const char*)gz.data() + at, (int)(gz.size() - at)) != (int)size)
+    return false;
+  std::vector<unsigned char>().swap(gz);
+  if (crc32_of(tar.data(), tar.size()) != crc) return false;
+  std::string long_name;
+  for (size_t pos = 0; pos + 512 <= tar.size();) {
+    const unsigned char* h = &tar[pos];
+    if (std::all_of(h, h + 512, [](unsigned char c) { return c == 0; })) break;
+    uint64_t length = 0;
+    for (int i = 124; i < 136 && h[i] >= '0' && h[i] <= '7'; ++i) length = length * 8 + (h[i] - '0');
+    const size_t data = pos + 512;
+    if (length > tar.size() - data) return false;
+    const char type = (char)h[156];
+    std::string name;
+    if (!long_name.empty()) { name.swap(long_name); }
+    else {
+      const std::string prefix((const char*)h + 345, strnlen((const char*)h + 345, 155));
+      name.assign((const char*)h, strnlen((const char*)h, 100));
+      if (std::memcmp(h + 257, "ustar", 5) == 0 && !prefix.empty()) name = prefix + "/" + name;
+    }
+    if (type == 'L') long_name.assign((const char*)&tar[data], strnlen((const char*)&tar[data], (size_t)length));
+    else if (type == 'x') {   // pax: "<length> path=<name>\n" records
+      const std::string records((const char*)&tar[data], (size_t)length);
+      for (size_t r = 0; r < records.size();) {
+        const size_t space = records.find(' ', r);
+        const size_t len = std::strtoul(records.c_str() + r, nullptr, 10);
+        if (space == std::string::npos || len == 0 || r + len > records.size()) break;
+        const std::string record = records.substr(space + 1, r + len - space - 2);
+        if (record.rfind("path=", 0) == 0) long_name = record.substr(5);
+        r += len;
+      }
+    } else if (type == '0' || type == '\0' || type == '5') {
+      while (!name.empty() && name.back() == '/') name.pop_back();
+      if (name.rfind("./", 0) == 0) name.erase(0, 2);
+      if (!name.empty() && name != ".") {
+        if (!relative_inside(name)) return false;
+        const std::filesystem::path target = dest / std::filesystem::u8path(name);
+        std::error_code ec;
+        if (type == '5') { std::filesystem::create_directories(target, ec); if (ec) return false; }
+        else {
+          std::filesystem::create_directories(target.parent_path(), ec);
+          std::ofstream o(target, std::ios::binary | std::ios::trunc);
+          if (length) o.write((const char*)&tar[data], (std::streamsize)length);
+          o.close();
+          if (!o) return false;
+        }
+      }
+    }   // links, pax headers and devices are not needed by any download: skipped
+    pos = data + (size_t)((length + 511) / 512 * 512);
+  }
+  return true;
+}
+}  // namespace
+
+void check(const std::string& current_version, bool install_experimental) {
+  join();
+  g_current = current_version;
+  g_state = State::Checking;
+  g_thread = std::thread([install_experimental] {
+    std::string body; int status = 0;
+    if (!http_get(REPO_API, &body, &status) || status != 200) { set_message(status ? "Update check failed (HTTP " + std::to_string(status) + ")" : "Update check failed (no connection)"); host::log("updater: GET %s failed, HTTP %d, error %lu", REPO_API, status, (unsigned long)GetLastError()); g_state = State::Failed; return; }
+    auto list = nlohmann::json::parse(body, nullptr, false);
+    nlohmann::json j;
+    std::vector<Download> catalog;
+    if (list.is_array()) for (auto& r : list) {
+      if (!r.is_object() || r.value("draft", false) || !r.count("tag_name") || !r["tag_name"].is_string()) continue;
+      std::string tag = r["tag_name"].get<std::string>();
+      if (!tag.empty() && tag[0] == 'v') tag.erase(0, 1);
+      if (!safe_version(tag)) continue;
+      Download d; d.release.version = tag; d.root_name = "MeleeUnlocked-" + tag;
+      if (r.count("published_at") && r["published_at"].is_string()) d.release.published = r["published_at"].get<std::string>().substr(0, 10);
+      if (r.count("body") && r["body"].is_string()) d.release.notes = r["body"].get<std::string>();
+      if (r.count("assets") && r["assets"].is_array()) for (const auto& a : r["assets"]) {
+        if (!a.is_object()) continue;
+        const std::string name = a.value("name", std::string());
+        const std::string url = a.value("browser_download_url", std::string());
+        if (!release_url(url)) continue;
+        if (name == "MeleeUnlocked-" + tag + kPlatformAsset) { d.legacy_url = url; d.legacy_size = a.value("size", size_t(0)); d.legacy_digest = asset_digest(a); d.release.legacy = true; }
+        if (name == "MeleePort-" + tag + "-win64.zip") { d.root_name = "MeleePort-" + tag; d.legacy_url = url; d.legacy_size = a.value("size", size_t(0)); d.legacy_digest = asset_digest(a); d.release.legacy = true; }
+        if (name == "MeleeUnlocked-" + tag + "-DLSS5-Experimental.zip") { d.experimental_url = url; d.experimental_size = a.value("size", size_t(0)); d.experimental_digest = asset_digest(a); d.release.experimental = true; }
+      }
+      if (d.release.legacy || d.release.experimental) catalog.push_back(std::move(d));
+      if (!j.is_object()) j = r;
+    }
+    if (!j.is_object()) { set_message("Update check failed (bad response)"); g_state = State::Failed; return; }
+    std::string tag = j["tag_name"].get<std::string>();
+    if (!tag.empty() && tag[0] == 'v') tag.erase(0, 1);
+    std::string zip, zip_digest;
+    size_t zip_size = 0;
+    char module[MAX_PATH]{}; GetModuleFileNameA(nullptr, module, MAX_PATH);
+    std::string dir(module); auto slash = dir.find_last_of("\\/");
+    if (slash != std::string::npos) dir.resize(slash);
+    // Since 0.7.0 there is one game build with DLSS 5 inside it, shipped as -win64.zip. A folder
+    // that still holds an old melee_port_dlss5.exe must not keep asking for a separate
+    // DLSS5-Experimental download, or it would never be offered an update again. The old name is
+    // only a fallback for a release that has no -win64.zip.
+    (void)dir;
+    const std::string wanted = "MeleeUnlocked-" + tag + kPlatformAsset;
+    const std::string fallback = "MeleeUnlocked-" + tag + "-DLSS5-Experimental.zip";
+    if (j.count("assets") && j["assets"].is_array()) {
+      for (auto& a : j["assets"]) if (a.is_object() && a.value("name", std::string()) == wanted) { zip = a.value("browser_download_url", std::string()); zip_size = a.value("size", size_t(0)); zip_digest = asset_digest(a); break; }
+      if (zip.empty())
+        for (auto& a : j["assets"]) if (a.is_object() && a.value("name", std::string()) == fallback) { zip = a.value("browser_download_url", std::string()); zip_size = a.value("size", size_t(0)); zip_digest = asset_digest(a); break; }
+    }
+    if (!zip.empty() && !release_url(zip)) zip.clear();   // the same origin rule as the version list
+    { std::lock_guard<std::mutex> lk(g_mutex); g_latest = tag; g_zip_url = zip; g_zip_size = zip_size; g_zip_digest = zip_digest; g_releases = std::move(catalog); }
+    if ((newer(tag, g_current) || install_experimental) && !zip.empty()) { set_message(install_experimental ? "Installing experimental build: " + tag : "Update available: " + tag); g_state = State::UpdateAvailable; host::log("updater: version %s available (running %s)", tag.c_str(), g_current.c_str()); }
+    else if (zip.empty() && install_experimental) { set_message("Experimental download missing from the latest release"); g_state = State::Failed; }
+    else { set_message("Up to date (" + g_current + ")"); g_state = State::UpToDate; }
+  });
+}
+
+bool download_matches(const std::string& body, const std::string& sha256_hex) { return digest_matches(body, sha256_hex); }
+bool unpack_archive(const std::string& zip_path_utf8, const std::string& dest_utf8) {
+  return unpack_zip(std::filesystem::u8path(zip_path_utf8), std::filesystem::u8path(dest_utf8));
+}
+bool unpack_download(const std::string& archive_utf8, const std::string& dest_utf8) {
+  const auto archive = std::filesystem::u8path(archive_utf8), dest = std::filesystem::u8path(dest_utf8);
+  if (!is_zip(archive)) return unpack_tar_gz(archive, dest);
+  std::vector<ZipEntry> entries;
+  if (!zip_entries(archive, entries)) return false;
+  for (const ZipEntry& e : entries) if (!relative_inside(e.name)) return false;
+  return unpack_zip(archive, dest);
+}
+bool archive_inside(const std::string& zip_path_utf8, const std::string& root) {
+  return archive_paths_safe(std::filesystem::u8path(zip_path_utf8), root);
+}
+
+std::vector<unsigned long> install_processes(const std::string& install_root_utf8) {
+  namespace fs = std::filesystem;
+  std::vector<unsigned long> pids;
+  std::error_code ec;
+  const auto root = fs::weakly_canonical(fs::u8path(install_root_utf8), ec);
+  if (ec) return pids;
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) return pids;
+  PROCESSENTRY32W entry{}; entry.dwSize = sizeof entry;
+  if (Process32FirstW(snapshot, &entry)) do {
+    const wchar_t* names[] = {L"melee_source.exe", L"melee_source_compat.exe", L"melee_port.exe",
+      L"melee_port_compat.exe", L"melee_port_dlss5.exe", L"melee_port_dlss5_compat.exe",
+      L"MeleeUnlockedLauncher.exe",
+      // The Linux build's programs, which carry no extension.
+      L"melee_source", L"melee_source_compat", L"MeleeUnlocked", L"melee_linux"};
+    bool game = false;
+    for (const auto* name : names) game |= _wcsicmp(entry.szExeFile, name) == 0;
+    if (!game) continue;
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+    if (!process) continue;
+    std::wstring path(32768, L'\0'); DWORD size = (DWORD)path.size();
+    const bool known = QueryFullProcessImageNameW(process, 0, path.data(), &size) != FALSE;
+    CloseHandle(process);
+    if (!known) continue;
+    path.resize(size);
+    const auto directory = fs::weakly_canonical(fs::path(path).parent_path(), ec);
+    if (!ec && _wcsicmp(directory.c_str(), root.c_str()) == 0) pids.push_back(entry.th32ProcessID);
+  } while (Process32NextW(snapshot, &entry));
+  CloseHandle(snapshot);
+  return pids;
+}
+
+void shutdown();   // below, with the DLSS 5 model download it also waits for
+State state() { return g_state.load(); }
+std::string latest_version() { std::lock_guard<std::mutex> lk(g_mutex); return g_latest; }
+std::string message() { std::lock_guard<std::mutex> lk(g_mutex); return g_message; }
+std::vector<Release> releases() { std::lock_guard<std::mutex> lk(g_mutex); std::vector<Release> out; for (const auto& d : g_releases) out.push_back(d.release); return out; }
+RollbackState rollback_state() { return g_rollback_state.load(); }
+std::string rollback_message() { std::lock_guard<std::mutex> lk(g_mutex); return g_rollback_message; }
+std::string rollback_folder() { std::lock_guard<std::mutex> lk(g_mutex); return g_rollback_folder; }
+
+bool install_release(const std::string& version, bool experimental, const std::string& install_root) {
+  if (!safe_version(version) || g_rollback_state == RollbackState::Downloading) return false;
+  Download chosen; bool found = false;
+  {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    for (const auto& d : g_releases) if (d.release.version == version &&
+        (experimental ? d.release.experimental : d.release.legacy)) { chosen = d; found = true; break; }
+    g_rollback_folder.clear();
+  }
+  if (!found) return false;
+  if (g_rollback_thread.joinable()) g_rollback_thread.join();
+  g_rollback_state = RollbackState::Downloading;
+  rollback_message("Installing " + version + " beside the current version...");
+  g_rollback_thread = std::thread([chosen, experimental, install_root] {
+    namespace fs = std::filesystem;
+    const std::string id = chosen.release.version + (experimental ? "-dlss5" : "-legacy");
+    const fs::path versions = fs::u8path(install_root) / "Versions";
+    const fs::path target = versions / id;
+    std::error_code ec;
+    if (valid_install(target, experimental)) {
+      { std::lock_guard<std::mutex> lk(g_mutex); g_rollback_folder = target.u8string(); }
+      rollback_message("Version " + chosen.release.version + " is ready"); g_rollback_state = RollbackState::Ready; return;
+    }
+    if (fs::exists(target, ec)) { rollback_message("Version folder exists but is incomplete; remove it before retrying"); g_rollback_state = RollbackState::Failed; return; }
+    fs::create_directories(versions, ec);
+    if (ec) { rollback_message("Cannot create Versions folder"); g_rollback_state = RollbackState::Failed; return; }
+    const fs::path stage = versions / ("." + id + ".stage-" + std::to_string(GetCurrentProcessId()));
+    if (fs::exists(stage, ec)) { rollback_message("A previous version install is still staged"); g_rollback_state = RollbackState::Failed; return; }
+    fs::create_directory(stage, ec);
+    if (ec) { rollback_message("Cannot create download folder"); g_rollback_state = RollbackState::Failed; return; }
+    const auto fail = [&](const std::string& why) {
+      fs::remove_all(stage, ec); rollback_message(why); g_rollback_state = RollbackState::Failed;
+    };
+    const std::string url = experimental ? chosen.experimental_url : chosen.legacy_url;
+    const size_t expected = experimental ? chosen.experimental_size : chosen.legacy_size;
+    std::string body; int status = 0;
+    if (!http_get(url, &body, &status) || status != 200 || body.size() < 1000000 ||
+        (expected && body.size() != expected)) { fail("Version download failed or was incomplete"); return; }
+    if (!digest_matches(body, experimental ? chosen.experimental_digest : chosen.legacy_digest)) {
+      fail("Version download is damaged (checksum does not match the release)"); return;
+    }
+    const fs::path zip = stage / "release.zip";
+    { std::ofstream f(zip, std::ios::binary); f.write(body.data(), (std::streamsize)body.size()); if (!f) { fail("Cannot save version archive"); return; } }
+    const fs::path unpack = stage / "unpack";
+    fs::create_directory(unpack, ec);
+    if (ec || !archive_paths_safe(zip, chosen.root_name) || !unpack_zip(zip, unpack)) {
+      fail("Version archive is invalid or could not be unpacked"); return;
+    }
+    const fs::path payload = unpack / chosen.root_name;
+    if (!valid_install(payload, experimental)) { fail("Archive does not contain the expected game files"); return; }
+    fs::rename(payload, target, ec);
+    if (ec) { fail("Could not install version beside current build"); return; }
+    fs::remove_all(stage, ec);
+    { std::lock_guard<std::mutex> lk(g_mutex); g_rollback_folder = target.u8string(); }
+    rollback_message("Version " + chosen.release.version + " is ready"); g_rollback_state = RollbackState::Ready;
+  });
+  return true;
+}
+
+// The script an update hands over to. It waits for this process and the installation's games to
+// exit, unpacks the zip (Windows 10+ ships tar for zips), copies the release folder over this one
+// (keeping User\, settings, saves, replays) and starts the game again. It is written in binary: text
+// mode would turn every \r\n into \r\r\n, and the stray carriage return becomes part of the last
+// argument on each line, which is what stopped the relaunch from working. `batch_dir` and `relaunch`
+// come with their percent signs doubled.
+std::string install_script(const std::string& batch_dir, unsigned long self, const std::vector<unsigned long>& others,
+                           const std::string& relaunch, bool show_failure) {
+  // The script runs without a window, so a failure opens one of its own to say so: a `pause` here
+  // waited for a key nobody could press, and the player saw an update that never finished.
+  const auto failed = [show_failure](const char* what) {
+    if (!show_failure) return std::string("exit /b 1\r\n");   // the unit test: never a window
+    return std::string("start \"Melee Unlocked update\" cmd /k \"echo ") + what +
+           " & echo Close the game and any open Explorer window on this folder, then update again."
+           " & echo Details: update.log in the game folder.\"\r\nexit /b 1\r\n";
+  };
+  std::ostringstream b;
+  b << "@echo off\r\nsetlocal DisableDelayedExpansion\r\nchcp 65001 >nul\r\ncd /d \"" << batch_dir << "\" || exit /b 1\r\n"
+    << "set LOG=\"" << batch_dir << "\\update.log\"\r\n"
+    << "echo update started %DATE% %TIME%> %LOG%\r\n"
+    << ":wait\r\ntasklist /FI \"PID eq " << self << "\" 2>nul | find \"" << self << "\" >nul && (timeout /t 1 /nobreak >nul & goto wait)\r\n"
+    << ":waitgame\r\n";
+  // Source also holds the DLL open. Wait for both engines and other launchers
+  // from this folder, without blocking on games in unrelated installations.
+  for (const auto pid : others)
+    if (pid != self)
+      b << "tasklist /FI \"PID eq " << pid << "\" 2>nul | find \"" << pid
+        << "\" >nul && (timeout /t 1 /nobreak >nul & goto waitgame)\r\n";
+  // The launcher normally unpacks update.zip into update_tmp itself (Wine and Proton have no tar)
+  // and leaves update_tmp\unpacked.txt; tar is only the fallback for an older handover.
+  b << "if exist update_tmp\\unpacked.txt goto findsrc\r\n"
+    << "rmdir /s /q update_tmp 2>nul\r\nmkdir update_tmp\r\n"
+    // Windows bsdtar reports "Cannot restore time" and other benign warnings with exit code 1
+    // even when every entry was extracted. Treat the presence of a release folder as the real
+    // success signal: SRC detection below catches genuine extraction failures.
+    // Windows' own tar by its full path: another tar earlier on the PATH (GNU tar from a Unix tool
+    // set) does not read zips.
+    << "set TAR=tar\r\n"
+    << "if exist \"%SystemRoot%\\System32\\tar.exe\" set TAR=\"%SystemRoot%\\System32\\tar.exe\"\r\n"
+    << "%TAR% -xf update.zip -C update_tmp 2>> %LOG%\r\n"
+    << ":findsrc\r\n"
+    << "set SRC=\r\n"
+    << "for /d %%d in (update_tmp\\MeleeUnlocked-* update_tmp\\MeleePort-*) do set SRC=%%d\r\n"
+    << "if defined SRC goto unpacked\r\n"
+    << "echo could not unpack update.zip>> %LOG%\r\n"
+    << failed("Could not unpack the update.")
+    << ":unpacked\r\n"
+    << "echo copying from %SRC%>> %LOG%\r\n"
+    // /r overwrites read-only files: Windows marks files unpacked from a downloaded zip read-only
+    // often enough that the copy failed outright with "Could not copy the update into place".
+    // A file can also still be held for a moment by the process that just exited, so retry.
+    << "set TRIES=0\r\n"
+    << ":copy\r\n"
+    << "set /a TRIES+=1\r\n"
+    << "attrib -r \"*.*\" /s >nul 2>&1\r\n"
+    << "xcopy /e /y /q /r \"%SRC%\\*\" \".\\\" >> %LOG% 2>&1\r\n"
+    << "if not errorlevel 1 goto copied\r\n"
+    << "if %TRIES% lss 5 (echo copy attempt %TRIES% failed, retrying>> %LOG% & timeout /t 2 /nobreak >nul & goto copy)\r\n"
+    // xcopy stops at the first path of 255 characters or more (a deep game folder and a long file
+    // name inside the release), leaving the folder half updated. robocopy copies those too; its exit
+    // codes below 8 mean every file is in place.
+    << "echo copy failed after %TRIES% attempts, trying robocopy>> %LOG%\r\n"
+    << "robocopy \"%SRC%\" \".\" /E /IS /IT /R:3 /W:2 /NFL /NDL /NJH /NJS /NP >> %LOG% 2>&1\r\n"
+    << "if not errorlevel 8 goto copied\r\n"
+    << "echo robocopy failed too>> %LOG%\r\n"
+    << failed("Could not copy the update into place.")
+    << ":copied\r\n"
+    << "rmdir /s /q update_tmp\r\ndel update.zip\r\n"
+    << "echo restarting application>> %LOG%\r\n"
+    << "start \"\" " << relaunch << "\r\n"
+    << "echo done>> %LOG%\r\n"
+    << "del \"%~f0\"\r\n";
+  return b.str();
+}
+
+#ifndef _WIN32
+// Linux: the same steps as update.bat, as a POSIX shell script. It waits for this process and the
+// installation's games to exit, unpacks the archive, copies the release folder over this one
+// (keeping User/, settings, saves, replays) and starts the game again.
+std::string shell_quote(const std::string& s) {
+  std::string out = "'";
+  for (char c : s) { if (c == '\'') out += "'\\''"; else out += c; }
+  return out + "'";
+}
+std::string install_script_sh(const std::string& dir, unsigned long self, const std::vector<unsigned long>& others,
+                              const std::string& relaunch) {
+  std::ostringstream b;
+  b << "#!/bin/sh\n"
+    << "cd " << shell_quote(dir) << " || exit 1\n"
+    << "LOG=update.log\n"
+    << "echo \"update started $(date)\" > \"$LOG\"\n"
+    << "while kill -0 " << self << " 2>/dev/null; do sleep 1; done\n";
+  for (const auto pid : others)
+    if (pid != self) b << "while kill -0 " << pid << " 2>/dev/null; do sleep 1; done\n";
+  b << "rm -rf update_tmp && mkdir update_tmp\n"
+    << "tar -xf update.tar.gz -C update_tmp 2>> \"$LOG\"\n"
+    << "SRC=$(find update_tmp -mindepth 1 -maxdepth 1 -type d -name 'MeleeUnlocked-*' | head -n 1)\n"
+    << "if [ -z \"$SRC\" ]; then echo 'could not unpack update.tar.gz' >> \"$LOG\"; "
+    << "command -v zenity >/dev/null && zenity --error --no-markup --title='Melee Unlocked update' "
+    << "--text='Could not unpack the update. Details: update.log in the game folder.'; exit 1; fi\n"
+    << "echo \"copying from $SRC\" >> \"$LOG\"\n"
+    << "if ! cp -a \"$SRC\"/. . 2>> \"$LOG\"; then echo 'copy failed' >> \"$LOG\"; "
+    << "command -v zenity >/dev/null && zenity --error --no-markup --title='Melee Unlocked update' "
+    << "--text='Could not copy the update into place. Details: update.log in the game folder.'; exit 1; fi\n"
+    << "rm -rf update_tmp update.tar.gz\n"
+    << "echo 'restarting application' >> \"$LOG\"\n"
+    << "(" << relaunch << ") >/dev/null 2>&1 &\n"
+    << "echo done >> \"$LOG\"\n"
+    << "rm -f \"$0\"\n";
+  return b.str();
+}
+// What was started, from /proc/self/cmdline, each argument quoted for the shell.
+std::string relaunch_command() {
+  std::ifstream in("/proc/self/cmdline", std::ios::binary);
+  std::string all((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  std::string out; size_t start = 0;
+  for (size_t i = 0; i <= all.size(); ++i)
+    if (i == all.size() || all[i] == 0) {
+      if (i > start) { if (!out.empty()) out += ' '; out += shell_quote(all.substr(start, i - start)); }
+      start = i + 1;
+    }
+  return out;
+}
+#endif
+
+void download_and_install() {
+  if (g_state != State::UpdateAvailable) return;
+  join();
+  g_state = State::Downloading;
+  set_message("Downloading update...");
+  g_thread = std::thread([] {
+    std::string url, digest, tag; size_t expected;
+    { std::lock_guard<std::mutex> lk(g_mutex); url = g_zip_url; expected = g_zip_size; digest = g_zip_digest; tag = g_latest; }
+    std::string body; int status = 0;
+    if (!http_get(url, &body, &status, "Downloading update...") || status != 200 || body.size() < 1000000 || (expected && body.size() != expected)) { set_message("Download failed or incomplete"); g_state = State::Failed; return; }
+    set_message("Checking the download...");
+    if (!digest_matches(body, digest)) {
+      set_message("Download is damaged (checksum does not match the release); try again"); g_state = State::Failed;
+      host::log("updater: %zu bytes downloaded, SHA-256 does not match the release's", body.size()); return;
+    }
+    wchar_t exe[32768]{}; DWORD length = GetModuleFileNameW(nullptr, exe, 32768);
+    if (!length || length >= 32768) { set_message("Cannot resolve application path"); g_state = State::Failed; return; }
+    const auto directory = std::filesystem::path(exe).parent_path();
+    const std::string dir = directory.u8string();
+#ifdef _WIN32
+    const auto zip = directory / "update.zip", bat = directory / "update.bat";
+#else
+    const auto zip = directory / "update.tar.gz", bat = directory / "update.sh";
+#endif
+    { std::ofstream f(zip, std::ios::binary); f.write(body.data(), (std::streamsize)body.size()); if (!f) { set_message("Cannot write update.zip"); g_state = State::Failed; return; } }
+    // The same entry check the side-by-side install makes: every path inside the release folder,
+    // none absolute, with a drive or with "..".
+    if (!archive_paths_safe(zip, "MeleeUnlocked-" + tag) && !archive_paths_safe(zip, "MeleePort-" + tag)) {
+      std::error_code removed; std::filesystem::remove(zip, removed);
+      set_message("The update archive has unexpected contents; not installed"); g_state = State::Failed;
+      host::log("updater: update.zip rejected, an entry is outside its release folder"); return;
+    }
+    // Relaunch exactly what was started, so this works the same from the release batch file, the
+    // launcher, or a development shortcut with its own arguments. Percent signs would be eaten by
+    // the batch interpreter.
+#ifndef _WIN32
+    {
+      std::ofstream b(bat, std::ios::binary);
+      b << install_script_sh(dir, GetCurrentProcessId(), install_processes(dir), relaunch_command());
+      b.close();
+      if (!b) { set_message("Cannot write update installer"); g_state = State::Failed; return; }
+      set_message("Update downloaded; restarting to install");
+      g_state = State::ReadyToInstall;
+      host::log("updater: %zu bytes downloaded, installing via update.sh", body.size());
+      std::wstring cmd = L"sh \"" + bat.wstring() + L"\"";
+      STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
+      if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, directory.c_str(), &si, &pi)) {
+        set_message("Cannot start update installer"); g_state = State::Failed; return;
+      }
+      CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+      host::request_exit(0);
+      return;
+    }
+#endif
+    {
+      set_message("Unpacking the update...");
+      const auto tmp = directory / "update_tmp";
+      std::error_code ec;
+      std::filesystem::remove_all(tmp, ec);
+      std::filesystem::create_directories(tmp, ec);
+      if (ec || !unpack_zip(zip, tmp)) {
+        std::filesystem::remove_all(tmp, ec); std::filesystem::remove(zip, ec);
+        set_message("Could not unpack the update; not installed"); g_state = State::Failed;
+        host::log("updater: update.zip could not be unpacked"); return;
+      }
+      std::ofstream(tmp / "unpacked.txt") << "unpacked by the launcher\n";
+    }
+    std::string relaunch = utf8(GetCommandLineW());
+    for (size_t i = relaunch.find('%'); i != std::string::npos; i = relaunch.find('%', i + 2)) relaunch.insert(i, 1, '%');
+    std::string batch_dir = dir;
+    for (size_t i = batch_dir.find('%'); i != std::string::npos; i = batch_dir.find('%', i + 2)) batch_dir.insert(i, 1, '%');
+
+    std::ofstream b(bat, std::ios::binary);
+    b << install_script(batch_dir, GetCurrentProcessId(), install_processes(dir), relaunch, true);
+    b.close();
+    if (!b) { set_message("Cannot write update installer"); g_state = State::Failed; return; }
+    set_message("Update downloaded; restarting to install");
+    g_state = State::ReadyToInstall;
+    host::log("updater: %zu bytes downloaded, installing via update.bat", body.size());
+    STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
+    // Doubled quotes: cmd strips one layer, and the path contains spaces.
+    std::wstring cmd = L"cmd /c \"\"" + bat.wstring() + L"\"\"";
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, directory.c_str(), &si, &pi)) {
+      set_message("Cannot start update installer"); g_state = State::Failed; return;
+    }
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    host::request_exit(0);
+  });
+}
+
+// ---------------- DLSS 5 model ----------------
+namespace {
+// NVIDIA's DLSS 5 model (RTX Remix 1.6.1's package, version 310.9.16), carried by the 0.9.57 release
+// as its own asset. The file inside is checked against NVIDIA's signed build, so a damaged or
+// different download is never put beside the game.
+constexpr const char* kModelUrl =
+    "https://github.com/hero88go/melee-unlocked/releases/download/v0.9.57/MeleeUnlocked-DLSS5-Model.zip";
+constexpr const char* kModelSha256 = "2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f";
+constexpr const char* kModelFile = "nvngx_dlssnr.dll";
+std::atomic<bool> g_model_busy{false}, g_model_failed{false};
+std::string g_model_message;
+std::thread g_model_thread;
+void model_message(const std::string& m) { std::lock_guard<std::mutex> lk(g_mutex); g_model_message = m; }
+}  // namespace
+
+bool dlss5_model_present(const std::string& game_dir_utf8) {
+  std::error_code ec;
+  const auto dir = std::filesystem::u8path(game_dir_utf8);
+  return std::filesystem::is_regular_file(dir / kModelFile, ec) ||
+         std::filesystem::is_regular_file(dir / "DLSS5" / kModelFile, ec);
+}
+
+void dlss5_model_download(const std::string& game_dir_utf8) {
+  if (g_model_busy.exchange(true)) return;
+  if (g_model_thread.joinable()) g_model_thread.join();
+  g_model_failed = false;
+  model_message(std::string("Downloading DLSS 5 (") + kDlss5ModelSize + ")...");
+  g_model_thread = std::thread([game_dir_utf8] {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::u8path(game_dir_utf8);
+    const fs::path work = dir / "dlss5-download";
+    std::error_code ec;
+    auto fail = [&](const std::string& why) {
+      fs::remove_all(work, ec);
+      model_message(why);
+      host::log("dlss5 download: %s", why.c_str());
+      g_model_failed = true;
+      g_model_busy = false;
+    };
+    std::string body; int status = 0;
+    if (!http_get(kModelUrl, &body, &status) || status != 200)
+      return fail(status ? "DLSS 5 download failed (HTTP " + std::to_string(status) + ")" : "DLSS 5 download failed (no connection)");
+    fs::remove_all(work, ec);
+    fs::create_directories(work, ec);
+    const fs::path zip = work / "model.zip";
+    { std::ofstream f(zip, std::ios::binary); f.write(body.data(), (std::streamsize)body.size()); if (!f) return fail("DLSS 5: cannot write the download"); }
+    body.clear(); body.shrink_to_fit();
+    if (!unpack_zip(zip, work / "files")) return fail("DLSS 5: the download is damaged");
+    fs::path found;
+    for (const auto& e : fs::recursive_directory_iterator(work / "files", ec))
+      if (e.is_regular_file(ec) && e.path().filename() == kModelFile) { found = e.path(); break; }
+    if (found.empty()) return fail("DLSS 5: the download has no model in it");
+    std::string data;
+    { std::ifstream f(found, std::ios::binary); data.assign(std::istreambuf_iterator<char>(f), {}); }
+    if (sha256_hex(data) != kModelSha256) return fail("DLSS 5: the model does not match NVIDIA's file; not installed");
+    data.clear(); data.shrink_to_fit();
+    fs::rename(found, dir / kModelFile, ec);
+    if (ec) { ec.clear(); fs::copy_file(found, dir / kModelFile, fs::copy_options::overwrite_existing, ec); }
+    if (ec) return fail("DLSS 5: cannot put the model beside the game (" + ec.message() + ")");
+    fs::remove_all(work, ec);
+    model_message("DLSS 5 is installed. It starts with the game's next start.");
+    host::log("dlss5 download: NVIDIA's model installed beside the game");
+    g_model_busy = false;
+  });
+}
+
+ModelState dlss5_model_state(const std::string& game_dir_utf8) {
+  if (g_model_busy.load()) return ModelState::Downloading;
+  if (dlss5_model_present(game_dir_utf8)) return ModelState::Present;
+  return g_model_failed.load() ? ModelState::Failed : ModelState::Missing;
+}
+std::string dlss5_model_message() { std::lock_guard<std::mutex> lk(g_mutex); return g_model_message; }
+
+void shutdown() {
+  join();
+  if (g_rollback_thread.joinable()) g_rollback_thread.join();
+  if (g_model_thread.joinable()) g_model_thread.join();
+}
+}  // namespace host::updater

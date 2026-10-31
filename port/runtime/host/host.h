@@ -1,0 +1,380 @@
+// Host services used by the recompiled guest and the HLE layer.
+// SPDX-License-Identifier: GPL-2.0-or-later
+#pragma once
+#include <atomic>
+#include <cstdint>
+#include <exception>
+#include <functional>
+#include <new>
+#include <string>
+#include <vector>
+#include <filesystem>
+#include "ppc.h"
+#include "../abi/mu_host.h"
+#include "phob.h"
+#include "tick_timing.h"
+
+namespace host {
+
+struct Options {
+  std::string iso;
+  std::string state_trace;        // optional per-retrace CPU/RAM/ARAM verification CSV
+  std::string state_digest;       // per-retrace gameplay state shared with the source build
+  std::string log_file;           // console log copy (default melee_port.log in the working directory)
+  uint32_t frames = 0;           // stop after N retraces (0 = run until exit)
+  bool fast = false;             // no real-time pacing
+  bool trace_calls = false;      // log HLE calls
+  bool quiet = false;
+  uint64_t time_base = 0;        // preset timebase (0 = derive from wall clock like Dolphin)
+  uint32_t rng_seed = 0;         // --rng-seed: force HSD_RandSeedPtr when a VS match starts (0 = off, game picks its own)
+  bool rng_seed_set = false;
+  int volume = 0;                // audio output volume percent (0 = muted, the development default)
+  double hang_watch = 0.0;       // seconds without a retrace before the guest is declared hung (0 = off)
+#ifdef MELEE_NO_SLIPPI
+  std::string sys_dir = "Sys";               // system files beside the game (the DSP coefficient table)
+#else
+  std::string sys_dir = "port/slippi_sys";   // Slippi Sys folder (code tables, GameFiles served over the EXI device)
+#endif
+  std::string replay_dir = "replays";        // where .slp recordings are written
+  std::string lab_dir = "Lab";               // Lab view character packs (tools/build_lab_assets.py)
+  std::string card_dir = "User/GC/CardA";    // memory card slot A as a folder of .gci files
+  std::string audio_dump;        // optional WAV file receiving everything the AI DMA plays
+  std::string input_log;         // --input-log: CSV of every PADRead (retrace, port, buttons, sticks, triggers)
+  bool no_gc_adapter = false;    // hidden/headless runs: never open the GameCube adapter (WinUSB is exclusive; a test run would take it from the player)
+  bool vanilla_game = false;     // --vanilla-game: the Source engine without Legacy's always-on code set (parity runs against the code-free recompilation)
+  // Static Recomp mod runs: the boot disc (iso) is a mod, and this is the player's vanilla 1.02 disc.
+  // The mod's changed game code then runs from RAM, compared against the vanilla code.
+  std::string mod_base_iso;
+};
+
+extern Options options;
+extern uint8_t* ram;             // guest RAM (MEM1)
+extern uint32_t ram_size;        // its size in bytes: 24 MB, the console's, unless a build gives the game more
+extern uint8_t* aram;            // 16 MB audio RAM (host side)
+extern ppc::Context* cpu;
+
+// ---- logging ----
+void log(const char* fmt, ...);
+void log_guest_text(const char* data, size_t len);  // OSReport output
+void log_flush();   // writes every queued log line now (log() hands lines to a writer thread)
+void log_memory();  // one line: this process's size and the memory Windows has left
+[[noreturn]] void die(const char* fmt, ...);
+// The body of a worker thread whose work the game can do without (a song, a video background, a
+// texture, a thumbnail, a file cache warm-up). An exception left a thread function and stopped the
+// whole game: a 0.8.99 report ran out of memory late in a session and the music thread's allocation
+// for the next song took the match down ("bad allocation"). Here it ends only that piece of work.
+template <class Body> void optional_work(const char* what, Body&& body) noexcept {
+  try {
+    body();
+  } catch (const std::bad_alloc&) {
+    log("%s: not enough memory; skipped", what);
+  } catch (const std::exception& e) {
+    log("%s: stopped (%s)", what, e.what());
+  } catch (...) {
+    log("%s: stopped", what);
+  }
+}
+// Ends the process now, with everything of ours already saved, without running DLL unload code
+// (see end_process in host.cpp for why).
+[[noreturn]] void end_process(int code);
+// The game is ending on purpose (end_process, or the Source Port's shutdown). From here an exception
+// nobody catches on some other thread (a driver's or an overlay's, tearing down) ends the process
+// quietly instead of reporting a crash.
+void set_process_ending();
+bool process_ending();
+// Called by die() with its message before the process exits, so a fatal error leaves the same crash
+// report as an exception (the app registers it; the launcher offers that report).
+void set_die_hook(void (*hook)(const char* message));
+void set_after_guest_call(void (*hook)(uint32_t addr));   // diagnostics: after each host-delivered guest callback
+// Hidden Static runs only, MELEE_TRACE_GUEST_HEAP=1: observe the known retail allocation assert.
+// Env off installs no hooks and reads no heap metadata. Allocation behavior is unchanged.
+void install_guest_heap_trace();
+const char* symbol_name(uint32_t addr);
+// Static Recomp: the boot disc is a mod (its changed code runs from RAM; see --mod-base-iso).
+bool mod_disc_active();
+// The mod disc runs without Slippi's codes (see host.cpp): nothing of Slippi's may be written into RAM.
+bool mod_clean_mode();
+// The mod's reference image: the code the compiled guest runs (vanilla, Slippi's boot codes and the
+// words the in-game applier installs from Slippi's served table). A function whose RAM words all match
+// it stays compiled. Sets `n` bytes at `addr` where they fall in the text ranges; false when none do.
+bool mod_reference_set(uint32_t addr, const uint8_t* bytes, uint32_t n);
+// False with MELEE_MOD_REFERENCE=boot: the reference then stays vanilla plus the boot codes (0.8.1 rule).
+bool mod_reference_from_table();
+
+// ---- guest memory (host side, big-endian) ----
+uint32_t rd32(uint32_t addr);
+uint16_t rd16(uint32_t addr);
+uint8_t rd8(uint32_t addr);
+void wr32(uint32_t addr, uint32_t v);
+void wr16(uint32_t addr, uint16_t v);
+void wr8(uint32_t addr, uint8_t v);
+uint8_t* ptr(uint32_t addr, uint32_t bytes = 1); // checks the complete RAM span
+// The same lookup without dying: nullptr when the span is not the game's memory. The source port
+// also has the game's own image, whose statics the console build kept in RAM; its physical form
+// (address & 0x3FFFFFFF) is 0x10000000 + offset for an image at 0x50000000.
+uint8_t* try_ptr(uint32_t addr, uint32_t bytes = 1);
+extern uint8_t* game_image;       // null for the recompiled build
+extern uint32_t game_image_size;
+void mark_ram_write(uint32_t addr, uint32_t bytes); // direct HLE/DMA write invalidation for renderer snapshots
+std::string cstr(uint32_t addr, size_t max = 256);
+
+// ---- disc ----
+struct DiscFile { uint32_t offset, size; };
+bool disc_open(const std::string& path);
+void disc_prefetch_wait();  // finish background file-cache warming before starting simulation/audio
+bool disc_read(uint32_t offset, void* dst, uint32_t size);
+// Bytes of the disc's main.dol by console address (data the game keeps in its executable, such as
+// the text font). False when the address is not in the DOL's sections.
+bool dol_data_read(uint32_t address, void* dst, uint32_t size);
+// File-relative read used by DVDFileInfo calls. Cosmetic replacements are resolved by the file's
+// original FST start plus this relative offset; absolute disc reads always use disc_read above.
+bool disc_read_file(uint32_t vanilla_file_start, uint32_t file_offset, void* dst, uint32_t size);
+uint32_t disc_fst_offset();
+uint32_t disc_fst_size();
+uint32_t disc_fst_addr();   // the file table as boot placed it (repairs the low-memory pointer when it was overwritten)
+uint32_t disc_fst_max_size();
+bool disc_find_file(const std::string& name, uint32_t* offset, uint32_t* size);
+// Resolves an absolute disc file offset (as sent to the jukebox) to its case-normalized FST path.
+bool disc_find_path_by_offset(uint32_t offset, std::string* path);
+// Lists menu and stage HPS paths from the loaded disc's FST.
+bool disc_music_paths(std::vector<std::string>* paths);
+
+// ---- boot ----
+void boot_setup();               // low memory, FST placement, DOL load, registers
+constexpr uint32_t kVanillaDolSize = 0x4385E0u;
+bool vanilla_dol_image(const std::vector<uint8_t>& image);
+bool disc_has_vanilla_dol();     // the disc's main.dol is retail NTSC 1.02 (modded discs are not)
+void init_state_digest();        // source path skips boot_setup but shares the digest writer
+
+// ---- events (interrupt delivery at guest wait points) ----
+using Completion = std::function<void()>;
+void post_completion(Completion fn);   // callback delivered at the next wait point
+void set_pe_finish_pending();
+void set_pe_token_pending(uint16_t token);
+void wait_event();                     // one OSSleepThread step
+void pump_completions();               // deliver queued callbacks now (from HLE entry points)
+void retrace();                        // one VI retrace: time, alarms, VI interrupt
+bool retrace_due();                    // the timebase has reached the next retrace boundary
+uint64_t next_retrace_tb();            // timebase of the next retrace boundary
+// Source port: the game is native code, not the recompiled guest. When set, retrace() calls this in
+// place of the guest's alarm, audio and VI interrupt delivery (everything else, pacing, window,
+// logging, exit, is shared).
+extern void (*native_retrace)();
+extern void (*native_state_snapshot)(MuStatePod*);
+// The game's current mode/scene (GameRouting::curr_mode, curr_state_id), read the same way for
+// both builds (native_state_snapshot when the source port is running, direct guest reads
+// otherwise). Used by an @scene script directive to align input to a game point instead of an
+// absolute retrace, so the same script drives both builds into the same match despite differing
+// boot and menu timing. Safe to call every retrace; cheap either way.
+void current_scene(uint32_t* major, uint32_t* minor, uint32_t* match_frame);
+#ifdef YOUGAME_AGENT_TEST_HOOK
+// The same live snapshot used by digest logging, without opening a log.
+void agent_test_digest_state(MuStatePod* out);
+#endif
+void deliver_interrupt(uint32_t number);
+bool exit_requested();
+void request_exit(int code);
+// The player closed the window or chose Quit. While a replay is on screen and has not reached its
+// end the exit code is kViewerClosedExit, so the launcher's replay queue stops instead of starting
+// the next replay; in every other case it is 0, as before.
+constexpr int kViewerClosedExit = 4;
+void request_user_exit();
+void set_replay_viewing(bool on);
+// Local launcher mailbox for an explicitly accepted lobby Direct match.
+// Only a normal completed game with one known winner contributes to W/L history.
+// Also YouGame's word that an online game ended (yougame::game_ended): `lras` is the port a No
+// Contest names (-1 none), `placements` the Game End record's four placement bytes when known.
+void publish_lobby_result(int winner_index, int end_method, int lras = -1, const uint8_t* placements = nullptr);
+// Relaunch this executable with the same command line, then shut down the way request_exit does,
+// so the replay is finalised and the pipeline cache written before the new process takes over.
+// Used for settings a running device cannot adopt, the graphics backend being the one that
+// matters today.
+void request_restart();
+int exit_code();
+uint32_t retrace_count();
+// Frame id read by the optional sampling profiler. It is atomic because the
+// profiler reads it from its sampling thread while the simulation advances it.
+uint32_t profiler_frame_id();
+const std::vector<uint32_t>& slow_sim_frames();
+
+// ---- simulation-thread cost accounting (per retrace; logged when a frame exceeds 20 ms) ----
+enum SimCost { SIM_DVD, SIM_AX, SIM_JUKEBOX, SIM_EXI, SIM_SNAPSHOT, SIM_QUEUE, SIM_OBSERVE, SIM_RECORD, SIM_DECODE,
+               // Where a frame's time goes besides work: reading the controllers, the frame's own timed waits
+               // (the audio steps), and how far past their deadlines those waits returned.
+               SIM_INPUT, SIM_WAIT, SIM_LATE, SIM_COST_COUNT };
+void sim_cost_add(int slot, double seconds);
+double last_sim_frame_ms();            // wall time of the most recent simulation interval (in-frame waits included)
+void report_sim_work();                // once, at orderly quit; completed intervals only
+double last_sim_frame_work_ms();       // the same frame without its in-frame pacing waits: the thread's own work            // work time of the most recent simulation frame (sleep excluded)
+bool last_sim_frame_late();          // the most recent frame finished after its 60 Hz deadline (the pacer had nothing to wait)
+
+// ---- time ----
+constexpr uint64_t TB_HZ = 40500000ull;   // bus clock / 4
+constexpr uint64_t TB_PER_FRAME = TB_HZ / 60;
+void advance_time(uint64_t ticks);
+// Idle-wait pacing: waits until the real time of console time `tb` inside the frame now running
+// (the frame started at its tick deadline; the coming retrace is one frame later on both clocks),
+// then advances the timebase to `tb`. False, without waiting, when `tb` is not before the coming
+// retrace or when running unpaced (--fast).
+bool wait_until_console_time(uint64_t tb);
+void install_audio_pacing();
+void install_clean_mode_music();   // Static Recomp, clean mode: music through the host's player
+void install_preload_room();   // Static Recomp: the preloader makes room in a full heap instead of stopping
+void install_mod_disc_guards();   // Static Recomp, mod disc: a file the disc lacks opens as an empty file   // Static Recomp: audio blocks at their 5 ms times during the frame wait
+void report_recent_files();   // a mod disc's game stopped: one line with the last files it asked for by name
+void report_heap_panic(ppc::Context& c);   // OSPanic at lbmemory.c:233: logs the heap that had no room and the title demo's draw
+void note_scene_memory();     // a mod disc's scene changed: one line with the current object heap's size and use
+void report_object_memory();   // OSPanic at memory.c:52: one line per object heap (size, free, largest free piece)
+bool grow_object_heap(uint32_t heap, uint32_t bytes);   // a full heap: add space above the console's 24 MB (host.cpp)
+void apply_wide_fighter_draw();   // Static Recomp, once per game frame: fighters in the added sides draw under True 16:9
+void install_console_clock();  // Static Recomp: OSGetTime carries the date (see os_get_time_dated)
+void install_language_override();  // Static Recomp: the functions that read the saved language follow g_game_language
+void install_low_poly_fighters();  // Static Recomp: the fighter parts hook behind "Low poly fighters" (gx::low_poly_fighters_active)
+void apply_player_tags_always();   // Static Recomp, once per game frame: keeps the P1 / P2 markers up while the option is on
+void apply_arcade_hitboxes();      // Static Recomp, once per game frame: the Arcade look's hitbox switches as the code's own words
+void apply_shield_colors();        // Static Recomp, once per game frame: the player's own shield colours
+void apply_low_poly_fighters();    // Static Recomp, once per game frame: runs the fighter draw from RAM while the option is on
+void install_cobj_guard();        // Static Recomp: an unknown camera projection type no longer stops the game (cobj.c:2000)
+void install_sub_color_guard();   // Static Recomp: a tint index past 4 no longer stops the game (fighter.c:828)
+void apply_freeze_final_destination();   // Static Recomp, once per game frame: "Freeze Final Destination" on or off
+void apply_final_destination_guard();   // Static Recomp, once per game frame: a Final Destination skin without its background animation does not stop the game
+uint64_t console_epoch_ticks(); // the console clock at start: ticks since 2000-01-01, local time
+void note_frame_submitted();   // the game handed over the frame's picture; until the retrace it only waits
+// Retrace pacing multiplier (Slippi Online nudges it by up to 1% to keep peers in step).
+void set_emulation_speed(double speed);
+double emulation_speed();
+// Host steady-clock seconds of the current simulation frame's retrace (the scheduled deadline when
+// paced, wall time when --fast). Sub-frame presentation measures its phase from this.
+double frame_time();
+double now_seconds();
+// Seconds a short timed sleep wakes late by on this system, as last measured (0 on a healthy one).
+// A wait that must end on time sleeps only when it has that much room, and spins otherwise.
+double sleep_slack();
+bool latency_trace_enabled();
+TickTiming& tick_timing();
+// Per-draw scopes run tens of thousands of times a frame, so they read the CPU time stamp counter
+// (one instruction) instead of QueryPerformanceCounter; tsc_seconds is calibrated once at startup.
+extern const double tsc_seconds;
+struct SimCostScope { int slot; uint64_t t0; explicit SimCostScope(int s) : slot(s), t0(__rdtsc()) {} ~SimCostScope() { sim_cost_add(slot, (double)(__rdtsc() - t0) * tsc_seconds); } };
+
+// ---- GX FIFO sink ----
+void gx_write(uint32_t value, int bytes);  // write-gather pipe data
+void gx_frame_present(uint32_t xfb_addr);
+void gx_stats(uint64_t* commands, uint64_t* draws, uint64_t* vertices, uint32_t* efb_copies);
+extern uint64_t g_disc_reads, g_disc_bytes;
+extern bool g_has_window;
+
+// ---- MMIO (0xCC000000 range) ----
+uint32_t mmio_read(uint32_t addr, int bytes);
+void mmio_write(uint32_t addr, uint32_t value, int bytes);
+
+// ---- input ----
+struct PadState { uint16_t button; int8_t stick_x, stick_y, sub_x, sub_y; uint8_t trig_l, trig_r, analog_a, analog_b; int8_t err; };
+void input_poll(PadState out[4]);
+// The controllers as they are right now, routed to the game's ports exactly as input_poll routes
+// them, with none of input_poll's side effects (no overlay snapshot, no settings chord, no script):
+// for the early-input sampler, which reads between the game's polls on its own thread.
+void input_read_devices(PadState out[4]);
+// Scripted runs (--script): true while a script is driving the pads, and the pads the script will
+// deliver at retrace `retrace` (no state is changed by asking).
+bool input_script_active();
+void input_script_peek(uint32_t retrace, PadState out[4]);
+// Online: the game frame whose pad was just sent, for scripts that count game frames
+// (MELEE_TEST_SCRIPT_PAD_FRAMES).
+void input_note_pad_frame(int32_t frame);
+// The state the game read on the last PADRead, for the on-screen controller overlay.
+void input_last_pads(PadState out[4]);
+// GameCube controller adapter (WUP-028 over WinUSB): fills plugged ports, returns their mask.
+uint32_t gcadapter_poll(PadState out[4]);
+// PhobGCC settings for an adapter port (phob.h): applied to every report while enabled.
+void gcadapter_phob_set(int port, const phob::Settings& settings);
+phob::Settings gcadapter_phob_get(int port);
+// The controller on `port` as the adapter reports it right now, for calibration. False if none.
+bool gcadapter_phob_raw(int port, phob::HardwareInput& in);
+// One adapter report as read and as the Phob settings shaped it, for the scope menus. Stick values
+// are relative to the neutral point.
+struct GCScopeSample {
+  uint32_t time_us;
+  int8_t raw_ax, raw_ay, raw_cx, raw_cy, ax, ay, cx, cy;
+  uint8_t raw_l, raw_r, l, r;
+  uint16_t raw_buttons, buttons;
+  uint8_t hw_ax, hw_ay, hw_cx, hw_cy;   // the stick bytes exactly as the adapter reported them (calibration reads these)
+};
+// The latest `max` reports for `port`, oldest first; returns how many were written.
+int gcadapter_scope(int port, GCScopeSample* out, int max);
+// Saved Phob settings (phob_store.cpp): load reads every port's file and applies it, save applies
+// and writes one port. Setups are named copies a player can share.
+// Test runs only (MELEE_TEST_ADAPTER_SCRIPT with the adapter off): plays a scripted controller on
+// socket 1 through the adapter's report path. Started when the PhobGCC section first draws.
+void gcadapter_test_script_start();
+void phob_store_load(const std::string& settings_path);
+bool phob_store_save(int port, const phob::Settings& s);
+std::string phob_store_folder();   // the PhobGCC folder beside the settings file
+std::vector<std::string> phob_setup_list();
+bool phob_setup_delete(const std::string& name);
+bool phob_setup_save(const std::string& name, const phob::Settings& s, bool with_calibration);
+bool phob_setup_load(const std::string& name, phob::Settings& s);
+// Measured incoming USB reports per second, shared by the four adapter sockets; zero if stale.
+double gcadapter_poll_rate_hz();
+// Why a plugged-in adapter cannot be read (another program has it, no driver), in words for the
+// Controls tab; empty when there is nothing to say.
+std::string gcadapter_problem();
+// The same for a Switch Online GameCube controller on USB that cannot be started (Steam holds it,
+// no driver on its command interface); empty once it streams.
+std::string switch_pad_problem();
+bool steam_running();   // steam.exe is running (it takes adapters and Switch controllers)
+// Reconnect and recalibrate the adapter on its worker, without blocking game/render threads.
+bool gcadapter_request_reset();
+bool gcadapter_reset_pending();
+void gcadapter_rumble(int port, bool on);
+// Rumble for an IN-GAME port, delivered to whichever adapter socket the port assignment routes to
+// that port (or nowhere, for a device without a motor). The game names ports, not sockets: a
+// player plugged into socket 2 and playing as port 1 online used to feel the OPPONENT's rumble,
+// because port 2's motor command went straight to socket 2.
+// The player's own switch for controller rumble (Controls tab), on by default. The game's rumble
+// option is not reachable in Slippi's online menus, so this is the only way to turn it off there.
+extern std::atomic<bool> g_rumble_enabled;
+// Background input (Game tab), on by default. On: controllers keep playing while another window has
+// focus, as they always have, and the keyboard is read then too. Off: every port reads neutral
+// until the game window has focus again, as in Dolphin with Background Input unticked.
+extern bool g_background_input;
+// The game's language as chosen in the PC settings (Game tab): 0 leaves the game's own choice
+// (Options > Language, kept in its save), 1 Japanese, 2 English. It is answered wherever the game
+// asks for its saved language, so the save itself is never changed, and it takes effect as each
+// screen loads. game_language_override() gives it in the game's own numbering: -1 none, 0 Japanese,
+// 1 English.
+extern std::atomic<int> g_game_language;
+int game_language_override();
+// "20XX CPUs" (Game tab, both engines): CPUs play with the 20XX Hack Pack's AI, offline only. On the
+// Static Recomp hackpack_ai.cpp reads this at each match start (MELEE_TEST_20XX_AI=1 forces it on).
+extern std::atomic<bool> g_cpu_20xx;
+// "Freeze Final Destination" (Game tab, both engines): Final Destination's background stays on its
+// first form. On the Static Recomp apply_freeze_final_destination() reads this once per frame.
+extern std::atomic<bool> g_freeze_fd;
+void input_rumble(int game_port, bool on);
+// Immediately clear any motors that were active when the Controls switch is turned off.
+void input_stop_all_rumble();
+// Rumble for the local netplay player through the first assigned rumble-capable input source.
+void input_rumble_local(bool on);
+// Forget a port's stored neutral so the next report re-establishes it (-1 for every port). The game
+// asks for this through PADRecalibrate.
+void gcadapter_recalibrate(int port);
+void gcadapter_shutdown();
+// EXPERIMENTAL, untested against hardware. Nintendo Switch Pro Controller (also the Joy-Cons and
+// the SNES Online pad) over USB or Bluetooth HID. Fills the slots that are sending input and returns
+// their mask, plus the raw SWPRO_* button bits for the remappable binding table. See switch_pro.cpp
+// for why this needs more than Raw Input.
+uint32_t switchpro_poll(PadState out[4], uint16_t buttons[4]);
+void switchpro_recalibrate(int slot);
+void switchpro_shutdown();
+
+// Guest call helpers for HLE code.
+void call_guest(uint32_t addr, uint32_t r3 = 0, uint32_t r4 = 0, uint32_t r5 = 0, uint32_t r6 = 0);
+
+}  // namespace host
+
+// Thrown by hle::OSLoadContext to unwind a guest interrupt/exception handler.
+struct LoadContextUnwind { uint32_t context; };
+
+// Unwind a normal game stop so renderer threads can drain and join.
+struct ExitRequested { int code; };

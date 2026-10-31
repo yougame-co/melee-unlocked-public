@@ -1,0 +1,253 @@
+// Regression: launcher-visible accounts must also enable the game's online menu.
+// Uses production User and EXI/native menu commands with synthetic accounts; no servers.
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "slippi_account.h"
+#include "slippi_net.h"
+#include "slippi_online.h"
+#include "native_slippi_bridge.h"
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <process.h>
+#include <atomic>
+#include <thread>
+
+#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); return 1; } } while (0)
+namespace fs = std::filesystem;
+namespace {
+void write(const fs::path& file, const std::string& text) {
+  fs::create_directories(file.parent_path());
+  std::ofstream output(file, std::ios::binary);
+  output << text;
+  if (!output) throw std::runtime_error("fixture write failed");
+}
+std::string read(const fs::path& file) {
+  std::ifstream input(file, std::ios::binary);
+  return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+std::string profile(const char* name, const char* code) {
+  return nlohmann::json{{"uid", "synthetic-test-user"}, {"playKey", "synthetic-test-key"},
+                        {"displayName", name}, {"connectCode", code}}.dump();
+}
+struct Environment {
+  std::string name, previous;
+  Environment(const char* key, const fs::path& path) : name(key) {
+    char* value = nullptr; size_t size = 0;
+    _dupenv_s(&value, &size, key);
+    if (value) previous = value;
+    free(value);
+    _putenv_s(key, path.string().c_str());
+  }
+  ~Environment() { _putenv_s(name.c_str(), previous.c_str()); }
+};
+struct OnlineShutdown { ~OnlineShutdown() { slippi::online::shutdown(); } };
+std::string version_reply;
+int version_http_status = 200;
+std::atomic<int> version_requests{0};
+std::atomic<bool> block_version_fetch{false};
+bool version_transport_ok = true;
+bool fetch_version(const std::string& url, std::string* response, int* status) {
+  ++version_requests;
+  while (block_version_fetch.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  *response = version_reply;
+  *status = version_http_status;
+  return version_transport_ok && url == "https://users-rest-dot-slippi.uc.r.appspot.com/user/synthetic-test-user";
+}
+}
+
+// A Dolphin build the Slippi Launcher's settings file points at, outside the launcher's folder,
+// and the three reasons an account can be missing.
+int moved_build_and_reasons(const fs::path& root) {
+  const fs::path local = root / "MU" / "User" / "Slippi";
+  const fs::path launcher = root / "Roaming" / "Slippi Launcher";
+  const std::vector<fs::path> roots{launcher};
+  CHECK(slippi::account::why_missing(local, roots) == slippi::account::Missing::Launcher);
+  fs::create_directories(launcher);
+  CHECK(slippi::account::why_missing(local, roots) == slippi::account::Missing::SignIn);
+  const fs::path elsewhere = root / "OtherDrive" / "Dolphin";
+  write(launcher / "Settings", nlohmann::json{{"settings", {{"netplayDolphinPath", elsewhere.string()}}}}.dump());
+  CHECK(!slippi::account::resolve(local, roots));
+  write(elsewhere / "User" / "Slippi" / "user.json", nlohmann::json{{"uid", "synthetic-test-user"}}.dump());
+  CHECK(!slippi::account::resolve(local, roots));
+  CHECK(slippi::account::why_missing(local, roots) == slippi::account::Missing::ConnectCode);
+  write(elsewhere / "User" / "Slippi" / "user.json", profile("Moved test", "MOVE#1"));
+  const auto found = slippi::account::resolve(local, roots);
+  CHECK(found && slippi::account::text(found.data, "connectCode") == "MOVE#1");
+  fs::remove_all(root);
+  return 0;
+}
+
+// Slippi Dolphin's own user folder as the root (Linux: ~/.config/SlippiOnline, ~/.local/share/SlippiDolphin):
+// the sign-in is Slippi/user.json there, with no User folder above it.
+int dolphin_folder_as_root(const fs::path& root) {
+  const fs::path local = root / "MU" / "User" / "Slippi";
+  const fs::path dolphin = root / "config" / "SlippiOnline";
+  const std::vector<fs::path> roots{dolphin};
+  write(dolphin / "Slippi" / "user.json", profile("Linux test", "LNX#1"));
+  const auto found = slippi::account::resolve(local, roots);
+  CHECK(found && slippi::account::text(found.data, "connectCode") == "LNX#1");
+  fs::remove_all(root);
+  return 0;
+}
+
+int main() {
+  const fs::path root = fs::current_path() / ("slippi-login-fixture-" + std::to_string(_getpid()));
+  // The folder is named after this process and removed at the end. A run that died left its folder
+  // behind, and Windows reuses process ids, so one found here is stale: clear it, do not fail on it.
+  std::error_code stale;
+  fs::remove_all(root, stale);
+  struct Cleanup { fs::path folder; ~Cleanup() { std::error_code ec; fs::remove_all(folder, ec); } } cleanup{root};
+  if (const int failed = moved_build_and_reasons(root / "moved")) return failed;
+  if (const int failed = dolphin_folder_as_root(root / "dolphin")) return failed;
+  CHECK(!fs::exists(root / "moved"));
+  fs::remove_all(root);
+  const fs::path local = root / "MU" / "User" / "Slippi";
+  const fs::path roaming = root / "Roaming" / "Slippi Launcher";
+  const fs::path localapp = root / "Local" / "Slippi Launcher";
+  Environment appdata("APPDATA", root / "Roaming");
+  Environment localappdata("LOCALAPPDATA", root / "Local");
+  slippi::Matchmaking::local_peer.enabled = true;
+
+  // Start before signing in, then create a relocated LOCALAPPDATA profile while the game is open.
+  slippi::online::config().user_dir = local.string();
+  std::vector<uint8_t> reply;
+  CHECK(slippi::online::handle(slippi::online::CMD_GET_ONLINE_STATUS, nullptr, 0, reply));
+  OnlineShutdown shutdown;
+  CHECK(!reply.empty() && reply[0] == 0);
+  const fs::path moved = localapp / "custom-build" / "netplay" / "User" / "Slippi" / "user.json";
+  const auto shared_data = profile("Shared test", "TEST#123");
+  write(moved, shared_data);
+  const auto launcher_profile = slippi::account::resolve(local);
+  CHECK(launcher_profile && launcher_profile.file == moved);
+  CHECK(slippi::online::handle(slippi::online::CMD_OPEN_LOGIN, nullptr, 0, reply));
+  CHECK(slippi::online::handle(slippi::online::CMD_GET_ONLINE_STATUS, nullptr, 0, reply));
+  CHECK(reply[0] == 1);  // The same logged-in reply used to unlock Unranked.
+  CHECK(slippi::online::config().user_dir == local.string());
+
+  // The Source Port native bridge must receive the same state as Static Recomp's EXI call.
+  uint8_t native_reply[128] = {};
+  uint32_t native_size = 0;
+  CHECK(slippi::online::native_command(slippi::online::CMD_GET_ONLINE_STATUS, nullptr, 0,
+    native_reply, sizeof native_reply, &native_size, 1, true,
+    [](uint8_t cmd, const uint8_t* data, uint32_t size, std::vector<uint8_t>& out) {
+      return slippi::online::handle(cmd, data, size, out);
+    }) == slippi::online::NATIVE_COMMAND_OK);
+  CHECK(native_size == reply.size() && std::equal(reply.begin(), reply.end(), native_reply));
+
+  // Mutable history stays local; authentication and Slippi's own history are never copied/written.
+  const auto shared_history = moved.parent_path() / "direct-codes.json";
+  write(shared_history, "[\"UNCHANGED#1\"]");
+  slippi::DirectCodes codes((local / "direct-codes.json").string());
+  codes.AddOrUpdateCode("LOCAL#2");
+  CHECK(fs::exists(local / "direct-codes.json"));
+  CHECK(read(shared_history) == "[\"UNCHANGED#1\"]");
+  CHECK(read(moved) == shared_data && !fs::exists(local / "user.json"));
+
+  // A stale partial local record or malformed preferred launcher profile cannot mask a valid login.
+  write(local / "user.json", "{\"displayName\":\"Stale\",\"connectCode\":\"OLD#1\"}");
+  write(roaming / "netplay" / "User" / "Slippi" / "user.json", "{broken");
+  CHECK(slippi::account::resolve(local).file == moved);
+  slippi::User user(local.string());
+  CHECK(user.IsLoggedIn() && user.GetUserInfo().connect_code == "TEST#123");
+  CHECK(user.dir() == local.string());
+  CHECK(user.GetUserChatMessages().size() == 16);
+
+  // A cached supported version must not authorize a match after the server updates, or while
+  // its fresh reply is unavailable/malformed. Use the production check with an offline transport.
+  std::string compatibility_error;
+  user.OverwriteLatestVersion(slippi::SLIPPI_SEMVER);
+  version_reply = nlohmann::json{{"latestVersion", slippi::SLIPPI_SEMVER}}.dump();
+  CHECK(user.CheckOnlineCompatibility(&compatibility_error, fetch_version));
+  CHECK(compatibility_error.empty() && version_requests == 1);
+  version_reply = "{\"latestVersion\":\"99.0.0\"}";
+  CHECK(!user.CheckOnlineCompatibility(&compatibility_error, fetch_version));
+  CHECK(compatibility_error.find("Update Melee Unlocked") != std::string::npos && version_requests == 2);
+  for (const auto* reply : {"{}", "null", "[]", "{broken", "{\"latestVersion\":123}",
+                           "{\"latestVersion\":\"\"}", "{\"latestVersion\":\"garbage\"}",
+                           "{\"latestVersion\":\"3.6.4-beta\"}", "{\"latestVersion\":\"3.6.4.0.1\"}"}) {
+    user.OverwriteLatestVersion(slippi::SLIPPI_SEMVER);
+    version_reply = reply;
+    CHECK(!user.CheckOnlineCompatibility(&compatibility_error, fetch_version) && !compatibility_error.empty());
+  }
+  version_reply = nlohmann::json{{"latestVersion", slippi::SLIPPI_SEMVER}}.dump();
+  version_http_status = 503;
+  CHECK(!user.CheckOnlineCompatibility(&compatibility_error, fetch_version));
+  version_http_status = 200; version_transport_ok = false;
+  CHECK(!user.CheckOnlineCompatibility(&compatibility_error, fetch_version));
+  version_transport_ok = true;
+  CHECK(user.CheckOnlineCompatibility(&compatibility_error, fetch_version));
+  // Rematches on the same peer connection also need a new check. Polling while the request is
+  // pending must leave the character screen responsive and must not issue duplicate requests.
+  struct ReleaseFetch { ~ReleaseFetch() { block_version_fetch = false; } } release_fetch;
+  block_version_fetch = true;
+  CHECK(user.PollOnlineCompatibility(&compatibility_error, fetch_version) == 0);
+  CHECK(user.PollOnlineCompatibility(&compatibility_error, fetch_version) == 0);
+  block_version_fetch = false;
+  const auto poll = [&] {
+    for (int i = 0; i < 2000; ++i) {
+      const int status = user.PollOnlineCompatibility(&compatibility_error, fetch_version);
+      if (status) return status;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return 0;
+  };
+  CHECK(poll() == 1);
+  const int requests_before_rematch = version_requests;
+  CHECK(user.PollOnlineCompatibility(&compatibility_error, fetch_version) == 1);
+  CHECK(version_requests == requests_before_rematch);
+  user.ResetOnlineCompatibility();
+  version_reply = "{\"latestVersion\":\"99.0.0\"}";
+  CHECK(poll() == -1 && version_requests == requests_before_rematch + 1);
+  // Cancelling a pending check must not let its result approve a later connection.
+  user.ResetOnlineCompatibility();
+  block_version_fetch = true;
+  const int before_cancelled_check = version_requests;
+  CHECK(user.PollOnlineCompatibility(&compatibility_error, fetch_version) == 0);
+  user.ResetOnlineCompatibility();
+  block_version_fetch = false;
+  CHECK(poll() == -1 && version_requests == before_cancelled_check + 2);
+
+  // A complete portable login takes priority. Logout/re-login and refresh read its current contents.
+  const auto portable = profile("Portable test", "LOCAL#123");
+  write(local / "user.json", portable);
+  CHECK(user.AttemptLogin(true) && user.GetUserInfo().connect_code == "LOCAL#123");
+  CHECK(slippi::account::resolve(local).file == local / "user.json");
+  user.LogOut();
+  CHECK(!user.IsLoggedIn() && user.GetUserInfo().play_key.empty());
+  const int requests_before_logout_check = version_requests;
+  CHECK(!user.CheckOnlineCompatibility(&compatibility_error, fetch_version));
+  CHECK(version_requests == requests_before_logout_check);
+  CHECK(user.AttemptLogin() && user.GetUserInfo().connect_code == "LOCAL#123");
+  write(local / "user.json", profile("Changed", "LOCAL#456"));
+  CHECK(user.AttemptLogin() && user.GetUserInfo().connect_code == "LOCAL#456");
+
+  // Removed/invalid credentials clear the entire cached record and never throw on field types.
+  for (const auto& invalid : {"{}", "null", "{broken", "{\"uid\":123,\"playKey\":true,\"connectCode\":[]}"}) {
+    write(local / "user.json", invalid);
+    CHECK(!user.AttemptLogin());
+    CHECK(!user.IsLoggedIn() && user.GetUserInfo().uid.empty() && user.GetUserInfo().play_key.empty());
+  }
+  CHECK(user.AttemptLogin(true) && user.GetUserInfo().connect_code == "TEST#123");
+
+  // Standard APPDATA netplay and playback fallbacks retain deterministic preference.
+  const auto standard = roaming / "netplay" / "User" / "Slippi" / "user.json";
+  const auto playback = roaming / "playback" / "User" / "Slippi" / "user.json";
+  write(standard, profile("Standard", "STD#123"));
+  write(playback, profile("Playback", "PLAY#123"));
+  CHECK(slippi::account::resolve(local).file == standard);
+  write(standard, "{}");
+  CHECK(slippi::account::resolve(local).file == playback);
+  CHECK(read(moved) == shared_data && read(shared_history) == "[\"UNCHANGED#1\"]");
+  // Explicit opt-in only: use a local launcher profile to exercise the real WinHTTP version
+  // check. No matchmaking request is made and the profile is only read, never changed.
+  if (const char* live_profile = std::getenv("MELEE_TEST_LIVE_SLIPPI_PROFILE")) {
+    slippi::Matchmaking::local_peer.enabled = false;
+    slippi::User live_user(live_profile);
+    std::string live_error;
+    CHECK(live_user.CheckOnlineCompatibility(&live_error));
+    CHECK(live_error.empty());
+    std::puts("Live Slippi user API version check passed");
+  }
+  std::puts("Slippi login regression passed: relocated profiles, live Log In, EXI/native status, local history, credential validation");
+  return 0;
+}

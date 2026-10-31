@@ -1,0 +1,370 @@
+
+# Melee Unlocked - Beta
+
+A native Windows build of Super Smash Bros. Melee (NTSC 1.02) with **Slippi online play** and an
+**unlocked display frame rate.** It has two engines, and the launcher lets you pick.
+
+**Source Port (the main build).** The game is compiled for Windows from C source code, the
+decompilation of Melee, and built as a native library. No GameCube code is run, emulated or
+translated. A native runtime stands in for the console around it: the game's drawing commands go to
+a D3D12 or D3D11 renderer, its sound goes through a native mixer, controllers are read directly, and
+the game's data is read from your own ISO. Slippi's rollback netplay is written natively too, and it
+plays against Slippi Dolphin.
+
+**Static Recomp.** The retail game's own PowerPC code, with Slippi's Gecko codes, translated ahead
+of time into C++ and run on the same runtime. It is the engine this project started with, and it is
+kept for the mods that need the game's original code.
+
+On both, the game logic runs at the console's 60 Hz while the display runs at any rate.
+In-between frames come from the game's own animation data and physics state, not from image
+interpolation, so an unlocked 200 Hz display shows real intermediate poses with no added latency.
+
+Nothing from the game is included. You supply your own Melee NTSC 1.02 ISO.
+
+No Monetization. No Donos. No Patreon. **FREE FOREVER**
+
+Version 0.8.5 added the **experimental Mod Update**. The launcher includes Source Port and
+Static Recomp, with an integrated Mods page. Supported 20XX TE saves and Training Mode CE
+1.4d1 run on Source Port; Akaneia runs on Static Recomp with matching Direct builds.
+See [the Mod Update notes](release/RELEASE_NOTES_0.8.5.md) for installation and compatibility
+limits. 
+
+This project is not affiliated with, endorsed by, or supported by the Slippi team, Nintendo or
+HAL Laboratory. Slippi netplay compatibility is implemented from Slippi's open source code
+(GPL). Questions and bugs about this build go to this repository or the Discord below, not to
+the Slippi team.
+
+**v0.8.5 Akaenia/Mod support and more DLSS5 controls** https://www.youtube.com/watch?v=126-FcptKMQ 
+
+**v0.6.1 DLSS5 Footage** can be found here https://www.youtube.com/watch?v=qZXsNr7HmAo
+
+**v0.5.0 Gameplay footage** can be found here: https://www.youtube.com/watch?v=JlmTDW6wQms
+
+## Discord / Help
+
+Discord can be found here https://discord.gg/K7HHs3r8ty
+And On X https://x.com/MeleeUnlocked
+
+## Screenshots
+
+Taken in the game with DLAA on, at the window's full resolution. No textures or other game files
+are included with Melee Unlocked.
+
+![Four-player match on Jungle Japes](docs/screenshots/gameplay-jungle-japes.jpg)
+
+| | |
+|---|---|
+| ![Title screen](docs/screenshots/title.jpg) | ![Slippi online menu](docs/screenshots/online-menu.jpg) |
+| Title screen | Slippi online play |
+| ![Character select](docs/screenshots/character-select.jpg) | ![Stage select](docs/screenshots/stage-select.jpg) |
+| Character select | Stage select |
+| ![Fountain of Dreams](docs/screenshots/gameplay-fountain.jpg) | ![Opening movie](docs/screenshots/opening-movie.jpg) |
+| Fountain of Dreams | The opening movie |
+
+### PC settings (F1)
+
+| | |
+|---|---|
+| ![GameCube controller](docs/screenshots/settings-controls-gc.png) | ![Switch Pro controller](docs/screenshots/settings-controls-switch.png) |
+| Controls: click a button on the controller to rebind it | Switch Pro controllers get their own layout |
+| ![Video settings](docs/screenshots/settings-video.png) | ![Game settings](docs/screenshots/settings-game.png) |
+| Video: one-click quality presets, DLSS and DLAA | Game: L-cancel helpers, PAL stock icons, frame delay |
+
+## Features
+
+<img width="1600" height="1040" alt="image" src="https://github.com/user-attachments/assets/91256ba3-b118-48c8-9ead-ebe42c2d78f4" />
+
+
+- Unlocked frame rate (monitor rate, a fixed cap, or fully unlocked) with sub-frame animation
+- Slippi online against regular Slippi Dolphin players, using your Slippi Launcher login
+- Subframe rollback (early inputs) between Melee Unlocked players: button presses and stick moves
+  are sent the moment they happen, between frames, so the other game predicts them sooner. Based on
+  Arte's subframe rollback work (see Credits)
+- GameCube adapter (WUP-028 with the WinUSB driver), keyboard fallback
+- DLSS / DLAA (NVIDIA Streamline), internal resolution up to 8x, SSAA, anisotropic filtering,
+  sharpening, borderless fullscreen, VSync
+- Direct3D 12 by default, with a Direct3D 11 renderer for machines where D3D12 will not start
+  (`--backend d3d11`, or Graphics backend in the PC settings panel; needs a restart, no DLSS)
+- "Low spec" switch in the PC settings panel: one control that puts internal resolution,
+  anti-aliasing, anisotropic filtering, visual effects, sub-frame animation and the frame cap at
+  their cheapest, for integrated graphics and older laptops. Turning it off restores exactly what
+  you had before. It reduces rendering cost only; the simulation runs at the same price either way.
+- Widescreen 16:9 (Slippi's own optional code, online safe)
+- Aspect ratio and window size pickers (`--aspect`, `--window`): Melee's native 73:60 by default,
+  4:3, 16:9, or stretched to fill the window with no black bars. Presentation only, so it cannot
+  desync and the two players in a match may each pick their own.
+- Memory card saves as .gci files (Dolphin GCI-folder format, drop in your existing save)
+- PC settings overlay in the game window: F1, Start + D-pad Down + Z, or PC Settings from Melee's Options menu.
+  Customize offers six menu appearances (Clean side, Icon tiles, GD Melee, Radial, Wide tabs and
+  Simple), each with its own colour palettes, plus the previous compact menu on F11. Video, Audio,
+  Game, Controls, Overlays, Customize, and Gecko Codes have their own pages. See the
+  [full v0.7 feature list](docs/v0.7-feature-list.md).
+- Fountain of Dreams reflections are on by default. The Video page can turn on Lagless FoD;
+  changing this only affects the optional visual code, not match rules.
+- Cosmetic DAT/ZIP and Nucleus vault imports for costumes, stage visuals, and move level effects.
+  Stage files map to exact disc resources; non texture stage changes use vanilla online. Supplied
+  CSPs and screenshots appear as previews in Customize. See [docs/cosmetic-imports.md](docs/cosmetic-imports.md).
+- Looping H.264 CSS and SSS backgrounds with target learning and vanilla fallback.
+- PhobGCC settings for stock GameCube controllers on an adapter (calibration, notches, snapback
+  filter, trigger modes), with PhobScope and Phob Check: PC settings > Controls > adapter socket > PhobGCC > Open PhobGCC menu.
+  Setups saves your settings under a name to load, overwrite, delete or share, on a PhobGCC and a stock
+  controller alike, and Reset to Default puts every setting back (your stick calibration stays).
+- Practice menu in Training (Start + D-pad Up + Z): your own CPU, frame advance,
+  save states, and searching for a match while you train. See [Practice](#practice).
+- Optional launcher with self-update
+
+## Install
+
+For launchers exposing vanilla, ACE, and Akaneia as separate entries, see
+[separate YouGame listings](docs/yougame-listings.md). `--vanilla-only` forces vanilla gameplay
+for one session while preserving the engine's native mod support and saved mod choices.
+
+Download `MeleeUnlocked-<version>-Stable-Recomp-Legacy-win64.zip` from [Releases](https://github.com/hero88go/melee-unlocked/releases)
+and extract it anywhere. Then pick one of two ways to run it. **The launcher is optional**;
+the game does not depend on it, and the manual way is complete on its own.
+
+### Manual (no launcher)
+
+1. Drag your Melee NTSC 1.02 ISO onto `MeleeUnlocked.bat`, or put the ISO next to it named
+   `melee.iso` and double-click `MeleeUnlocked.bat`.
+2. Play. The first launch precompiles the graphics pipelines (15 to 30 seconds, progress in
+   the title bar). In game, F1 (or Start + D-pad Down + Z on a GameCube controller) opens the PC settings;
+   Melee's own Options menu also has a PC Settings entry.
+3. To update, extract a newer zip over the folder. Settings, saves and replays are kept.
+
+Native DualShock 4 support is experimental. Connect a DS4 by USB or Bluetooth, open PC
+settings with F1, select a DS4 tab, rebind its actions if needed, and assign it to a game
+port. It uses Windows Raw Input directly; DS4Windows is not required.
+
+### Melee Unlocked Launcher (optional)
+
+A small window in the same zip, `MeleeUnlockedLauncher.exe`, for people who want setup,
+updates and the Slippi account check in one place.
+
+- **Build tab**: drop the ISO onto the window. It checks the disc, precompiles the graphics
+  pipelines for your GPU once and remembers the path. The ISO is never copied.
+- **Play**: press PLAY. It shows which Slippi account will be used.
+- **Updates**: it checks for a new release on every start. "Update and restart" installs it in
+  place; settings, saves and replays stay.
+- **Version rollback**: choose a published Windows version from **Choose version** on the Play
+  page. The launcher downloads it into `Versions/` and keeps the current game files intact.
+  Previously installed versions remain selectable offline. The selected version is remembered;
+  choose **Current install** to return. The ISO, settings, saves, and replays are shared, while
+  each version uses its own game files and `Sys` resources.
+
+### DLSS 5
+
+DLSS 5 (NVIDIA's 3D-Guided Neural Rendering) runs on top of DLAA or DLSS through NVIDIA's own
+runtime, the way NVIDIA's RTX Remix 1.6 integrates it. NVIDIA's signed model is a separate download
+(`MeleeUnlocked-DLSS5-Model.zip` on the release): the launcher offers it on an RTX 50 series card,
+and PC settings > Video has a Download DLSS 5 button. Either one checks the file and puts
+`nvngx_dlssnr.dll` beside the game, where updates leave it. Choose Model A, B or C in PC settings >
+Video; the HUD is left as the game drew it. For other cards, a model build made for the card can be
+placed in the `DLSS5` folder.
+
+For renderer diagnostics, `--frame-generation` enables 2x. The explicit forms
+`--frame-generation=2x|3x|4x|5x|6x|dynamic` select a driver-supported mode.
+
+### Build from source
+
+Windows 10/11, your own ISO, about 5-10 minutes the first time. The game is translated to C++
+and compiled on your machine; nothing from the ISO enters the repository.
+
+Either drag the ISO onto `play.bat` in a clone of this repo (it installs Python, CMake and the
+Visual Studio 2022 Build Tools with winget if missing, then builds and starts the game), or:
+
+```powershell
+git clone https://github.com/hero88go/melee-unlocked.git
+cd melee-unlocked
+python tools/extract_dol.py "C:/path/to/melee.iso" build/main.dol
+python port/recomp/recomp.py --dol build/main.dol --gct-base 0x8065CC80
+cmake -S . -B build-review -G "Visual Studio 17 2022" -A x64 -DMELEE_BUILD_EXPERIMENTAL_PORT=ON
+cmake --build build-review --config Release --target melee_port --parallel
+build-review/port/Release/melee_port.exe --iso "C:/path/to/melee.iso" --threaded-renderer --fps unlocked --frame-mode authored --scale auto --volume 70
+```
+
+(Add the target `melee_unlocked` to the build line if you want the optional launcher; run
+`build-review/port/Release/MeleeUnlockedLauncher.exe` from the checkout and it finds the repo.)
+
+## FAQ
+
+**Was this "vibe coded"?**
+
+This was developed using Fable 5.1 and GPT 6 Astra, much like the 100% decomp. 
+You can either complain about it or enjoy it, the truth is the decomp + PC port would not have been possible or would have taken infinitely longer without the latest AI coding models.
+As humans we can either work with the robots or against them, I believe in technlogical progress and making cool shit, if we do not use all tools available we are choosing to limit our results.
+I will not handicap myself and there's no reason anyone has to wait any longer for ports and advancements like this. If I were to shy away from every new technology I would not be the person I am today. 
+
+I am interested in collabing with other developers but so far have found no collective space for this type of dicussion; PC port dicussion is actively discouraged in the Melee decomp discord
+My vision for the project is keeping it open source so anyone can view the work and make it better. 
+
+## Lab view
+
+Shows the match the way [Slippi Lab](https://github.com/frankborden/slippilab) draws
+replays: flat character silhouettes on a plain stage, with the grid, blast zones, shields, lasers
+and projectiles, and a percent and stock readout. Toggle it with **F3**, or "Lab view" in the
+Overlays tab of the PC settings (F1). Menus and character select look normal; the view takes over
+only while a match is running.
+
+It is display only. The view reads the same per-frame events the Slippi recording codes already
+send for replays and draws them over the game image, so it never touches the simulation and is
+safe online: your opponent's game is unaffected, and the rollback state it shows is exactly what
+the game is running.
+
+The silhouettes are Slippi Lab's own animation frames and are not shipped with this build.
+Generate them once from a Slippi Lab checkout (Python 3, no extra packages):
+
+```powershell
+git clone https://github.com/frankborden/slippilab.git
+python tools/build_lab_assets.py --slippilab slippilab --out "C:/path/to/MeleeUnlocked/Lab"
+```
+
+The game reads `Lab\` next to it (or `--lab-dir <folder>`). Without it, characters show as plain
+markers. The view runs at the game's 60 Hz; sub-frame animation does not apply to it.
+
+Stages are drawn from the collision the game is actually using each frame, so moving platforms,
+Randall and Pokémon Stadium's transformations always match where characters can stand, and stages
+Slippi Lab has no outline for still get one. The solid body of the six legal stages is Slippi
+Lab's shape; if the collision cannot be read, its fixed platforms are used instead.
+
+While the view is showing, the game's own 3D scene is not drawn, since it would be covered anyway.
+That makes the Lab view much lighter on the graphics card than the normal game, which helps on weak
+laptops. "Skip the 3D scene underneath" under the Lab view checkbox turns that off.
+
+## Arcade look
+
+PC settings (F1) > Video > Arcade look gives the match a 2D-fighter look, one switch each, with an
+**Arcade preset** button that turns them all on:
+
+- **Show attack hitboxes** on every fighter (hurtboxes stay off; the Practice menu has those), and
+  **Projectile hitboxes too**. **Draw hitboxes behind the fighter** shows them around the model
+  instead of over it. Offline matches and replays only. Both engines.
+- **Combo counter:** "N HITS" over the attacker's damage, from the second hit until the other player
+  can act again. Offline matches and replays only. Both engines.
+- **2D camera:** the match camera loses its perspective. Fighters and platforms keep the size and
+  place the normal camera gives them; depth no longer shrinks the stage. Display only, online too.
+- **Background:** *Plain colour* hides the scenery behind the fighting area; *Grid* adds lines every
+  five units behind the stage (the Source Port draws the grid; the Static Recomp shows the plain
+  colour). Display only, online too.
+
+**Shield colours** (Video) sets each port's shield and KO blast colour with a colour wheel or one of
+the game's preset colours. Online, your "Online (you)" colour is sent to opponents on Melee
+Unlocked, who see it too (Slippi Dolphin opponents, and peer-to-peer Direct for now, show your port
+colour; you always see yours).
+Team matches keep team colours.
+
+**Get mod looks** (Video) installs Diet Melee (Classic, 64 and Crystal) and Animelee Complete Edition
+in one click. Each is downloaded from its authors' own page, checked against the file they
+published, and built from your own Melee disc; nothing is re-hosted.
+
+An imported 2D-style m-ex build (its demo 2.0 disc) runs on the Source Port: its skins and stages
+load as files, its camera and HUD codes run natively, and its hitbox look turns on with the profile.
+A pasted always-display hitbox code turns on the same switches on the Source Port.
+
+## Practice
+
+In Training, press **Start + D-pad Up + Z** to open the Practice menu (keyboard: **Tab**). The first
+few times you enter Training a banner shows those buttons. Everything works with the controller alone,
+and none of it runs online.
+
+- **Fight a pro**: coming in a later update.
+- **CPU**: decide how the Training CPU moves, attacks, shields, DIs, techs, gets up and uses the ledge.
+  Movement includes wavelands, shield drops (on platforms), dash jumps, running past you and turning
+  around; Throws picks its throw once it grabs you; Jumps sets its drift, double jumps, fast fall
+  timing and whether its aerials come out rising or falling; Hit reactions has floorhugging.
+  Presets cover common drills, and three slots keep your own setups.
+- **Tools**: random numbers set to the same seed each Training start, or frozen, so items, turnips
+  and hammers come out the same every time. Frame advance (L + R + Z freezes the game, Z steps one frame). On the Source Port also
+  save states on the D-pad (right saves, left loads), recording the CPU (down records, up plays it
+  back), hitboxes and an input display.
+- **Search**: start an Unranked, Direct or Teams search and keep training; the match starts by itself
+  when one is found. Skip in Unranked turns down up to three connect codes.
+- **Four looks**: PC settings (F1) > Overlays > Practice menu look.
+
+**Practice from replays** (Source Port): open a replay from the launcher's Replay Viewer. The
+buttons are shown at the bottom: A takes over a player from that moment, X and Y jump between tips,
+Start opens the replay's practice settings.
+
+**After online play**: when an online session ends you go straight into a Training match with your
+character. D-pad Up searches again, D-pad Down keeps training. Turn it off in PC settings > Game >
+Online.
+
+## Slippi online
+
+Everything Slippi Dolphin does for netplay is built in: matchmaking, rollback netcode, the
+Slippi code set, replay recording, game reporting. Slippi Dolphin itself is not needed and is
+not touched.
+
+**Is the Slippi Launcher required?** For online play, yes: a Slippi account is required and
+accounts are created and logged in only through the [Slippi Launcher](https://slippi.gg/downloads).
+Install it, log in once, and the game picks up that login automatically (the optional Melee
+Unlocked Launcher shows the account on its Play page and links to the download if none is
+found). The **Slippi** Launcher also installs the WinUSB driver a GameCube adapter needs. For
+offline play the Slippi Launcher is not required. NOTE: **we are not affiliated with the Slippi team.**
+
+Unranked, Direct codes and Teams work against players on regular Slippi Dolphin; they change
+nothing on their side. Replays (.slp) are written to `Replays\`.
+
+The optional launcher's **Multiplayer Lobby** tab offers an opt-in peer-to-peer lobby.
+Checking **Go Online** lists your name for reachable players and enables match requests
+while the launcher is open. The lobby works without a Melee Unlocked server.
+It uses DHT discovery and direct encrypted
+messages for the roster, chat, friends, presence and match requests, then starts
+accepted matches through Slippi Direct. Reachability depends on each player's
+network; this experimental mode has no relay or guaranteed global chat history.
+See the [lobby setup and limitations](lobby/README.md).
+
+
+## Bug reports
+
+Open a [GitHub issue](https://github.com/hero88go/melee-unlocked/issues) using the template.
+Attach `melee_port.log` from the game folder, your `port-settings.ini`, and the .slp replay if
+the bug happened in a match.
+
+## Repository layout
+
+`port/recomp/` is the recompiler (Python): it reads the DOL and the Slippi code tables
+(`port/slippi_sys/`, vendored from Slippi) and writes `port/generated/` (not committed).
+`port/runtime/` is the host runtime: PowerPC helpers, HLE of the GameCube SDK (OS, VI, PAD, DVD,
+AI/AX audio, CARD, EXI), the Slippi EXI device, netcode, game reporting, the D3D12 and D3D11
+renderers and the sub-frame solver. `port/app/launcher.cpp` is the optional launcher. `tools/` holds validation,
+benchmarking and packaging scripts. See `PORT_COMPLETION.md` for the technical state and
+evidence, and `docs/v0.7-feature-list.md` for the current feature list.
+
+`tools/package_release.py` produces the release zip (version from `VERSION`). The replay
+playback build (`melee_port_playback`, used to verify frame-exactness against Dolphin replays)
+is described in `PORT_COMPLETION.md`.
+
+## Verification
+
+Development launcher: `run-native.bat` (or `python tools/launch_native.py --iso <iso> ...`) starts the
+build in `build-review/port/Play/` if present, else the Release build, muted and windowed by default.
+
+- `ctest --test-dir build-review -C Release`: unit tests
+- `python tools/validate_native.py --iso <iso>`: 2400 simulation checkpoints must match across
+  headless, hidden, threaded and authored rendering
+- `python tools/online_pair.py --script port/scripts/online_bot.txt`: two local instances play a
+  full Slippi online match; the log must show no `DESYNC`
+
+## License
+
+GPL-3.0-or-later, starting with 0.8.5 (0.8.1 and earlier: GPL-2.0-or-later). See `LICENSE` and
+`NOTICE`. Parts of the runtime are ports of Dolphin and Slippi Ishiiruka code (GPL-2.0-or-later)
+and of Slippi's game code (GPL-3.0). `NOTICE` lists every third-party component and its license;
+a release carries the license texts in `licenses/`. The NVIDIA and Intel runtime files keep their
+own terms (see the additional permission in `NOTICE`). Super Smash Bros. Melee is the property of
+Nintendo and HAL Laboratory; this project contains none of its data.
+
+## Credits
+
+Hero88go - developer 
+
+Johnny Brookes Aka Lainthewired for their major contribution of the last graphic error fix that took this project from alpha -> beta. Could not have done it without them 
+
+SSBM_Arte for subframe rollback: the idea and the original implementation of sending inputs between frames so the other game can predict and roll back sooner. Melee Unlocked's early inputs, early rollback and the check against faked early inputs are adapted from that work, and the exclusive audio timing draws on Arte's audio research.
+
+The PhobGCC team (Phobos132, FrostSSBM, CarVac, NiceMitch and contributors) for the PhobGCC firmware and PhobVision, which the PhobGCC controller settings are ported from.
+
+greenwave-1 for GCC Test Suite, whose tester views inspired the PhobScope additions.
+
+venus23gg for the Melee stickmaps, and Altimor for the Melee Stick Coordinate Visualizer they were made with.

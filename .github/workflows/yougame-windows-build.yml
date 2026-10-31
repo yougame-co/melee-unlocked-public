@@ -1,0 +1,132 @@
+name: YouGame Windows package (manual, unsigned)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream version (approved fact headers support 0.9.81 and 0.9.82)'
+        required: true
+        default: '0.9.81'
+        type: string
+      upstream_zip_sha256:
+        description: 'Independently verified SHA-256 of the public upstream Windows release zip'
+        required: true
+        type: string
+      build_key:
+        description: 'Package label, e.g. yg-ci0001 (letters, digits, underscore, hyphen)'
+        required: true
+        default: 'yg-ci0001'
+        type: string
+      win_net:
+        description: 'yougame-native.json net value'
+        required: true
+        default: 'internet'
+        type: string
+      win_direct:
+        description: 'Add direct:true to the launch spec; false removes the field'
+        required: true
+        default: false
+        type: boolean
+      source_patch_path:
+        description: 'Repository file under tools/ci/inputs/: matching G31-free YouGame v2 source patch'
+        required: true
+        default: 'tools/ci/inputs/yougame-online.patch'
+        type: string
+      source_patch_sha256:
+        description: 'Independently verified SHA-256 of that source patch'
+        required: true
+        type: string
+      launch_spec_path:
+        description: 'Repository file under tools/ci/inputs/: canonical yg2 yougame-native.json'
+        required: true
+        default: 'tools/ci/inputs/yougame-native.json'
+        type: string
+      launch_spec_sha256:
+        description: 'Independently verified SHA-256 of that launch spec'
+        required: true
+        type: string
+      winlibs_sha256:
+        description: 'SHA-256: WinLibs GCC 15.2.0 / MinGW-w64 13.0.0 / UCRT r3 x86_64 POSIX SEH .7z (see tools/ci/README.md)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows-package:
+    # Keep this manual job out of branch protection / required checks.
+    runs-on: windows-latest
+    timeout-minutes: 180
+    outputs:
+      artifact_name: ${{ steps.validate.outputs.artifact_name }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_url: ${{ steps.upload.outputs.artifact-url }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      BUILD_VERSION: ${{ inputs.version }}
+      UPSTREAM_ZIP_SHA256: ${{ inputs.upstream_zip_sha256 }}
+      BUILD_KEY: ${{ inputs.build_key }}
+      WIN_NET: ${{ inputs.win_net }}
+      WIN_DIRECT: ${{ inputs.win_direct }}
+      SOURCE_PATCH_PATH: ${{ inputs.source_patch_path }}
+      SOURCE_PATCH_SHA256: ${{ inputs.source_patch_sha256 }}
+      LAUNCH_SPEC_PATH: ${{ inputs.launch_spec_path }}
+      LAUNCH_SPEC_SHA256: ${{ inputs.launch_spec_sha256 }}
+      WINLIBS_SHA256: ${{ inputs.winlibs_sha256 }}
+    steps:
+      - name: Checkout fork (no recursive submodules or persisted credentials)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: false
+          fetch-depth: 1
+
+      - name: Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Validate build identity and approved fact headers
+        id: validate
+        run: ./tools/ci/build-windows.ps1 -Step validate
+
+      - name: Public source submodule and verified package inputs
+        run: ./tools/ci/build-windows.ps1 -Step inputs
+
+      - name: Cache pinned WinLibs archive (verified again on every use)
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/winlibs-download/winlibs.7z
+          key: winlibs-x64-gcc15.2.0-ucrt13-r3-${{ inputs.winlibs_sha256 }}
+
+      - name: Verified WinLibs GCC and runner Visual Studio 2022
+        run: ./tools/ci/build-windows.ps1 -Step toolchain
+
+      - name: Prepare public native sources and build melee_game.dll (MinGW)
+        run: ./tools/ci/build-windows.ps1 -Step dll
+
+      - name: Build staging and production melee_source.exe (MSVC, Source only)
+        run: ./tools/ci/build-windows.ps1 -Step host
+
+      - name: Audit linked provenance and package unsigned zips
+        run: ./tools/ci/build-windows.ps1 -Step package
+
+      - name: Verify packages and publish local SHA-256 sidecars
+        run: ./tools/ci/build-windows.ps1 -Step checks
+
+      - name: Upload checked packages, SHA-256 files and logs only
+        id: upload
+        if: ${{ always() && steps.validate.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.validate.outputs.artifact_name }}
+          path: |
+            ${{ runner.temp }}/yougame-ci/out/*
+            ${{ runner.temp }}/yougame-ci/logs/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

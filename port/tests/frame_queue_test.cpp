@@ -1,0 +1,145 @@
+#include "frame_queue.h"
+#include <cstdio>
+#include <cstdlib>
+#include <future>
+#include <new>
+#include <atomic>
+static std::atomic<bool> fail_next_allocation{false};
+void* operator new(std::size_t size) {
+  if (fail_next_allocation.exchange(false)) throw std::bad_alloc();
+  if (void* p = std::malloc(size ? size : 1)) return p;
+  throw std::bad_alloc();
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+#define check(x) do { if (!(x)) { std::printf("frame_queue_test FAILED line %d: %s\n", __LINE__, #x); std::fflush(stdout); std::abort(); } } while (0)
+static gx::Frame frame(uint64_t sequence) { gx::Frame f; f.sequence = sequence; return f; }
+int main() {
+  // The reported bad_alloc originated in speculative frame headroom. A failed
+  // allocation must preserve already-recorded geometry and allow later growth.
+  {
+    gx::Frame f = frame(99);
+    f.vertices.resize(1);
+    const auto* storage = f.vertices.data();
+    fail_next_allocation.store(true);
+    f.reserve_gameplay_capacity();
+    check(!fail_next_allocation.load());
+    check(f.sequence == 99 && f.vertices.size() == 1 && f.vertices.data() == storage);
+    f.reserve_gameplay_capacity();
+    check(f.vertices.capacity() >= 65536 && f.draws.capacity() >= 1024);
+  }
+  // The queue used to block the producer at two frames, which made the renderer able to stall the
+  // 60 Hz simulation: a slow presented frame cost a simulation tick and the game ran in slow
+  // motion. Frames are never dropped (EFB copies made in one frame feed later ones), so instead the
+  // renderer drains a backlog without presenting and the cap exists only to catch a renderer that
+  // has stopped consuming altogether. This test pins that contract: pushing a backlog must not
+  // block, and order must survive it.
+  {
+    gx::FrameQueue queue;
+    for (uint64_t i = 1; i <= 31; ++i) {
+      auto pushed = std::async(std::launch::async, [&] { return queue.push(frame(i)); });
+      check(pushed.wait_for(std::chrono::milliseconds(200)) == std::future_status::ready);
+      check(pushed.get());
+    }
+    check(queue.size() == 31);
+    gx::Frame out;
+    for (uint64_t i = 1; i <= 31; ++i) { check(queue.pop(out)); check(out.sequence == i); }
+    check(!queue.pop(out));
+  }
+  // A backlog of large frames waits on the memory it holds, not only on the count: 32 frames of a
+  // big scene were several hundred MB and ran a 5.7 GB PC out of memory. Two frames always fit.
+  {
+    gx::FrameQueue queue;
+    auto big = [](uint64_t sequence) { gx::Frame f = frame(sequence); f.vertices.reserve((200u << 20) / sizeof(gx::Vertex)); return f; };
+    check(queue.push(big(1)));
+    check(queue.push(big(2)));
+    auto blocked = std::async(std::launch::async, [&] { return queue.push(big(3)); });
+    check(blocked.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+    gx::Frame out;
+    check(queue.pop(out) && out.sequence == 1);
+    out = gx::Frame{};
+    check(blocked.get());
+    check(queue.size() == 2);
+  }
+  // At the cap the producer waits rather than dropping a frame, and a pop releases it.
+  {
+    gx::FrameQueue queue;
+    for (uint64_t i = 1; i <= 32; ++i) check(queue.push(frame(i)));
+    auto blocked = std::async(std::launch::async, [&] {
+      host::perf::active = &host::perf::sim_timer;
+      host::perf::active->begin();
+      const bool pushed = queue.push(frame(33));
+      const auto timing = host::perf::active->finish();
+      check(timing.get(host::perf::Stage::Wait) > 0);
+      check(host::perf::active->stage == host::perf::Stage::Step);
+      return pushed;
+    });
+    check(blocked.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+    gx::Frame out;
+    check(queue.pop(out) && out.sequence == 1);
+    check(blocked.get());
+    check(host::perf::active == nullptr); // consumer scopes stay inactive
+    check(!host::perf::sim_timer.running && host::perf::sim_timer.work.count == 1); // survives producer exit
+    check(queue.size() == 32);
+  }
+  // finish() stops new frames but still hands over what is already queued, in order.
+  {
+    gx::FrameQueue queue;
+    check(queue.push(frame(1))); check(queue.push(frame(2)));
+    queue.finish();
+    check(!queue.push(frame(3)));
+    gx::Frame out;
+    check(queue.pop(out) && out.sequence == 1);
+    check(queue.pop(out) && out.sequence == 2);
+    check(queue.drained() && !queue.pop(out));
+  }
+  // finish(true) discards the backlog and wakes a producer waiting at the cap, so shutdown cannot
+  // hang on a renderer that has already gone away.
+  {
+    gx::FrameQueue cancelled;
+    for (uint64_t i = 1; i <= 32; ++i) check(cancelled.push(frame(i)));
+    auto waiting = std::async(std::launch::async, [&] { return cancelled.push(frame(33)); });
+    check(waiting.wait_for(std::chrono::milliseconds(20)) == std::future_status::timeout);
+    cancelled.finish(true);
+    check(!waiting.get() && cancelled.drained());
+  }
+  // push_and_recycle hands the producer back a cleared frame, reusing a returned buffer when the
+  // renderer has given one back, so the simulation thread does not reallocate every frame.
+  {
+    gx::FrameQueue queue;
+    gx::Frame producer = frame(1);
+    check(queue.push_and_recycle(producer));
+    check(producer.sequence == 0);            // handed back cleared, ready to refill
+    check(producer.vertices.capacity() >= 65536);
+    check(producer.draws.capacity() >= 1024);
+    gx::Frame out;
+    check(queue.pop(out) && out.sequence == 1);
+    queue.recycle(std::move(out));
+    producer = frame(2);
+    check(queue.push_and_recycle(producer));
+    check(producer.sequence == 0);
+    check(queue.pop(out) && out.sequence == 2);
+  }
+  // A producer buffer is prepared with headroom from the submitted frame. This keeps an abrupt
+  // increase in stage geometry from reallocating and moving live DrawCall snapshots next frame.
+  {
+    gx::FrameQueue queue;
+    gx::Frame producer = frame(1);
+    producer.vertices.resize(66000);
+    producer.draws.resize(1030);
+    check(queue.push_and_recycle(producer));
+    check(producer.vertices.capacity() >= 82501);
+    check(producer.draws.capacity() >= 1288);
+  }
+  // try_pop never blocks; wait_available reports a frame arriving rather than spinning.
+  {
+    gx::FrameQueue queue;
+    gx::Frame out;
+    check(!queue.try_pop(out));
+    check(!queue.wait_available(std::chrono::milliseconds(5)));
+    check(queue.push(frame(7)));
+    check(queue.wait_available(std::chrono::milliseconds(5)));
+    check(queue.try_pop(out) && out.sequence == 7);
+  }
+  std::puts("backlog without stalling the simulation, ordering, cap, drain, cancellation, recycling passed");
+}

@@ -1,0 +1,57 @@
+name: Announce release on Discord
+
+# Announces newly published releases on Discord; manual runs can repost the latest four.
+# One-time setup by the server owner:
+#   1. Discord: Server Settings > Integrations > Webhooks > New Webhook, pick the updates
+#      channel, Copy Webhook URL.
+#   2. GitHub: repository Settings > Secrets and variables > Actions > New repository secret,
+#      name DISCORD_WEBHOOK, value = that URL (or: gh secret set DISCORD_WEBHOOK).
+# Nothing is posted until the secret exists.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Post or clean up announcement messages
+        required: false
+        default: post
+      version:
+        description: Release version to post, without v (empty posts latest four)
+        required: false
+        default: ''
+      message_ids:
+        description: Comma-separated Discord webhook message IDs to delete when action=cleanup
+        required: false
+        default: ''
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out release formatter
+        uses: actions/checkout@v4
+      - name: Announce release or requested release batch
+        env:
+          MELEE_DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          GITHUB_TOKEN: ${{ github.token }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -z "$MELEE_DISCORD_WEBHOOK" ]; then
+            echo "::error::DISCORD_WEBHOOK repository secret is not configured; refusing to report a successful Discord post"
+            exit 1
+          fi
+          if [ "${{ inputs.action }}" = "cleanup" ]; then
+            python3 tools/post_discord.py --delete-ids "${{ inputs.message_ids }}"
+            exit $?
+          fi
+          if [ "$GITHUB_EVENT_NAME" = "release" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            python3 tools/post_discord.py --version "$version" --send
+          elif [ -n "$REQUESTED_VERSION" ]; then
+            python3 tools/post_discord.py --version "$REQUESTED_VERSION" --send
+          else
+            python3 tools/post_discord.py --last 4 --send
+          fi

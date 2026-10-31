@@ -1,0 +1,310 @@
+// Measures input-to-present latency of any running program, from the outside.
+//
+// A key is injected with SendInput at a known QPC timestamp, then the desktop compositor's own
+// copy of the screen is watched until the picture changes. Windows reports, per captured frame,
+// the time the application actually presented it (DXGI_OUTDUPL_FRAME_INFO::LastPresentTime), so
+// the result is the time from the key reaching the system to the responding frame being handed to
+// the display, with the capture pipeline's own delay excluded. Everything after that (scanout and
+// panel response) is identical for any program on the same monitor, so two programs measured this
+// way can be compared directly.
+//
+// The scene must be still enough that the response stands out: the probe first watches for a
+// moment with no input and records the largest change it sees, then counts only changes several
+// times larger than that. Menus with a cursor work well.
+//
+//   latency_probe --title "Melee" --key down --trials 30 [--settle 600] [--timeout 400]
+//
+// SPDX-License-Identifier: GPL-2.0-or-later
+#define NOMINMAX
+#include <windows.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cctype>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "user32.lib")
+
+namespace {
+
+double qpc_frequency() {
+  LARGE_INTEGER f;
+  QueryPerformanceFrequency(&f);
+  return (double)f.QuadPart;
+}
+long long qpc_now() {
+  LARGE_INTEGER t;
+  QueryPerformanceCounter(&t);
+  return t.QuadPart;
+}
+
+struct FoundWindow { HWND window = nullptr; std::wstring title; };
+FoundWindow g_found;
+std::wstring g_wanted;
+
+BOOL CALLBACK enum_window(HWND window, LPARAM) {
+  if (!IsWindowVisible(window)) return TRUE;
+  wchar_t title[512];
+  if (!GetWindowTextW(window, title, 512)) return TRUE;
+  std::wstring text(title);
+  if (text.find(g_wanted) == std::wstring::npos) return TRUE;
+  RECT r{};
+  GetWindowRect(window, &r);
+  if (r.right - r.left < 200 || r.bottom - r.top < 150) return TRUE;   // skip tool windows
+  g_found.window = window;
+  g_found.title = text;
+  return FALSE;
+}
+
+// One captured frame reduced to a coarse luminance grid, so comparing two frames is cheap and
+// insensitive to single-pixel noise.
+constexpr int GRID_W = 48, GRID_H = 27;
+using Grid = std::array<uint16_t, GRID_W * GRID_H>;
+
+struct Duplicator {
+  ID3D11Device* device = nullptr;
+  ID3D11DeviceContext* context = nullptr;
+  IDXGIOutputDuplication* duplication = nullptr;
+  ID3D11Texture2D* staging = nullptr;
+  UINT width = 0, height = 0;
+
+  bool start(HWND window) {
+    D3D_FEATURE_LEVEL level;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device, &level, &context))) {
+      std::fprintf(stderr, "cannot create a D3D11 device\n");
+      return false;
+    }
+    IDXGIDevice* dxgi = nullptr;
+    IDXGIAdapter* adapter = nullptr;
+    if (FAILED(device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgi)) || FAILED(dxgi->GetAdapter(&adapter))) return false;
+    HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY);
+    IDXGIOutput* output = nullptr;
+    for (UINT i = 0; adapter->EnumOutputs(i, &output) != DXGI_ERROR_NOT_FOUND; ++i) {
+      DXGI_OUTPUT_DESC desc{};
+      output->GetDesc(&desc);
+      if (desc.Monitor == monitor) break;
+      output->Release();
+      output = nullptr;
+    }
+    if (!output) { std::fprintf(stderr, "cannot find the monitor showing that window\n"); return false; }
+    IDXGIOutput1* output1 = nullptr;
+    if (FAILED(output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1))) return false;
+    if (FAILED(output1->DuplicateOutput(device, &duplication))) {
+      std::fprintf(stderr, "cannot duplicate the display output (is another capture running?)\n");
+      return false;
+    }
+    DXGI_OUTDUPL_DESC desc{};
+    duplication->GetDesc(&desc);
+    width = desc.ModeDesc.Width;
+    height = desc.ModeDesc.Height;
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = width; td.Height = height; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_STAGING; td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(device->CreateTexture2D(&td, nullptr, &staging))) return false;
+    adapter->Release(); dxgi->Release(); output1->Release(); output->Release();
+    return true;
+  }
+
+  // Grabs the next presented frame. Returns false on timeout. `present` is the QPC time the
+  // application presented it.
+  bool next(Grid& grid, long long* present, UINT timeout_ms) {
+    DXGI_OUTDUPL_FRAME_INFO info{};
+    IDXGIResource* resource = nullptr;
+    HRESULT hr = duplication->AcquireNextFrame(timeout_ms, &info, &resource);
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) return false;
+    if (FAILED(hr)) { std::fprintf(stderr, "capture lost (%08lX)\n", (unsigned long)hr); return false; }
+    bool ok = false;
+    ID3D11Texture2D* texture = nullptr;
+    if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&texture))) {
+      context->CopyResource(staging, texture);
+      D3D11_MAPPED_SUBRESOURCE map{};
+      if (SUCCEEDED(context->Map(staging, 0, D3D11_MAP_READ, 0, &map))) {
+        grid.fill(0);
+        for (int gy = 0; gy < GRID_H; ++gy) {
+          for (int gx = 0; gx < GRID_W; ++gx) {
+            const UINT x = (UINT)((gx + 0.5) * width / GRID_W);
+            const UINT y = (UINT)((gy + 0.5) * height / GRID_H);
+            const uint8_t* p = (const uint8_t*)map.pData + (size_t)y * map.RowPitch + (size_t)x * 4;
+            grid[gy * GRID_W + gx] = (uint16_t)((p[2] * 77 + p[1] * 151 + p[0] * 28) >> 8);
+          }
+        }
+        context->Unmap(staging, 0);
+        *present = info.LastPresentTime.QuadPart;
+        ok = true;
+      }
+      texture->Release();
+    }
+    resource->Release();
+    duplication->ReleaseFrame();
+    return ok;
+  }
+};
+
+// Menus animate constantly, so a plain whole-screen difference is swamped by the background. Only
+// the cells that hold still while nothing is pressed are watched; the response (a cursor moving, a
+// panel highlighting) lands in those.
+using Mask = std::array<bool, GRID_W * GRID_H>;
+
+int difference(const Grid& a, const Grid& b, const Mask& mask) {
+  int total = 0;
+  for (size_t i = 0; i < a.size(); ++i) if (mask[i]) total += std::abs((int)a[i] - (int)b[i]);
+  return total;
+}
+
+int g_hold_ms = 24;   // --hold: how long the key stays down
+
+// Sent as a hardware scan code: DirectInput (Dolphin's keyboard device) reads scan codes and
+// ignores a virtual-key-only event. Arrow keys carry the extended flag so Windows still reports
+// them as arrows, not numpad keys, to programs that read window messages. Down and up are separate
+// so the capture loop keeps running through the hold (sleeping through it missed the first
+// response: the game answers within the hold).
+void key_event(WORD key, bool up) {
+  const bool extended = key == VK_UP || key == VK_DOWN || key == VK_LEFT || key == VK_RIGHT;
+  const DWORD flags = KEYEVENTF_SCANCODE | (extended ? KEYEVENTF_EXTENDEDKEY : 0) | (up ? KEYEVENTF_KEYUP : 0);
+  INPUT input{};
+  input.type = INPUT_KEYBOARD; input.ki.wScan = (WORD)MapVirtualKeyW(key, MAPVK_VK_TO_VSC); input.ki.dwFlags = flags;
+  SendInput(1, &input, sizeof(INPUT));
+}
+
+WORD parse_key(const std::string& name) {
+  if (name == "down") return VK_DOWN;
+  if (name == "up") return VK_UP;
+  if (name == "left") return VK_LEFT;
+  if (name == "right") return VK_RIGHT;
+  if (name == "start" || name == "enter") return VK_RETURN;
+  if (name.size() == 1) return (WORD)std::toupper(name[0]);
+  return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  std::string title = "Melee", key_name = "down", key2_name;
+  HWND chosen = nullptr;   // --hwnd: this exact window, for programs with several matching titles
+  int trials = 30, settle_ms = 600, timeout_ms = 400, gap_ms = 180;
+  double jitter_ms = 0;        // --jitter: a random wait before each press, so presses land at every
+                               // point of the frame instead of in step with the probe's own loop
+  bool whole_screen = false;   // --whole-screen: watch every cell (a full-screen flip, e.g. the lag
+                               // test's white background on a stage that animates everywhere)
+  for (int i = 1; i < argc; ++i) {
+    std::string a = argv[i];
+    auto next = [&]() { return i + 1 < argc ? argv[++i] : ""; };
+    if (a == "--title") title = next();
+    else if (a == "--hwnd") chosen = (HWND)(uintptr_t)std::strtoull(next(), nullptr, 0);
+    else if (a == "--key") key_name = next();
+    else if (a == "--key2") key2_name = next();   // alternated with --key, so a menu cursor keeps moving
+    else if (a == "--trials") trials = std::atoi(next());
+    else if (a == "--settle") settle_ms = std::atoi(next());
+    else if (a == "--timeout") timeout_ms = std::atoi(next());
+    else if (a == "--gap") gap_ms = std::atoi(next());
+    else if (a == "--hold") g_hold_ms = std::atoi(next());
+    else if (a == "--jitter") jitter_ms = std::atof(next());
+    else if (a == "--whole-screen") whole_screen = true;   // pause after each trial (a jump must land before the next press)
+    else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
+  }
+  const WORD key = parse_key(key_name);
+  if (!key) { std::fprintf(stderr, "unknown key %s\n", key_name.c_str()); return 2; }
+  const WORD key2 = key2_name.empty() ? key : parse_key(key2_name);
+  if (!key2) { std::fprintf(stderr, "unknown key %s\n", key2_name.c_str()); return 2; }
+
+  g_wanted.assign(title.begin(), title.end());
+  if (chosen) {
+    wchar_t text[512] = L"";
+    GetWindowTextW(chosen, text, 512);
+    if (IsWindowVisible(chosen)) { g_found.window = chosen; g_found.title = text; }
+  } else {
+    EnumWindows(enum_window, 0);
+  }
+  if (!g_found.window) { std::fprintf(stderr, "no visible window whose title contains \"%s\"\n", title.c_str()); return 1; }
+  std::wprintf(L"window: %s\n", g_found.title.c_str());
+  SetForegroundWindow(g_found.window);
+  Sleep(400);
+
+  Duplicator capture;
+  if (!capture.start(g_found.window)) return 1;
+  const double frequency = qpc_frequency();
+
+  // Watch the idle scene: per cell, how much it moves on its own.
+  Grid previous{}, current{};
+  long long present = 0;
+  int frames = 0;
+  std::array<int, GRID_W * GRID_H> cell_noise{};
+  const long long noise_until = qpc_now() + (long long)(frequency * settle_ms / 1000.0);
+  while (qpc_now() < noise_until) {
+    if (!capture.next(current, &present, 100)) continue;
+    if (frames++)
+      for (size_t i = 0; i < current.size(); ++i) cell_noise[i] = std::max(cell_noise[i], std::abs((int)previous[i] - (int)current[i]));
+    previous = current;
+  }
+  Mask mask{};
+  int still = 0;
+  for (size_t i = 0; i < cell_noise.size(); ++i) { mask[i] = cell_noise[i] <= 2; still += mask[i] ? 1 : 0; }
+  if (whole_screen || still < GRID_W * GRID_H / 8) { mask.fill(true); still = GRID_W * GRID_H; }   // watch everything
+  // How much those still cells move on their own (compression and dithering keep it small but nonzero).
+  int noise = 0;
+  const long long recheck_until = qpc_now() + (long long)(frequency * settle_ms / 1000.0);
+  while (qpc_now() < recheck_until) {
+    if (!capture.next(current, &present, 100)) continue;
+    noise = std::max(noise, difference(previous, current, mask));
+    previous = current;
+  }
+  // A whole-screen flip moves every cell by over 100 levels; a moving stage moves a fraction of that.
+  const int threshold = whole_screen ? std::max(noise * 3, GRID_W * GRID_H * 60) : std::max(noise * 3, 150);
+  std::printf("%d of %d cells hold still; idle change in them up to %d; response counts above %d\n",
+              still, GRID_W * GRID_H, noise, threshold);
+
+  std::vector<double> results;
+  for (int trial = 0; trial < trials; ++trial) {
+    // Start from the newest picture. Waiting for the desktop to go quiet never ends on a screen whose
+    // background keeps animating, so the wait is bounded; the masked cells already ignore it.
+    const long long drain_until = qpc_now() + (long long)(frequency * 0.25);
+    while (qpc_now() < drain_until && capture.next(previous, &present, 50)) {}
+    SetForegroundWindow(g_found.window);
+    if (jitter_ms > 0) {
+      // Spin, not Sleep: a 1 ms timer would put every press back on a millisecond grid.
+      const long long until = qpc_now() + (long long)(frequency * (jitter_ms * (std::rand() / (double)RAND_MAX)) / 1000.0);
+      while (qpc_now() < until) YieldProcessor();
+    }
+    const WORD this_key = trial % 2 ? key2 : key;
+    const long long pressed = qpc_now();
+    key_event(this_key, false);
+    const long long release_at = pressed + (long long)(frequency * g_hold_ms / 1000.0);
+    bool released = false;
+    double latency = -1;
+    const long long give_up = pressed + (long long)(frequency * timeout_ms / 1000.0);
+    while (qpc_now() < give_up) {
+      if (!released && qpc_now() >= release_at) { key_event(this_key, true); released = true; }
+      if (!capture.next(current, &present, 5)) continue;
+      if (difference(previous, current, mask) >= threshold) {
+        if (present > pressed) latency = (double)(present - pressed) * 1000.0 / frequency;
+        break;
+      }
+      previous = current;
+    }
+    while (!released) { if (qpc_now() >= release_at) { key_event(this_key, true); released = true; } else YieldProcessor(); }
+    if (latency >= 0) { results.push_back(latency); std::printf("  trial %2d: %6.1f ms\n", trial + 1, latency); }
+    else std::printf("  trial %2d: no response\n", trial + 1);
+    Sleep((DWORD)gap_ms);
+  }
+
+  if (results.empty()) { std::fprintf(stderr, "no trial produced a measurable response\n"); return 1; }
+  std::sort(results.begin(), results.end());
+  const double median = results[results.size() / 2];
+  const double p95 = results[std::min(results.size() - 1, (size_t)(results.size() * 0.95))];
+  double sum = 0; for (double r : results) sum += r;
+  const double mean = sum / results.size();
+  double var = 0; for (double r : results) var += (r - mean) * (r - mean);
+  const double ci = results.size() > 1 ? 1.96 * std::sqrt(var / (results.size() - 1)) / std::sqrt((double)results.size()) : 0.0;
+  std::printf("\n%zu of %d trials measured\nmedian %.1f ms | mean %.1f ms (95%% interval +/- %.1f) | p95 %.1f ms | min %.1f | max %.1f\n",
+              results.size(), trials, median, mean, ci, p95, results.front(), results.back());
+  return 0;
+}

@@ -1,0 +1,38 @@
+// Slippi code tables embedded by the recompiler (port/generated/gecko_data.cpp).
+// SPDX-License-Identifier: GPL-2.0-or-later
+#pragma once
+#include <cstddef>
+#include <cstdint>
+
+namespace gecko {
+extern const uint8_t codehandler_bin[]; extern const size_t codehandler_bin_size;
+extern const uint8_t bootloader_gct[];  extern const size_t bootloader_gct_size;
+extern const uint8_t slippi_gct[];      extern const size_t slippi_gct_size;
+struct Write { uint32_t addr; uint32_t size; const uint8_t* data; };
+extern const Write boot_writes[];       extern const size_t boot_writes_count;
+struct HookInstall { uint32_t hook; uint32_t cave_addr; uint32_t words; };
+extern const HookInstall boot_hooks[];  extern const size_t boot_hooks_count;
+extern const uint32_t gct_base_used;
+// Run-time optional codes (compiled both ways by the recompiler; see gecko.py RUNTIME_OPTIONAL).
+extern bool option_widescreen;                 // read by translated code at the patched instructions
+extern bool option_lagless_fod;                // true when FoD particles/reflections are disabled
+extern bool option_pal_stock_icons;            // PAL-sized stock icons (a port code, see recomp/gecko.py)
+// A translation generated before a flag existed (the playback guest can be an older prebuilt one)
+// does not define it; the linker then takes this default instead (see exi_slippi.cpp).
+extern bool option_pal_stock_icons_default;
+extern bool option_no_screen_shake;            // camera shake off (a port code, see recomp/gecko.py)
+extern bool option_no_screen_shake_default;
+// Two switches over lines of Slippi's own code set, kept by the host every frame (host.cpp,
+// apply_code_switches): "Unlock All Characters and Stages" follows the player's setting offline and
+// is always on in a network session; the results screen after a VS match is kept offline only.
+extern bool option_unlock_all;
+extern bool option_unlock_all_default;
+extern bool option_offline_results;
+extern bool option_offline_results_default;
+extern const uint32_t optional_gct_offset;     // where the optional codes start inside slippi_gct
+extern const uint32_t port_gct_offset;         // where the always-present port suffix starts
+struct OptionalWrite { uint32_t addr; uint32_t size; const uint8_t* patched; const uint8_t* original; const char* flag; };
+extern const OptionalWrite optional_writes[]; extern const size_t optional_writes_count;
+struct OptionalCode { uint32_t offset; uint32_t size; const char* flag; };
+extern const OptionalCode optional_codes[]; extern const size_t optional_codes_count;
+}  // namespace gecko

@@ -1,0 +1,232 @@
+// Exercise the production renderer with deliberately tiny descriptor/upload pools.
+// SPDX-License-Identifier: GPL-2.0-or-later
+#define NOMINMAX
+#include <windows.h>
+#include "gx_d3d12.h"
+#include "gx_shader.h"
+#include "gx_texture.h"
+#include "texture_pack.h"
+#include "video_background.h"
+#include "user_shader.h"
+#include <cstdarg>
+#include <cstddef>
+#include <cstdio>
+#include <fstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+namespace host {
+void log(const char* fmt, ...) { va_list args; va_start(args, fmt); vprintf(fmt,args); va_end(args); puts(""); }
+[[noreturn]] void die(const char* fmt, ...) { char buf[1024]; va_list args; va_start(args,fmt); vsnprintf(buf,sizeof buf,fmt,args); va_end(args); throw std::runtime_error(buf); }
+// The renderer reaches back into the window for fullscreen changes; this test owns a bare HWND.
+bool window_take_fullscreen_toggle() { return false; }
+bool window_take_activation() { return false; }
+void window_set_fullscreen(bool) {}
+bool window_is_fullscreen() { return false; }
+void window_client_size(int* w, int* h) { if (w) *w = 640; if (h) *h = 480; }
+void window_set_title(const wchar_t*) {}
+void loading_show(const wchar_t*, size_t, size_t) {}
+double now_seconds() { return 0.0; }
+void loading_close() {}
+void log_memory() {}
+}
+namespace slippi { void request_widescreen(bool) {} void request_fod_reflections(bool) {} }
+// These visual setting hooks are not exercised by the resource-pool test. Keep the production
+// D3D12 backend linkable without pulling in the full game core or generated Gecko data.
+namespace gx { void set_hud_scales(int, int, bool) {} void set_low_poly_fighters(bool) {} void set_fod_reflections(bool) {} void set_css_background_free(bool) {} void set_player_tags_always(bool) {} void set_arcade_display(ArcadeSource, uint32_t) {} void set_shield_colors(const uint32_t*, uint32_t) {} void set_presented_test_fill(int) {} void set_lightweight_level(int) {} void lightweight_count(bool) {} void lightweight_publish_counts() {} void lightweight_debug(const Frame&, const LightweightFilter&) {} void arcade_debug(const Frame&, const LightweightFilter&) {} int8_t& lightweight_skip_slot(const Frame&, size_t, int) { static int8_t s; s = -1; return s; } }
+namespace gecko { bool option_pal_stock_icons = false; }
+// This renderer regression test deliberately links the production D3D12 backend without Media
+// Foundation. Keep its video-background hooks inert so it exercises descriptor/upload behavior.
+namespace gx::video_bg {
+void begin_frame(uint8_t, uint8_t) {}
+bool wants_texture_names() { return false; }
+std::shared_ptr<const Frame> lookup(const std::string&, uint32_t, uint32_t, int*) { return {}; }
+std::shared_ptr<const Frame> fullscreen_frame(int*) { return {}; }
+void set_enabled(bool) {}
+void report_backend_failure(int, const std::string&) {}
+void set_border(const std::string&) {}
+std::shared_ptr<const Frame> border_frame(bool*) { return {}; }
+}
+// The player-chosen shader presets need librashader, which this test does not load.
+namespace gx::user_shader {
+bool d3d12_prepare(ID3D12Device*, const std::string&, void (*)(void*), void*) { return false; }
+bool d3d12_draw(ID3D12GraphicsCommandList*, ID3D12Resource*, size_t, int, uint32_t, uint32_t, const Target&, size_t) { return false; }
+void d3d12_release() {}
+}
+static void check(bool b, const char* why) { if(!b) throw std::runtime_error(why); }
+static void f32(uint32_t& out, float f) { memcpy(&out,&f,4); }
+static gx::TextureRef texture(uint32_t addr, uint8_t r, uint8_t b) {
+  gx::TextureRef t; t.addr=addr; t.width=t.height=4; t.format=6; t.used=true;
+  auto data=std::make_shared<gx::TextureSnapshot>(); data->image.resize(64);
+  for(int i=0;i<16;++i) { data->image[i*2]=255; data->image[i*2+1]=r; data->image[32+i*2]=0; data->image[33+i*2]=b; }
+  data->hash=gx::hash_bytes(data->image.data(),data->image.size()); t.data=data; return t;
+}
+int main(int argc, char** argv) {
+  // Optional real-asset diagnostic: exercise the exact production PNG decoder and native
+  // selector identity lookup without booting the game or touching the ISO/catalog.
+  if (argc == 3) {
+    try {
+      gx::texpack::set_cosmetic_companions({
+          {"csp", "PlFxGr.dat", argv[1]}, {"stock", "PlFxGr.dat", argv[2]},
+      });
+      check(!gx::texpack::enabled() && gx::texpack::cosmetics_enabled(),
+            "cosmetic lookup remains active with the general texture-pack toggle off");
+      const std::string csp_name = "tex1_136x188_344dd1ecdd6c1ce7_0000000000000000_9";
+      const std::string stock_name = "tex1_24x24_f9e2c8c1f7328ccd_0000000000000000_8";
+      check(gx::texpack::has(csp_name) && gx::texpack::has(stock_name),
+            "green Fox native companion identities resolve");
+      auto csp = gx::texpack::load(csp_name, ~0ull);
+      auto stock = gx::texpack::load(stock_name, ~0ull);
+      check(csp && csp->width && csp->height, "real CSP decodes through the production loader");
+      check(stock && stock->width && stock->height,
+            "real stock icon decodes through the production loader");
+      std::printf("Tom Nook companion decode passed: CSP %ux%u, stock %ux%u\n",
+                  csp->width, csp->height, stock->width, stock->height);
+      return 0;
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "%s\n", e.what());
+      return 1;
+    }
+  }
+  HWND window=nullptr;
+  try {
+    // Rebuilding a GPU texture must reuse its decoded PNG, even after every upload reference
+    // was released. Removing the file makes an accidental second decode fail deterministically.
+    const unsigned char png[] = {137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,0,1,0,0,0,1,8,6,0,0,0,31,21,196,137,0,0,0,13,73,68,65,84,120,156,99,248,207,192,240,31,0,5,0,1,255,137,153,61,29,0,0,0,0,73,69,78,68,174,66,96,130};
+    const char* fixture = "texture-cache-fixture.png";
+    std::ofstream(fixture, std::ios::binary).write((const char*)png, sizeof png);
+    const std::string identity = "tex1_136x188_344dd1ecdd6c1ce7_0000000000000000_9";
+    gx::texpack::set_cosmetic_companions({{"csp", "PlFxGr.dat", fixture}});
+    auto decoded = gx::texpack::load(identity, ~0ull);
+    check(decoded && decoded->width == 1 && decoded->pixels[0] == 255, "fixture decodes");
+    decoded.reset();
+    std::remove(fixture);
+    check(gx::texpack::ready(identity), "uploaded texture stays decoded");
+    decoded = gx::texpack::load(identity, ~0ull);
+    check(decoded && decoded->pixels[0] == 255, "texture rebuild needs no file read");
+    gx::texpack::set_cosmetic_companions({});
+    check(!gx::texpack::ready(identity) && !gx::texpack::load(identity, ~0ull), "changing cosmetics invalidates the cache");
+    check(decoded->pixels[0] == 255, "an upload remains valid while the cache is cleared");
+    decoded.reset();
+    WNDCLASSW wc{}; wc.lpfnWndProc=DefWindowProcW; wc.hInstance=GetModuleHandleW(nullptr); wc.lpszClassName=L"MeleeGpuResourceTest";
+    RegisterClassW(&wc);
+    window=CreateWindowW(wc.lpszClassName,L"GPU resource regression",WS_OVERLAPPEDWINDOW,0,0,640,480,nullptr,nullptr,wc.hInstance,nullptr);
+    check(window!=nullptr,"hidden window creation");
+    gx::RenderOptions options; options.efb_scale=1; options.capture_frame=6; options.capture_path="gpu-resource-test.ppm";
+    std::unique_ptr<gx::Backend> renderer(gx::create_d3d12_backend(window,640,480,options));
+    gx::Frame frame; frame.sequence=1;
+    // The first red quad must survive every subsequent descriptor/page rollover.
+    auto red=texture(0x1000,255,0), blue=texture(0x2000,0,255);
+    gx::DrawCall d{}; d.primitive=0x80; d.vertex_count=4; d.components=gx::VB_HAS_UV0;
+    {
+      gx::DrawCall portrait=d;
+      portrait.xf_regs[0x3F]=1;
+      portrait.bp.reg[gx::BP_GENMODE]=1|(1u<<10); // two TEV stages
+      portrait.bp.reg[gx::BP_ZMODE]=3;
+      portrait.bp.reg[gx::BP_ZTEX2]=10; // Z24 replace, late depth
+      portrait.bp.reg[gx::BP_TREF]=64|(65u<<12);
+      portrait.bp.reg[gx::BP_TEV_COLOR_ENV+2]=0x8fff0; // keep previous color, consume depth independently
+      portrait.bp.reg[gx::BP_TEV_ALPHA_ENV+2]=0x8ff90;
+      const auto shader=gx::generate_pixel_shader(gx::make_ps_uid(portrait));
+      check(shader.find("SV_Depth")!=std::string::npos,"portrait writes texture depth");
+      check(shader.find("Tex[1].Sample")!=std::string::npos,"depth-only final TEV stage fetches its texture");
+      portrait.bp.reg[gx::BP_ZTEX2]=0;
+      check(gx::generate_pixel_shader(gx::make_ps_uid(portrait)).find("SV_Depth")==std::string::npos,
+            "ordinary draws retain hardware depth");
+    }
+    d.posMatrices[0]=d.posMatrices[5]=d.posMatrices[10]=1;
+    d.matrix_index_a=60u<<6; // identity texture matrix
+    d.xf_regs[0x26]=1; d.xf_regs[0x3F]=1; d.xf_regs[0x40]=5u<<7;
+    f32(d.xf_regs[0x1A],320); f32(d.xf_regs[0x1B],-240);
+    f32(d.xf_regs[0x1C],16777215); f32(d.xf_regs[0x1D],662); f32(d.xf_regs[0x1E],582); f32(d.xf_regs[0x1F],16777215);
+    f32(d.xf_regs[0x20],1); f32(d.xf_regs[0x22],1); f32(d.xf_regs[0x24],1);
+    d.bp.reg[gx::BP_GENMODE]=1;
+    d.bp.reg[gx::BP_BLENDMODE]=24;
+    d.bp.reg[gx::BP_SCISSORTL]=(342u<<12)|342u;
+    d.bp.reg[gx::BP_SCISSORBR]=((342u+639)<<12)|(342u+479);
+    d.bp.reg[gx::BP_SCISSOROFFSET]=(171u<<10)|171u;
+    d.bp.reg[gx::BP_TREF]=64;
+    d.bp.reg[gx::BP_TEV_KSEL]=4; d.bp.reg[gx::BP_TEV_KSEL+1]=14;
+    d.bp.reg[gx::BP_TEV_COLOR_ENV]=0x8fff8;
+    d.bp.reg[gx::BP_TEV_ALPHA_ENV]=0x8ffc0;
+    d.bp.reg[gx::BP_ALPHACOMPARE]=(7u<<16)|(7u<<19);
+    gx::EfbCopy clear{}; clear.src_w=640; clear.src_h=480; clear.clear=true; clear.clear_color=0xff000000; clear.clear_z=0xffffff;
+    // A copy with clear initializes the EFB before the actual test draws.
+    clear.dest_addr=0x3000; frame.copies.push_back(clear); frame.commands.push_back({gx::FrameCommand::Copy,0});
+    for(unsigned i=0;i<40;++i) {
+      d.first_vertex=(uint32_t)frame.vertices.size(); d.textures[0]=i==0?red:texture(0x4000+i*0x100,0,255);
+      d.textures[0].mode1=i<<8; // distinct sampler sets force sampler rollover
+      float left=i==0?-1.f:0.f, right=i==0?0.f:1.f;
+      const float xy[4][2]={{left,-1},{right,-1},{right,1},{left,1}};
+      for(auto& p:xy) { gx::Vertex v{}; v.pos[0]=p[0]; v.pos[1]=p[1]; v.uv[0][0]=v.uv[0][1]=0.5f; frame.vertices.push_back(v); }
+      frame.draws.push_back(d); frame.commands.push_back({gx::FrameCommand::Draw,i});
+    }
+    gx::EfbCopy present{}; present.to_xfb=true; present.src_w=640; present.src_h=480; present.y_scale=1;
+    frame.copies.push_back(present); frame.commands.push_back({gx::FrameCommand::Copy,1});
+    for (unsigned n=0; n<6; ++n) { frame.sequence=n+1; renderer->submit_frame(frame); }
+    const uint64_t owner_a = frame.draws[0].cached_pipeline_owner;
+    // Replay the same immutable packets through a new device/backend: their
+    // cached PSO pointers must never be reused after the original owner dies.
+    renderer.reset();
+    renderer.reset(gx::create_d3d12_backend(window,640,480,options));
+    uint32_t warmed = 0; gx::d3d12_stats(renderer.get(), nullptr, &warmed, nullptr);
+    check(warmed > 0, "recorded pipelines prewarm before the next draw");
+    for (unsigned n=0; n<6; ++n) { frame.sequence=n+1; renderer->submit_frame(frame); }
+    const uint64_t owner_b = frame.draws[0].cached_pipeline_owner;
+    // A draw's cached pipeline belongs to one backend AND one motion-vector (DLSS) variant: the
+    // variant changes shader generation and the render target count, so a pipeline built for the
+    // other one must never be handed back after DLSS is switched on or off. The owner is
+    // backend_id*4 + 2*variant + wire, so the plain variant is a multiple of four and two backends
+    // created in sequence step by four.
+    printf("pso cache owners: %llu then %llu\n",(unsigned long long)owner_a,(unsigned long long)owner_b);
+    check(owner_a!=0&&owner_b!=0,"draws resolved a real pipeline");
+    check(owner_a%4==0&&owner_b%4==0,"pipelines without motion vectors or wireframe cache under the backend's first owner");
+    check(owner_b==owner_a+4,"each backend owns one cache identity per motion-vector and wireframe variant");
+
+    // Texture generator 7 must read Vertex::texmtx[7] (offset 104), not generator 6's index.
+    static_assert(offsetof(gx::Vertex,texmtx)+7==104,"texmtx[7] byte offset");
+    {
+      gx::DrawCall t=d;
+      t.components|=(gx::VB_HAS_TEXMTXIDX0<<6)|(gx::VB_HAS_TEXMTXIDX0<<7);   // per-vertex matrix index for texgens 6 and 7
+      t.xf_regs[0x3F]=8;                                                     // eight texture generators
+      for(int i=0;i<8;++i) t.xf_regs[0x40+i]=5u<<7;                          // all of them from TEXCOORD0
+      const std::string vs=gx::generate_vertex_shader(gx::make_vs_uid(t));
+      check(vs.find("uint blend_index7 : BLENDINDICES2")!=std::string::npos,"texgen 7 has its own vertex input");
+      const size_t six=vs.find("o.tex6.xyz"), seven=vs.find("o.tex7.xyz");
+      check(six!=std::string::npos&&seven!=std::string::npos,"eight texture generators emitted");
+      // Each assignment is preceded by the "int tmp = int(<input>);" line naming the input it reads.
+      const std::string src6=vs.substr(vs.rfind("int tmp = int(",six),40), src7=vs.substr(vs.rfind("int tmp = int(",seven),40);
+      printf("texgen 6 reads %s\ntexgen 7 reads %s\n",src6.c_str(),src7.c_str());
+      check(src6!=src7,"texgens 6 and 7 read different matrix indices");
+      check(src7.find("blend_index7")!=std::string::npos,"texgen 7 reads texmtx[7]");
+      // And the input layout really feeds it: D3D12 refuses a pipeline whose vertex shader reads an
+      // element the layout does not provide, so building this draw's pipeline proves the wiring.
+      gx::Frame texgen_frame; texgen_frame.sequence=7;
+      texgen_frame.copies.push_back(clear); texgen_frame.commands.push_back({gx::FrameCommand::Copy,0});
+      t.first_vertex=0; t.textures[0]=red;
+      const float xy[4][2]={{-1,-1},{1,-1},{1,1},{-1,1}};
+      for(auto& p:xy) { gx::Vertex v{}; v.pos[0]=p[0]; v.pos[1]=p[1]; v.uv[0][0]=v.uv[0][1]=0.5f; v.texmtx[6]=57; v.texmtx[7]=60; texgen_frame.vertices.push_back(v); }
+      t.cached_pipeline=nullptr; t.cached_pipeline_owner=0;
+      texgen_frame.draws.push_back(t); texgen_frame.commands.push_back({gx::FrameCommand::Draw,0});
+      // The renderer never waits for a pipeline compile: until the worker publishes the real
+      // pipeline the draw uses the fallback, which is never cached on the draw. Keep submitting
+      // (each submit collects finished compiles) for up to five seconds.
+      const ULONGLONG texgen_deadline=GetTickCount64()+5000;
+      for(unsigned n=0;;++n) {
+        texgen_frame.sequence=7+n; renderer->submit_frame(texgen_frame);
+        if(texgen_frame.draws[0].cached_pipeline!=nullptr||GetTickCount64()>texgen_deadline) break;
+        if(n>=6) Sleep(2);
+      }
+      check(texgen_frame.draws[0].cached_pipeline!=nullptr,"eight-texgen pipeline built against the new input layout");
+    }
+    renderer.reset(); DestroyWindow(window); window=nullptr;
+    std::ifstream file(options.capture_path,std::ios::binary); std::string magic; int w,h,max;
+    file>>magic>>w>>h>>max; file.get(); check(magic=="P6"&&w==640&&h==480&&max==255,"capture header");
+    std::vector<unsigned char> image(w*h*3); file.read((char*)image.data(),image.size()); check((size_t)file.gcount()==image.size(),"capture size");
+    const auto* l=&image[(240*w+160)*3]; const auto* r=&image[(240*w+480)*3];
+    printf("left=%u,%u,%u right=%u,%u,%u\n",l[0],l[1],l[2],r[0],r[1],r[2]);
+    check(l[0]>240&&l[2]<10,"earlier red draw survives descriptor/upload rollover");
+    check(r[2]>240&&r[0]<10,"later blue draw has independent descriptors");
+    puts("D3D12 descriptor and upload lifetime regression passed"); return 0;
+  } catch(const std::exception& e) { if(window)DestroyWindow(window); fprintf(stderr,"%s\n",e.what()); return 1; }
+}

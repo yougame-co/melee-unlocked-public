@@ -1,0 +1,73 @@
+// Native practice matchmaking coordinator. Renderers exchange snapshots/commands with it; only
+// tick() touches Slippi networking or guest scene state, and tick() runs on the simulation thread.
+// SPDX-License-Identifier: GPL-2.0-or-later
+#pragma once
+
+#include "native_practice_model.h"
+
+#include <cstdint>
+#include <string>
+
+namespace host { struct PadState; }
+
+namespace slippi::native_practice {
+
+// Values intentionally match Slippi's OnlinePlayMode (Melee Unlocked has no Ranked).
+enum class MatchMode : uint8_t { None = 0xFF, Unranked = 1, Direct = 2, Teams = 3 };
+
+struct Snapshot {
+  Phase phase = Phase::Idle;
+  MatchMode mode = MatchMode::None;
+  bool in_practice = false;
+  bool tab_available = false;
+  bool can_start = false;
+  bool cosmetic_profile_locked = false;
+  int controller_port = 0;
+  int matchmaking_state = 0;
+  uint32_t generation = 0;
+  uint32_t search_ticks = 0;
+  std::string connect_code;
+  std::string status;
+  std::string detail;
+  std::string opponent;
+  // After an online session: back in Training, "search again?" (D-pad Up searches, Down dismisses).
+  std::string offer;          // the prompt, empty when none
+  // Characters the memory card has unlocked, a bit per character kind (all set when not known, and on
+  // the Static Recomp). Fight a pro offers a pro only when that pro's character can be picked.
+  uint32_t unlocked = 0xFFFFFFFFu;
+};
+
+Snapshot snapshot();
+void submit_start_unranked();
+void submit_start_direct(const std::string& connect_code);
+// Teams: four players who all enter the same connect code.
+void submit_start_teams(const std::string& connect_code);
+// In a Training match: start it again with the CPU as `character` (a ghost's own character).
+void submit_train_against(int character);
+void submit_cancel();
+void submit_acknowledge_failure();
+
+// Called once per 60 Hz retrace, before the guest advances its frame.
+void tick();
+// Called with the freshly polled pads, before the game sees them (both engines): presses through
+// Training's character and stage select after an online session, and takes the requeue prompt's D-pad.
+void apply_pads(host::PadState* pads);   // four pads
+void shutdown();
+
+// Narrow integration hook for cosmetic work: do not change the active cosmetic profile from the
+// start of a search through online cleanup. No cosmetic implementation is required by this module.
+bool cosmetic_profile_locked();
+const char* match_mode_name(MatchMode mode);
+
+// The Source Port game's practice operations (MuGameApi::practice, MU_PRACTICE_* in mu_host.h).
+// Unset, the coordinator works on the static recomp's console memory.
+using NativeBridge = int32_t (*)(int32_t op, int32_t* args, int32_t count);
+void set_native_bridge(NativeBridge bridge);
+
+// Source-only host content policy, simulation thread. A search advertises the requested
+// online build without replacing files under the running offline exercise. Activate only
+// at the accepted scene handoff or the return to the offline scene. Unset on Static.
+using ContentBridge = void (*)(int mode, bool activate);
+void set_content_bridge(ContentBridge bridge);
+
+}  // namespace slippi::native_practice

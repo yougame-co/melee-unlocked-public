@@ -1,0 +1,113 @@
+// HLSL generation for GX vertex/pixel pipelines (transcribed from Dolphin's shader generators).
+// SPDX-License-Identifier: GPL-2.0-or-later
+#pragma once
+#include <cstdint>
+#include <string>
+#include "gx_core.h"
+
+namespace gx {
+
+// Constant buffer layouts shared with the generated HLSL.
+// Bytes of VSConstants a draw's shader can actually read. The trailing blocks are conditional: the
+// post-transform matrices only when dual-texture transform is on, and the previous-pose matrices and
+// projections only when motion vectors are generated (DLSS). Uploading the whole 4.9 KB for every
+// draw made constants the single largest cost in the renderer, 0.72 us of a 1.57 us draw, most of it
+// matrices the draw never reads.
+size_t vs_constants_bytes(const DrawCall& dc, bool motion_vectors);
+
+struct VSConstants {
+  float projection[4][4];
+  float depthparams[4];
+  float viewparams[4];
+  float materials[4][4];
+  float lights[40][4];
+  float texmatrices[24][4];
+  float transformmatrices[64][4];
+  float normalmatrices[32][4];
+  float posttransformmatrices[64][4];
+  float unjittered_projection[4][4];
+  float prev_projection[4][4];
+  float prev_transformmatrices[64][4];
+};
+struct PSConstants {
+  int32_t colors[4][4];
+  int32_t kcolors[4][4];
+  int32_t alpha[4];
+  float texdims[8][4];
+  int32_t zbias[2][4];
+  int32_t indtexscale[2][4];
+  int32_t indtexmtx[6][4];
+  int32_t fogcolor[4];
+  int32_t fogi[4];
+  float fogf[2][4];
+  float zslope[4];
+  int32_t flags[4];
+  float efbscale[4];
+  float mvscale[4];   // ndc delta -> pixel motion vector scale (DLSS)
+  // Display-only colour multiply applied to the finished pixel, xyz, with w the blend amount.
+  // (1,1,1,0) for every draw unless a per-player tint is set, and an amount of 0 leaves the pixel
+  // exactly as it was.
+  float tint[4];
+};
+
+struct VSUid {
+  uint32_t components;
+  uint32_t numTexGens, numColorChans;
+  uint32_t xf_regs[0x58];   // channel controls, texgen infos, dual tex, post infos
+  uint32_t motion_vectors;  // emit previous/current clip positions for a motion-vector target
+  uint64_t hash() const;
+  bool operator==(const VSUid& o) const;
+};
+struct PSUid {
+  BPMemory bp;              // full BP image; hash covers the relevant registers only
+  uint32_t numTexGens;
+  uint32_t motion_vectors;  // write SV_Target1 = pixel-space motion (previous - current)
+  uint64_t hash() const;
+  bool operator==(const PSUid& o) const;
+};
+
+VSUid make_vs_uid(const DrawCall& dc);
+PSUid make_ps_uid(const DrawCall& dc);
+std::string generate_vertex_shader(const VSUid& uid);
+std::string generate_pixel_shader(const PSUid& uid);
+
+// Fill constants for a draw.
+// Motion/jitter inputs for DLSS: pixel-space jitter applied to the projection, and the previous
+// presented pose of this draw (position matrices + unjittered projection), both optional.
+struct MotionInfo { float jitter_x = 0, jitter_y = 0; const float* prev_pos = nullptr; const float* prev_proj = nullptr; };
+void build_projection(const DrawCall& dc, float m[16], const float* override_projection = nullptr);   // row-major, as dotted in the vertex shader
+// The Arcade look's 2D camera: the orthographic matrix equal to the GX perspective `p` on the plane `d`
+// units in front of the camera, depth kept in GX's -1 (near) to 0 (far) range.
+void arcade_orthographic(const float* p, float d, float m[16]);
+// DLSS: the frame's main 3D camera projection (null when the frame has none, e.g. menus). Only draws
+// with exactly this projection are the scene DLSS reconstructs; everything else (Melee's HUD camera
+// with the timer, stocks and percentages, player tags, overlays) is shown as rendered.
+void set_main_projection(const DrawCall* scene);
+bool is_scene_draw(const DrawCall& dc);
+void fill_vs_constants(const DrawCall& dc, VSConstants& out, int efb_scale, const DrawMatrices* override_matrices = nullptr, const MotionInfo* motion = nullptr);
+void fill_ps_constants(const DrawCall& dc, PSConstants& out, int efb_scale);
+
+// Display-only per-player fighter tint (the missed-L-cancel red flash). `amount` 0 disables it.
+// Nothing here reads or writes guest memory: the draw already carries the player slot that rendered
+// it (DrawCall::owner_player), so this only decides a colour. Set from the simulation thread, read
+// by fill_ps_constants on the render thread.
+void set_player_tint(int player, float r, float g, float b, float amount);
+void clear_player_tints();
+
+// EXPERIMENTAL true 16:9: widen the camera frustum in the renderer instead of injecting the Slippi
+// widescreen Gecko code. Melee's camera asks for 73:60 and 73/60 * 320/219 is exactly 16/9, so the
+// horizontal half of a perspective projection is scaled by 219/320 and nothing else changes.
+// Orthographic projections (the HUD, the magnifier, every 2D element) are left alone, which is the
+// part the Gecko code cannot do: it widens the whole frame, so 2D authored for 73:60 stretches.
+// It is mutually exclusive with the Gecko code because applying both would widen twice.
+// The game still decides what is on screen with its own 73:60 camera, so on its own this leaves a
+// fighter who walks into the added sides undrawn (only the bubble shows). Both engines therefore
+// draw such a fighter anyway while this is on, the way the Slippi code does: the Source Port
+// draws and puts the fighter's state back (ftdrawcommon.c), the Static Recomp runs the game's
+// draw test with Slippi's one-instruction change (host::apply_wide_fighter_draw).
+void set_css_scene(bool on);   // the character select is on screen this frame (its edge bands stretch)
+void set_true_widescreen(bool on, float aspect = 16.0f / 9.0f);   // aspect: the shape the world widens to
+float true_widescreen_factor();   // the x scale widened draws get (219/320 at 16:9)
+bool true_widescreen_active();   // what the renderer is doing now (True 16:9 on and the Slippi code off)
+
+}  // namespace gx

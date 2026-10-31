@@ -1,0 +1,77 @@
+# BROKEN: this lands on Onett, not Fountain of Dreams. Verified 2026-09-16 by reading the stage id
+# out of the replay it writes (id 9). Do not use it as a Fountain of Dreams fixture and do not trust
+# a result taken with it.
+#
+# The Vs stage select is an analog pointer, not a grid cursor, so the two-frame stick taps below
+# move it nowhere and the A press takes whatever tile it started on. Holding a direction to an edge
+# does work and gives a repeatable anchor: up-left lands on Icicle Mountain, up-right on Flat Zone.
+# Whoever fixes this should anchor to a corner and step from there, then confirm the stage from the
+# replay rather than from the tile they think they picked.
+#
+# graphics_yoshi.txt and graphics_yoshi_move.txt were checked the same way and do reach Yoshi's
+# Story, so only this fixture is wrong.
+300 B
+310
+380 B
+390
+460 sy=-127
+466
+500 A
+510
+580 A
+590
+700 p=2
+1000 sx=61 sy=127
+1000 p=2 sy=127
+1017
+1017 p=2
+1040 A
+1040 p=2 A
+1050
+1050 p=2
+1100 START
+1110
+1300 sy=100
+1367
+1380 sx=100
+1382
+1410 A
+1420
+1900 sx=80
+1960 X
+1965
+1990 A
+1995
+2020 p=2 R
+2030 A
+2035
+2060 A
+2065
+2090 B
+2095
+2120 p=2
+2140 A
+2145
+2170 A
+2175
+2200 B
+2205
+2240 B
+2245
+2280 B
+2285
+2320 p=2 B sy=-127
+2330 p=2
+2360 A
+2365
+2400 B
+2405
+2440 B
+2445
+2480 A
+2485
+2520 B
+2525
+2560 B
+2565
+2600

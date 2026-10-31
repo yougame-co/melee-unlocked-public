@@ -1,0 +1,59 @@
+// High-level emulation of the GameCube AX DSP ucode (port of Dolphin's AXUCode / AXVoice.h),
+// operating directly on guest RAM and the host ARAM buffer. The recompiled AX library builds
+// command lists and parameter blocks exactly as on hardware; this runs them synchronously when
+// the command-list mail arrives, so audio state in guest RAM evolves like it does under Dolphin.
+// SPDX-License-Identifier: GPL-2.0-or-later
+#pragma once
+#include <cstdint>
+
+namespace ax {
+
+// Memory access used by the mixer; production binds it to host RAM/ARAM, tests to buffers.
+struct Memory {
+  uint16_t (*rd16)(uint32_t addr);
+  uint32_t (*rd32)(uint32_t addr);
+  void (*wr16)(uint32_t addr, uint16_t v);
+  void (*wr32)(uint32_t addr, uint32_t v);
+  const uint8_t* aram;      // 16 MB
+  uint32_t aram_size;
+};
+
+struct VoiceTrace {
+  uint64_t frame;
+  uint32_t pb_addr, cur_before, cur_after, end_addr, ratio;
+  uint16_t millisecond, frac_before, frac_after, volume_before, volume_delta;
+  int16_t input_first, input_last, input_peak;
+  int16_t output_first, output_last, output_peak;
+};
+using VoiceTraceFn = void (*)(const VoiceTrace&);
+
+// Per-voice frame trace (M4 diagnostic, inert until a host installs a sink): a "kind=frame" line as
+// each command list starts, then one "kind=voice" line per parameter block that rendered samples or
+// that the CPU changed since the ucode last wrote it back. A voice line carries FNV-1a hashes of the
+// block's own 160 samples before the final mix (after its volume envelope, and every mixer
+// contribution in bus order) and, when the CPU changed the block, its words as the frame began.
+using FrameTraceFn = void (*)(const char* line);
+
+void set_memory(const Memory& mem);
+void set_voice_trace(VoiceTraceFn trace);
+void set_frame_trace(FrameTraceFn sink);
+// The block a command list has just mixed, exactly as it went to RAM for the AI DMA (R, L sample
+// pairs in host order). The console plays it one to two blocks later (the AX library double
+// buffers the DMA); the host hands it to the sound card now (audio_core.cpp, hle_stubs.cpp).
+using OutputSink = void (*)(const int16_t* rl, uint32_t frames);
+void set_output_sink(OutputSink sink);
+// Blocks mixed since start (each command list's OUTPUT), for the fronts to tell a new block apart.
+uint64_t blocks_output();
+void reset();
+// CPU -> DSP mailbox (DSPSendMailToDSP). Runs a command list when its address arrives.
+void handle_mail(uint32_t mail);
+// Exposed for tests.
+// Initial time delay (the ucode's per-voice ITD). On unless MELEE_AUDIO_ITD=0; tests switch it here.
+void set_itd_enabled(bool on);
+uint32_t convert_mixer_control(uint16_t mixer_control);
+void process_pb_list(uint32_t pb_addr);
+void output_samples(uint32_t lr_addr, uint32_t surround_addr);
+void setup_processing(uint32_t init_addr);
+uint64_t frames_processed();
+
+}  // namespace ax

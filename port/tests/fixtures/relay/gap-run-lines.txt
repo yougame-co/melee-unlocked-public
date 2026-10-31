@@ -1,0 +1,8 @@
+# 1: P1 DualSense, P2 Xbox, P3 Xbox (all idle)
+yg-pads {"seq":1,"t":1000,"pads":[{"slot":0,"id":"p1","name":"DualSense Wireless Controller","kind":"ps","b":0,"lx":0,"ly":0,"rx":0,"ry":0,"lt":0,"rt":0,"familyIndex":0},{"slot":1,"id":"p2","name":"Xbox Wireless Controller","kind":"xbox","b":0,"lx":0,"ly":0,"rx":0,"ry":0,"lt":0,"rt":0,"familyIndex":0},{"slot":2,"id":"p3","name":"Xbox Wireless Controller","kind":"xbox","b":0,"lx":0,"ly":0,"rx":0,"ry":0,"lt":0,"rt":0,"familyIndex":1}]}
+# 2: P2 unplugs: P1 stays slot 0, P3 stays slot 2 (a hole at slot 1)
+yg-pads {"seq":2,"t":2000,"pads":[{"slot":0,"id":"p1","name":"DualSense Wireless Controller","kind":"ps","b":0,"lx":0,"ly":0,"rx":0,"ry":0,"lt":0,"rt":0,"familyIndex":0},{"slot":2,"id":"p3","name":"Xbox Wireless Controller","kind":"xbox","b":0,"lx":0,"ly":0,"rx":0,"ry":0,"lt":0,"rt":0,"familyIndex":1}]}
+# 3: P1 holds south (Cross), P3 holds south (A): both ports must read their press
+yg-pads {"seq":3,"t":3000,"pads":[{"slot":0,"id":"p1","name":"DualSense Wireless Controller","kind":"ps","b":4096,"lx":0,"ly":0,"rx":0,"ry":0,"lt":0,"rt":0,"familyIndex":0},{"slot":2,"id":"p3","name":"Xbox Wireless Controller","kind":"xbox","b":4096,"lx":0,"ly":0,"rx":0,"ry":0,"lt":0,"rt":0,"familyIndex":1}]}
+# 4: both released
+yg-pads {"seq":4,"t":4000,"pads":[{"slot":0,"id":"p1","name":"DualSense Wireless Controller","kind":"ps","b":0,"lx":0,"ly":0,"rx":0,"ry":0,"lt":0,"rt":0,"familyIndex":0},{"slot":2,"id":"p3","name":"Xbox Wireless Controller","kind":"xbox","b":0,"lx":0,"ly":0,"rx":0,"ry":0,"lt":0,"rt":0,"familyIndex":1}]}
