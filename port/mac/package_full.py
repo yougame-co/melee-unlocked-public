@@ -3,7 +3,6 @@ from pathlib import Path
 from build_full import GAME_LIBRARY, build_dir
 import argparse, hashlib, json, os, plistlib, runpy, shutil, subprocess
 ROOT = Path(__file__).resolve().parents[2]
-VERSION = (ROOT/'VERSION').read_text().strip()
 BUILD = ROOT/'build-mac-full'
 APP = BUILD/'MeleeUnlocked.app'
 # The ELF, exclusions, and Sys assets must come from the same native build.
@@ -31,7 +30,7 @@ def main():
     version = (ROOT/'VERSION').read_text().strip()
     manifest = BUILD/'build-manifest.json'
     if not manifest.is_file():
-        raise SystemExit(f'Missing full-host build manifest; rebuild before packaging {VERSION}')
+        raise SystemExit('Missing full-host build manifest; rebuild before packaging 0.9.56')
     built = json.loads(manifest.read_text())
     if (built.get('build_script') != 'port/mac/build_full.py' or
         built.get('host_entry') != 'port/app/main.cpp'):
@@ -47,23 +46,13 @@ def main():
     for needed in [GAME_LIBRARY, GAME_LIBRARY.with_suffix('.snapexcl'), GAME_ASSETS/'Sys/GC/dsp_coef.bin']:
         if not needed.is_file():
             raise SystemExit(f'Missing native build input: {needed}')
-    # APFS can skip entries while a big folder (Resources/shader-seed) is emptied, and rmtree then fails with
-    # "Directory not empty"; another pass lists the rest.
-    for attempt in range(3):
-        if not APP.exists():
-            break
-        try:
-            shutil.rmtree(APP)
-        except OSError:
-            if attempt == 2:
-                raise
+    if APP.exists():
+        shutil.rmtree(APP)
     contents = APP/'Contents'
     res = contents/'Resources'
     copy(BUILD/'MeleeUnlocked', contents/'MacOS/MeleeUnlocked')
     copy(ROOT.parent/'deps/sdl2/lib/libSDL2-2.0.0.dylib', contents/'Frameworks/libSDL2-2.0.0.dylib')
     copy(GAME_LIBRARY,res/'melee_game.so')
-    # Includes optional gx-metal-msl-3-s{1,2} MSL + recipes generated offline by
-    # port/mac/seed_metal.py. Preserve the existing GL seed directories verbatim.
     if (ROOT/'spike/shader-seed').is_dir():
         copy(ROOT/'spike/shader-seed',res/'shader-seed')
     copy(GAME_LIBRARY.with_suffix('.snapexcl'),res/'melee_game.snapexcl')
@@ -108,7 +97,7 @@ def main():
                 raise SystemExit('Unsupported source in Linux release license list')
             for pair in node.iter.elts:
                 copy(rooted_path(pair.elts[0]), res/'licenses'/ast.literal_eval(pair.elts[1]))
-    (res/'EXPERIMENTAL.txt').write_text(f'M7 {VERSION} full macOS host spike; unsigned. See port/mac/README.md for measured limitations.\n')
+    (res/'EXPERIMENTAL.txt').write_text('M7 0.9.56 full macOS host spike; unsigned. See port/mac/README.md for measured limitations.\n')
     staging = 'STAGING ONLY — STAGING AGENT-TEST BUILD — NOT FOR PRODUCTION\n\n' if artifact_hook else ''
     (res/'README.txt').write_text(staging + 'Melee Unlocked macOS experimental build; unsigned.\n', encoding='utf-8')
     (res/'build-manifest.json').write_text(json.dumps(built, indent=2)+'\n')

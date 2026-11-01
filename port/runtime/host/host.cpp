@@ -7,9 +7,6 @@
 #include "host.h"
 #include "session_logs.h"
 #include "sim_work.h"
-#ifdef __APPLE__
-#include "pause_probe.h"
-#endif
 #include "audio.h"
 #include "cosmetic_mods.h"
 #include "gameplay_policy.h"
@@ -2822,24 +2819,13 @@ double sleep_slack() {
 // a millisecond sleep stands in for it. The sleep is as long as the measured lateness leaves room
 // for (sleep_slack): on a system whose sleeps overshoot, the wait spins instead.
 static void wait_for_tick(std::chrono::steady_clock::time_point deadline) {
-#ifdef __APPLE__
-  pause_probe::PacingPhase pause_phase;
-#endif
   static const HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, 0x2 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
   for (;;) {
     const double remaining = std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()).count();
     if (remaining <= 0.0) return;
     const double slack = sleep_slack();
     if (remaining > 0.0006 + slack) {
-#ifdef __APPLE__
-      const double requested = remaining - 0.0004 - slack;
-      const uint64_t before = pause_probe::active ? mach_absolute_time() : 0;
-      const bool slept = timed_sleep(timer, requested);
-      if (pause_probe::active && slept) pause_probe::pacing(before, requested, g_retraces);
-      if (!slept) YieldProcessor();
-#else
       if (!timed_sleep(timer, remaining - 0.0004 - slack)) YieldProcessor();
-#endif
     } else {
       YieldProcessor();
     }
@@ -2934,9 +2920,6 @@ bool wait_until_console_time(uint64_t tb) {
 }
 
 void retrace() {
-#ifdef __APPLE__
-  pause_probe::frame_progress();
-#endif
   if (!perf::active) perf::active = &perf::sim_timer;
   struct Guard { Guard() { g_in_retrace = true; } ~Guard() { g_in_retrace = false; } } guard;
   g_frame_submitted = false;

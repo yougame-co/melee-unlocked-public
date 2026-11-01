@@ -30,9 +30,6 @@
 #include <future>
 #include <cmath>
 #include <thread>
-#ifdef __APPLE__
-#include "../../mac/thread_qos.h"
-#endif
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -698,9 +695,6 @@ class ThreadedBackend final : public Backend {
     std::promise<void> initialized;
     auto ready = initialized.get_future();
     worker = std::thread([this, options = options_, visible, init = std::move(initialized)]() mutable {
-#ifdef __APPLE__
-      mac_host::interactive_thread_qos_once("render/submit");
-#endif
       // Above normal so other programs cannot delay presentation; below the simulation thread
       // (main.cpp), which an unlocked renderer would otherwise starve.
       SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);

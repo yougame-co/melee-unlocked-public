@@ -4,12 +4,6 @@
 #include "platform_paths.h"
 #include <exception>
 #include <filesystem>
-#ifdef __APPLE__
-#include "window_state.h"
-#ifdef MELEE_LINUX_GRAPHICS
-#include <SDL_syswm.h>
-#endif
-#endif
 #ifdef MELEE_LINUX_GRAPHICS
 #include "renderer_gl.h"
 #include "gx_host_compat.h"
@@ -72,12 +66,6 @@ struct Presentation {
        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 960, 720,
        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | (hidden ? SDL_WINDOW_HIDDEN : 0));
     if (!window) throw std::runtime_error(SDL_GetError());
-#ifdef __APPLE__
-    SDL_SysWMinfo info{};
-    SDL_VERSION(&info.version);
-    if (SDL_GetWindowWMInfo(window, &info) && info.subsystem == SDL_SYSWM_COCOA)
-      mac_window_disable_restoration(info.info.cocoa.window);
-#endif
   }
   void open(bool hidden, bool threaded = false, double fps = 120) {
     open_window(hidden);
@@ -134,9 +122,6 @@ void observe(const MuStatePod& state,const linux_host::Counters& counts,void* us
 }
 }
 int main(int argc,char** argv) {
-#ifdef __APPLE__
-  mac_disable_window_restoration();
-#endif
   const char* dev_spike = std::getenv("MELEE_MAC_DEV_SPIKE");
   if (!dev_spike || std::string(dev_spike) != "1") {
     std::fputs("Mac dev spike: set MELEE_MAC_DEV_SPIKE=1 to run this development-only host\n", stderr);

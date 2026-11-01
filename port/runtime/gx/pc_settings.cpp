@@ -5,8 +5,6 @@
 #include "settings_page_navigation.h"
 #ifdef __APPLE__
 #include "../../mac/platform_paths.h"
-#include "../../mac/embed_mac.h"
-#include "../../mac/imgui_retina.h"
 #endif
 #include <mutex>
 #include <thread>
@@ -2068,9 +2066,6 @@ static struct {
 
 static void apply_practice_tools(RenderOptions& options);   // below, with the Practice page
 void load_pc_settings(RenderOptions& options, int& volume) {
-#ifdef __APPLE__
-  mac_embed::set_retina(false); // missing key defaults OFF on every load; standalone ignores it
-#endif
   host::ds4_bindings_defaults();    // before the defaults are captured and the saved buttons read
   capture_default_bindings();   // the built-in buttons, before the saved ones replace them
   g_edit_follow_active = true;
@@ -2127,9 +2122,6 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       bool matched = true;
       if (key == "fps") { double rate = std::stod(value); if (rate == -1 || rate == 0 || rate >= 30) options.fps_cap = std::min(rate, 2000.0); }
       else if (key == "scale") { int scale = std::stoi(value); if (scale >= 0 && scale <= 8) options.efb_scale = scale; }
-#ifdef __APPLE__
-      else if (key == "retina") mac_embed::set_retina(value == "1");
-#endif
       else if (key == "fullscreen") options.fullscreen = value == "1";
       else if (key == "exclusivefullscreen") options.exclusive_fullscreen = value == "1";
       else if (key == "vsync") { options.vsync = value == "1"; vsync_seen = true; }
@@ -2646,15 +2638,6 @@ static float game_ui_scale(float client_height) {
   if (forced > 0.0f) return forced;
   return client_height > 1080.0f ? std::min(client_height / 1080.0f, 3.0f) : 1.0f;
 }
-#ifdef __APPLE__
-static SDL_Window* g_settings_sdl_window = nullptr;
-static float retina_ui_scale() {
-  int w = 0, h = 0;
-  mac_embed::drawable_size(g_settings_sdl_window, &w, &h);
-  return g_fill_window.load(std::memory_order_relaxed) ?
-      g_window_scale.load(std::memory_order_relaxed) : game_ui_scale(float(h));
-}
-#endif
 // MELEE_TEST_MENU_STYLE=<0..5> (tests): the panel uses that menu style, and the standalone settings
 // window draws it the way the game does instead of its own old screen, so a hidden
 // MELEE_TEST_SETTINGS_SHOT run can capture any style. -1 when the variable is not set.
@@ -3378,9 +3361,6 @@ void settings_context_create(void* window, bool open_at_startup) {
 #ifndef _WIN32
   if (SDL_GetWindowFlags(static_cast<SDL_Window*>(window)) & SDL_WINDOW_VULKAN) ImGui_ImplSDL2_InitForVulkan(static_cast<SDL_Window*>(window));
   else ImGui_ImplSDL2_InitForOpenGL(static_cast<SDL_Window*>(window), SDL_GL_GetCurrentContext());
-#ifdef __APPLE__
-  g_settings_sdl_window = static_cast<SDL_Window*>(window);
-#endif
   ImGui_ImplSDL2_SetGamepadMode(ImGui_ImplSDL2_GamepadMode_Manual, nullptr, 0);
   // The window code decides when the pointer shows (window_sdl.inl show_cursor). Without this the
   // SDL backend turned it back on every frame, so it never hid on Linux.
@@ -3388,9 +3368,7 @@ void settings_context_create(void* window, bool open_at_startup) {
   host::window_set_message_callback([](void* w, uint32_t m, uintptr_t, intptr_t) {
     if (m != host::kSdlEventMessage) return false;
     SDL_Event e = *static_cast<SDL_Event*>(w);
-#ifdef __APPLE__
-    if (mac_embed::imgui_retina_process_event(g_settings_sdl_window, e, retina_ui_scale())) return false;
-#endif
+    // The pointer arrives in pixels and a scaled frame is laid out in smaller units.
     if (const float scale = g_frame_ui_scale.load(std::memory_order_relaxed); scale != 1.0f) {
       if (e.type == SDL_MOUSEMOTION) { e.motion.x = (int)std::lround(e.motion.x / scale); e.motion.y = (int)std::lround(e.motion.y / scale); }
       if (e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP) { e.button.x = (int)std::lround(e.button.x / scale); e.button.y = (int)std::lround(e.button.y / scale); }
@@ -4235,10 +4213,6 @@ static bool write_settings_file(const SettingsState& state, const RenderOptions&
 static bool write_settings_file_impl(const SettingsState& state, const RenderOptions& options) {
   std::filesystem::path path(options.settings_path), temporary = path; temporary += ".tmp";
   std::ofstream file(temporary);
-#ifdef __APPLE__
-  // Preserve the opt-in across ordinary settings saves without changing OFF files.
-  if (mac_embed::retina_setting()) file << "retina 1\n";
-#endif
   file << "fps " << options.fps_cap << "\nscale " << options.efb_scale << "\nfullscreen " << options.fullscreen
        << "\nexclusivefullscreen " << options.exclusive_fullscreen
        << "\nvsync " << (g_display_keys.own_vsync ? g_display_keys.vsync : options.vsync)
@@ -4820,11 +4794,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
 #ifdef _WIN32
   ImGui_ImplWin32_NewFrame();
 #else
-#ifdef __APPLE__
-  mac_embed::imgui_retina_new_frame(g_settings_sdl_window, retina_ui_scale());
-#else
   ImGui_ImplSDL2_NewFrame();
-#endif
 #endif
   // The backend has just set the display size in pixels. On a scaled frame (the standalone settings
   // window on a scaled display, the game window above 1080 pixels high) lay it out in smaller units
@@ -4836,15 +4806,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     g_frame_pixel_size = io.DisplaySize;
     const float ui_scale = g_fill_window.load(std::memory_order_relaxed) ?
         g_window_scale.load(std::memory_order_relaxed) : game_ui_scale(io.DisplaySize.y);
-#ifdef __APPLE__
-    mac_embed::imgui_retina_display_size(g_settings_sdl_window, ui_scale);
-#else
     // The small allowance keeps float rounding from turning an exact 1080 into 1081.
     if (ui_scale != 1.0f)
       io.DisplaySize = ImVec2(std::ceil(io.DisplaySize.x / ui_scale - 0.001f),
                               std::ceil(io.DisplaySize.y / ui_scale - 0.001f));
     io.DisplayFramebufferScale = ImVec2(ui_scale, ui_scale);
-#endif
     g_frame_ui_scale.store(ui_scale, std::memory_order_relaxed);
   }
   // UI navigation is armed only after the selected pad has returned to neutral. A held A that

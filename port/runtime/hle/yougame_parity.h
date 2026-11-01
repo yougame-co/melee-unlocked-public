@@ -14,8 +14,6 @@ inline constexpr const char* kSettingsHint = "F1: game settings";
 inline constexpr const char* kMenuHint = "Shift+Tab / YouGame menu (D-pad + Start)";
 #if defined(_WIN32) || defined(__linux__)
 inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\"]}";
-#elif defined(__APPLE__)
-inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\",\"screenshot\"]}";
 #else
 inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\"]}";
 #endif

@@ -30,14 +30,8 @@ def conditional_source(text, defines):
                 output.append(line)
             continue
         kind, argument = directive.groups()
-        if kind in ("ifdef", "ifndef", "if"):
-            if kind == "if":
-                terms = argument.strip().split(" && ")
-                if not all(re.fullmatch(r"defined\(\w+\)", term) for term in terms):
-                    raise AssertionError("Extend branch selector for: " + line)
-                condition = all(term[8:-1] in defines for term in terms)
-            else:
-                condition = argument.split()[0] in defines
+        if kind in ("ifdef", "ifndef"):
+            condition = argument.split()[0] in defines
             if kind == "ifndef":
                 condition = not condition
             stack.append((enabled, condition))
@@ -55,25 +49,6 @@ def conditional_source(text, defines):
 
 
 class YouGame0962MergeTest(unittest.TestCase):
-    def test_compound_branch_selector_preserves_nested_else(self):
-        text = """#ifdef OUTER
-#if defined(__APPLE__) && defined(GX_PC_SETTINGS)
-retina
-#else
-ordinary
-#endif
-#else
-outside
-#endif"""
-        for defines, expected in ((set(), "outside"), ({"OUTER"}, "ordinary"),
-                                  ({"OUTER", "__APPLE__"}, "ordinary"),
-                                  ({"OUTER", "GX_PC_SETTINGS"}, "ordinary"),
-                                  ({"OUTER", "__APPLE__", "GX_PC_SETTINGS"}, "retina")):
-            with self.subTest(defines=defines):
-                self.assertEqual(conditional_source(text, defines), expected)
-        with self.assertRaisesRegex(AssertionError, "Extend branch selector"):
-            conditional_source("#if unsupported\n#endif", set())
-
     def test_all_merge_boundaries_have_no_markers(self):
         for path in CONFLICTED:
             with self.subTest(path=path):
@@ -155,8 +130,6 @@ outside
                     if settings:
                         defines.add("GX_PC_SETTINGS")
                     active = conditional_source(renderer, defines)
-                    self.assertEqual("embed_scale_.active = mac_embed::retina_size(" in active,
-                                     mac and settings)
                     if mac:
                         self.assertIn("shader_translation::Queue translations_;", active)
                         self.assertIn("translations_.stop();", active)
@@ -165,8 +138,6 @@ outside
                         self.assertNotIn("translate_shader(", active)
                         self.assertNotIn("translate_worker()", active)
                     else:
-                        self.assertIn("<GL/glew.h>", active)
-                        self.assertNotIn("<OpenGL/", active)
                         self.assertIn("void translate_shader(", active)
                         self.assertIn("void translate_worker()", active)
                         self.assertIn("stop_translators();", active)

@@ -28,10 +28,6 @@
 // character select (agent-only rooms), so the held-seat rejoin runs without root or network tools.
 // openMenu:"phob:<1-4>" opens Controls -> PhobGCC on the chosen socket at boot.
 // Source renderer hook: present_log:"<name>", present_frames:"<directory-name>:<1..600>".
-// Mac player-box hook keys (Apple only; other platforms keep their ordinary unknown-key handling):
-// panelKeyAfter:1..600 seconds (the panel takes the keyboard focus once, as a click on it does),
-// activateAfter:1..600 seconds (the game asks to become the active app once), and
-// macPanel:"neverKey"|"fsAux"|"refreshActivity" (full-screen slowdown test switches, one per run).
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <nlohmann/json.hpp>
@@ -448,21 +444,6 @@ inline Settings map_keys(const nlohmann::json& object, Engine engine = Engine::S
       else { out.stop_at_frame = value.get<int>(); applied("stopAt"); }
       continue;
     }
-#ifdef __APPLE__
-    if (key == "panelKeyAfter" || key == "activateAfter" || key == "macPanel") {
-      const bool mode = key == "macPanel";
-      if (mode ? !(value.is_string() && (value == "neverKey" || value == "fsAux" || value == "refreshActivity"))
-               : !integer_in(value, 1, 600))
-        diagnostic(key + " invalid value");
-      else {
-        out.environment.emplace_back(key == "panelKeyAfter" ? "MELEE_TEST_PANEL_KEY_AFTER" :
-                                     key == "activateAfter" ? "MELEE_TEST_ACTIVATE_AFTER" : "MELEE_TEST_MAC_PANEL",
-                                     mode ? value.get<std::string>() : std::to_string(value.get<int>()));
-        applied(key.c_str());
-      }
-      continue;
-    }
-#endif
     if (key == "captureEvery" || key == "frames") {
       const bool capture = key == "captureEvery";
 #if defined(MELEE_LINUX) && !defined(__APPLE__)

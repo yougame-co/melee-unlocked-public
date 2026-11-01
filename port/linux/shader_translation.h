@@ -2,7 +2,6 @@
 // One translation worker, no GL context or game-state access. Header-only for both Mac hosts.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -150,21 +149,10 @@ struct Result {
 class Queue {
  public:
   ~Queue() { stop(); }
-  // Called only by the frame thread. A stage is read/queued once per renderer, including failures. An urgent request
-  // (a draw on screen now) goes ahead of queued boot prewarm work, and moves an already queued job to the front.
-  std::shared_ptr<Result> request(const std::filesystem::path& path, std::function<std::string()> translate,
-                                  bool urgent = false) {
+  // Called only by the frame thread. A stage is read/queued once per renderer, including failures.
+  std::shared_ptr<Result> request(const std::filesystem::path& path, std::function<std::string()> translate) {
     const auto key = path.string();
-    if (auto found = results_.find(key); found != results_.end()) {
-      if (urgent && found->second->state.load(std::memory_order_acquire) == Result::Pending) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto queued = std::find_if(jobs_.begin(), jobs_.end(), [&](const Job& job) { return job.result == found->second; });
-        if (queued != jobs_.end() && queued != jobs_.begin()) {
-          Job job = std::move(*queued); jobs_.erase(queued); jobs_.push_front(std::move(job));
-        }
-      }
-      return found->second;
-    }
+    if (auto found = results_.find(key); found != results_.end()) return found->second;
     auto result = std::make_shared<Result>();
     result->glsl = read_text(path);
     if (!result->glsl.empty()) {
@@ -175,8 +163,7 @@ class Queue {
       ++translation_misses_;
       std::lock_guard<std::mutex> lock(mutex_);
       if (!worker_.joinable()) worker_ = std::thread([this] { work(); });
-      if (urgent) jobs_.push_front({result, std::move(translate)});
-      else jobs_.push_back({result, std::move(translate)});
+      jobs_.push_back({result, std::move(translate)});
       wake_.notify_one();
     }
     results_.emplace(key, result);

@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #define NOMINMAX
 #include "test_env.h"
-#if defined(YOUGAME_AGENT_TEST_HOOK) && defined(__APPLE__)
-#include "yougame_agent_present.h"
-#endif
 #include <functional>
 #include <windows.h>
 #include <dbghelp.h>
@@ -1462,10 +1459,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 #endif
 #ifdef __APPLE__
 #include "../mac/full_launch.h"
-#include "../mac/window_state.h"
-#include "../mac/thread_qos.h"
 int main(int argc, char** argv) {
-  mac_disable_window_restoration();
   auto args = mac_host::full_launch_arguments(argc, argv);
   std::vector<char*> pointers;
   for (auto& arg : args) pointers.push_back(arg.data());
@@ -1517,9 +1511,6 @@ static int melee_main(int argc, char** argv) {
   yougame::net_test::install(agent_test.net);
   yougame::ranked_cpu::enabled = agent_test.ranked_cpu;
   for (const auto& [name, value] : agent_test.environment) _putenv_s(name.c_str(), value.c_str());
-#endif
-#if defined(YOUGAME_AGENT_TEST_HOOK) && defined(__APPLE__)
-  yougame::agent_present::start_standalone(yougame::active());
 #endif
   user_gecko::set_sources_allowed(yougame::mode_policy::mod_sources(yougame::active()).folders);
 #ifndef MELEE_SOURCE_PORT
@@ -1620,11 +1611,6 @@ static int melee_main(int argc, char** argv) {
   // melee_port.log let it rotate the game's log away at its start, so a player's log held only the
   // panel's three lines and every desync line of the match was lost.
   if (settings_window_only && host::options.log_file.empty()) host::options.log_file = "melee_settings.log";
-#ifdef __APPLE__
-  // This main thread runs simulation in both embedded and standalone launches.
-  // The early parse above must select --log-file before the QoS result is logged.
-  mac_host::interactive_thread_qos_once("simulation");
-#endif
 #ifdef _WIN32
   // Log only after the early --log-file parse, so the report uses the game's chosen run log.
   host::log("timing: timeBeginPeriod(1) %s", timer_resolution.raised ? "ok" : "failed");
@@ -1771,11 +1757,6 @@ static int melee_main(int argc, char** argv) {
     else if (a == "--headless") headless = true;
     else if (a == "--hidden") hidden = true;
     else if (a == "--threaded-renderer") threaded = true;
-#ifdef __APPLE__
-    else if (a == "--mac-retina") setenv("MELEE_MAC_EMBED_RETINA", "1", 1);  // embedded Retina for one launch
-    else if (a == "--mac-metal") setenv("MELEE_MAC_RENDERER", "metal", 1);  // the Metal renderer for one launch (a test build's spec)
-    else if (a == "--mac-pause-probe") setenv("MELEE_PAUSE_PROBE", "1", 1);  // pause_probe.h diagnostics for one launch (a test build's spec)
-#endif
     else if (a == "--fps") {   // display rate: N or "unlocked"; enables the render thread
       std::string v = next(); gfx.fps_cap = v == "unlocked" ? 0 : v == "monitor" ? -1 : std::atoi(v.c_str());
       if (v != "unlocked" && v != "monitor" && (gfx.fps_cap < 1 || v.find_first_not_of("0123456789") != std::string::npos)) { usage(); return 2; }

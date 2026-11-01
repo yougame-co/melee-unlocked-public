@@ -70,7 +70,6 @@
 #endif
 #ifdef __APPLE__
 #include <SDL_syswm.h>
-#include "../../mac/window_state.h"
 extern "C" bool mac_window_is_fullscreen(void*);
 extern "C" void mac_toggle_fullscreen(void*);
 #endif

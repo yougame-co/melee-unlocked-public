@@ -10,9 +10,6 @@
 #include "jukebox.h"
 #endif
 #include <SDL.h>
-#ifdef __APPLE__
-#include "../../mac/thread_qos.h"
-#endif
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -186,9 +183,6 @@ void render(int16_t* out, size_t frames) {
 }
 
 void callback(void*, Uint8* stream, int len) {
-#ifdef __APPLE__
-  mac_host::audio_thread_qos_once();
-#endif
   int16_t* out = reinterpret_cast<int16_t*>(stream);
   const size_t frames = (size_t)len / 4;
   render(out, frames);
@@ -281,10 +275,6 @@ bool audio_open(int volume_percent, const char* wav_dump_path, bool open) {
 
 void audio_close() {
   if (g_device) { SDL_CloseAudioDevice(g_device); g_device = 0; }
-#ifdef __APPLE__
-  // The callback has stopped; preserve a pending result even on close/reopen before a frame.
-  mac_host::report_audio_thread_qos();
-#endif
   if (g_wav) {
     std::fseek(g_wav, 0, SEEK_SET);
     wav_header(g_wav, g_wav_bytes);

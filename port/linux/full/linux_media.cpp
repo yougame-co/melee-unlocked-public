@@ -1,8 +1,8 @@
 #ifdef __APPLE__
 #include "linux_media.h"
 namespace linux_media {
-bool decode_audio(const std::filesystem::path&, int, size_t, const AudioSink&, size_t* expected_frames, bool* too_long) {
-  if (expected_frames) *expected_frames = 0; if (too_long) *too_long = false; return false;
+bool decode_audio(const std::filesystem::path&, int, size_t, std::vector<int16_t>& out, bool* too_long) {
+  out.clear(); if (too_long) *too_long = false; return false;
 }
 bool load_picture(const std::filesystem::path&, uint32_t, uint32_t, uint32_t* w, uint32_t* h, std::vector<uint8_t>& out) {
   if (w) *w = 0; if (h) *h = 0; out.clear(); return false;

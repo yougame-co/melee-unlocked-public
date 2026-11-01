@@ -10,31 +10,17 @@
 #include "gx_vulkan.h"
 #include "exi_slippi.h"
 #include "gx_shader.h"
-#ifdef __APPLE__
-#ifndef GL_SILENCE_DEPRECATION
-#define GL_SILENCE_DEPRECATION
-#endif
-#include <OpenGL/gl3.h>
-#else
 #include <GL/glew.h>
-#endif
 #include <SDL.h>
 #ifndef __APPLE__
 #include <SDL_vulkan.h>
 #endif
 #include <algorithm>
-#ifdef __APPLE__
-#include <cstdlib>
-#include <cstring>
-#endif
 #include <memory>
 #include <string>
 #include <cctype>
 #ifdef __APPLE__
 #include "../../mac/embed_mac.h"
-#endif
-#ifdef __APPLE__
-#include "../../mac/gx_metal.h"  // opt-in Metal renderer (MELEE_MAC_RENDERER=metal or --mac-metal)
 #endif
 
 namespace gx {
@@ -61,12 +47,6 @@ int linux_scale(const RenderOptions& options, int client_h) {
 bool d3d11_available() { return false; }
 
 Backend* create_render_backend(void* hwnd, int client_w, int client_h, const RenderOptions& options) {
-#ifdef __APPLE__
-  // Foreign SDL dimensions are points. Only the opted-in panel changes the factory's pixel inputs.
-  mac_embed::retina_size(static_cast<SDL_Window*>(hwnd), &client_w, &client_h);
-  if (const char* renderer = std::getenv("MELEE_MAC_RENDERER"); renderer && std::strcmp(renderer, "metal") == 0)
-    return record_started_backend(create_metal_backend(hwnd, client_w, client_h, options), "Metal");
-#endif
   auto* window = static_cast<SDL_Window*>(hwnd);
 #ifndef __APPLE__
   // Vulkan (PC settings > Graphics backend): the same renderer as on Windows, with its own settings

@@ -15,12 +15,12 @@
 namespace mac_embed {
 using Millis = int64_t; // monotonic clock, supplied by the adapter (or a test)
 struct Rect { double x = 0, y = 0, w = 0, h = 0; };
-inline constexpr bool equal(Rect a, Rect b) { return a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h; }
+inline bool equal(Rect a, Rect b) { return a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h; }
 // The app sends the player box in its window's backing pixels (the page's placeEmbed: CSS pixels times devicePixelRatio,
 // page zoom included, plus the title bar in backing pixels); AppKit places windows in points. Taking the pixels as points
 // made the panel twice the box on a 2x display: d0017/d0018 drew the picture low and off to the side, d0019 twice too
 // big. scale is the backing scale of the display the parent is on; anything not positive counts as 1.
-inline constexpr Rect points_from_backing(Rect box, double scale) {
+inline Rect points_from_backing(Rect box, double scale) {
   if (!(scale > 0)) scale = 1;
   return {box.x / scale, box.y / scale, box.w / scale, box.h / scale};
 }
@@ -45,7 +45,7 @@ inline std::optional<uint32_t> parent_id(std::string_view text) {
   if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || id == 0) return {};
   return id;
 }
-enum class Kind { Rect, View, Show, Hide, Focus, Blur, Quit, Scale };
+enum class Kind { Rect, Show, Hide, Focus, Blur, Quit, Scale };
 // scale: the app's display scale for the rects that follow ("embed scale n", desktop 0.13.1076+).
 struct Command { Kind kind; Rect rect{}; double scale = 0; };
 // The stdio bridge strips "embed ". Reject malformed/trailing/overflow input atomically.
@@ -64,26 +64,14 @@ inline std::optional<Command> parse_command(const std::string& line) {
     if (!(in >> scale) || (in >> trailing) || !std::isfinite(scale) || scale < 0.5 || scale > 8) return {};
     return Command{Kind::Scale, {}, scale};
   }
-  const bool view = line.rfind("view ", 0) == 0;
-  if (line.size() > 128 || (!view && line.rfind("rect ", 0) != 0)) return {};
+  if (line.size() > 128 || line.rfind("rect ", 0) != 0) return {};
   std::istringstream in(line.substr(5));
   int x, y, w, h;
   std::string trailing;
   if (!(in >> x >> y >> w >> h) || (in >> trailing)) return {};
   constexpr int limit = 100000;
   if (x < -limit || x > limit || y < -limit || y > limit || w < 0 || h < 0 || w > limit || h > limit) return {};
-  return Command{view ? Kind::View : Kind::Rect, {double(x), double(y), double(w), double(h)}};
-}
-
-// Both boxes use the same parent-relative, top-left backing-pixel coordinates.
-// A rect may precede the first view (legacy mapping until then); subsequent rects only clip.
-inline constexpr Rect intersection(Rect a, Rect b) {
-  const double x = std::max(a.x, b.x), y = std::max(a.y, b.y);
-  return {x, y, std::max(0.0, std::min(a.x + a.w, b.x + b.w) - x),
-                std::max(0.0, std::min(a.y + a.h, b.y + b.h) - y)};
-}
-inline constexpr bool contains_point(Rect box, double x, double y) {
-  return x >= box.x && y >= box.y && x < box.x + box.w && y < box.y + box.h;
+  return Command{Kind::Rect, {double(x), double(y), double(w), double(h)}};
 }
 
 class QueryTimer {
@@ -168,10 +156,9 @@ class Tracker {
 // Keep tiny/zero page boxes hidden even through subsequent "show" commands.
 class Presentation {
  public:
-  constexpr void apply(Command command) {
+  void apply(Command command) {
     switch (command.kind) {
       case Kind::Rect: box = command.rect; have_rect_ = true; break;
-      case Kind::View: view_ = command.rect; have_view_ = true; break;
       case Kind::Show: shown_ = true; break;
       case Kind::Hide: shown_ = false; break;
       case Kind::Focus: focused = true; break;
@@ -180,18 +167,14 @@ class Presentation {
       case Kind::Scale: app_scale = command.scale; break;
     }
   }
-  constexpr void first_frame() { frame_ = true; }
-  constexpr Rect picture() const { return have_view_ ? view_ : box; }
-  constexpr Rect visible_box() const { return have_view_ ? intersection(box, view_) : box; }
-  constexpr bool visible(const Parent& parent) const {
-    const auto clip = visible_box();
-    return !quit && frame_ && have_rect_ && shown_ && clip.w >= 32 && clip.h >= 32 && parent.on_screen;
+  void first_frame() { frame_ = true; }
+  bool visible(const Parent& parent) const {
+    return !quit && frame_ && have_rect_ && shown_ && box.w >= 32 && box.h >= 32 && parent.on_screen;
   }
   Rect box{};
   double app_scale = 0;   // from the app's "scale" line; 0 until one arrives (apps before 0.13.1076 send none)
   bool focused = true, quit = false;
  private:
-  Rect view_{};
-  bool frame_ = false, have_rect_ = false, have_view_ = false, shown_ = true;
+  bool frame_ = false, have_rect_ = false, shown_ = true;
 };
 } // namespace mac_embed

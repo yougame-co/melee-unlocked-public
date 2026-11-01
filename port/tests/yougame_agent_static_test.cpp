@@ -65,42 +65,6 @@ static void mapping(const char* scratch) {
                                         nlohmann::json(600.5), nlohmann::json(true)})
       CHECK(map_keys({{"stopAt", value}}, engine).stop_at_frame == 0);
   }
-#ifdef __APPLE__
-  // Mac player-box keys: bounded seconds or one named switch, mapped to the variables embed_mac.mm reads.
-  for (const auto engine : {Engine::Static, Engine::Source}) {
-    for (const auto& [key, variable] : {std::pair{"panelKeyAfter", "MELEE_TEST_PANEL_KEY_AFTER"},
-                                        std::pair{"activateAfter", "MELEE_TEST_ACTIVATE_AFTER"}}) {
-      for (int seconds : {1, 600}) {
-        const auto mapped = map_keys({{key, seconds}}, engine);
-#ifdef __APPLE__
-        CHECK(environment(mapped, variable) == std::to_string(seconds) && mapped.environment.size() == 1);
-        CHECK(mapped.log == std::string("agent-test.json applied default keys: ") + key);
-#else
-        CHECK(mapped.environment.empty() && mapped.arguments.empty());
-        CHECK(mapped.log == std::string("agent test: ") + key + " not supported on this platform; ignored");
-#endif
-      }
-      for (const nlohmann::json& value : {nlohmann::json(0), nlohmann::json(601), nlohmann::json("10"),
-                                          nlohmann::json(10.5), nlohmann::json(true)}) {
-        const auto refused = map_keys({{key, value}}, engine);
-        CHECK(refused.environment.empty() && refused.arguments.empty());
-#ifdef __APPLE__
-        CHECK(refused.log == std::string("agent test: ") + key + " invalid value; ignored");
-#endif
-      }
-    }
-    for (const char* mode : {"neverKey", "fsAux", "refreshActivity"}) {
-      const auto mapped = map_keys({{"macPanel", mode}}, engine);
-#ifdef __APPLE__
-      CHECK(environment(mapped, "MELEE_TEST_MAC_PANEL") == mode && mapped.environment.size() == 1);
-#else
-      CHECK(mapped.environment.empty() && mapped.log == "agent test: macPanel not supported on this platform; ignored");
-#endif
-    }
-    for (const nlohmann::json& value : {nlohmann::json("never"), nlohmann::json(""), nlohmann::json(1), nlohmann::json(true)})
-      CHECK(map_keys({{"macPanel", value}}, engine).environment.empty());
-  }
-#endif
   for (int timer : {5, 600})
     CHECK(environment(map_keys({{"timer", timer}}, Engine::Static), "MELEE_ONLINE_TEST_TIMER") == std::to_string(timer));
   for (int quit : {1, 3})

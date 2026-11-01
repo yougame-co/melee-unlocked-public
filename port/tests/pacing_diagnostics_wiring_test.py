@@ -93,65 +93,6 @@ class PacingDiagnosticsWiringTest(unittest.TestCase):
       host::log("present: vsync %s (settings)", options.vsync ? "on" : "off");
 #endif'''
         self.assertIn(addition, s)
-        # Retina changes are Apple-only. Reverse these exact guarded additions,
-        # retaining the whole-file observer comparison and all Windows guards.
-        for addition in (
-            '#include "../../mac/embed_mac.h"\n',
-            '#include "../../mac/imgui_retina.h"\n',
-            '''#ifdef __APPLE__
-  mac_embed::set_retina(false); // missing key defaults OFF on every load; standalone ignores it
-#endif
-''',
-            '''#ifdef __APPLE__
-      else if (key == "retina") mac_embed::set_retina(value == "1");
-#endif
-''',
-            '''#ifdef __APPLE__
-static SDL_Window* g_settings_sdl_window = nullptr;
-static float retina_ui_scale() {
-  int w = 0, h = 0;
-  mac_embed::drawable_size(g_settings_sdl_window, &w, &h);
-  return g_fill_window.load(std::memory_order_relaxed) ?
-      g_window_scale.load(std::memory_order_relaxed) : game_ui_scale(float(h));
-}
-#endif
-''',
-            '''#ifdef __APPLE__
-  g_settings_sdl_window = static_cast<SDL_Window*>(window);
-#endif
-''',
-            '''#ifdef __APPLE__
-  // Preserve the opt-in across ordinary settings saves without changing OFF files.
-  if (mac_embed::retina_setting()) file << "retina 1\\n";
-#endif
-''',
-        ):
-            self.assertEqual(s.count(addition), 1, addition)
-            s = s.replace(addition, '')
-        for old, new in (
-            ('    // The pointer arrives in pixels and a scaled frame is laid out in smaller units.\n',
-             '''#ifdef __APPLE__
-    if (mac_embed::imgui_retina_process_event(g_settings_sdl_window, e, retina_ui_scale())) return false;
-#endif
-'''),
-            ('  ImGui_ImplSDL2_NewFrame();\n',
-             '''#ifdef __APPLE__
-  mac_embed::imgui_retina_new_frame(g_settings_sdl_window, retina_ui_scale());
-#else
-  ImGui_ImplSDL2_NewFrame();
-#endif
-'''),
-            ('    // The small allowance keeps float rounding from turning an exact 1080 into 1081.\n',
-             '''#ifdef __APPLE__
-    mac_embed::imgui_retina_display_size(g_settings_sdl_window, ui_scale);
-#else
-    // The small allowance keeps float rounding from turning an exact 1080 into 1081.
-'''),
-            ('    io.DisplayFramebufferScale = ImVec2(ui_scale, ui_scale);\n',
-             '    io.DisplayFramebufferScale = ImVec2(ui_scale, ui_scale);\n#endif\n'),
-        ):
-            self.assertEqual(s.count(new), 1, new)
-            s = s.replace(new, old)
         # Build 42 merges upstream v0.9.89: first reverse exactly its pc_settings.cpp hunks (vs 0565f039).
         for approved in json.loads((ROOT / 'port/tests/fixtures/build42_0989_settings_ranges.json').read_text()):
             self.assertEqual(s.count(approved['after']), 1, approved['after'])

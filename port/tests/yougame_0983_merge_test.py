@@ -97,27 +97,6 @@ class YouGame0983MergeTest(unittest.TestCase):
             self.assertIn(token, present)
         self.assertIn('bind_vertex_array(vao_);', gl)
 
-    def test_metal_ready_requires_successful_real_present(self):
-        from yougame_console_wiring_test import body
-        metal = source('port/mac/gx_metal.mm')
-        self.assertIn('#include "../runtime/hle/yougame_parity.h"', metal)
-        present = body(metal, 'MetalBackend::present')
-        self.assertIn('if (w <= 0 || h <= 0)', present)
-        self.assertIn('if (!drawable)', present)
-        callback = '''  const bool real_frame = frame.test_fill < 0;
-  [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
-    if (presented.presentedTime > 0)
-      yougame::parity::signals.presented(real_frame);
-  }];'''
-        self.assertIn(callback, present)
-        self.assertLess(present.index('if (!drawable)'), present.index(callback))
-        self.assertLess(present.index(callback), present.index('[command_.get() presentDrawable:drawable]'))
-        self.assertEqual(metal.count('yougame::parity::signals.presented('), 1)
-        # Like GL, use presented()'s default Clock::now() under the agent hook.
-        self.assertIn('Clock::time_point now = Clock::now()', source('port/runtime/hle/yougame_parity.h'))
-        submit = body(metal, 'MetalBackend::submit_frame')
-        self.assertLess(submit.index('if (!skip_) present(frame, efb)'), submit.index('[command_.get() commit]'))
-
     def test_dxgi_probes_cannot_release_cover_or_pollute_present_metrics(self):
         for api in (11, 12):
             text = source(f'port/runtime/gx/gx_d3d{api}.cpp')

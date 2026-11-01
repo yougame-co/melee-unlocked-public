@@ -47,14 +47,10 @@ struct KeyScript {
 }
 namespace mac_embed {
 bool pump() { ++native_calls; ++mac_pumps; return false; }
-// Mac embed picture size (mac-0993-view): no picture snapshot in this harness, so the pump keeps its old path.
-bool drawable_size(SDL_Window*, int*, int*) { return false; }
 void destroy() { ++native_calls; }
 }
 namespace host {
 SdlVideoThread g_sdl_video_thread;
-int g_client_w = 0, g_client_h = 0;          // read by the Apple pump's picture-size check
-void (*g_on_resize)(int, int) = nullptr;
 void log(const char*, const char* message) { if (std::strcmp(message,"window: pump skipped on a non-video thread")) std::abort(); ++logs; }
 bool video_thread(SdlVideoThread::Call call) {
 ''' + body(SDL, 'video_thread') + r'''

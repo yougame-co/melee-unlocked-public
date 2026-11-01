@@ -7,9 +7,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#ifdef __APPLE__
-#include <atomic>
-#endif
 
 namespace host::perf {
 struct Histogram {
@@ -37,13 +34,6 @@ struct Histogram {
 };
 
 enum class Stage { Step, Decode, Submit, Input, Wait, Count };
-#ifdef __APPLE__
-// Bound only on the probed simulation thread. No clock or atomic store when off.
-inline thread_local std::atomic<Stage>* pause_phase = nullptr;
-inline void publish_pause_phase(Stage stage) {
-  if (pause_phase) pause_phase->store(stage, std::memory_order_relaxed);
-}
-#endif
 struct Frame {
   std::array<double, static_cast<size_t>(Stage::Count)> ms{};
   double work_ms() const {
@@ -71,9 +61,6 @@ struct Timer {
   }
   Stage enter(Stage next, Clock::time_point now = Clock::now()) {
     advance(now);
-#ifdef __APPLE__
-    publish_pause_phase(next);
-#endif
     const auto previous = stage; stage = next; return previous;
   }
   void set_resim(bool enabled, Clock::time_point now = Clock::now()) {
@@ -92,9 +79,6 @@ struct Timer {
   }
   void begin(Clock::time_point now = Clock::now()) {
     frame = {}; stage = Stage::Step; last = now; running = true;
-#ifdef __APPLE__
-    publish_pause_phase(stage);
-#endif
   }
   Frame finish(Clock::time_point now = Clock::now()) {
     advance(now);

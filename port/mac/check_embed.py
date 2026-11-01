@@ -34,8 +34,6 @@ def main():
                 code = 124
         result = {'step':label, 'exit':code}
         print(f'{label}: exit {code}', flush=True)
-        if code:
-            print((BUILD / (label + '.log')).read_text(), flush=True)
         results.append(result)
         return code
     clang = '/usr/bin/clang++'
@@ -50,15 +48,14 @@ def main():
     if run('native-build', [clang,*flags,'-fblocks','-fno-objc-arc','-I'+str(SDL/'include'),'-I'+str(SDL/'include/SDL2'),
                             '-c',str(ROOT/'port/mac/embed_mac.mm'),'-o',str(native)]):
         return 1
-    # QuartzCore supplies CAMetalLayer used by the real adapter; no Cocoa code runs.
+    # Link the real adapter against SDL and AppKit, without running any Cocoa code.
     stub = BUILD/'link-stub.cpp'
     stub.write_text('#include "yougame_link.h"\n'
-        'namespace yougame { void set_box_handler(std::function<void(const std::string&)>) {} bool stdio_bridge() { return false; } }\n'
-        'namespace host { void log(const char*, ...) {} void audio_set_page_volume(int) {} }\n'
+        'namespace yougame { void set_box_handler(std::function<void(const std::string&)>) {} }\n'
+        'namespace host { void log(const char*, ...) {} }\n'
         'int main() { return 0; }\n')
     if run('native-link', [clang,*flags,'-I'+str(ROOT/'port/runtime/hle'),str(stub),str(native),
         '-L'+str(SDL/'lib'),'-lSDL2-2.0.0','-framework','AppKit','-framework','CoreGraphics',
-        '-framework','QuartzCore',
         '-Wl,-rpath,'+str(SDL/'lib'),'-o',str(BUILD/'embed-link-check')]):
         return 1
     if run('manual-helper-build', [clang,*flags,'-fblocks','-fno-objc-arc',
