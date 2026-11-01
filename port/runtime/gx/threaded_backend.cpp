@@ -368,7 +368,7 @@ class ThreadedBackend final : public Backend {
         should_render = current.sequence != rendered_sequence;   // once per simulation frame
         // A paused replay sends no new frames, but its bar and the settings panel still have to be
         // drawn: the frame on screen is submitted again, 60 times a second.
-        if (!should_render && !queue.drained() && replay_control::repaint_wanted() && host::now_seconds() >= idle_repaint)
+        if (!should_render && !queue.drained() && (replay_control::repaint_wanted() || yougame::update_handoff_visible()) && host::now_seconds() >= idle_repaint)
           should_render = true;
         if (!should_render) {
           if (queue.drained()) break;

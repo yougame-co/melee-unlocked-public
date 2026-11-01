@@ -126550,7 +126550,7 @@ index 7a5af635b..c99b3a78a 100644
  /* 21ED74 */ void grHomeRun_8021ED74(void);
  /* 21EDD4 */ void grHomeRun_8021EDD4(void);
 diff --git a/src/melee/gr/gricemt.c b/src/melee/gr/gricemt.c
-index efc73d37a..ff471de03 100644
+index efc73d37a..5b2262940 100644
 --- a/src/melee/gr/gricemt.c
 +++ b/src/melee/gr/gricemt.c
 @@ -112,9 +112,9 @@ struct grIceMt_YakumonoParam {
@@ -127106,6 +127106,17 @@ index efc73d37a..ff471de03 100644
          }
      }
  }
+@@ -1346,8 +1348,8 @@ static inline void grIceMt_GetRandomTimer(int* out)
+     s32 b;
+     s32 d;
+ 
+-    a = ((s16*) yakumono_param)[0x36 / 2];
+-    b = ((s16*) yakumono_param)[0x38 / 2];
++    a = BEV(((be_s16*) yakumono_param)[0x36 / 2]);
++    b = BEV(((be_s16*) yakumono_param)[0x38 / 2]);
+     if (a > b) {
+         d = a - b;
+         a = b + (d != 0 ? HSD_Randi(d) : 0);
 @@ -1426,8 +1428,8 @@ int fn_801F9150(Ground_GObj* arg0, int* out)
      s32 a;
  
@@ -127285,7 +127296,17 @@ index efc73d37a..ff471de03 100644
              }
          }
      }
-@@ -1900,13 +1845,15 @@ bool grIceMt_801FA364(struct grIceMt_FA364_State* state, f32* out,
+@@ -1893,20 +1838,24 @@ bool grIceMt_801FA364(struct grIceMt_FA364_State* state, f32* out,
+             state->idx = cb(gobj, &next_delay);
+             state->delay = (s16) next_delay;
+             state->phase = 1;
+-            state->lerp_count = ((s16*) yakumono_param)[0x34 / 2];
++            /* A big-endian word of the stage file: read raw it was byte swapped (60 frames became
++             * 15360), so the climb speed never changed and the mountain did not scroll. */
++            state->lerp_count = BEV(((be_s16*) yakumono_param)[0x34 / 2]);
+         }
+         break;
+     case 1:
          state->lerp_count = state->lerp_count - 1;
          tmp = state->lerp_count;
          if (tmp != 0) {
@@ -137787,7 +137808,7 @@ index 15f5b5d6f..cc4eb2249 100644
  
  void grTZelda_802240FC(Ground_GObj* gobj) {}
 diff --git a/src/melee/gr/grvenom.c b/src/melee/gr/grvenom.c
-index e0baf2753..de901c9f1 100644
+index e0baf2753..0b9ceef64 100644
 --- a/src/melee/gr/grvenom.c
 +++ b/src/melee/gr/grvenom.c
 @@ -45,8 +45,8 @@ struct grVenom_YakumonoParam {
@@ -137977,6 +137998,15 @@ index e0baf2753..de901c9f1 100644
      grVe_803E5348.arwing.arwing_gobj[gp->u.venom.xC8 = grVe_804D6A34] = arg0;
  
      other = grVenom_80203EAC(base[base[gp->u.venom.xC8 + 14] + 170]);
+@@ -1066,7 +1094,7 @@ check_scale_uniform:
+ scale_nonuniform:
+     HSD_JObjSetScaleX(jobj, scale);
+     HSD_JObjSetScaleY(jobj, scale);
+-    HSD_JObjSetScaleZ(jobj, scale * *(f32*) ((u8*) yakumono_param + 0x34));
++    HSD_JObjSetScaleZ(jobj, scale * BEV(*(be_f32*) ((u8*) yakumono_param + 0x34)));
+     goto done_scale;
+ 
+ scale_uniform:
 @@ -1109,6 +1137,10 @@ void grVenom_802052E0(Ground_GObj* gobj, Vec3* pos)
  
      if (gobj != NULL) {
@@ -162465,7 +162495,7 @@ index c564ebfe4..20714ea36 100644
  }
  
 diff --git a/src/melee/it/kinds/itoldkuri.c b/src/melee/it/kinds/itoldkuri.c
-index bc765ea53..ba2cbdbd1 100644
+index bc765ea53..b4e401903 100644
 --- a/src/melee/it/kinds/itoldkuri.c
 +++ b/src/melee/it/kinds/itoldkuri.c
 @@ -4,6 +4,7 @@
@@ -162476,9 +162506,12 @@ index bc765ea53..ba2cbdbd1 100644
  #include <melee/cm/camera.h>
  #include <melee/ft/ftlib.h>
  #include <melee/it/inlines.h>
-@@ -18,11 +19,11 @@
+@@ -17,12 +18,14 @@
+ #include <melee/it/itzako.h>
  #include <sysdolphin/baselib/random.h>
  
++/* x0 points at two words: [0] the damage it takes before it is knocked out (an int), [1] its walk speed
++ * (a float, read as one: as an int its bits made a speed in the billions and it left the stage at once). */
  typedef struct itOldkuriAttributes {
 -    s32* x0;
 +    DISC_PTR(be_s32) x0;
@@ -162490,29 +162523,29 @@ index bc765ea53..ba2cbdbd1 100644
  
  ItemStateTable it_803F8320[] = {
      { -1, itOldkuri_UnkMotion0_Anim, itOldkuri_UnkMotion0_Phys,
-@@ -108,8 +109,8 @@ bool itOldkuri_UnkMotion0_Coll(Item_GObj* gobj)
+@@ -108,8 +111,8 @@ bool itOldkuri_UnkMotion0_Coll(Item_GObj* gobj)
  void it_802D758C(Item_GObj* gobj)
  {
      Item* ip = GET_ITEM(gobj);
 -    itOldkuriAttributes* attr = ip->xC4_article_data->x4_specialAttributes;
 -    ip->xDD4_itemVar.oldkuri.xDF4 = ip->facing_dir * ((f32*) attr->x0)[1];
 +    itOldkuriAttributes* attr = DP(ip->xC4_article_data->x4_specialAttributes);
-+    ip->xDD4_itemVar.oldkuri.xDF4 = ip->facing_dir * BEV(DP(attr->x0)[1]);
++    ip->xDD4_itemVar.oldkuri.xDF4 = ip->facing_dir * BEV(((be_f32*) DP(attr->x0))[1]);
      ip->x40_vel.x = ip->xDD4_itemVar.oldkuri.xDF4;
      ip->x40_vel.z = 0.0f;
      ip->x40_vel.y = 0.0f;
-@@ -158,8 +159,8 @@ bool itOldkuri_UnkMotion1_Coll(Item_GObj* gobj)
+@@ -158,8 +161,8 @@ bool itOldkuri_UnkMotion1_Coll(Item_GObj* gobj)
  void it_802D775C(Item_GObj* gobj)
  {
      Item* ip = GET_ITEM(gobj);
 -    itOldkuriAttributes* attr = ip->xC4_article_data->x4_specialAttributes;
 -    ip->xDD4_itemVar.oldkuri.xDF4 = ip->facing_dir * ((f32*) attr->x0)[1];
 +    itOldkuriAttributes* attr = DP(ip->xC4_article_data->x4_specialAttributes);
-+    ip->xDD4_itemVar.oldkuri.xDF4 = ip->facing_dir * BEV(DP(attr->x0)[1]);
++    ip->xDD4_itemVar.oldkuri.xDF4 = ip->facing_dir * BEV(((be_f32*) DP(attr->x0))[1]);
      ip->x40_vel.x = ip->xDD4_itemVar.oldkuri.xDF4;
      ip->x40_vel.z = 0.0f;
      ip->x40_vel.y = 0.0f;
-@@ -178,9 +179,9 @@ bool itOldkuri_UnkMotion2_Anim(Item_GObj* gobj)
+@@ -178,9 +181,9 @@ bool itOldkuri_UnkMotion2_Anim(Item_GObj* gobj)
          } else {
              Item* ip = GET_ITEM(gobj);
              itOldkuriAttributes* attr =
@@ -162520,33 +162553,33 @@ index bc765ea53..ba2cbdbd1 100644
 +                DP(ip->xC4_article_data->x4_specialAttributes);
              ip->xDD4_itemVar.oldkuri.xDF4 =
 -                ip->facing_dir * ((f32*) attr->x0)[1];
-+                ip->facing_dir * BEV(DP(attr->x0)[1]);
++                ip->facing_dir * BEV(((be_f32*) DP(attr->x0))[1]);
              ip->x40_vel.x = ip->xDD4_itemVar.oldkuri.xDF4;
              ip->x40_vel.z = 0.0f;
              ip->x40_vel.y = 0.0f;
-@@ -198,8 +199,8 @@ void itOldkuri_UnkMotion2_Phys(Item_GObj* gobj)
+@@ -198,8 +201,8 @@ void itOldkuri_UnkMotion2_Phys(Item_GObj* gobj)
      PAD_STACK(8);
      if (ip->xDD4_itemVar.oldkuri.xDFC != 0 && it_802750E8(gobj, 2) != 0) {
          Item* ip = GET_ITEM(gobj);
 -        itOldkuriAttributes* attr = ip->xC4_article_data->x4_specialAttributes;
 -        ip->xDD4_itemVar.oldkuri.xDF4 = ip->facing_dir * ((f32*) attr->x0)[1];
 +        itOldkuriAttributes* attr = DP(ip->xC4_article_data->x4_specialAttributes);
-+        ip->xDD4_itemVar.oldkuri.xDF4 = ip->facing_dir * BEV(DP(attr->x0)[1]);
++        ip->xDD4_itemVar.oldkuri.xDF4 = ip->facing_dir * BEV(((be_f32*) DP(attr->x0))[1]);
          ip->x40_vel.x = ip->xDD4_itemVar.oldkuri.xDF4;
          ip->x40_vel.z = 0.0f;
          ip->x40_vel.y = 0.0f;
-@@ -219,8 +220,8 @@ bool itOldkuri_UnkMotion2_Coll(Item_GObj* gobj)
+@@ -219,8 +222,8 @@ bool itOldkuri_UnkMotion2_Coll(Item_GObj* gobj)
      it_8026D62C(gobj, it_802D7AF0);
      if (it_80276308(gobj) == 8 && ip->xDD4_itemVar.oldkuri.xDFC != 0) {
          Item* ip = GET_ITEM(gobj);
 -        itOldkuriAttributes* attr = ip->xC4_article_data->x4_specialAttributes;
 -        ip->xDD4_itemVar.oldkuri.xDF4 = ip->facing_dir * ((f32*) attr->x0)[1];
 +        itOldkuriAttributes* attr = DP(ip->xC4_article_data->x4_specialAttributes);
-+        ip->xDD4_itemVar.oldkuri.xDF4 = ip->facing_dir * BEV(DP(attr->x0)[1]);
++        ip->xDD4_itemVar.oldkuri.xDF4 = ip->facing_dir * BEV(((be_f32*) DP(attr->x0))[1]);
          ip->x40_vel.x = ip->xDD4_itemVar.oldkuri.xDF4;
          ip->x40_vel.z = 0.0f;
          ip->x40_vel.y = 0.0f;
-@@ -249,7 +250,7 @@ void itOldkuri_UnkMotion3_Phys(Item_GObj* gobj)
+@@ -249,7 +252,7 @@ void itOldkuri_UnkMotion3_Phys(Item_GObj* gobj)
  bool itOldkuri_UnkMotion3_Coll(Item_GObj* gobj)
  {
      Item* ip = GET_ITEM(gobj);
@@ -162555,7 +162588,7 @@ index bc765ea53..ba2cbdbd1 100644
      ip->xDD4_itemVar.oldkuri.xDF8 = (s32) attr->xC;
      it_8026E414(gobj, it_802D747C);
      return it_8027C794(gobj);
-@@ -283,7 +284,7 @@ void itOldkuri_UnkMotion4_Phys(Item_GObj* gobj)
+@@ -283,7 +286,7 @@ void itOldkuri_UnkMotion4_Phys(Item_GObj* gobj)
  bool itOldkuri_UnkMotion4_Coll(Item_GObj* gobj)
  {
      Item* ip = GET_ITEM(gobj);
@@ -162564,7 +162597,7 @@ index bc765ea53..ba2cbdbd1 100644
      ip->xDD4_itemVar.oldkuri.xDF8 = (s32) attr->xC;
      it_8026E414(gobj, it_802D747C);
      return it_8027C794(gobj);
-@@ -405,10 +406,10 @@ static inline void it_2725_Logic0_DmgReceived_inline(Item_GObj* gobj)
+@@ -405,10 +408,10 @@ static inline void it_2725_Logic0_DmgReceived_inline(Item_GObj* gobj)
  bool it_2725_Logic0_DmgReceived(Item_GObj* gobj)
  {
      Item* ip = GET_ITEM(gobj);
@@ -162577,7 +162610,7 @@ index bc765ea53..ba2cbdbd1 100644
          it_8027C9D8(ip);
          it_80274C88(gobj);
          it_802756D0(gobj);
-@@ -471,7 +472,7 @@ bool itOldkuri_UnkMotion7_Coll(Item_GObj* gobj)
+@@ -471,7 +474,7 @@ bool itOldkuri_UnkMotion7_Coll(Item_GObj* gobj)
  void it_802D81FC(Item_GObj* gobj)
  {
      Item* ip = GET_ITEM(gobj);
@@ -162586,7 +162619,7 @@ index bc765ea53..ba2cbdbd1 100644
      ip->x40_vel.x *= attr->x8;
      Item_80268E5C(gobj, 8, ITEM_ANIM_UPDATE);
  }
-@@ -524,9 +525,7 @@ bool itOldkuri_UnkMotion10_Coll(Item_GObj* gobj)
+@@ -524,9 +527,7 @@ bool itOldkuri_UnkMotion10_Coll(Item_GObj* gobj)
  void it_802D839C(Item_GObj* gobj)
  {
      Item* ip = GET_ITEM(gobj);
@@ -183689,7 +183722,7 @@ index dc6746eee..f1bb81a6b 100644
      return true;
  }
  
-@@ -769,12 +790,63 @@ static void mn_80229A7C(MainMenuData* data, MenuKind menu_kind, int selection)
+@@ -769,12 +790,67 @@ static void mn_80229A7C(MainMenuData* data, MenuKind menu_kind, int selection)
      }
      sis_idx = mn_803EB6B0[menu_kind].description_indices;
      if (sis_idx != 0) {
@@ -183732,6 +183765,10 @@ index dc6746eee..f1bb81a6b 100644
 +#ifdef MU_NATIVE
 +        if (menu_kind == MENU_KIND_8 && mu_slippi_menus_enabled() && mu_slippi_yougame_menu()) {
 +            switch (mu_slippi_menu_option(selection)) {
++            case MU_SLP_MODE_RANKED:
++                if (!mu_slippi_option_unlocked(selection))
++                    mu_slippi_menu_description(text, "Ranked isn't on for this game yet.");
++                break;
 +            case MU_SLP_OPT_FRIENDS:
 +                mu_slippi_menu_description(text, "Invite a friend to play.");
 +                break;
@@ -183753,7 +183790,7 @@ index dc6746eee..f1bb81a6b 100644
      }
  }
  
-@@ -783,7 +855,7 @@ static inline void mn_80229A7C_dontinline(void* arg0, int arg1, int arg2)
+@@ -783,7 +859,7 @@ static inline void mn_80229A7C_dontinline(void* arg0, int arg1, int arg2)
      mn_80229A7C(arg0, arg1, arg2);
  }
  
@@ -183762,7 +183799,7 @@ index dc6746eee..f1bb81a6b 100644
  
  HSD_GObj* mn_80229B2C(void)
  {
-@@ -803,25 +875,25 @@ HSD_GObj* mn_80229B2C(void)
+@@ -803,25 +879,25 @@ HSD_GObj* mn_80229B2C(void)
      return temp_r30;
  }
  
@@ -183807,7 +183844,7 @@ index dc6746eee..f1bb81a6b 100644
  
  void fn_80229BF4(HSD_GObj* gobj)
  {
-@@ -870,6 +942,9 @@ void fn_80229BF4(HSD_GObj* gobj)
+@@ -870,6 +946,9 @@ void fn_80229BF4(HSD_GObj* gobj)
          break;
      }
      mn_8022ED6C(sp20, &mn_803EB354);
@@ -183817,7 +183854,7 @@ index dc6746eee..f1bb81a6b 100644
  }
  
  HSD_GObj* mn_80229DC0(void)
-@@ -908,6 +983,9 @@ HSD_GObj* mn_80229DC0(void)
+@@ -908,6 +987,9 @@ HSD_GObj* mn_80229DC0(void)
      user_data->cur_menu = tmp;
      user_data->prev_menu = tmp;
      user_data->state = 0;
@@ -183827,7 +183864,7 @@ index dc6746eee..f1bb81a6b 100644
      return temp_r31;
  }
  
-@@ -950,6 +1028,10 @@
+@@ -950,6 +1032,10 @@
      mn_8022F3D8(jobj, 0x12, TOBJ_MASK);
      mn_8022F3D8(jobj, 0x13, TOBJ_MASK);
      HSD_JObjAnim(jobj);
@@ -183838,7 +183875,7 @@ index dc6746eee..f1bb81a6b 100644
      new_var = mn_8022F298(sp54[0]);
      HSD_JObjReqAnimAll(sp54[0], mn_803EB360[1].start_frame +
                                      (new_var - mn_803EB360[0].start_frame));
-@@ -1004,6 +1086,10 @@
+@@ -1004,6 +1090,10 @@
      mn_8022F3D8(r29, 0x12, TOBJ_MASK);
      mn_8022F3D8(r29, 0x13, TOBJ_MASK);
      HSD_JObjAnim(r29);
@@ -183849,7 +183886,7 @@ index dc6746eee..f1bb81a6b 100644
      f = mn_8022F298(sp24[0]);
      HSD_JObjReqAnimAll(sp24[0], (f - mn_803EB360[1].start_frame) +
                                      mn_803EB360[0].start_frame);
-@@ -1140,7 +1226,11 @@ void mn_8022ADD8(HSD_GObj* gp, bool selection_changed)
+@@ -1140,7 +1230,11 @@ void mn_8022ADD8(HSD_GObj* gp, bool selection_changed)
                  anim_loop = &mn_803EB438;
              } else if (data->menu_kind == MENU_KIND_1P &&
                         data->hovered_selection == SEL_1P_REG &&
@@ -183861,7 +183898,7 @@ index dc6746eee..f1bb81a6b 100644
              {
                  anim_loop = &mn_803EB480;
              } else {
-@@ -1203,8 +1293,7 @@ void fn_8022AFEC(HSD_GObj* gp)
+@@ -1203,8 +1297,7 @@ void fn_8022AFEC(HSD_GObj* gp)
      MainMenuSelection hovered_selection;
      u8 state;
      u8 option_count;
@@ -183871,7 +183908,7 @@ index dc6746eee..f1bb81a6b 100644
      PAD_STACK(18);
  
      var_r26 = 0;
-@@ -1216,7 +1305,12 @@ void fn_8022AFEC(HSD_GObj* gp)
+@@ -1216,7 +1309,12 @@ void fn_8022AFEC(HSD_GObj* gp)
      state = data->state;
      if ((state == MENU_STATE_5 || state <= MENU_STATE_ENTER_TO ||
           state == MENU_STATE_EXIT_TO) &&
@@ -183884,7 +183921,7 @@ index dc6746eee..f1bb81a6b 100644
      {
          if (mn_804A04F0.entering_menu != 0) {
              data->state = MENU_STATE_ENTER_FROM;
-@@ -1400,7 +1494,7 @@ HSD_GObj* mn_8022B3A0(u8 state)
+@@ -1400,7 +1498,7 @@ HSD_GObj* mn_8022B3A0(u8 state)
      u8 cur_menu;
      MenuKind menu_kind;
      MainMenuData* user_data;
@@ -183893,7 +183930,7 @@ index dc6746eee..f1bb81a6b 100644
      u8 hovered_selection;
      AnimLoopSettings* anim_loop;
      struct {
-@@ -1485,6 +1579,11 @@
+@@ -1485,6 +1583,11 @@
              mn_8022F3D8(jobj.value, 0x12, TOBJ_MASK);
              mn_8022F3D8(jobj.value, 0x13, TOBJ_MASK);
              HSD_JObjAnim(jobj.value);
@@ -183905,7 +183942,7 @@ index dc6746eee..f1bb81a6b 100644
              if (i == hovered_selection) {
                  HSD_JObjReqAnimAll(
                      cursor_parts[2],
-@@ -1515,7 +1614,11 @@ HSD_GObj* mn_8022B3A0(u8 state)
+@@ -1515,7 +1618,11 @@ HSD_GObj* mn_8022B3A0(u8 state)
          hover_anim = &mn_803EB438;
      } else if (user_data->menu_kind == MENU_KIND_1P &&
                 user_data->hovered_selection == SEL_1P_REG &&
@@ -183917,7 +183954,7 @@ index dc6746eee..f1bb81a6b 100644
      {
          hover_anim = &mn_803EB480;
      } else {
-@@ -1598,7 +1701,7 @@ void mn_8022BA1C(HSD_GObj* gp)
+@@ -1598,7 +1705,7 @@ void mn_8022BA1C(HSD_GObj* gp)
      HSD_CObjSetEyePosition(cobj, &sp24);
  }
  
@@ -183926,7 +183963,7 @@ index dc6746eee..f1bb81a6b 100644
  {
      HSD_FogSet(gobj->hsd_obj);
  }
-@@ -1628,7 +1731,7 @@ void mn_8022BD8C(void)
+@@ -1628,7 +1735,7 @@ void mn_8022BD8C(void)
      mn_804D6BB0->gxlink_prios = 0x80;
  }
  
@@ -183935,7 +183972,7 @@ index dc6746eee..f1bb81a6b 100644
  {
      HSD_Fog* fog = GET_FOG(mn_804D6BA8);
      if (HSD_CObjSetCurrent(GET_COBJ(gobj)) != 0) {
-@@ -2164,7 +2267,11 @@ void mn_8022CC28(HSD_GObj* gp)
+@@ -2164,7 +2271,11 @@ void mn_8022CC28(HSD_GObj* gp)
          case SEL_REG_ALLSTAR:
              sfxForward();
              data = gm_GetCurrentSceneExitData();
@@ -183947,7 +183984,7 @@ index dc6746eee..f1bb81a6b 100644
              gm_801A4B60();
              return;
          }
-@@ -2484,7 +2591,12 @@ void mn_8022D594(HSD_GObj* gp)
+@@ -2484,7 +2595,12 @@ void mn_8022D594(HSD_GObj* gp)
          case SEL_VS_TOURNAMENT:
              sfxForward();
              data = gm_GetCurrentSceneExitData();
@@ -183960,7 +183997,7 @@ index dc6746eee..f1bb81a6b 100644
              gm_801A4B60();
              break;
          case SEL_VS_SPECIAL:
-@@ -2596,9 +2708,20 @@ void mn_8022D7F4(HSD_GObj* gp)
+@@ -2596,9 +2712,20 @@ void mn_8022D7F4(HSD_GObj* gp)
              break;
          case SEL_1P_EVENT:
              sfxForward();
@@ -183982,7 +184019,7 @@ index dc6746eee..f1bb81a6b 100644
          case SEL_1P_TRAINING:
              sfxForward();
              data = gm_GetCurrentSceneExitData();
-@@ -2727,7 +2850,7 @@ void mnMain_Scene_OnFrame(void)
+@@ -2727,7 +2854,7 @@ void mnMain_Scene_OnFrame(void)
          sfxBack();
          mn_8022F268();
          gm_801603B0();
@@ -183991,7 +184028,7 @@ index dc6746eee..f1bb81a6b 100644
          lbMthp_8001F800();
          mn_8022EBDC();
          HSD_SisLib_803A5E70();
-@@ -2924,7 +3047,16 @@ void mnMain_Scene_OnEnter(void* user_data)
+@@ -2924,7 +3051,16 @@ void mnMain_Scene_OnEnter(void* user_data)
              &MenMainCursorSs_Top.shapeanim_joint,
              "MenMainCursorSs_Top_shapeanim_joint",
  
@@ -184009,7 +184046,7 @@ index dc6746eee..f1bb81a6b 100644
  
          if (lbLang_IsSavedLanguageUS()) {
              HSD_SisLib_803A62A0(0, "SdMenu.usd", "SIS_MenuData");
-@@ -2944,7 +3076,7 @@ void mnMain_Scene_OnEnter(void* user_data)
+@@ -2944,7 +3080,7 @@ void mnMain_Scene_OnEnter(void* user_data)
  
      switch (data->menu_kind) {
      case MENU_KIND_EVENT:
@@ -184018,7 +184055,7 @@ index dc6746eee..f1bb81a6b 100644
          break;
      case MENU_KIND_MULTI_VS:
          mnHyaku_8024CD64(data->hovered_selection);
-@@ -2959,7 +3091,11 @@ void mnMain_Scene_OnEnter(void* user_data)
+@@ -2959,7 +3095,11 @@ void mnMain_Scene_OnEnter(void* user_data)
          break;
      }
      lbAudioAx_80023F28(gmMainLib_8015ECB0());
@@ -184031,7 +184068,7 @@ index dc6746eee..f1bb81a6b 100644
  }
  
  char null_terminator[1] = "\0";
-@@ -3043,3 +3179,37 @@ void mn_8022EBDC(void)
+@@ -3043,3 +3183,37 @@ void mn_8022EBDC(void)
  /// fn_8022F538\n"); } void mn_8022FB88() { OSPanic(__FILE__, __LINE__, "not
  /// implemented: mn_8022FB88\n"); } void mn_8022FD18() { OSPanic(__FILE__,
  /// __LINE__, "not implemented: mn_8022FD18\n"); }

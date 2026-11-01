@@ -16,6 +16,21 @@
 #include <melee/mp/types.h>
 #include "../../../port/runtime/abi/mu_look_snapshot.h"
 
+/* Optional read-only host probe. An older module without it is never assumed safe. */
+MU_EXPORT int mu_update_ranked_busy_v1(void)
+{
+#ifdef MU_NO_SLIPPI
+    return 0;
+#else
+    int mu_ranked_update_busy(void);
+    return mu_ranked_update_busy();
+#endif
+}
+
+/* Keep the host's conservative idle-scene ids tied to the game's named modes. */
+_Static_assert(GM_TITLE == 0x00 && GM_MENU == 0x01 && GM_HANYU_CSS == 0x08,
+               "YouGame update idle-scene mode ids");
+
 int mu_is_game_memory(const void* p, unsigned long size);   /* shim/mu_entry.c */
 extern StaticPlayer player_slots[];
 

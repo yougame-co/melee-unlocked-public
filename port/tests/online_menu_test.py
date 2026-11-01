@@ -183,6 +183,23 @@ int main() {
     // A new Online entry starts on Ranked, including boot.
     mu_slippi_switch_to_online_menu(); CHECK(switched_menu == 8 && switched_row == 0);
     boot_oneshot = 1; u8 menu, hovered; CHECK(mu_slippi_menu_enter(GM_BOOT, &menu, &hovered)); CHECK(hovered == 0);
+    // A listing without a ladder keeps Ranked greyed and starts on Unranked.
+    ranked_offered = 0;
+    CHECK(!mu_slippi_option_unlocked(0) && mu_slippi_first_unlocked() == 1);
+    for (int row : {1, 2, 3}) CHECK(mu_slippi_option_unlocked(row));
+    mu_slippi_switch_to_online_menu(); CHECK(switched_row == 1);
+    boot_oneshot = 1; CHECK(mu_slippi_menu_enter(GM_BOOT, &menu, &hovered)); CHECK(hovered == 1);
+    mn_804A04F0.hovered_selection = 1;
+    press(MenuInput_Up); CHECK(mn_804A04F0.hovered_selection == 3);
+    press(MenuInput_Down); CHECK(mn_804A04F0.hovered_selection == 1);
+    int before_unranked = entered; press(MenuInput_Confirm);
+    CHECK(entered == before_unranked + 1 && slp.mode == MU_SLP_MODE_UNRANKED);
+    mn_804A04F0.hovered_selection = 3; press(MenuInput_Confirm);
+    CHECK(slippi_submenu && mu_slippi_first_unlocked() == 0);
+    for (int row = 0; row < 3; ++row) CHECK(mu_slippi_option_unlocked(row));
+    press(MenuInput_Back); CHECK(!slippi_submenu && switched_row == 3);
+    ranked_offered = 1;
+    CHECK(mu_slippi_option_unlocked(0) && mu_slippi_first_unlocked() == 0);
     // Preserve the protected Ranked CPU auto-entry despite moving Direct into a submenu.
     p2p = cpu = boot_oneshot = 1;
     CHECK(mu_slippi_menu_enter(GM_BOOT, &menu, &hovered));
@@ -506,7 +523,7 @@ NOTICE_CASES = r'''int main() {
         CHECK(data.description==&text);
     }
     CHECK(notice=="Sign in to Slippi to play Direct, Teams and Party");
-    for(const char* message:{"Invite a friend to play.","Sign in to Slippi to play Direct, Teams and Party"}) {
+    for(const char* message:{"Invite a friend to play.","Ranked isn't on for this game yet.","Sign in to Slippi to play Direct, Teams and Party"}) {
         mu_slippi_menu_description(&text,message);
         CHECK(data.description==&text);
         HSD_Text params=text;
@@ -606,6 +623,43 @@ class OnlineMenuTest(unittest.TestCase):
         disabled = re.search(r'#if 0(.*?)#endif', header, re.S)[1]
         self.assertEqual(re.findall(r'MU_SLP_OPT_\w+', disabled),
                          ['MU_SLP_OPT_DOUBLES', 'MU_SLP_OPT_TOURNAMENT'])
+
+    def test_ranked_description_and_plain_hud_wiring(self):
+        patch = (ROOT / 'sourceport/patches/melee-native.patch').read_text()
+        start = patch.index('+        if (menu_kind == MENU_KIND_8 && mu_slippi_menus_enabled() && mu_slippi_yougame_menu()) {')
+        hook = '\n'.join(line[1:] for line in patch[start:patch.index('+#endif', start)].splitlines())
+        source = (ROOT / 'sourceport/game/shim/mu_slippi_menu.c').read_text()
+        production = '\n'.join(fixture.extract(source, name) for name in
+                               ('mu_slippi_menu_count', 'mu_slippi_menu_option', 'mu_slippi_option_unlocked'))
+        self.compile_fixture('ranked-description', STUBS + production + r'''
+static std::string description;
+static int mu_slippi_yougame_menu() { return ranked_supported; }
+static void mu_slippi_menu_description(void*, const char* message) { description = message; }
+static void describe(int selection) {
+    int menu_kind = MENU_KIND_8; void* text = nullptr;
+''' + hook + r'''
+}
+int main() {
+    ranked_supported = 1;
+    for (int offered : {0,1}) {
+        ranked_offered = offered; slippi_submenu = 0;
+        description = "retail Ranked"; describe(0);
+        CHECK(description == (offered ? "retail Ranked" : "Ranked isn't on for this game yet."));
+        description = "retail Unranked"; describe(1); CHECK(description == "retail Unranked");
+        slippi_submenu = 1;
+        const char* expected[] = {"Play a Slippi friend by connect code.", "Slippi's 2v2 teams queue.", "Slippi's party mode."};
+        for (int row = 0; row < 3; ++row) {
+            CHECK(mu_slippi_option_unlocked(row)); describe(row); CHECK(description == expected[row]);
+        }
+    }
+    std::printf("ranked help: %d checks passed\n", checks);
+}
+''', '-I', str(ROOT / 'sourceport/game/include'))
+        online = (ROOT / 'port/runtime/hle/slippi_online.cpp').read_text()
+        hud = online.split('std::array<std::string, 4> player_names_for_overlay() {', 1)[1].split('\n}', 1)[0]
+        self.assertNotIn('opponent_label', hud)
+        self.assertIn('g_matchmaking->GetPlayerName', hud)
+        self.assertIn('convert_string_for_game(display::opponent_label', online)
 
     def test_production_entry_cursor_submenu_and_standalone(self):
         source = (ROOT / 'sourceport/game/shim/mu_slippi_menu.c').read_text()

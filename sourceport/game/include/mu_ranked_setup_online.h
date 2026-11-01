@@ -18,4 +18,8 @@ void mu_ranked_setup_game_result(int winner, unsigned end_mode, int disconnected
 int mu_ranked_setup_finish_game(int connected, MuYgU16 stage);
 /* True only with paired host/game YOUGAME_AGENT_TEST_HOOK builds and rankedCpu. */
 int mu_ranked_setup_cpu(void);
+/* Update guard persists through room cleanup until the result reveal was drawn. */
+int mu_ranked_update_busy(void);
+void mu_ranked_update_reset(void);
+void mu_ranked_update_result_shown(void);
 #endif

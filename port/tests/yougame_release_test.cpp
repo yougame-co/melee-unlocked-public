@@ -105,6 +105,73 @@ int main() {
   CHECK(notice.command("embed update_available 0.9.79"));
   CHECK(notice.available()); // A stale app line cannot erase the site's refusal.
   CHECK(update::version_line() == "Melee Unlocked 0.9.80");
+  const std::string id = "01234567-89ab-cdef-0123-456789abcdef";
+  const std::string other = "fedcba98-7654-3210-fedc-ba9876543210";
+  update::Notice ready;
+  CHECK(ready.pending().empty() && !ready.visible());
+  CHECK(ready.command("embed update_ready " + id));
+  CHECK(ready.pending() == id && !ready.available());
+  CHECK(ready.take_ready_log() == id && ready.take_ready_log().empty());
+  for (const auto& bad : {"", " ", "0.9.85-online-test.27", "01234567-89AB-cdef-0123-456789abcdef",
+       "0123456789ab-cdef-0123-456789abcdef", "01234567-89ab-cdef-0123-456789abcde",
+       "01234567-89ab-cdef-0123-456789abcdef0", "01234567-89ab-cdef-0123-456789abcdeg"}) {
+    CHECK(ready.command(std::string("embed update_ready ") + bad));
+    CHECK(ready.pending() == id && ready.take_ready_log().empty());
+  }
+  for (const auto& bad : {std::string("embed update_ready"), "embed update_ready\t" + id,
+                          "embed update_ready " + id + "\n", "embed update_ready " + id + " extra",
+                          "embed update_ready  " + id, "embed update_ready " + id + "\r"}) {
+    CHECK(ready.command(bad)); CHECK(ready.pending() == id);
+  }
+  CHECK(!ready.command("embed volume 1"));
+  CHECK(!ready.command("update_ready " + id));
+  CHECK(ready.command("embed update_available 0.9.81")); CHECK(ready.available());
+  CHECK(ready.pending() == id);
+  update::SafePoint safe{true,false,false,false,false};
+  CHECK(update::safe(safe)); CHECK(!update::safe({}));
+  for (int condition = 0; condition < 5; ++condition) {
+    auto blocked = safe;
+    if (condition == 0) blocked.idle_scene = false;
+    if (condition == 1) blocked.online_busy = true;
+    if (condition == 2) blocked.room_or_link = true;
+    if (condition == 3) blocked.ranked_set = true;
+    if (condition == 4) blocked.friends_room = true;
+    CHECK(!update::safe(blocked)); CHECK(!ready.begin(blocked));
+    CHECK(ready.presented(5000).empty() && ready.pending() == id);
+  }
+  CHECK(ready.command("embed update_ready " + other)); CHECK(ready.pending() == other);
+  CHECK(ready.begin(safe)); CHECK(ready.visible()); CHECK(!ready.begin(safe));
+  CHECK(ready.presented(0).empty()); CHECK(ready.presented(999).empty());
+  // A newer installation during the notice replaces the pending id too.
+  CHECK(ready.command("embed update_ready " + id));
+  CHECK(ready.presented(1000) == "yougame: update accept " + id);
+  CHECK(ready.pending().empty());
+  for (uint64_t now : {1000,1001,2000,9999}) CHECK(ready.presented(now).empty());
+  CHECK(ready.command("embed update_ready " + other)); CHECK(ready.pending().empty());
+  CHECK(!ready.begin(safe));
+  update::Notice refused_without_ready;
+  refused_without_ready.refuse(); CHECK(!refused_without_ready.begin(safe));
+  update::Notice refused_with_ready;
+  CHECK(refused_with_ready.command("embed update_ready " + id));
+  refused_with_ready.refuse(); CHECK(refused_with_ready.begin(safe));
+  CHECK(refused_with_ready.presented(500).empty());
+  CHECK(refused_with_ready.presented(1500) == "yougame: update accept " + id);
+  // From an Online screen the line ends in " online" (the app passes --resume online); it is not a safety condition.
+  update::Notice from_online;
+  CHECK(from_online.command("embed update_ready " + id));
+  auto online_safe = safe; online_safe.online_screen = true; CHECK(update::safe(online_safe));
+  CHECK(from_online.begin(online_safe)); CHECK(from_online.presented(0).empty());
+  CHECK(from_online.presented(1000) == "yougame: update accept " + id + " online");
+  auto online_blocked = online_safe; online_blocked.ranked_set = true; CHECK(!update::safe(online_blocked));
+  CHECK(update::resume(nullptr) == update::Resume::Absent);
+  CHECK(update::resume("online") == update::Resume::Online);
+  for (const auto* value : {"", "Online", "ranked", "online ", "friends"})
+    CHECK(update::resume(value) == update::Resume::Unknown);
+  CHECK(update::idle_scene(0,0)); CHECK(update::idle_scene(1,0)); CHECK(update::idle_scene(8,0));
+  CHECK(!update::idle_scene(0x19,0));  // GM_DEBUG_CUTSCENE, not the title
+  CHECK(!update::idle_scene(8,2)); CHECK(!update::idle_scene(8,5));
+  CHECK(!update::idle_scene(0x0e,1)); CHECK(!update::idle_scene(0x2b,1));
+  CHECK(!update::idle_scene(0xff,0));
   std::printf("yougame_release (%s): %d checks, 40 compatibility combinations, %d version cases passed\n",
               *compat_tag ? compat_tag : "default", checks, versions);
 }

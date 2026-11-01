@@ -1,0 +1,10 @@
+[
+  {
+    "before": "// The volume the settings file holds.",
+    "after": "// App-installed update: centered in the game picture, independent of optional HUD readouts.\nstatic void draw_update_handoff_notice() {\n  if (!yougame::update_handoff_visible()) return;\n  const OverlayBounds bounds = overlay_bounds();\n  ImGui::SetNextWindowPos(ImVec2((bounds.left + bounds.right) * 0.5f,\n                               (bounds.top + bounds.bottom) * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));\n  ImGui::SetNextWindowBgAlpha(0.9f);\n  ImGui::Begin(\"YouGameUpdatingNotice\", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |\n      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);\n  ImGui::TextUnformatted(\"Updating...\");\n  ImGui::End();\n  yougame::update_notice_presented();\n}\n\n// The volume the settings file holds."
+  },
+  {
+    "before": "  ImGui::Render();",
+    "after": "  draw_update_handoff_notice();\n  ImGui::Render();"
+  }
+]

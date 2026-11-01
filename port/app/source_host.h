@@ -43,6 +43,7 @@ bool set_online_test(const char* spec);
 // patched menu files and sets MU_GAME_OPT_SLIPPI_MENUS; forced off with --replay, --online-test,
 // --vanilla-game or when the system files cannot be built.
 void set_slippi_menus(bool on);
+void set_resume_online(); // reuse Slippi boot_oneshot; no mode selection or search
 // Runs an isolated native card round-trip without booting an ISO. Intended for the M10 acceptance
 // test; the caller must provide a new scratch directory.
 bool card_self_test(const char* directory);

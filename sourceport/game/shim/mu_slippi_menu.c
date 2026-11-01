@@ -400,7 +400,8 @@ unsigned char mu_slippi_team_costume(int team, int ckind)
  * today's app-state locks: Unranked/Direct/Teams/Party, Log in, or Update. */
 int mu_slippi_option_unlocked(int sel)
 {
-    if (ranked_supported) return sel >= 0 && sel < mu_slippi_menu_count();
+    if (ranked_supported) return sel >= 0 && sel < mu_slippi_menu_count() &&
+        (slippi_submenu || sel != MU_YG_ROW_RANKED || ranked_offered);
     if (sel == MU_SLP_OPT_FRIENDS || sel == MU_SLP_OPT_SLIPPI) return 0;
     switch (slp.app_state) {
     case MU_SLP_APP_LOGGED_IN:
@@ -417,12 +418,12 @@ int mu_slippi_option_unlocked(int sel)
     }
 }
 
-/* YouGame starts on Ranked; standalone scans from Unranked as before. */
+/* YouGame starts on Ranked when offered, otherwise Unranked. Slippi starts on Direct. */
 int mu_slippi_first_unlocked(void)
 {
     int i;
     int count = mn_803EB6B0[MENU_KIND_8].selection_count;
-    if (ranked_supported) return 0;
+    if (ranked_supported) return !slippi_submenu && !ranked_offered ? MU_YG_ROW_UNRANKED : 0;
     for (i = MU_SLP_MODE_UNRANKED; i < count; i++) {
         if (mn_80229938(MENU_KIND_8, i)) {
             break;
@@ -780,6 +781,7 @@ static void online_on_load(void)
 static void online_on_unload(void)
 {
     mu_ranked_practice_control(MU_YG_PRACTICE_STOP);
+    mu_ranked_update_reset(); // leaving the online major abandons any unfinished set
     mu_ranked_set_reset();
     zelda_sheik = 0;
 }

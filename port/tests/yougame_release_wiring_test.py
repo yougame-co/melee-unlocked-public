@@ -2,6 +2,8 @@
 from pathlib import Path
 import unittest
 import re
+import tempfile
+import subprocess
 from relay_pads_wiring_test import code, block
 def literal_function(text, name):
     # Locate braces in masked C++, but keep string literals in the returned body.
@@ -14,6 +16,130 @@ def literal_function(text, name):
 ROOT = Path(__file__).resolve().parents[2]
 def source(p): return (ROOT / p).read_text(encoding='utf-8-sig')
 class HeadReleaseWiringTest(unittest.TestCase):
+    def test_ready_is_first_and_consumed_before_all_other_commands(self):
+        reader = literal_function(source('port/runtime/hle/yougame_link.cpp'), 'handle_app_line')
+        self.assertTrue(reader.lstrip().startswith('if (g_update_notice.command(line)) {'))
+        branch = reader[:reader.index('  if (line.rfind("yg-pads ')]
+        self.assertIn('return;', branch)
+        self.assertIn('update: ready %s (waiting for a safe point)', branch)
+
+    def test_production_stdout_writer_accepts_once_and_requests_clean_exit(self):
+        from online_menu_test import compiler_command
+        link = source('port/runtime/hle/yougame_link.cpp')
+        reader = literal_function(link, 'handle_app_line')
+        reader = reader[:reader.index('  if (line.rfind("yg-pads ')] + '\n ++forwarded;\n'
+        harness = r'''
+#include "yougame_update.h"
+#include <vector>
+#include <cstdio>
+#include <cstdlib>
+using namespace yougame;
+using HANDLE = int; using DWORD = unsigned;
+constexpr int STD_OUTPUT_HANDLE = 1, INVALID_HANDLE_VALUE = -1;
+static std::vector<std::string> writes, logs;
+static int forwarded, exits;
+static uint64_t clock_ms;
+static uint64_t now_ms() { return clock_ms; }
+struct { std::mutex write_mutex; } g_io;
+static update::Notice g_update_notice;
+static HANDLE GetStdHandle(int) { return 1; }
+static void WriteFile(HANDLE, const char* p, DWORD n, DWORD* wrote, void*) {
+  writes.emplace_back(p,n); *wrote=n;
+}
+namespace host {
+void log(const char* fmt, ...) { logs.emplace_back(fmt); }
+void set_replay_viewing(bool) {}
+void request_user_exit() { ++exits; }
+}
+'''
+        harness += 'void write_line(const std::string& line) {' + literal_function(link, 'write_line') + '}\n'
+        harness += 'void handle_app_line(const std::string& line) {' + reader + '}\n'
+        harness += 'void update_notice_presented() {' + literal_function(link, 'update_notice_presented') + '}\n'
+        harness += r'''
+#define CHECK(x) do { if(!(x)) { std::fprintf(stderr,"line %d: %s\n",__LINE__,#x); return 1; } } while(0)
+int main() {
+  const std::string id="01234567-89ab-cdef-0123-456789abcdef";
+  handle_app_line("embed update_ready bad");
+  handle_app_line("embed update_ready");
+  CHECK(!forwarded && g_update_notice.pending().empty() && logs.empty());
+  handle_app_line("embed update_ready " + id);
+  CHECK(!forwarded && g_update_notice.pending()==id && logs.size()==1);
+  handle_app_line("embed volume 1"); CHECK(forwarded==1);
+  CHECK(g_update_notice.begin({true,false,false,false,false}));
+  clock_ms=300; update_notice_presented(); CHECK(writes.empty() && !exits);
+  clock_ms=1299; update_notice_presented(); CHECK(writes.empty() && !exits);
+  clock_ms=1300; update_notice_presented();
+  CHECK(writes==std::vector<std::string>{"yougame: update accept " + id + "\n"});
+  CHECK(exits==1);
+  clock_ms=2000; update_notice_presented(); update_notice_presented();
+  CHECK(exits==1 && writes.size()==1 && logs.size()==2);
+  std::puts("production ready routing, stdout newline and once-only clean exit verified");
+}
+'''
+        with tempfile.TemporaryDirectory(prefix='update-stdout-') as directory:
+            cpp, exe = Path(directory)/'test.cpp', Path(directory)/'test'
+            cpp.write_text(harness)
+            subprocess.run(compiler_command() + ['-std=c++17', '-pthread', '-I'+str(ROOT/'port/runtime/hle'),
+                '-I'+str(ROOT/'port/third_party'), str(cpp), '-o', str(exe)], check=True, capture_output=True)
+            subprocess.run([str(exe)], check=True, capture_output=True)
+
+    def test_safe_point_uses_session_search_room_retirement_and_friends(self):
+        link = source('port/runtime/hle/yougame_link.cpp')
+        safe = literal_function(link, 'update_safe_point')
+        for signal in ('online_busy || g_update_searches.load() != 0',
+                       'bool(g_room) || g_slippi_match || retiring', 'g_room && g_room->friends',
+                       'g_retired.wait_for', 'g_update_notice.begin(state)'):
+            self.assertIn(signal, safe)
+        self.assertIn('++g_update_searches', literal_function(link, 'find_match'))
+        self.assertIn('--g_update_searches', literal_function(link, 'find_match'))
+        self.assertIn('update: safe point, handing back to YouGame', safe)
+
+    def test_scene_loop_is_held_and_renderer_repaints_without_subframes(self):
+        host = source('port/app/source_host.cpp')
+        wait = literal_function(host, 'h_vi_wait_retrace')
+        self.assertIn('if (g_resim)', wait)
+        self.assertIn('slippi::online::session_mode() >= 0', wait)
+        self.assertIn('while (yougame::update_safe_point(', wait)
+        self.assertIn('!g_update_ranked_busy || g_update_ranked_busy() != 0', wait)
+        self.assertIn('slippi::online::online_status_visible()))', wait)  # " online" accept suffix
+        self.assertIn('game_proc("mu_update_ranked_busy_v1")', host)
+        repaint = source('port/runtime/gx/threaded_backend.cpp')
+        self.assertIn('(replay_control::repaint_wanted() || yougame::update_handoff_visible())', repaint)
+        ui = source('port/runtime/gx/pc_settings.cpp')
+        notice = literal_function(ui, 'draw_update_handoff_notice')
+        for text in ('bounds.left + bounds.right', 'bounds.top + bounds.bottom', 'ImVec2(0.5f, 0.5f)',
+                     'ImGuiWindowFlags_NoInputs', 'ImGui::TextUnformatted("Updating...")',
+                     'yougame::update_notice_presented();'):
+            self.assertIn(text, notice)
+        self.assertIn('draw_update_handoff_notice();\n  ImGui::Render();', ui)
+
+    def test_ranked_guard_waits_for_real_result_reveal(self):
+        game = source('sourceport/game/shim/mu_ranked_setup_online.c')
+        self.assertIn('update_set_active = 1;', literal_function(game, 'mu_ranked_setup_begin'))
+        finish = literal_function(game, 'mu_ranked_setup_finish_game')
+        self.assertIn('result == MU_SETUP_SET_OVER || result == MU_SETUP_SET_ABORTED', finish)
+        self.assertNotIn('mu_ranked_update_reset', finish)
+        reveal = literal_function(source('sourceport/game/shim/mu_ranked_reveal.c'), 'mu_ranked_reveal_frame')
+        self.assertIn('reveal.panel && previous >= REVEAL_GLOW_END', reveal)
+        self.assertLess(reveal.index('reveal_draw();'), reveal.index('mu_ranked_update_result_shown();'))
+        self.assertIn('mu_ranked_update_reset();', literal_function(
+            source('sourceport/game/shim/mu_slippi_menu.c'), 'online_on_unload'))
+
+    def test_resume_reuses_existing_boot_and_never_selects_a_mode(self):
+        main = source('port/app/main.cpp')
+        resume = main[main.index('    if (a == "--resume")'):main.index('    if (a == "--vanilla-only") continue;')]
+        self.assertIn('yougame::update::resume(value)', resume)
+        self.assertIn('source_port::set_resume_online();', resume)
+        self.assertEqual(resume.count('resume: unknown value ignored'), 1)
+        for forbidden in ('set_online_test', 'native_start_match', 'set_match('):
+            self.assertNotIn(forbidden, resume)
+        host = source('port/app/source_host.cpp')
+        self.assertIn('g_slippi_menus ? "resume: online', host)
+        self.assertIn('Online boot menu unavailable', host)
+        boot = literal_function(source('sourceport/game/shim/mu_slippi_menu.c'), 'mu_slippi_boot_mode')
+        self.assertIn('boot_oneshot = 1;', boot)
+        self.assertIn('return GM_MENU;', boot)
+
     def test_refusal_precedes_generic_error(self):
         bridge = literal_function(source('port/runtime/hle/yougame_link.cpp'), 'bridge')
         self.assertLess(bridge.index('update::required(refused)'), bridge.index('if (!j.value("ok", false))'))

@@ -8,6 +8,12 @@ void gm_801A4B60(void);
 void mu_online_abi_log(const char* text);
 int snprintf(char* buffer, __SIZE_TYPE__ size, const char* format, ...);
 
+static int update_set_active, update_result_pending;
+int mu_ranked_update_busy(void) { return update_set_active; }
+void mu_ranked_update_reset(void) { update_set_active = update_result_pending = 0; }
+void mu_ranked_update_result_shown(void) {
+    if (update_result_pending) mu_ranked_update_reset();
+}
 static MuRankedSetupModel model;
 #if defined(YOUGAME_AGENT_TEST_HOOK) || (defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH)
 static MuRankedSetupModel cpu_model;
@@ -75,6 +81,8 @@ void mu_ranked_setup_begin(void)
     const MuMatchState* ms;
     MuYgU8 status;
     unsigned i;
+    update_set_active = 1; /* conservative: include game-one setup/striking */
+    update_result_pending = 0;
     memset(&model, 0, sizeof model);
     sent_result = ended = has_draft = 0; ready_frames = 0;
     /* Require a fresh finalized result for every match (including a tiebreak). */
@@ -182,6 +190,7 @@ int mu_ranked_setup_finish_game(int connected, MuYgU16 stage)
     unsigned game = set->cur_game;
     int result = mu_ranked_setup_record_game(set, result_winner, result_end,
                                             stage, result_disconnect || !connected);
+    if (result == MU_SETUP_SET_OVER || result == MU_SETUP_SET_ABORTED) update_result_pending = 1;
     if (result == MU_SETUP_NEXT_GAME || result == MU_SETUP_TIEBREAK || result == MU_SETUP_SET_OVER ||
         result == MU_SETUP_SET_ABORTED) {
         unsigned local = mu_slippi_match_state()->local_index & 1;

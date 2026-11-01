@@ -139,6 +139,7 @@ static void reveal_tick(MuReveal* s)
 }
 
 #ifndef MU_RANKED_REVEAL_TEST
+#include <mu_ranked_setup_online.h>
 #include <mu_native.h>
 #include <mu_ranked.h>
 #include <mu_rank_badge.h>
@@ -324,6 +325,8 @@ void mu_ranked_reveal_frame(void)
     previous = s->frame;
     reveal_draw();
     reveal_tick(s);
+    // Allow the result to finish drawing/animating before handing the game back.
+    if (reveal.panel && previous >= REVEAL_GLOW_END) mu_ranked_update_result_shown();
     /* Existing game's menu confirmation, once at the swap; no imported sounds. */
     if (!s->reduced && s->result.status == MU_YG_RESULT_RECORDED &&
         previous < REVEAL_NEW_START && s->frame == REVEAL_NEW_START &&

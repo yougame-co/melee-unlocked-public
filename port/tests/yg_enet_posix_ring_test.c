@@ -129,6 +129,40 @@ static void eof(void) {
     CHECK(enet_socket_wait(s,&c,500)==-1 && !yg_enet_channel_ready() && !yg_enet_enabled());
     CHECK(attach(&l)==-1); enet_socket_destroy(s); dispose(&l);
 }
+static void shutdown_flag(void) {
+    Lease leases[3]; unsigned i;
+    /* Keep distinct leases alive: each new section is a new attachment. */
+    for(i=0;i<3;i++) lease(&leases[i]);
+    for(i=0;i<3;i++) {
+        Lease *l=&leases[i]; ENetSocket s=start(l); ENetAddress a;
+        char byte=1, captured[256]; ENetBuffer b={&byte,1}; enet_uint32 c;
+        int capture[2], saved; ssize_t n;
+        const char *line="yougame: direct link helper set the shutdown flag; direct link down\n";
+        CHECK(yg_enet_link_address(1,&a)==0);
+        CHECK(pipe(capture)==0); saved=dup(STDERR_FILENO); CHECK(saved>=0);
+        CHECK(fflush(stderr)==0 && dup2(capture[1],STDERR_FILENO)==STDERR_FILENO); close(capture[1]);
+        CHECK(yg_enet_channel_ready() && attach(l)==0); /* idempotence keeps the log latch */
+        if(i==2) { /* An already-broken ring must not report a helper shutdown. */
+            put32(l->m+YG_IN,YG_SLOTS+1);
+            CHECK(enet_socket_receive(s,NULL,&b,1)==0);
+        }
+        put32(l->m+28,1);
+        CHECK(!yg_enet_channel_ready() && !yg_enet_channel_ready());
+        CHECK(!yg_enet_enabled() && yg_enet_link_state(1)==3);
+        CHECK(enet_socket_send(s,&a,&b,1)==-1 && enet_socket_receive(s,NULL,&b,1)==-1);
+        c=ENET_SOCKET_WAIT_RECEIVE; CHECK(enet_socket_wait(s,&c,0)==-1);
+        if(i!=2) {
+            put32(l->m+28,0); CHECK(yg_enet_channel_ready() && attach(l)==0);
+            put32(l->m+28,2); CHECK(!yg_enet_channel_ready());
+        }
+        CHECK(fflush(stderr)==0 && dup2(saved,STDERR_FILENO)==STDERR_FILENO); close(saved);
+        n=read(capture[0],captured,sizeof captured); close(capture[0]);
+        CHECK(n==(i==2 ? 0 : (ssize_t)strlen(line)));
+        if(i!=2) CHECK(!memcmp(captured,line,(size_t)n));
+        enet_socket_destroy(s);
+    }
+    for(i=0;i<3;i++) dispose(&leases[i]);
+}
 static volatile sig_atomic_t signals;
 static void signal_seen(int sig) { (void)sig; signals++; }
 typedef struct Interrupt { pthread_t target; ENetSocket s; } Interrupt;
@@ -248,6 +282,7 @@ int main(void) {
     run(invalid,"fd/header/size validation, ownership and idempotence");
     run(full_and_sigpipe,"full doorbell EAGAIN and helper EPIPE/SIGPIPE");
     run(eof,"helper EOF with pending doorbell");
+    run(shutdown_flag,"shutdown flag logs once per attachment, never after broken");
     run(waits,"EINTR deadline, coalescing, local wake and retired ids");
     run(enet_pair,"helper relays real ENet connect/send/receive/disconnect");
     run(standalone,"no-broker native dispatch (offline stubs)");

@@ -2032,6 +2032,20 @@ static void draw_skin_online_notice() {
   ImGui::End();
 }
 
+// App-installed update: centered in the game picture, independent of optional HUD readouts.
+static void draw_update_handoff_notice() {
+  if (!yougame::update_handoff_visible()) return;
+  const OverlayBounds bounds = overlay_bounds();
+  ImGui::SetNextWindowPos(ImVec2((bounds.left + bounds.right) * 0.5f,
+                               (bounds.top + bounds.bottom) * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+  ImGui::SetNextWindowBgAlpha(0.9f);
+  ImGui::Begin("YouGameUpdatingNotice", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
+  ImGui::TextUnformatted("Updating...");
+  ImGui::End();
+  yougame::update_notice_presented();
+}
+
 // The volume the settings file holds. state.volume is only assigned while the Audio tab is being
 // drawn, and ImGui runs a tab's body only when it is the selected one, so saving from any other
 // tab used to write whatever that field happened to start as, which is zero. Players saw the
@@ -10355,6 +10369,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     if (g_settings_old_font) ImGui::PopFont();
     ImGui::GetStyle() = launcher_saved_style;
   }
+  draw_update_handoff_notice();
   ImGui::Render();
   // Apply opacity after ImGui has built the overlay: this includes the game-facing custom
   // geometry and images as well as standard widgets, leaving the emulated frame visible beneath.

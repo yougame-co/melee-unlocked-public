@@ -1649,10 +1649,7 @@ std::array<std::string, 4> player_names_for_overlay() {
   std::array<std::string, 4> names{};
   if (!g_in_online_match || !g_matchmaking) return names;
   for (int i = 0; i < 4; ++i) names[i] = g_matchmaking->GetPlayerName((uint8_t)i);
-  // Host-rendered nickname overlay only; never feeds the game, reports or .slp metadata.
-  for (int i = 0; i < 4; ++i)
-    if (i != (int)g_local_player_index && !names[i].empty())
-      names[i] = display::opponent_label(g_matchmaking->DisplayProvider(), names[i], 32);
+  // HUD nicknames stay plain; provider labels belong to the CSS summary only.
   if (g_user && g_local_player_index < 4 && names[g_local_player_index].empty())
     names[g_local_player_index] = g_user->GetUserInfo().display_name;
   return names;

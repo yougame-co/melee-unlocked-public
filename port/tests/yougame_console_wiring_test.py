@@ -462,8 +462,8 @@ class ConsoleOffEquivalence(unittest.TestCase):
     def test_patch_hunk_counts(self):
         patch = read('sourceport/patches/melee-native.patch')
         hunks = list(re.finditer(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[^\n]*\n', patch, re.M))
-        # HEAD has 10064 hunks; v0.9.83 adds the unsafe player-tag guard.
-        self.assertEqual(len(hunks), 10065)
+        # Build 28 plus upstream v0.9.86 has 10067 hunks.
+        self.assertEqual(len(hunks), 10067)
         for i, h in enumerate(hunks):
             after = patch[h.end():hunks[i + 1].start() if i + 1 < len(hunks) else len(patch)]
             after = after.split('diff --git ')[0]

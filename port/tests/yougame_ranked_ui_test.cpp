@@ -6,6 +6,9 @@
 #include "ranked_ui_badge.inc"
 #include "../../sourceport/game/shim/mu_ranked_rank.c"
 #include "../../sourceport/game/shim/mu_ranked_reveal.c"
+static unsigned update_result_shown;
+void mu_ranked_update_result_shown() { ++update_result_shown; }
+
 
 // CSS camera's 640x480 safe area in world units. SIS positive y goes down;
 // GX vertices from the badge renderer have already negated it.
@@ -200,8 +203,21 @@ static void unavailable_text_retries() {
     match.connection_state=MU_SLP_MM_CONNECTION_SUCCESS;
 }
 
+static void update_after_reveal() {
+    ranks.result={};ranks.result.status=MU_YG_RESULT_UNRATED;
+    menu.mode=MU_SLP_MODE_RANKED;
+    mu_ranked_reveal_enter();
+    CHECK(reveal.panel && update_result_shown==0);
+    for(unsigned f=1;f<REVEAL_GLOW_END;++f) {
+        mu_ranked_reveal_frame();
+        CHECK(update_result_shown==0);
+    }
+    mu_ranked_reveal_frame(); CHECK(update_result_shown==1);
+    reveal_close();
+}
+
 int main() {
-    unavailable_text_retries();placements_with_art();reveal_layout();
+    unavailable_text_retries();placements_with_art();reveal_layout();update_after_reveal();
     CHECK(text_count==0 && !badges);
     std::cout<<"ranked UI with real badges: "<<checks<<" checks passed\n";
 }

@@ -264,7 +264,11 @@ host::controller_relay::Snapshot relayed_controllers() {
 }
 
 void handle_app_line(const std::string& line) {
-  if (g_update_notice.command(line)) return;
+  if (g_update_notice.command(line)) {
+    const auto id = g_update_notice.take_ready_log();
+    if (!id.empty()) host::log("update: ready %s (waiting for a safe point)", id.c_str());
+    return;
+  }
   if (line.rfind("yg-pads ", 0) == 0) {
     // The provider goes in before the first line is accepted, so a reader that sees relay mode
     // already sees the families. A line that does not parse installs nothing: native pads stay.
@@ -884,6 +888,7 @@ struct Room : transport::RoomState<Socket> {
   }
 };
 std::unique_ptr<Room> g_room;
+std::atomic<unsigned> g_update_searches{0};
 bool g_slippi_match = false;  // g_mutex; identity refresh must not switch a live Slippi match's ENet
 
 void select_match_transport(bool slippi) {
@@ -1566,6 +1571,30 @@ void pause_event(bool pausable, bool paused, const char* reason) {
   write_line("yg " + json{{"event", event}}.dump());
 }
 
+bool update_safe_point(bool idle_scene, bool online_busy, bool ranked_set, bool online_screen) {
+  if (g_update_notice.visible()) return true;
+  if (g_update_notice.pending().empty()) return false;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  const bool retiring = g_retired.valid() &&
+      g_retired.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready;
+  const update::SafePoint state{idle_scene,
+      online_busy || g_update_searches.load() != 0,
+      bool(g_room) || g_slippi_match || retiring, ranked_set,
+      g_room && g_room->friends, online_screen};
+  if (!g_update_notice.begin(state)) return false;
+  host::log("update: safe point, handing back to YouGame");
+  return true;
+}
+bool update_handoff_visible() { return g_update_notice.visible(); }
+void update_notice_presented() {
+  const auto line = g_update_notice.presented(now_ms());
+  if (line.empty()) return;
+  write_line(line); // host::log alone goes to stderr in app stdio mode, NOT the app's stdout.
+  host::log("%s", line.c_str());
+  host::set_replay_viewing(false); // update acceptance always exits 0, including a finished replay
+  host::request_user_exit();
+}
+
 std::string status_line() {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_status = friends::expire_joined(g_status, g_status_since, now_ms());
@@ -1650,8 +1679,8 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   const auto cancelled = [&] { return !g_search_generation.current(epoch) || cancel_requested(); };
   struct SearchScope {
     search_policy::BusyRetry retry;
-    explicit SearchScope(const std::function<bool()>& stop) { g_search_stopped = stop; g_ticket_retry = &retry; }
-    ~SearchScope() { g_search_stopped = {}; g_ticket_retry = nullptr; }
+    explicit SearchScope(const std::function<bool()>& stop) { ++g_update_searches; g_search_stopped = stop; g_ticket_retry = &retry; }
+    ~SearchScope() { g_search_stopped = {}; g_ticket_retry = nullptr; --g_update_searches; }
   } scope(cancelled);
   if (cancelled()) return fail("Cancelled");
   try {

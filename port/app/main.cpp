@@ -8,6 +8,7 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include "yougame_link.h"
+#include "yougame_update.h"
 #ifdef MELEE_SOURCE_PORT
 #include "replay_bar.h"
 #include "yougame_console_boot.h"
@@ -1722,6 +1723,17 @@ static int melee_main(int argc, char** argv) {
       std::fprintf(stderr, "--vanilla-only cannot be combined with %s; launch the mod listing without --vanilla-only\n", a.c_str());
       return 2;
     }
+    if (a == "--resume") {
+      const char* value = i + 1 < argc && argv[i + 1][0] != '-' ? argv[++i] : "";
+      if (yougame::update::resume(value) == yougame::update::Resume::Online) {
+#ifdef MELEE_SOURCE_PORT
+        source_port::set_resume_online();
+#else
+        host::log("resume: online ignored (Online boot menu unavailable)");
+#endif
+      } else host::log("resume: unknown value ignored"); // one bounded line, no untrusted argv text
+      continue;
+    }
     if (a == "--vanilla-only") continue;   // resolved before settings were loaded
     if (a == "--no-mod-autodetect") {
       host::gameplay::mod_autodetect_disabled = true;
@@ -2264,15 +2276,19 @@ static int melee_main(int argc, char** argv) {
   if (yougame::embed_toplevel()) gfx.exclusive_fullscreen = false;
 #endif
   std::unique_ptr<gx::Backend> backend;
-  if (!headless && threaded) {
-    backend = gx::create_threaded_backend(gfx, !hidden);
-  } else if (!headless) {
-    // Vulkan chosen but not usable here: choose the fallback before creating the SDL window.
+  // Vulkan chosen but not usable here: choose the fallback before creating the SDL window. For both paths
+  // (upstream v0.9.86): the threaded renderer (every normal launch) makes its window too, and without this a
+  // Linux Vulkan choice got an OpenGL window whose Vulkan surface could not be created, so the game stopped.
+  if (!headless) {
     if (gfx.api == gx::RenderApi::Vulkan && !gx::vulkan_available()) {
       host::log("vulkan: not usable on this system; starting on the default renderer");
       gfx.api = gx::RenderApi::D3D12;
     }
     host::window_prefer_vulkan(gfx.api == gx::RenderApi::Vulkan);
+  }
+  if (!headless && threaded) {
+    backend = gx::create_threaded_backend(gfx, !hidden);
+  } else if (!headless) {
 #ifdef __APPLE__
     // An app older than 0.13.1048 asks for the player box (YOUGAME_EMBED=1) but passes no parent window: the game
     // can't embed there, so it starts in full screen on its own, as before.

@@ -238,6 +238,25 @@ static void cpu() {
   reset();CHECK(!mu_ranked_setup_cpu()); // production adapter has no test path
 #endif
 }
+static void update_lifecycle() {
+  reset(); mu_ranked_update_reset(); CHECK(!mu_ranked_update_busy());
+  mu_ranked_update_result_shown(); CHECK(!mu_ranked_update_busy());
+  begin(); CHECK(mu_ranked_update_busy());
+  mu_ranked_update_result_shown(); CHECK(mu_ranked_update_busy()); // idle CSS cannot clear game one
+  mu_ranked_setup_game_result(0,2,0);
+  CHECK(mu_ranked_setup_finish_game(1,31)==MU_SETUP_NEXT_GAME);
+  CHECK(mu_ranked_update_busy());
+  mu_ranked_update_result_shown(); CHECK(mu_ranked_update_busy()); // between games
+  mu_ranked_setup_begin(); CHECK(mu_ranked_update_busy());
+  mu_ranked_setup_game_result(0,2,0);
+  CHECK(mu_ranked_setup_finish_game(1,32)==MU_SETUP_SET_OVER);
+  CHECK(mu_ranked_update_busy()); // room cleanup / set-over log is earlier than the result reveal
+  mu_ranked_update_result_shown(); CHECK(!mu_ranked_update_busy());
+  reset(); begin(); mu_ranked_setup_game_result(-1,7,1);
+  CHECK(mu_ranked_setup_finish_game(0,31)==MU_SETUP_SET_ABORTED);
+  CHECK(mu_ranked_update_busy());
+  mu_ranked_update_reset(); CHECK(!mu_ranked_update_busy()); // online-major exit/abandon
+}
 static void result_logging() {
   for(unsigned seat=0;seat<2;++seat) for(bool practice : {false,true}) {
 #if !defined(YOUGAME_AGENT_TEST_HOOK) && !(defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH)
@@ -279,4 +298,4 @@ static void result_logging() {
       "ranked set: game 1 over, winner none, score 0-0, practice "+p+", next abandoned\n"}));
   }
 }
-int main() {normal();game_two_counterpick();disconnects();timers();tiebreak();desync_replay_hosts();cpu();result_logging();std::printf("Ranked setup adapter: %u checks passed\n",checks);}
+int main() {normal();game_two_counterpick();disconnects();timers();tiebreak();desync_replay_hosts();cpu();update_lifecycle();result_logging();std::printf("Ranked setup adapter: %u checks passed\n",checks);}

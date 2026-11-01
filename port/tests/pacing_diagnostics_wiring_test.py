@@ -93,6 +93,10 @@ class PacingDiagnosticsWiringTest(unittest.TestCase):
       host::log("present: vsync %s (settings)", options.vsync ? "on" : "off");
 #endif'''
         self.assertIn(addition, s)
+        # Round 27 adds only the centered update notice and its unconditional draw call.
+        for approved in json.loads((ROOT / 'port/tests/fixtures/round27_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1)
+            s = s.replace(approved['after'], approved['before'], 1)
         # Round 24 admits only these literal, reviewed settings edits, including label observers.
         # Reversing each exact byte range retains the existing whole-file pacing comparison.
         ranges = json.loads((ROOT / 'port/tests/fixtures/round24_settings_ranges.json').read_text())

@@ -13,6 +13,7 @@
 #include "yougame_agent_paths.h"
 #endif
 #include "source_host.h"
+#include "yougame_update.h"
 #include <windows.h>
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -860,6 +861,7 @@ bool read_cosmetic(uint32_t offset, void* dst, uint32_t size, bool* ok) {
 // the native game asks for them through the ordinary disc path, so they are registered in the
 // filesystem table here, built once at boot with the same code. Own offset range, never counted as
 // mod assets. Any failure turns the menus off for the run instead of mixing vanilla and patched.
+bool g_resume_online = false;
 bool g_slippi_menus_requested = true;   // --slippi-menus on|off
 bool g_slippi_menus = false;            // requested and the layer loaded
 struct SystemFile { std::string path; uint32_t start; std::vector<uint8_t> data; };
@@ -1151,6 +1153,7 @@ void h_poll() {
   });
 }
 
+static int (*g_update_ranked_busy)() = nullptr;
 static void (*g_look_snapshot)(MuLookSnapshot*) = nullptr;
 static void (*g_look_items)(MuLookItems*) = nullptr;
 void native_retrace() {
@@ -2283,7 +2286,18 @@ void h_vi_wait_retrace() {
     return;
   }
   if (g_resim) { ++g_resim_vi_waits; rollback_frame_callback(); return; }
-  guarded([] { host::retrace(); });
+  guarded([] {
+    host::retrace();
+    uint32_t major = 0, minor = 0, frame = 0;
+    host::current_scene(&major, &minor, &frame);
+    // Stay inside this VI wait: no scene bodies or new menu choices can run during the notice.
+    // Retraces keep exit handling, window messages and the renderer alive, with the last picture.
+    while (yougame::update_safe_point(yougame::update::idle_scene(major, minor),
+                                     slippi::online::session_mode() >= 0,
+                                     !g_update_ranked_busy || g_update_ranked_busy() != 0,
+                                     slippi::online::online_status_visible()))
+      host::retrace();
+  });
 }
 
 // The idle wait before a retrace, one audio period at a time (host API 16). Plays each block at
@@ -3673,6 +3687,7 @@ bool set_online_test(const char* spec) {
 }
 
 void set_slippi_menus(bool on) { g_slippi_menus_requested = on; }
+void set_resume_online() { g_resume_online = true; }
 
 void set_mod_directory(const char* path) {
   g_mod_layers.push_back({mods::LayerKind::Dir, std::filesystem::u8path(path)});
@@ -4110,6 +4125,9 @@ int run(void (*shutdown)(int)) {
                     : g_online_test_mode >= 0 ? "--online-test"
                     : host::options.vanilla_game ? "--vanilla-game"
                     : mods::status().rogue ? "rogueMelee disc, played offline with its own menus" : nullptr);
+  if (g_resume_online)
+    host::log(g_slippi_menus ? "resume: online (existing boot-to-Online menu; no search)"
+                            : "resume: online ignored (Online boot menu unavailable)");
   apply_content_mode(-1);   // offline: the mod's files, if a profile is loaded
 #ifndef MELEE_NO_SLIPPI
   slippi::online::load_ranked_rules();
@@ -4191,6 +4209,7 @@ int run(void (*shutdown)(int)) {
 #endif
 #endif
   auto entry = (MuGameEntry)game_proc("mu_game_entry");
+  g_update_ranked_busy = (int (*)())game_proc("mu_update_ranked_busy_v1");
   g_look_snapshot = (void (*)(MuLookSnapshot*))game_proc("mu_look_snapshot_v1");
   g_look_items = (void (*)(MuLookItems*))game_proc("mu_look_items_v1");
   user_gecko::set_native_writer((user_gecko::NativeWrite)game_proc("mu_user_gecko_write"));

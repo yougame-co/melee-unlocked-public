@@ -127,8 +127,8 @@ class YouGame0983MergeTest(unittest.TestCase):
                 self.assertEqual(new, old + delta + (old_n == 0) - (new_n == 0), section.splitlines()[0])
                 delta += new_n - old_n
                 count += 1
-        # Build 19 adds two Slippi title hooks to the earlier v0.9.83 merge.
-        self.assertEqual(count, 10065)
+        # Build 28 plus upstream v0.9.86 has 10067 hunks.
+        self.assertEqual(count, 10067)
 
 
 if __name__ == '__main__':

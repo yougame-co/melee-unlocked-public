@@ -214,6 +214,13 @@ enum class Leave { Quit, Lost, Over };
 // Leaves the room: the session is over (the game's online cleanup). Only Ranked reads `why`.
 void end_session(Leave why);
 
+// Simulation thread: starts only from a positively known idle game scene and set state.
+// Once started the caller holds the scene loop until the renderer requests the normal clean exit.
+// online_screen: an Online menu or online CSS is showing, so the accept line ends in " online".
+bool update_safe_point(bool idle_scene, bool online_busy, bool ranked_set, bool online_screen);
+bool update_handoff_visible();
+void update_notice_presented(); // renderer, after drawing Updating...
+
 // Status for logs and the YouGame page: "searching", "connecting", "playing", the opponent.
 std::string status_line();
 

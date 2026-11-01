@@ -74,7 +74,9 @@ class FriendsMenuWiringTest(unittest.TestCase):
             ('MU_SLP_MODE_PARTY', "Slippi's party mode."),
         ):
             self.assertIn('case ' + option + ':\n+                mu_slippi_menu_description(text, "' + message + '");', help)
-        self.assertNotIn('case MU_SLP_MODE_RANKED:', help)
+        self.assertIn('case MU_SLP_MODE_RANKED:', help)
+        self.assertIn('if (!mu_slippi_option_unlocked(selection))', help)
+        self.assertIn("Ranked isn't on for this game yet.", help)
         self.assertNotIn('case MU_SLP_MODE_UNRANKED:', help)
         # The hook runs AFTER the retail constructor, font parameters and SIS
         # catalog lookup. Our helper preserves those fields and copies its prefix.
@@ -89,9 +91,11 @@ class FriendsMenuWiringTest(unittest.TestCase):
         self.assertIn('mu_menu_description_prefix(text->sis_buffer)', helper)
         self.assertIn('memcpy(stream, text->sis_buffer, prefix)', helper)
 
-    def test_display_rows_are_unlocked_and_cursor_wraps_through_them(self):
+    def test_display_rows_respect_ladder_and_cursor_skips_locks(self):
         menu = source("sourceport/game/shim/mu_slippi_menu.c")
-        self.assertIn('if (ranked_supported) return sel >= 0 && sel < mu_slippi_menu_count();', menu)
+        self.assertIn('if (ranked_supported) return sel >= 0 && sel < mu_slippi_menu_count() &&', menu)
+        self.assertIn('(slippi_submenu || sel != MU_YG_ROW_RANKED || ranked_offered)', menu)
+        self.assertIn('!slippi_submenu && !ranked_offered ? MU_YG_ROW_UNRANKED : 0', menu)
         think = menu[menu.index('void mu_slippi_online_menu_think'):menu.index('/* ---- the online major')]
         self.assertEqual(think.count('mu_slippi_menu_count() - 1'), 2)
         self.assertEqual(think.count('while (!mn_80229938(MENU_KIND_8, mn_804A04F0.hovered_selection))'), 2)

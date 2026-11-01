@@ -4,6 +4,7 @@
 #include "enet/yg_enet_socket.h"
 #include <limits.h>
 #include <string.h>
+#include <stdio.h>
 #ifdef _WIN32
 #include <windows.h>
 static SRWLOCK mutex = SRWLOCK_INIT;
@@ -19,7 +20,6 @@ static uint64_t clock_ms(void) { return GetTickCount64(); }
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
-#include <stdio.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -48,7 +48,7 @@ static uint64_t mirror_clock_ms(void) {
 }
 static unsigned char *mem;
 static uint32_t tx, rx; /* Private counters, never read our own published fields. */
-static int selected, enabled, broken;
+static int selected, enabled, broken, shutdown_logged;
 static YGDoorbells bells;
 static ENetSocket current = ENET_SOCKET_NULL;
 static unsigned serial;
@@ -72,7 +72,16 @@ int yg_enet_mirror_service(unsigned ping,YGNetMirror *window,uint64_t *elapsed) 
 static enet_uint16 local_port;
 static unsigned get16(const unsigned char *p) { return p[0] | ((unsigned)p[1]<<8); }
 static void put16(unsigned char *p,unsigned n) { p[0]=(unsigned char)n; p[1]=(unsigned char)(n>>8); }
-static int live(void) { return mem && !broken && !load32(mem+28); }
+/* Called under the ring mutex on every OS. Logging never changes ring state. */
+static int live(void) {
+    if(!mem || broken) return 0;
+    if(load32(mem+28)) {
+        if(!shutdown_logged) fprintf(stderr,"yougame: direct link helper set the shutdown flag; direct link down\n");
+        shutdown_logged=1;
+        return 0;
+    }
+    return 1;
+}
 static int state(unsigned link) {
     unsigned i;
     if (!link || link>65534 || !live()) return 3;
@@ -94,7 +103,7 @@ static int attach_locked(void *memory,size_t size,YGDoorbells b) {
         load32(m+8)==YG_SLOTS && load32(m+12)==YG_STRIDE &&
         load32(m+16)==YG_DATAGRAM && load32(m+20)==YG_OUT && load32(m+24)==YG_IN &&
         b.notify && b.wake && b.wait) {
-        mem=m; bells=b; tx=rx=0; broken=0; enabled=0; ok=1;
+        mem=m; bells=b; tx=rx=0; broken=0; shutdown_logged=0; enabled=0; ok=1;
     }
     return ok ? 0 : -1;
 }
