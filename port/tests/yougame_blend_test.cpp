@@ -390,7 +390,7 @@ void link_line() {
     CHECK(link.size() == (link["linked"].get<bool>() ? 2u : 1u));
   }
   CHECK(std::string(yougame::blend::kSearchBoth) == "Searching Slippi + YouGame");
-  CHECK(std::string(yougame::blend::kSearchYouGameOnly) == "Slippi not linked: searching YouGame only");
+  CHECK(std::string(yougame::blend::kSearchYouGameOnly) == "Searching YouGame players");
   ++cases;
 }
 }  // namespace

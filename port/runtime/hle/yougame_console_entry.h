@@ -21,8 +21,11 @@ inline std::string seed_hex(uint64_t seed) {
   std::ostringstream s; s << std::hex << std::setw(16) << std::setfill('0') << seed; return s.str();
 }
 inline json session_launch(const SessionConfig& c) {
-  return {{"type","consoleSession"},{"room",c.room},{"sessionId",c.session_id},{"port",c.my_port},
+  json launch = {{"type","consoleSession"},{"room",c.room},{"sessionId",c.session_id},{"port",c.my_port},
     {"players",c.ports.size()},{"seed",seed_hex(c.seed)},{"epochMs",c.epoch_ms},{"inputDelay",c.input_delay}};
+  // Exactly the app's eight consoleSession fields (desktop/src/console-session.ts drops any other
+  // key, "consoleSession dropped: fields"). The rejoin reads cardDigest from the room's frozen start.
+  return launch;
 }
 inline json relaunch_message(const SessionConfig& c) { return {{"type","relaunch"},{"request",session_launch(c)}}; }
 // Fingerprint the actual host executable, not its marketing version or path.
@@ -102,7 +105,13 @@ class Entry {
   bool start() const { std::lock_guard<std::mutex> lock(mutex_); return start_; }
   bool poll(int port, bool connected, uint16_t buttons) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!active_ || port < 0 || port >= 4) return false;
+    if (port < 0 || port >= 4) return false;
+    if (!active_) {
+      if (friends::events.join_pending() && connected && (buttons & 0x10)) {
+        friends::events.take_join(true); return true;
+      }
+      return false; // keep playing if the invite is waiting for a safe scene
+    }
     if (connected && (buttons & 0x10)) { cancelled_ = true; active_ = false; status_.clear(); }
     if (edges_[port].poll(connected,buttons,true,true,false) && ready_) start_ = true;
     return true; // the waiting panel owns this pad; don't reopen the Friends picker
@@ -114,6 +123,11 @@ class Entry {
   friends::InviteEdge edges_[4];
 };
 inline Entry entry;
+inline std::string waiting_status() {
+  const auto status = entry.status();
+  // Show the accepted invite immediately, including the safe-scene settling gap.
+  return friends::events.join_pending() ? kGuestWait : status;
+}
 void friends_entry(const std::string& room);
 void take_pending_launch();
 } // namespace yougame::console

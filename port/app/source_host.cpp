@@ -14,6 +14,7 @@
 #endif
 #include "source_host.h"
 #include "yougame_update.h"
+#include "yougame_console_card.h"
 #include <windows.h>
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -116,6 +117,7 @@
 #include "pack_audio_safety.h"
 #include "texture_pack.h"
 #include "window.h"
+#include "console_input.h"
 
 // The settings panel's port-code options (pc_settings.cpp); the native game reads them through
 // MuHostApi.game_options.
@@ -127,7 +129,9 @@ bool g_console_boot = false; // retain pad/card isolation after a session ends
 std::filesystem::path g_console_card;
 yougame::console::Pads console_hardware() {
   host::PadState raw[4]{};
-  host::input_read_console_devices(raw); // no UI capture, offline delay, scripts, or practice overrides
+  host::input_read_console_devices(raw); // publishes UI from this one read, before local capture
+  static host::console_input::Capture capture;
+  capture.apply(raw, host::window_input_captured());
   yougame::console::Pads pads{};
   for (int i = 0; i < 4; ++i) {
     pads[i].button = raw[i].button;
@@ -1100,7 +1104,12 @@ int32_t h_console_frame_begin() {
     presented = host::retrace_count();
     MuStatePod state{};
     if (g_game.state_snapshot) g_game.state_snapshot(&state);
-    engine.advance(engine.needs_sample() ? console_hardware() : yougame::console::Pads{}, state);
+    // One hardware read per forward body, even when its target was already sampled (the bodies
+    // after a rollback clock restore): the menus and the held-on-close latch follow live input.
+    // Replays never come through here, and an already-sampled target sends nothing new.
+    const bool sample = engine.needs_sample();
+    const yougame::console::Pads hardware = console_hardware();
+    engine.advance(sample ? hardware : yougame::console::Pads{}, state);
   }
   return 1; // also replace any queued remote sample after a loss
 }
@@ -2639,6 +2648,7 @@ static_assert(sizeof(SourceCardStat) == 0x6C, "native CARDStat layout");
 std::vector<SourceCardFile*> g_card_files;
 std::filesystem::path g_card_dir;
 bool g_card_mounted = false;
+std::shared_ptr<const std::vector<uint8_t>> g_console_host_snapshot;
 
 uint16_t card_be16(const uint8_t* p) { return (uint16_t)(((uint16_t)p[0] << 8) | p[1]); }
 uint32_t card_be32(const uint8_t* p) {
@@ -2682,7 +2692,24 @@ std::string card_shown(const std::filesystem::path& p) {
   try { const auto text = p.u8string(); return std::string(text.begin(), text.end()); }
   catch (...) { return "<name not printable>"; }
 }
+void card_snapshot(const SourceCardFile* file) {
+  std::shared_ptr<const std::vector<uint8_t>> snapshot = std::make_shared<const std::vector<uint8_t>>();
+  if (file && card_same_game(*file) && file->name() == "SuperSmashBros0110290334") {
+    auto bytes = std::make_shared<std::vector<uint8_t>>(file->dir,file->dir+sizeof file->dir);
+    bytes->insert(bytes->end(),file->data.begin(),file->data.end());
+    if (yougame::console::melee_gci(*bytes)) snapshot = bytes;
+  }
+  std::atomic_store(&g_console_host_snapshot,std::move(snapshot));
+}
+void card_refresh_snapshot() {
+  const auto melee = card_find("SuperSmashBros0110290334");
+  card_snapshot(melee < 0 ? nullptr : g_card_files[melee]);
+}
 void card_save(SourceCardFile& file) {
+  // The session card is a disposable copy. Guests never persist progress; the host's real card
+  // is never touched either. Keep identical in-memory CARD results on all seats for lockstep.
+  if (g_console_boot) return;
+  if (file.name() == "SuperSmashBros0110290334") card_snapshot(&file);
   try {
     if (file.path.empty()) file.path = g_card_dir / card_safe_name(file);
     std::filesystem::path temporary = file.path; temporary += L".tmp";
@@ -2802,10 +2829,15 @@ void card_mount_files() {
     host::log("card: imported %s as %s (copy-on-write)", source.string().c_str(), file->name().c_str());
   }
   g_card_mounted = true;
+  card_refresh_snapshot();
   host::log("card: source slot A mounted from %s (%zu files, %u of %u blocks used)",
             card_shown(g_card_dir).c_str(), slot, card_used_blocks(), CARD_TOTAL_BLOCKS);
 }
-void card_reset_mount() { card_clear_files(); g_card_mounted = false; }
+void card_reset_mount() {
+  // Keep the last mounted save's snapshot: Melee unmounts its card after every access, and Friends
+  // reads the host's save at START, long after. The next mount, a save, delete, rename or format refreshes it.
+  card_clear_files(); g_card_mounted = false;
+}
 // Seconds since 2000-01-01 on the console clock (its date at start plus game time), as the game's
 // own calendar reads it: a save file used to be stamped January 1, 2000.
 uint32_t card_time_2000() {
@@ -2899,8 +2931,9 @@ int32_t h_card_delete(int32_t chan, const char* name) {
   const int32_t no = card_find(name ? name : "");
   if (no < 0) return CARD_NOFILE;
   SourceCardFile* file = g_card_files[no];
-  std::error_code ec; std::filesystem::remove(file->path, ec);
+  std::error_code ec; if (!g_console_boot) std::filesystem::remove(file->path, ec);
   delete file; g_card_files[no] = nullptr;
+  card_refresh_snapshot();
   return CARD_READY;
 }
 int32_t h_card_rename(int32_t chan, const char* old_name, const char* new_name) {
@@ -2911,9 +2944,10 @@ int32_t h_card_rename(int32_t chan, const char* old_name, const char* new_name) 
   if (no < 0) return CARD_NOFILE;
   if (card_find(new_file) >= 0) return CARD_EXIST;
   SourceCardFile& file = *g_card_files[no];
-  std::error_code ec; std::filesystem::remove(file.path, ec); file.path.clear();
+  std::error_code ec; if (!g_console_boot) std::filesystem::remove(file.path, ec); file.path.clear();
   std::memset(file.dir + 8, 0, 32); std::memcpy(file.dir + 8, new_file.data(), new_file.size());
   card_save(file);
+  card_refresh_snapshot();
   return CARD_READY;
 }
 int32_t h_card_read(int32_t chan, int32_t file_no, void* dst, uint32_t length, uint32_t offset) {
@@ -2958,9 +2992,10 @@ int32_t h_card_format(int32_t chan) {
   card_mount_files();
   for (SourceCardFile*& file : g_card_files) {
     if (!file) continue;
-    std::error_code ec; std::filesystem::remove(file->path, ec);
+    std::error_code ec; if (!g_console_boot) std::filesystem::remove(file->path, ec);
     delete file; file = nullptr;
   }
+  card_refresh_snapshot();
   return CARD_READY;
 }
 
@@ -3633,6 +3668,34 @@ LONG CALLBACK on_game_exception(EXCEPTION_POINTERS* info) {
 
 bool card_self_test(const char* directory) { return card_self_test_impl(directory); }
 
+std::vector<uint8_t> console_host_save() {
+  // Snapshot published by the simulation thread using the mounted card's exact save selection.
+  const auto snapshot = std::atomic_load(&g_console_host_snapshot);
+  if (snapshot) {
+    if (snapshot->empty()) host::log("card: Friends host save: the mounted card has no usable Melee save");
+    return *snapshot;
+  }
+  // A direct console launch can precede source_port::run and its card mount. Read only the
+  // canonical Melee save in the configured ordinary card (including VanillaOnly), never a
+  // different save or an imported/profile file. Human Friends uses the mounted snapshot above.
+  const auto path = std::filesystem::u8path(host::options.card_dir) / "GALE01-SuperSmashBros0110290334.gci";
+  std::error_code ec;
+  if (std::filesystem::is_symlink(path,ec) || !std::filesystem::is_regular_file(path,ec)) {
+    host::log("card: Friends host save: %s %s (card not mounted)", std::filesystem::is_symlink(path,ec) ? "a link, not read:" : "no save file at",
+              card_shown(path).c_str());
+    return {};
+  }
+  const auto size = std::filesystem::file_size(path,ec);
+  if (ec || size < 64 || size > yougame::console::kCardLimit) {
+    host::log("card: Friends host save: unusable size %llu (card not mounted)", (unsigned long long)(ec ? 0 : size)); return {};
+  }
+  std::ifstream in(path,std::ios::binary); std::vector<uint8_t> bytes(size);
+  in.read(reinterpret_cast<char*>(bytes.data()),size);
+  if (in && yougame::console::melee_gci(bytes)) return bytes;
+  host::log("card: Friends host save: %s (%llu bytes, card not mounted)", in ? "not a Melee save" : "couldn't read the save", (unsigned long long)size);
+  return {};
+}
+
 bool begin_console(std::unique_ptr<yougame::console::SessionLink> link,
                    const yougame::console::SessionConfig& config) {
   if (g_console_boot || g_game.run || g_replaying || g_online_test_mode >= 0 || source_p2p::requested() ||
@@ -3651,6 +3714,11 @@ bool begin_console(std::unique_ptr<yougame::console::SessionLink> link,
   };
   const bool rollback = yougame::console::rollback_setting(std::getenv("MELEE_CONSOLE_ROLLBACK"));
   if (!yougame::console::console_engine().begin(std::move(link), config, std::move(hooks), rollback)) return false;
+  // Friends (2 seats) whose host couldn't share its save: same fresh card on every seat, say so.
+  if (config.ports.size() == 2 && config.card_digest.empty()) {
+    host::log("console: %s", yougame::console::kDefaultCard);
+    screen_label::show(yougame::console::kDefaultCard, 12.0);
+  }
   g_console_card = std::move(card);
   g_console_boot = true;
   return true;
@@ -4279,6 +4347,9 @@ int run(void (*shutdown)(int)) {
 }  // namespace source_port
 
 namespace yougame::console {
+// Before main: Friends' save read lives in the runtime library, built without MELEE_SOURCE_PORT.
+[[maybe_unused]] static const bool host_save_installed =
+    (host_save_reader.store(&source_port::console_host_save, std::memory_order_release), true);
 bool console_begin(std::unique_ptr<SessionLink> link, const SessionConfig& config) {
   return source_port::begin_console(std::move(link), config);
 }

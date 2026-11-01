@@ -140,11 +140,20 @@ void mu_slippi_menu_description(HSD_Text* text, const char* message)
 void mu_slippi_signin_notice(HSD_GObj* menu)
 {
     MainMenuData* data;
+    u8 query = 2;
+    u8 link_line[128] = { 0 };
+    unsigned int got = 0;
     if (!menu || !mu_slippi_menus_enabled() || !mu_slippi_yougame_menu()) return;
     data = menu->user_data;
     if (!data) return;
-    mu_slippi_menu_description(data->description,
-                              "Sign in to Slippi to play Direct, Teams and Party");
+    if (mu_slippi_cmd(0xE7, &query, 1, link_line, sizeof link_line, &got) == 0 &&
+        got == sizeof link_line && link_line[0]) {
+        link_line[sizeof link_line - 1] = 0;
+        mu_slippi_menu_description(data->description, (const char*) link_line);
+    } else {
+        mu_slippi_menu_description(data->description,
+                                  "Sign in to Slippi to play Direct, Teams and Party");
+    }
 }
 
 

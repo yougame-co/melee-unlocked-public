@@ -291,11 +291,29 @@ static void result_logging() {
       "ranked set: over 0-2, practice "+p+"\n"}));
     reset(seat,1,practice);
     mu_ranked_setup_game_result(seat,2,1);CHECK(mu_ranked_setup_finish_game(1,31)==MU_SETUP_SET_ABORTED);
-    mu_ranked_setup_game_result(seat,2,0);CHECK(mu_ranked_setup_finish_game(0,31)==MU_SETUP_SET_ABORTED);
-    // A disconnect abandons the set: one line per abandoned game, never a winner or a set-over line.
+    std::strcpy(match.error,"Lost connection to the mm server");match.connection_state=MU_SLP_MM_ERROR;
+    mu_ranked_setup_game_result(seat,2,1);CHECK(mu_ranked_setup_finish_game(0,31)==MU_SETUP_SET_ABORTED);
+    // A disconnect shown during the game abandons the set: no winner or set-over line, and a line
+    // saying which condition ended it, with the link's error text when it has one.
+    const std::string ok=std::to_string(MU_SLP_MM_CONNECTION_SUCCESS), err=std::to_string(MU_SLP_MM_ERROR);
+    const std::string game="ranked set: game 1 over, winner none, score 0-0, practice "+p+", next abandoned\n";
+    const std::string why="ranked set: abandoned after game 1: disconnect shown 1, link state ", w=", winner "+std::to_string(seat)+"\n";
     CHECK((set_lines==std::vector<std::string>{
-      "ranked set: game 1 over, winner none, score 0-0, practice "+p+", next abandoned\n",
-      "ranked set: game 1 over, winner none, score 0-0, practice "+p+", next abandoned\n"}));
+      game, why+ok+" (connected)"+w,
+      game, why+err+" (not connected)"+w,
+      "ranked set: link error: Lost connection to the mm server\n"}));
+    // 11-01, a set: a conclusive game counts even when the read after it says "not connected"
+    // (Slippi ends a set only on the disconnect shown in game); the setup screen checks the link.
+    reset(seat,1,practice);set_lines.clear();match.connection_state=MU_SLP_MM_IDLE;
+    mu_ranked_setup_game_result(seat,2,0);CHECK(mu_ranked_setup_finish_game(0,31)==MU_SETUP_NEXT_GAME);
+    CHECK(state.score[seat]==1 && state.cur_game==2);
+    CHECK((set_lines==std::vector<std::string>{
+      "ranked set: game 1 over, winner local, score 1-0, practice "+p+", next setup\n",
+      "ranked set: game 1 counted although the link read state "+std::to_string(MU_SLP_MM_IDLE)+
+        " after it; the next screen checks the link again\n"}));
+    mu_ranked_setup_begin();CHECK(mu_ranked_setup_model()->status==MU_SETUP_DISCONNECTED && c2_mode==1);
+    // The set ended in the setup scene: its result reveal releases the update gate.
+    CHECK(mu_ranked_update_busy());mu_ranked_update_result_shown();CHECK(!mu_ranked_update_busy());
   }
 }
 int main() {normal();game_two_counterpick();disconnects();timers();tiebreak();desync_replay_hosts();cpu();update_lifecycle();result_logging();std::printf("Ranked setup adapter: %u checks passed\n",checks);}

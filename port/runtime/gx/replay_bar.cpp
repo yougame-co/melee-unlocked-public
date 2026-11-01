@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "replay_bar.h"
+#include "yougame_console_menu.h"
 #include "replay_control.h"
 #include "host.h"
 #include <imgui.h>
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cfloat>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -169,7 +171,27 @@ void show(const char* text, double seconds) {
   g_until = host::now_seconds() + seconds;
 }
 
-void draw(float width, float height) {
+void draw(float width, float height, float game_aspect) {
+  static yougame::console::MenuHintAnimation animation;
+  const float alpha = animation.alpha(yougame::console::console_menu_visible(),host::now_seconds());
+  if (alpha > 0) {
+    // The retail CSS header meets the grid with no spare text row. A compact host "Friends"
+    // header and its hint use the picture's empty top margin, above all retail labels/cards.
+    // Use the actual presentation aspect (73:60, 16:9, etc.), including letterboxing.
+    const float picture_height = std::min(height,width/std::max(game_aspect,0.1f));
+    const float top = (height-picture_height)*0.5f;
+    const float font_size = picture_height*9.0f/480.0f;
+    const auto* hint = yougame::console::kMenuHint;
+    ImFont* font = ImGui::GetFont();
+    const ImVec2 size = font->CalcTextSizeA(font_size,FLT_MAX,0,hint);
+    const ImVec2 at((width-size.x)*0.5f,top+picture_height*0.027f);
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    const ImVec2 heading = font->CalcTextSizeA(font_size,FLT_MAX,0,"Friends");
+    dl->AddText(font,font_size,ImVec2((width-heading.x)*0.5f,top+picture_height*0.003f),
+                IM_COL32(236,240,246,int(255*alpha)),"Friends");
+    dl->AddRectFilled(ImVec2(at.x-5,at.y-2),ImVec2(at.x+size.x+5,at.y+size.y+2),IM_COL32(10,12,18,int(170*alpha)),3);
+    dl->AddText(font,font_size,at,IM_COL32(255,239,170,int(255*alpha)),hint);
+  }
   std::string text;
   {
     std::lock_guard<std::mutex> lock(g_lock);

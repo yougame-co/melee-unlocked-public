@@ -48,6 +48,7 @@
 #include "cursor_idle.h"   // window_sdl.inl (Linux) hides the pointer after a rest
 #include "replay_control.h"
 #include "input_bindings.h"
+#include "keyboard_ui_navigation.h"
 #include "controller_relay.h"
 #include "settings_chord.h"
 #include "hid_pad.h"
@@ -104,6 +105,7 @@ std::atomic<bool> g_ui_capture{false};
 std::mutex g_ui_pad_mutex;
 PadState g_ui_pad{};
 PadState g_ui_pads[4]{};
+PadState g_ui_navigation_pads[4]{};
 bool g_ui_has_pad = false;
 bool g_ui_gamecube = false;
 bool g_ui_settings_chord_held[4]{};
@@ -252,6 +254,16 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
   // the screen for the rest of the match. It comes back the moment the panel opens or focus leaves.
   // Before the ImGui handler, which would otherwise set the arrow itself.
   if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && !g_ui_capture.load() && window_focused(h)) { SetCursor(nullptr); return TRUE; }
+  // One embedded Escape press has one game owner: bypass ImGui's NavCancel and pad bindings.
+  if (yougame::stdio_bridge() && w == VK_ESCAPE &&
+      (m == WM_KEYDOWN || m == WM_KEYUP || m == WM_SYSKEYDOWN || m == WM_SYSKEYUP)) {
+    const bool capture_key = yougame::parity::embedded_escape(
+        m == WM_KEYDOWN || m == WM_SYSKEYDOWN, (GetKeyState(VK_SHIFT) & 0x8000) != 0,
+        (l & (1LL << 30)) != 0, g_capturing.load(),
+        [](const char* key) { yougame::relay_key(key); }, [] { g_escape_press.store(true); });
+    std::lock_guard<std::mutex> lock(g_keys_mutex); g_keys[VK_ESCAPE] = capture_key;
+    return 0;
+  }
   // App shortcuts run before ImGui, bindings, Tab's practice toggle and Alt+Enter.
   // Handle system-key messages too: Windows uses them for Alt chords.
   if (m == WM_KILLFOCUS || (m == WM_ACTIVATE && LOWORD(w) == WA_INACTIVE) ||
@@ -377,11 +389,8 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
       // frames that are drawn, so presses made during a load queued up and were replayed afterwards,
       // and ImGui's repeat turned a held key into the panel flickering open and shut.
       //
-      // Under the YouGame app, Esc belongs to the page (it leaves full screen in every game), which
-      // cannot see keys while this window has the keyboard: it is relayed, and F1 does what Esc did
-      // here (opens the menu, goes back a page, closes it). Esc during a rebind only cancels it.
+      // Embedded Escape is routed before ImGui above. F1 keeps the same in-game action.
       if (yougame::stdio_bridge()) {
-        if (w == VK_ESCAPE && !(l & (1 << 30)) && !g_capturing.load()) yougame::relay_key("escape");
         if (w == VK_F11 && !(l & (1 << 30))) g_legacy_settings_toggle.store(true);
         if (w == VK_F1 && !(l & (1 << 30))) g_escape_press.store(true);
       } else {
@@ -698,12 +707,17 @@ void window_input_capture(bool capture) {
   if (g_ui_capture.exchange(capture) != capture && g_hwnd) PostMessageW(g_hwnd, kCursorRefresh, capture ? 1 : 0, 0);
 }
 bool window_ui_gamecube_pad(PadState& pad) { std::lock_guard<std::mutex> lock(g_ui_pad_mutex); pad = g_ui_pad; return g_ui_gamecube; }
-bool window_ui_pads(PadState pads[4]) {
+bool window_ui_pads(PadState pads[4], PadState navigation_pads[4]) {
   std::lock_guard<std::mutex> lock(g_ui_pad_mutex);
-  for (int i = 0; i < 4; ++i) pads[i] = g_ui_pads[i];
+  for (int i = 0; i < 4; ++i) {
+    pads[i] = g_ui_pads[i];
+    if (navigation_pads) navigation_pads[i] = g_ui_navigation_pads[i];
+  }
 #ifdef YOUGAME_AGENT_TEST_HOOK
-  if (g_ui_agent_step >= 0 && !yougame::agent_test::pad_back.consume_ui(g_ui_agent_step))
+  if (g_ui_agent_step >= 0 && !yougame::agent_test::pad_back.consume_ui(g_ui_agent_step)) {
     pads[0] = {};   // already consumed: release while waiting for input_poll to publish the next step
+    if (navigation_pads) navigation_pads[0] = {};
+  }
 #endif
   return g_ui_has_pad;
 }
@@ -861,6 +875,8 @@ const char* window_menu_key() { return yougame::stdio_bridge() ? yougame::parity
 const char* window_menu_key() { return yougame::stdio_bridge() ? "F1" : "Esc"; }
 #endif
 #endif
+
+bool window_input_captured() { return g_ui_capture.load(); }
 
 // GameCube button bits (PADStatus.button)
 enum : uint16_t {
@@ -1273,21 +1289,9 @@ void apply_known_box_layout(int idx) {
 // functions beside it), where the unit tests reach them. Both callers of each (input_poll and
 // input_debug_snapshot) go through the same function, so the game and the Controls tab agree.
 
-// The keyboard: every key is a button, and a key on L or R bottoms the trigger out with its click.
-template <class Key> uint32_t keyboard_apply_bindings(PadState& kb, Key key, box::State& box_state) {
-  const uint32_t actions = button_apply_bindings(kb, 0, 0,
-      [&](int i) { const int vk = g_key_bindings.vk[i]; return vk && key(vk); }, [](int i) { return (int)g_key_bindings.level[i]; });
-  apply_stick_actions(actions, kb.stick_x, kb.stick_y, g_stick_modifier_percent);
-  if (kb.button & PAD_L) kb.trig_l = 255;
-  if (kb.button & PAD_R) kb.trig_r = 255;
-  // Mod X or Mod Y bound: the keyboard is a box, and its stick and C-stick take the box coordinates.
-  apply_box_actions(g_key_bindings.vk[(size_t)BindAction::ModX] || g_key_bindings.vk[(size_t)BindAction::ModY],
-                    actions, kb, box_state);
-  return actions;
-}
-// The opposing-direction rule of box mode remembers the last poll, so the game's read and the
-// Controls tab's preview each keep their own: [0] input_poll, [1] input_debug_snapshot.
+// Box SOCD history must be independent for game polling, Controls preview and UI navigation.
 box::State g_box_keyboard[2];
+box::State g_box_keyboard_navigation;
 box::State g_box_hid[2][4];
 
 void apply_family_options(PadFamily family, PadState& pad) {
@@ -1568,7 +1572,8 @@ static void script_pads(uint32_t frame, bool update_state, PadState out[4]) {
 // side_effects: the game's own poll, which may re-point a port at a renamed HID slot and records
 // what feeds each port; the early-input sampler reads with false, under the same lock.
 static std::mutex g_devices_mutex;
-static void read_devices(PadState out[4], InputDebugSnapshot& debug, bool side_effects) {
+static void read_devices(PadState out[4], InputDebugSnapshot& debug, bool side_effects,
+                         PadState* keyboard_navigation = nullptr, bool console = false) {
   // Poll every physical source unconditionally, then route each in-game port to
   // whichever device g_port_sources[port] assigns it to. This lets keyboard, an
   // Xbox pad, and the GC adapter all drive different ports at the same time.
@@ -1606,7 +1611,15 @@ static void read_devices(PadState out[4], InputDebugSnapshot& debug, bool side_e
       if (live && vk >= 8 && vk != VK_TAB) return (GetAsyncKeyState(vk) & 0x8000) != 0;
       return g_keys[vk];
     };
-    keyboard_actions = keyboard_apply_bindings(kb, key, g_box_keyboard[0]);
+    keyboard_actions = keyboard_apply_bindings(kb, g_key_bindings, key, g_box_keyboard[0], g_stick_modifier_percent);
+    if (keyboard_navigation) {
+      *keyboard_navigation = {};
+      const bool shift_only = key(VK_SHIFT) && !key(VK_CONTROL) && !key(VK_MENU) &&
+                              !key(VK_LWIN) && !key(VK_RWIN);
+      keyboard_apply_bindings(*keyboard_navigation, g_key_bindings,
+          [&](int vk) { return !imgui_keyboard_navigation_key(vk, shift_only) && key(vk); },
+          g_box_keyboard_navigation, g_stick_modifier_percent);
+    }
   }
 
   PadState xin[4];
@@ -1706,7 +1719,8 @@ static void read_devices(PadState out[4], InputDebugSnapshot& debug, bool side_e
     }
   }
   for (int port = 0; port < 4; ++port) {
-    const PortSource src = effective_port_source(g_port_sources, facts, port);
+    PortSource src = effective_port_source(g_port_sources, facts, port);
+    if (console && keyboard_actions) src = controller_relay::console_source(src);
     if (side_effects) {
       g_port_feeding[port] = src;
       controller_relay::routed(src.kind, src.index, port);
@@ -1756,132 +1770,145 @@ static std::pair<int, int> route_takeover(PadState out[4]) {
   return {port, source};
 }
 
-void input_poll(PadState out[4]) {
-  controller_relay::GamePoll relay_poll;
-  perf::Scope work_cost(perf::Stage::Input);
-  struct InputCost { double start = now_seconds(); ~InputCost() { sim_cost_add(SIM_INPUT, now_seconds() - start); } } input_cost;
-  struct UiSnapshot {
-    PadState* pads; bool gamecube = false;
+// Shared by the offline poll and the console hardware read; never reads a device itself.
+struct UiSnapshot {
+  PadState* pads; bool gamecube = false;
+  bool console = false; // sessions publish UI, but never poll entry/Friends or suppress the raw sample
+  PadState keyboard_navigation{};
+  bool keyboard_ports[4]{};
 #ifdef YOUGAME_AGENT_TEST_HOOK
-    PortSource feeding[4]{};
+  PortSource feeding[4]{};
 #endif
-    ~UiSnapshot() {
+  ~UiSnapshot() {
 #ifdef YOUGAME_AGENT_TEST_HOOK
-      // Override the routed port at the common read boundary, before either the chord detector
-      // or ImGui sees it, and before UI capture suppresses gameplay. Covers the script early return
-      // too. Physical polling/routing stays intact, so the next read after completion restores it.
-      auto scripted = yougame::agent_test::pad_back.sample_for_ui(yougame::agent_test::PadBack::Clock::now());
-      if (scripted.active && !agent_input_allowed(yougame::agent_test::InputKey::PadBack))
-        scripted = {};
-      static int reported_step = -1;
-      if (scripted.active) {
-        feeding[0] = {DeviceKind::None, 0};
-        pads[0] = {};
-        pads[0].button = scripted.pad.button;
-        pads[0].err = scripted.pad.err;
-        gamecube = true;
-        if (scripted.step != reported_step) {
-          reported_step = scripted.step;
-          log("[yougame] agent test: pad %s", yougame::agent_test::pad_back_ui_steps[scripted.step].name);
-        }
-        std::lock_guard<std::mutex> lock(g_last_pads_mutex);
-        g_last_pads[0] = pads[0];
-      } else if (reported_step >= 0) {
-        log("[yougame] agent test: pad done");
-        reported_step = -2;
+    // Override the routed port at the common read boundary, before either the chord detector
+    // or ImGui sees it, and before UI capture suppresses gameplay. Covers the script early return
+    // too. Physical polling/routing stays intact, so the next read after completion restores it.
+    auto scripted = yougame::agent_test::pad_back.sample_for_ui(yougame::agent_test::PadBack::Clock::now());
+    if (scripted.active && !agent_input_allowed(yougame::agent_test::InputKey::PadBack))
+      scripted = {};
+    static int reported_step = -1;
+    if (scripted.active) {
+      feeding[0] = {DeviceKind::None, 0};
+      keyboard_ports[0] = false;
+      pads[0] = {};
+      pads[0].button = scripted.pad.button;
+      pads[0].err = scripted.pad.err;
+      gamecube = true;
+      if (scripted.step != reported_step) {
+        reported_step = scripted.step;
+        log("[yougame] agent test: pad %s", yougame::agent_test::pad_back_ui_steps[scripted.step].name);
       }
-      // Both hosts supply a live sample only during their game PADRead. Fight input wins
-      // over padBack on the local port, so the UI script cannot send a settings chord into combat.
-      if (yougame::agent_test::input_owner(input_script_active(),
-              yougame::agent_test::current_fight_sample.port >= 0 &&
-              yougame::agent_test::current_fight_sample.port < 4) == yougame::agent_test::InputOwner::Fight &&
-          yougame::agent_test::apply_fight(pads, yougame::agent_test::current_fight_sample,
-              yougame::agent_test::live_input_state(slippi::online::session_mode()),
-              [](const char* line) { log("%s", line); })) {
-        feeding[yougame::agent_test::current_fight_sample.port] = {DeviceKind::None, 0};
-        gamecube = true;
-        std::lock_guard<std::mutex> lock(g_last_pads_mutex);
-        g_last_pads[yougame::agent_test::current_fight_sample.port] =
-            pads[yougame::agent_test::current_fight_sample.port];
-      }
+      std::lock_guard<std::mutex> lock(g_last_pads_mutex);
+      g_last_pads[0] = pads[0];
+    } else if (reported_step >= 0) {
+      log("[yougame] agent test: pad done");
+      reported_step = -2;
+    }
+    // Both hosts supply a live sample only during their game PADRead. Fight input wins
+    // over padBack on the local port, so the UI script cannot send a settings chord into combat.
+    if (yougame::agent_test::input_owner(input_script_active(),
+            yougame::agent_test::current_fight_sample.port >= 0 &&
+            yougame::agent_test::current_fight_sample.port < 4) == yougame::agent_test::InputOwner::Fight &&
+        yougame::agent_test::apply_fight(pads, yougame::agent_test::current_fight_sample,
+            yougame::agent_test::live_input_state(slippi::online::session_mode()),
+            [](const char* line) { log("%s", line); })) {
+      feeding[yougame::agent_test::current_fight_sample.port] = {DeviceKind::None, 0};
+      keyboard_ports[yougame::agent_test::current_fight_sample.port] = false;
+      gamecube = true;
+      std::lock_guard<std::mutex> lock(g_last_pads_mutex);
+      g_last_pads[yougame::agent_test::current_fight_sample.port] =
+          pads[yougame::agent_test::current_fight_sample.port];
+    }
 #endif
-      std::lock_guard<std::mutex> lock(g_ui_pad_mutex);
+    std::lock_guard<std::mutex> lock(g_ui_pad_mutex);
 #ifdef YOUGAME_AGENT_TEST_HOOK
-      g_ui_agent_step = scripted.step;
+    g_ui_agent_step = scripted.step;
 #endif
-      const uint64_t menu_now = static_cast<uint64_t>(now_seconds() * 1000.0);
-      yougame::parity::signals.emit(g_overlay_pad.tick(menu_now));
-      bool toggle_settings = false;
-      const bool invite_focused = g_hwnd && window_focused(g_hwnd);
+    const uint64_t menu_now = static_cast<uint64_t>(now_seconds() * 1000.0);
+    yougame::parity::signals.emit(g_overlay_pad.tick(menu_now));
+    bool toggle_settings = false;
+    const bool invite_focused = g_hwnd && window_focused(g_hwnd);
+    for (int i = 0; i < 4; ++i) {
+      // Only ImGui receives the filtered keyboard copy. All chord/console/friends readers
+      // below keep the original routed pad, including Start and the arrow-made stick.
+      g_ui_navigation_pads[i] = keyboard_ports[i] ? keyboard_navigation : pads[i];
+      const uint16_t raw_buttons = pads[i].button;
+      const bool opened_here =
+          settings_shortcut::poll_z_start(pads[i].err == 0, pads[i].button,
+                                          g_ui_settings_chord_held[i]);
+      uint16_t menu_buttons = raw_buttons;
+      yougame::parity::signals.emit(g_overlay_pad.poll(yougame::stdio_bridge(), i,
+          pads[i].err == 0, menu_buttons, menu_now, g_ui_settings_chord_held[i]));
+      if (!console && yougame::active() && !opened_here && !g_ui_capture.load()) {
+        if (yougame::console::entry.poll(i, pads[i].err == 0 && invite_focused, menu_buttons)) {
+          const auto err = pads[i].err;
+          pads[i] = {}; pads[i].err = err;
+          g_ui_navigation_pads[i] = pads[i];
+          menu_buttons = 0;
+        } else yougame::friends::events.poll_pad(i, pads[i].err == 0 && invite_focused, menu_buttons);
+      }
+      if (!(menu_buttons & 0x1000)) pads[i].button &= static_cast<uint16_t>(~0x1000);
+      g_ui_navigation_pads[i].button &= pads[i].button; // preserve consumed chords/shortcuts
+      toggle_settings |= opened_here;
+      if (opened_here) g_settings_controller_port.store(i, std::memory_order_release);
+      if (settings_shortcut::poll_practice(pads[i].err == 0, pads[i].button, g_ui_practice_chord_held[i]))
+        g_practice_toggle.store(true, std::memory_order_release);   // same as Tab
+    }
+    if (toggle_settings) g_settings_toggle.store(true, std::memory_order_release);
+    g_ui_pad = pads[0];
+    g_ui_gamecube = gamecube;
+    g_ui_has_pad = false;
+    for (int i = 0; i < 4; ++i) {
+      g_ui_pads[i] = pads[i];
+      if (pads[i].err == 0) g_ui_has_pad = true;
+    }
+    if (!console && g_ui_capture.load()) {
+      // UI capture is global, not player-one-only. Keeping ports 2-4 live made menu navigation
+      // leak into Training and, during handoff, into the first online gameplay inputs.
       for (int i = 0; i < 4; ++i) {
-        const uint16_t raw_buttons = pads[i].button;
-        const bool opened_here =
-            settings_shortcut::poll_z_start(pads[i].err == 0, pads[i].button,
-                                            g_ui_settings_chord_held[i]);
-        uint16_t menu_buttons = raw_buttons;
-        yougame::parity::signals.emit(g_overlay_pad.poll(yougame::stdio_bridge(), i,
-            pads[i].err == 0, menu_buttons, menu_now, g_ui_settings_chord_held[i]));
-        if (yougame::active() && !opened_here && !g_ui_capture.load()) {
-          if (yougame::console::entry.poll(i, pads[i].err == 0 && invite_focused, menu_buttons)) {
-            const auto err = pads[i].err;
-            pads[i] = {}; pads[i].err = err;
-            menu_buttons = 0;
-          } else yougame::friends::events.poll_pad(i, pads[i].err == 0 && invite_focused, menu_buttons);
-        }
-        if (!(menu_buttons & 0x1000)) pads[i].button &= static_cast<uint16_t>(~0x1000);
-        toggle_settings |= opened_here;
-        if (opened_here) g_settings_controller_port.store(i, std::memory_order_release);
-        if (settings_shortcut::poll_practice(pads[i].err == 0, pads[i].button, g_ui_practice_chord_held[i]))
-          g_practice_toggle.store(true, std::memory_order_release);   // same as Tab
+        const int8_t err = pads[i].err;
+        pads[i] = {};
+        pads[i].err = err;
       }
-      if (toggle_settings) g_settings_toggle.store(true, std::memory_order_release);
-      g_ui_pad = pads[0];
-      g_ui_gamecube = gamecube;
-      g_ui_has_pad = false;
-      for (int i = 0; i < 4; ++i) {
-        g_ui_pads[i] = pads[i];
-        if (pads[i].err == 0) g_ui_has_pad = true;
-      }
-      if (g_ui_capture.load()) {
-        // UI capture is global, not player-one-only. Keeping ports 2-4 live made menu navigation
-        // leak into Training and, during handoff, into the first online gameplay inputs.
-        for (int i = 0; i < 4; ++i) {
-          const int8_t err = pads[i].err;
-          pads[i] = {};
-          pads[i].err = err;
-        }
-      }
+    }
 #ifdef YOUGAME_AGENT_TEST_HOOK
-      // After capture/chord suppression: exactly the values returned to the game's PADRead.
-      for (int i = 0; i < 4; ++i) {
-        const auto& p = pads[i];
-        const auto src = feeding[i];
-        std::string source = "none";
-        if (p.err == 0 && !input_script_active()) {
-          if (src.kind == DeviceKind::Keyboard) source = "keyboard";
-          else if (src.kind == DeviceKind::GCAdapter) source = "adapter";
-          else if (src.kind != DeviceKind::None) {
-            source = "sdl";
-            // The mixed relay slot differs from the index within a controller family.
-            const auto read = controller_relay::reader.load(std::memory_order_acquire);
-            if (read && (src.kind != DeviceKind::HidPad || relay_owns_hid())) {
-              const auto snapshot = read();
-              for (size_t slot = 0; slot < snapshot.devices.size(); ++slot) {
-                const auto& device = snapshot.devices[slot];
-                if (device.family == controller_relay::family_of(src.kind) && device.index == src.index) {
-                  source = "relayed slot " + std::to_string(slot + 1);
-                  break;
-                }
+    // After chord suppression (and offline capture): console capture is applied at console_hardware.
+    for (int i = 0; i < 4; ++i) {
+      const auto& p = pads[i];
+      const auto src = feeding[i];
+      std::string source = "none";
+      if (p.err == 0 && !input_script_active()) {
+        if (src.kind == DeviceKind::Keyboard) source = "keyboard";
+        else if (src.kind == DeviceKind::GCAdapter) source = "adapter";
+        else if (src.kind != DeviceKind::None) {
+          source = "sdl";
+          // The mixed relay slot differs from the index within a controller family.
+          const auto read = controller_relay::reader.load(std::memory_order_acquire);
+          if (read && (src.kind != DeviceKind::HidPad || relay_owns_hid())) {
+            const auto snapshot = read();
+            for (size_t slot = 0; slot < snapshot.devices.size(); ++slot) {
+              const auto& device = snapshot.devices[slot];
+              if (device.family == controller_relay::family_of(src.kind) && device.index == src.index) {
+                source = "relayed slot " + std::to_string(slot + 1);
+                break;
               }
             }
           }
         }
-        yougame::agent_test::pad_trace.poll(i, {p.button, p.stick_x, p.stick_y, p.sub_x, p.sub_y,
-                                               p.trig_l, p.trig_r, p.err, source});
       }
-#endif
+      yougame::agent_test::pad_trace.poll(i, {p.button, p.stick_x, p.stick_y, p.sub_x, p.sub_y,
+                                             p.trig_l, p.trig_r, p.err, source});
     }
-  } ui{out};
+#endif
+  }
+};
+
+void input_poll(PadState out[4]) {
+  controller_relay::GamePoll relay_poll;
+  perf::Scope work_cost(perf::Stage::Input);
+  struct InputCost { double start = now_seconds(); ~InputCost() { sim_cost_add(SIM_INPUT, now_seconds() - start); } } input_cost;
+  UiSnapshot ui{out};
   if (TickTiming& tick = tick_timing(); tick.pad == 0) tick.pad = now_seconds();
   early_input::note_poll();   // before the read: a change after this point is the next frame's
   for (int i = 0; i < 4; ++i) { std::memset(&out[i], 0, sizeof out[i]); out[i].err = -1; }
@@ -1903,10 +1930,13 @@ void input_poll(PadState out[4]) {
   InputDebugSnapshot debug{};
   {
     std::lock_guard<std::mutex> devices(g_devices_mutex);
-    read_devices(out, debug, true);
+    read_devices(out, debug, true, &ui.keyboard_navigation);
   }
   ui.gamecube = debug.gc_mask != 0;
   const auto takeover = route_takeover(out);
+  for (int i = 0; i < 4; ++i)
+    ui.keyboard_ports[i] = debug.feeding[i].kind == DeviceKind::Keyboard;
+  if (takeover.first >= 0) ui.keyboard_ports[takeover.first] = ui.keyboard_ports[takeover.second];
 #ifdef YOUGAME_AGENT_TEST_HOOK
   for (int i = 0; i < 4; ++i) ui.feeding[i] = debug.feeding[i];
   if (takeover.first >= 0) ui.feeding[takeover.first] = debug.feeding[takeover.second];
@@ -1940,15 +1970,27 @@ void input_read_devices(PadState out[4]) {
 }
 
 void input_read_console_devices(PadState out[4]) {
+  controller_relay::GamePoll relay_poll; // same one-snapshot boundary as offline PADRead
+  UiSnapshot ui{out};
+  ui.console = true;
   InputDebugSnapshot debug{};
-  std::lock_guard<std::mutex> devices(g_devices_mutex);
   for (int i = 0; i < 4; ++i) { out[i] = {}; out[i].err = -1; }
-  read_devices(out, debug, false);
+  {
+    std::lock_guard<std::mutex> devices(g_devices_mutex);
+    read_devices(out, debug, true, &ui.keyboard_navigation, true);
+  }
+  ui.gamecube = debug.gc_mask != 0;
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  for (int i = 0; i < 4; ++i) ui.feeding[i] = debug.feeding[i];
+#endif
   bool controller = false;
   for (int i = 0; i < 4; ++i)
     controller |= out[i].err == 0 && debug.feeding[i].kind != DeviceKind::Keyboard;
   if (controller) for (int i = 0; i < 4; ++i)
     if (debug.feeding[i].kind == DeviceKind::Keyboard) { out[i] = {}; out[i].err = -1; }
+  for (int i = 0; i < 4; ++i)
+    ui.keyboard_ports[i] = out[i].err == 0 && debug.feeding[i].kind == DeviceKind::Keyboard;
+  { std::lock_guard<std::mutex> lock(g_last_pads_mutex); for (int i = 0; i < 4; ++i) g_last_pads[i] = out[i]; }
 }
 
 bool input_script_active() {
@@ -2106,7 +2148,7 @@ void input_debug_snapshot(InputDebugSnapshot& snapshot) {
 #endif
       return g_keys[vk];
     };
-    snapshot.keyboard_actions = keyboard_apply_bindings(kb, key, g_box_keyboard[1]);
+    snapshot.keyboard_actions = keyboard_apply_bindings(kb, g_key_bindings, key, g_box_keyboard[1], g_stick_modifier_percent);
   }
 
   PadState xin[4];

@@ -32,7 +32,10 @@ enum { MU_YG_PRACTICE_STOP, MU_YG_PRACTICE_START,
 enum { MU_YG_RESULT_NONE, MU_YG_RESULT_RECORDING, MU_YG_RESULT_RECORDED,
        MU_YG_RESULT_UNRATED, MU_YG_RESULT_ERROR };
 enum { MU_YG_REASON_NONE, MU_YG_REASON_PACK, MU_YG_REASON_VOID,
-       MU_YG_REASON_OTHER, MU_YG_REASON_UNAVAILABLE, MU_YG_REASON_MALFORMED };
+       MU_YG_REASON_OTHER, MU_YG_REASON_UNAVAILABLE, MU_YG_REASON_MALFORMED,
+       /* RECORDED only: the room gave the set by a leave (disposition "forfeit"), to this seat
+        * or to the other one. Appended: older games ignore a RECORDED result's reason. */
+       MU_YG_REASON_FORFEIT_WON, MU_YG_REASON_FORFEIT_LOST };
 
 /* ALL wire integers are big endian, signed integers are two's complement. These
  * C structs are decoded values, NEVER memcpy'd onto the wire (no ABI padding).

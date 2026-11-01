@@ -178,9 +178,7 @@ static struct {
  * keeps the bottom edge where it was. */
 enum { REVEAL_X = -120, REVEAL_Y = 18, REVEAL_W = 430, REVEAL_H = 146,
        REVEAL_LABEL_X = -42, REVEAL_LABEL_Y = 78, REVEAL_BADGE_Y = 66, REVEAL_RATING_Y = 104 };
-/* The SIS encoder has no ASCII '+' (it reads it as half of a two-byte character and drops it);
- * the font has the full-width plus. */
-#define REVEAL_PLUS "\x81\x7B"
+#define REVEAL_PLUS MU_RANK_PLUS /* mu_rank_text.h: the SIS encoder has no ASCII '+' */
 static float reveal_x(float x) { return x * .1f; }
 static float reveal_y(float y) { return y * .1f; }
 
@@ -220,8 +218,7 @@ static void reveal_close(void)
 
 static void reveal_label(HSD_Text* t, const MuYgRank* rank, float offset, float scale, float alpha)
 {
-    static const unsigned rgb[] = {0xb5c0cd, 0xc98a5b, 0xb5c0cd, 0xf0c040, 0x5fd8c8, 0x8cc8ff, 0xffc857};
-    unsigned c = rgb[rank->tier <= 6 ? rank->tier : 0];
+    unsigned c = mu_rank_text_rgb(rank->tier);
     GXColor color = {c >> 16, c >> 8, c, (unsigned char)(alpha*255)};
     char label[32];
     if (!t) return;

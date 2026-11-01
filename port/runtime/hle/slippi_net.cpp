@@ -12,6 +12,7 @@
 #include "yougame_mode_policy.h"
 #include "yougame_friends.h"
 #include "yougame_blend.h"
+#include "yougame_slippi_link.h"
 #include "yougame_update.h"
 #include "yougame_search.h"
 #ifdef YOUGAME_AGENT_TEST_HOOK
@@ -1476,7 +1477,8 @@ void Matchmaking::startMatchmaking() {
     const bool slippi_mode = yougame::mode_policy::slippi_menu_mode(
         search_settings_.mode, !search_settings_.friend_room.empty());
     if ((slippi_mode || (unranked && vanilla)) && user_)
-      slippi_user_ = User::GrantedSlippiUser(user_->dir());
+      if (!yougame::slippi_linking::presentation.later)
+        slippi_user_ = User::GrantedSlippiUser(user_->dir());
     // Account I/O may finish after the player cancelled and began a replacement search.
     // Do not announce, change state, or reserve a generation on behalf of that old worker.
     if (is_mm_terminated_ || state_ != INITIALIZING) return;

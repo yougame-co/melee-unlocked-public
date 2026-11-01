@@ -22,5 +22,5 @@ bool active();
 // stage select screen). Any thread may set it; the UI thread draws it.
 namespace screen_label {
 void show(const char* text, double seconds);
-void draw(float width, float height);
+void draw(float width, float height, float game_aspect = 73.0f / 60.0f);
 }  // namespace screen_label

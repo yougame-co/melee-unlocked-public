@@ -4,8 +4,11 @@
 #include "yougame_console_link.h"
 #include "yougame_console_engine.h"
 #include "yougame_console_entry.h"
+#include "yougame_console_card.h"
 #include "yougame_agent_test.h"
+#include "yougame_update.h"
 #include <cstdio>
+#include <set>
 #include <cstdlib>
 #include <future>
 #include <atomic>
@@ -446,6 +449,41 @@ static void common_end_reason() {
   a.push({{"t","sessionEnded"},{"sessionId",ca.session_id},{"port",2},{"reason","left"}}); la->pump(0); CHECK(la->lost());
   b.push({{"t","msg"},{"from","c0"},{"d",a.messages.back()["d"]}}); lb->pump(0); CHECK(lb->lost() == la->lost());
 }
+// The desktop app's consoleSession check (YouGame desktop/src/console-session.ts consoleSessionError,
+// apps up to 0.13.1225: exactly these 8 fields; 1226 adds an optional cardDigest) and bridge.ts's
+// relaunch envelope (exactly {type, request}, at most 1024 bytes). A dropped relaunch hangs Friends.
+static std::string app_console_session_error(const json& r) {
+  static const std::set<std::string> fields = {"type","room","sessionId","port","players","seed","epochMs","inputDelay"};
+  if (!r.is_object()) return "request";
+  for (auto it = r.begin(); it != r.end(); ++it) if (!fields.count(it.key())) return "fields";
+  auto integer = [&](const char* k) { return r.count(k) && r[k].is_number_integer(); };
+  if (str(r,"type") != "consoleSession") return "type";
+  const auto room = str(r,"room");
+  if (room.size() < 4 || room.size() > 16 || room.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789") != std::string::npos) return "room";
+  const auto id = str(r,"sessionId");
+  if (id.empty() || id.size() > 64 || id.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") != std::string::npos) return "sessionId";
+  if (!integer("players") || r["players"].get<int64_t>() < 2 || r["players"].get<int64_t>() > 4) return "players";
+  if (!integer("port") || r["port"].get<int64_t>() < 1 || r["port"].get<int64_t>() > r["players"].get<int64_t>()) return "port";
+  const auto seed = str(r,"seed");
+  if (seed.size() != 16 || seed.find_first_not_of("0123456789abcdef") != std::string::npos) return "seed";
+  if (!integer("epochMs") || r["epochMs"].get<int64_t>() < 0) return "epochMs";
+  if (!integer("inputDelay") || r["inputDelay"].get<int64_t>() < 1 || r["inputDelay"].get<int64_t>() > 8) return "inputDelay";
+  return {};
+}
+static void app_launch_contract() {
+  for (const bool shared : {true,false}) for (const size_t players : {size_t(2),size_t(4)}) {
+    ++cases;
+    SessionConfig c; c.room = "ABCDEF"; c.session_id = "b1c99ca4-63b7-4502-969e-c74c8b547c7a"; c.my_port = 2;
+    c.ports.clear(); for (size_t p = 1; p <= players; ++p) c.ports.push_back(int(p));
+    c.seed = 0x0123456789abcdefull; c.epoch_ms = 1793443200123LL; c.input_delay = 2;
+    if (shared) c.card_digest = std::string(64,'a');
+    const auto launch = session_launch(c);
+    CHECK(app_console_session_error(launch).empty());
+    const auto relaunch = relaunch_message(c);
+    CHECK(relaunch.size() == 2 && relaunch.count("type") && relaunch.count("request") && relaunch.dump().size() <= 1024);
+    CHECK(app_console_session_error(relaunch["request"]).empty());
+  }
+}
 static void final_rooms_contract() {
   ++cases;
   Fixture f; SessionConfig c; auto link = f.start(c);
@@ -510,6 +548,31 @@ static void boot_liveness() {
   ++f.now; link->pump(0); CHECK(link->lost() == kBootTimeout);
   CHECK(f.now-began == 60000);
   CHECK(f.logs.back() == std::string("console: session ended: ")+kBootTimeout);
+}
+// No Engine/body pump: these calls model the transport worker while gameplay is at 5 fps.
+static void watchdog_receive_clock() {
+  ++cases; Fixture f; SessionConfig c; auto link = f.start(c);
+  link->send_digest(0,42);
+  auto heartbeat = f.sent.back().second; heartbeat[1] = 2;
+  heartbeat[12] = heartbeat[13] = heartbeat[14] = heartbeat[15] = 255;
+  f.inbox.emplace_back(2,heartbeat); link->pump(0);
+  CHECK(!link->lost());
+  // Receiving at 5 Hz keeps the transport alive, regardless of simulation progress.
+  for (int frame = 0; frame < 40; ++frame) {
+    f.now += 200; f.inbox.emplace_back(2,heartbeat); link->pump(0); CHECK(!link->lost());
+  }
+  // A nearly-five-second foreground gap does not end a peer that just sent again.
+  f.now += 4999; f.inbox.emplace_back(2,heartbeat); link->pump(0); CHECK(!link->lost());
+  f.now += 4999; link->pump(0); CHECK(!link->lost());
+  ++f.now; link->pump(0); CHECK(link->lost() == "your friend disconnected");
+  const auto diagnostic = "console: port 2 silent 5000 ms (last heard frame 0): no receive for 5 s";
+  CHECK(std::count(f.logs.begin(),f.logs.end(),diagnostic) == 1);
+  CHECK(f.logs[f.logs.size()-2] == diagnostic);
+  CHECK(f.logs.back() == "console: session ended: your friend disconnected");
+  // Explicit close names a different cause and does not wait for the silence threshold.
+  Fixture closed; auto other = closed.start(c); closed.state = 3; other->pump(0);
+  CHECK(other->lost() == "your friend disconnected");
+  CHECK(closed.logs[closed.logs.size()-2].find("transport closed") != std::string::npos);
 }
 static void background_boot_service() {
   ++cases; Fixture f; SessionConfig c; std::string error;
@@ -837,6 +900,195 @@ static void latency(bool measure_only) {
   for (const auto& f : fixtures) for (const auto& line : f->logs)
     if (line.find("console: port ") == 0) std::printf("%s\n",line.c_str());
 }
+// 11-01: a throw before the seat wait logged only "link setup threw". The log now names the stage and the
+// exception category (never its text, which can carry a ticket).
+static void setup_throw_names_step() {
+  struct Case { const char* type; int kind; const char* line; };
+  for (const Case k : {Case{"mpTicket",0,"console: setup threw at ticket (runtime_error)"},
+                       Case{"mpTicket",1,"console: setup threw at ticket (update_required)"},
+                       Case{"mpTicket",2,"console: setup threw at ticket (json)"},
+                       Case{"mpTicket",3,"console: setup threw at ticket (other)"}}) {
+    ++cases; Fixture f; auto io = f.io();
+    const auto request = io.request;
+    io.request = [&](const json& q,int ms) -> json {
+      if (str(q,"type") == k.type) {
+        if (k.kind == 0) throw std::runtime_error("refused: secret-ticket-text");
+        if (k.kind == 1) throw yougame::update::Required();
+        if (k.kind == 2) return json::array().at(3);
+        throw 7;
+      }
+      return request(q,ms);
+    };
+    SessionConfig c; std::string error;
+    CHECK(!start_session(f.input(),c,error,std::move(io)));
+    CHECK(error == (k.kind == 1 ? std::string(yougame::update::kMessage) : std::string("couldn't connect to your friend")));
+    CHECK(std::count(f.logs.begin(),f.logs.end(),std::string(k.line)) == 1);
+    CHECK(std::count(f.logs.begin(),f.logs.end(),std::string("console: update required")) == (k.kind == 1 ? 1 : 0));
+    CHECK(std::none_of(f.logs.begin(),f.logs.end(),[](const std::string& s) { return s.find("secret-ticket-text") != std::string::npos; }));
+  }
+  ++cases; Fixture a; auto io = a.io();
+  io.attach = [](int) -> bool { throw std::runtime_error("attach"); };
+  SessionConfig c; std::string error;
+  CHECK(!start_session(a.input(),c,error,std::move(io)));
+  CHECK(std::count(a.logs.begin(),a.logs.end(),std::string("console: setup threw at attach (runtime_error)")) == 1);
+}
+static Bytes save_fixture() {
+  Bytes bytes(64+11*8192,0x5a);
+  std::copy_n("GALE01",6,bytes.begin());
+  std::fill(bytes.begin()+8,bytes.begin()+40,0);
+  std::copy_n("SuperSmashBros0110290334",24,bytes.begin()+8);
+  bytes[0x38] = 0; bytes[0x39] = 11;
+  return bytes;
+}
+static void card_transfers() {
+  const auto save = save_fixture(); CHECK(melee_gci(save));
+  CHECK(card_sha(Bytes{'a','b','c'}) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  const auto digest = card_sha(save);
+  const auto root = std::filesystem::current_path() / ("round37-card-test-"+std::to_string(
+      std::chrono::steady_clock::now().time_since_epoch().count()));
+  std::filesystem::create_directory(root);
+  auto prepared = [&](const SessionConfig& c) {
+    CHECK(c.card_bytes == save && c.card_digest == digest);
+    std::filesystem::path card;
+    CHECK(prepare_card(root,c,card));
+    std::ifstream in(card / "GALE01-SuperSmashBros0110290334.gci",std::ios::binary);
+    Bytes written((std::istreambuf_iterator<char>(in)),{}); CHECK(written == save);
+    CHECK(!prepare_card(root,c,card)); // never reuse the prepared directory
+  };
+  ++cases;
+  Fixture host; auto io = host.io(); bool handed = false, flushed = false;
+  io.host_save = [&] { return save; };
+  io.persist_card = [&](const SessionConfig& c) { return stage_card(root,c); };
+  io.flush_room = [&](int ms) { CHECK(ms > 0); flushed = true; return true; };
+  io.wait = [](int) { CHECK(false); }; // no datagram helper exists in the waiting process
+  io.prepared = [&](const SessionConfig& c) { CHECK(flushed); prepared(c); handed = true; };
+  host.start_delay = 2;
+  host.alter_start = [&](json& s) { s["console"]["cardDigest"] = digest; };
+  auto request = host.input(); request["inputDelay"] = 2;
+  SessionConfig config; std::string error;
+  CHECK(!start_session(request,config,error,std::move(io))); CHECK(handed && error.empty());
+  Bytes sent; size_t chunks = 0;
+  for (const auto& m : host.messages) {
+    if (str(m,"t") == "begin") { CHECK(m["inputDelay"] == 2); CHECK(m["cardDigest"] == digest); }
+    if (str(m,"t") != "msg" || str(m["d"],"kind") != "mu-card") continue;
+    CHECK(m.dump().size() < 16*1024 && m["to"] == "c1");
+    CHECK(m["d"]["match"] == "session-fixed" && m["d"]["v"] == 1);
+    CHECK(m["d"]["i"] == chunks && m["d"]["n"] == (save.size()+kCardChunk-1)/kCardChunk);
+    Bytes bytes; CHECK(card_decode(m["d"]["data"],bytes)); CHECK(bytes.size() <= 12*1024);
+    sent.insert(sent.end(),bytes.begin(),bytes.end()); ++chunks;
+  }
+  CHECK(chunks > 1 && sent == save);
+  CHECK(std::count(host.logs.begin(),host.logs.end(),"console: card sent "+std::to_string(chunks)+" chunks sha "+digest.substr(0,8)) == 1);
+  SessionConfig restored; restored.session_id = "session-fixed"; restored.card_digest = digest;
+  CHECK(load_card(root,restored) && restored.card_bytes == save);
+  CHECK(!stage_card(root,restored)); // no overwrite through a repeated handoff
+  auto launch = session_launch(restored); json parsed;
+  launch["room"] = "ABCDEF"; launch["port"] = 1; launch["players"] = 2; launch["epochMs"] = 1793443200123LL; launch["inputDelay"] = 2;
+  // The app relays exactly its eight consoleSession fields; the rejoin takes cardDigest from the frozen start.
+  CHECK(session_launch(restored).size() == 8 && !session_launch(restored).count("cardDigest"));
+  CHECK(parse_request(launch,parsed) && !parsed.count("cardDigest"));
+
+  // An unusable host save never refuses START: no cardDigest, no chunks, a default-card start.
+  for (const Bytes& bad : {Bytes{}, Bytes(100,0)}) {
+    ++cases;
+    Fixture plain; auto pio = plain.io(); bool started = false; int reads = 0;
+    pio.host_save = [&] { ++reads; return bad; };
+    pio.prepared = [&](const SessionConfig& c) { CHECK(c.card_digest.empty() && c.card_bytes.empty()); started = true; };
+    plain.start_delay = 2;
+    auto plain_request = plain.input(); plain_request["inputDelay"] = 2;
+    SessionConfig plain_config; std::string plain_error;
+    CHECK(!start_session(plain_request,plain_config,plain_error,std::move(pio))); CHECK(started && plain_error.empty());
+    CHECK(reads == 1);
+    for (const auto& m : plain.messages) {
+      if (str(m,"t") == "begin") CHECK(!m.count("cardDigest"));
+      CHECK(!(m.count("d") && m["d"].is_object() && str(m["d"],"kind") == "mu-card"));
+    }
+    const auto want = "console: couldn't share the host's save (" + std::to_string(bad.size()) + " bytes); every seat starts with default unlocks";
+    CHECK(std::count(plain.logs.begin(),plain.logs.end(),want) == 1);
+    CHECK(std::count(plain.logs.begin(),plain.logs.end(),std::string("console: no shared save in the start; this seat starts with default unlocks")) == 1);
+  }
+
+  ++cases;
+  Fixture rejoin; rejoin.start_delay = 2; rejoin.session = "session-fixed";
+  auto resume = rejoin.io(); bool loaded = false;
+  resume.host_save = []() -> Bytes { CHECK(false); return {}; };
+  resume.restore_card = [&](SessionConfig& c) { loaded = true; return load_card(root,c); };
+  const auto next_resume = resume.next_room;
+  resume.next_room = [&](json& m,int ms) {
+    const bool got = next_resume(m,ms);
+    if (got && m.count("room") && m["room"].count("console")) m["room"]["console"]["cardDigest"] = digest;
+    return got;
+  };
+  launch["seed"] = "fedcba9876543210";
+  auto resumed = start_session(launch,config,error,std::move(resume));
+  CHECK(resumed && error.empty() && loaded && config.card_bytes == save);
+  CHECK(std::none_of(rejoin.messages.begin(),rejoin.messages.end(),[](const json& m) {
+    return str(m,"t") == "begin" || (m.count("d") && str(m["d"],"kind") == "mu-card");
+  }));
+
+  // Good out-of-order delivery and duplicate; then missing, corrupt, excessive count/total,
+  // malformed index/base64, absent digest, room closure, cancellation and write failure.
+  for (int mode = 0; mode < 13; ++mode) {
+    ++cases; Fixture guest(2,1); auto g = guest.io(); bool ready = false, persisted = false;
+    g.host_save = []() -> Bytes { CHECK(false); return {}; }; // guest never reads its own save
+    const auto next = g.next_room; bool injected = false;
+    const auto id = "guest-"+std::to_string(mode);
+    g.next_room = [&](json& m,int ms) {
+      const bool got = next(m,ms);
+      if (got && m.count("console")) {
+        m["console"]["sessionId"] = id; m["matchId"] = id;
+        if (mode != 8) m["console"]["cardDigest"] = mode == 2 ? std::string(64,'0') : digest;
+        if (!injected) {
+          injected = true;
+          const size_t count = mode == 4 ? (kCardLimit+kCardChunk-1)/kCardChunk : chunks;
+          for (size_t n = count; n-- > 0;) {
+            if (mode == 1 && n == 0) continue;
+            const size_t offset = mode == 4 ? 0 : n*kCardChunk;
+            json d = {{"kind","mu-card"},{"v",1},{"match",id},{"i",n},{"n",count},
+                {"data",card_encode(save.data()+offset,std::min(kCardChunk,save.size()-offset))}};
+            if (mode == 3) d["n"] = 99999;
+            if (mode == 5) d["i"] = count;
+            if (mode == 6) d["data"] = "%%%=";
+            if (mode == 7) d["data"] = std::string(20000,'A');
+            if (mode == 9) continue; // completely absent: 20 s timeout
+            guest.push({{"t","msg"},{"from","c0"},{"d",d}});
+            if (mode == 0) guest.push({{"t","msg"},{"from","c0"},{"d",d}});
+          }
+        }
+      }
+      return got;
+    };
+    g.persist_card = [&](const SessionConfig& c) {
+      persisted = true;
+      if (mode == 12) return false;
+      return stage_card(root,c);
+    };
+    g.prepared = [&](const SessionConfig& c) {
+      if (mode == 8) CHECK(c.card_digest.empty() && c.card_bytes.empty()); else prepared(c);
+      ready = true;
+    };
+    if (mode == 10) g.room_closed = [&] { return injected; };
+    if (mode == 11) g.cancelled = [&] { return injected; };
+    CHECK(!start_session(guest.input(),config,error,std::move(g)));
+    if (mode == 0) { CHECK(ready && persisted && error.empty()); }
+    else if (mode == 8) { CHECK(ready && !persisted && error.empty()); } // no digest: default card, no transfer
+    else {
+      CHECK(!ready); CHECK(error == (mode == 11 ? "cancelled" : kCardFailure));
+      CHECK(persisted == (mode == 12));
+      if (mode == 1 || mode == 9) {
+        CHECK(guest.now >= 20001 && guest.now <= 20051);
+        CHECK(std::any_of(guest.logs.begin(),guest.logs.end(),[](const std::string& s) { return s.find("chunks sha ") != std::string::npos && s.find(" timeout") != std::string::npos; }));
+      }
+      if (mode == 2) CHECK(std::any_of(guest.logs.begin(),guest.logs.end(),[](const std::string& s) { return s.find(" mismatch") != std::string::npos; }));
+    }
+  }
+  ++cases;
+  Fixture doubles(4); auto four = doubles.io();
+  four.host_save = []() -> Bytes { CHECK(false); return {}; };
+  auto link = start_session(doubles.input(),config,error,std::move(four)); CHECK(link && error.empty());
+  CHECK(config.ports == std::vector<int>({1,2,3,4}));
+  for (const auto& m : doubles.messages) if (str(m,"t") == "begin") CHECK(!m.count("cardDigest") && m["inputDelay"] == 3);
+}
 int main(int argc,char** argv) {
   if (argc > 1 && std::string(argv[1]) == "--pacing") {
     ack_and_pacing(argc > 2 && std::string(argv[2]) == "--measure"); return 0;
@@ -845,9 +1097,15 @@ int main(int argc,char** argv) {
     latency(argc > 2 && std::string(argv[2]) == "--measure");
     std::printf("yougame_console_latency: %d cases, %d checks passed\n",cases,checks.load()); return 0;
   }
+  if (argc > 1 && std::string(argv[1]) == "--watchdog") {
+    watchdog_receive_clock(); background_boot_service();
+    std::printf("console watchdog: %d cases, %d checks passed\n",cases,checks.load()); return 0;
+  }
+  watchdog_receive_clock();
+  card_transfers();
   ack_and_pacing(false);
-  boot_liveness(); background_boot_service(); interruption_shapes(); relaunch_no_leave(); final_rooms_contract(); rejoin(); routes_and_delay(); human_room_start(); real_delay_mesh();
+  boot_liveness(); background_boot_service(); interruption_shapes(); relaunch_no_leave(); app_launch_contract(); final_rooms_contract(); rejoin(); routes_and_delay(); human_room_start(); real_delay_mesh();
   intake(); starts(); agent_create_join(); host_waits_for_seats(); failure_cases(); invalid_start(); mesh(2,false); mesh(2,true); mesh(4,true); departures_and_waits(); common_end_reason();
-  sparse_starts(); sparse_invalid_rosters(); sparse_relaunch(); sparse_peer_logs();
+  sparse_starts(); sparse_invalid_rosters(); sparse_relaunch(); sparse_peer_logs(); setup_throw_names_step();
   std::printf("yougame_console_link: %d cases, %d checks passed\n",cases,checks.load());
 }

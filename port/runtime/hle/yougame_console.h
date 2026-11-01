@@ -24,6 +24,8 @@ struct SessionConfig {
   uint64_t seed = 0;            // Game RNG seed at frame 0.
   int64_t epoch_ms = 0;         // The boot clock every machine starts from (rooms' start time).
   int input_delay = 3;          // Frames between sampling a pad and the frame that uses it.
+  std::string card_digest;      // Frozen SHA-256 of the host Melee GCI.
+  std::vector<uint8_t> card_bytes; // Verified host copy, carried only inside this process.
   std::string settings_digest;  // Host settings hash (sha256 hex); empty until settings sync exists.
 };
 

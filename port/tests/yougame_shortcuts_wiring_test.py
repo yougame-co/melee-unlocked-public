@@ -117,7 +117,7 @@ class ShortcutsWiringTest(unittest.TestCase):
         self.assertIn('yougame::parity::kSettingsHint : "F1, or Start + D-pad Down + Z on a GameCube controller, opens settings."', settings)
         self.assertIn('yougame::parity::kSettingsHint : "Settings: F1  /  START + DOWN + Z"', settings)
         # Keep the separate app/menu hint used after matches.
-        self.assertIn('kMenuHint = "Escape / YouGame menu (D-pad + Start)"', parity)
+        self.assertIn('kMenuHint = "Shift+Tab / YouGame menu (D-pad + Start)"', parity)
 
     def test_slippi_report_logs_only_error_count(self):
         report = source("port/runtime/hle/slippi_report.cpp")

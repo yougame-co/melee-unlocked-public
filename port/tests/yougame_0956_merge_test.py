@@ -39,7 +39,9 @@ class YouGame0956MergeTest(unittest.TestCase):
     def test_yougame_menu_routing_survives_activation_merge(self):
         window = source("port/runtime/host/window.cpp")
         routing = window.split("if (yougame::stdio_bridge()) {", 1)[1].split("} else {", 1)[0]
-        self.assertIn('yougame::relay_key("escape")', routing)
+        # Escape now routes before ImGui; F1 retains the merged game's menu action.
+        self.assertIn('yougame::parity::embedded_escape(', window[:window.index('if (g_on_message &&')])
+        self.assertIn('else { relay("escape"); back(); }', source("port/runtime/hle/yougame_parity.h"))
         self.assertIn("if (w == VK_F1 && !(l & (1 << 30))) g_escape_press.store(true);", routing)
         self.assertIn('const char* window_menu_key() { return yougame::stdio_bridge() ? yougame::parity::kMenuHint : "Esc"; }', window)
         self.assertIn("bool window_take_escape() { return g_escape_press.exchange(false); }", window)

@@ -1,5 +1,7 @@
 #include "yougame_console_engine.h"
 #include "native_savestate.h"
+#include "yougame_console_menu.h"
+#include "yougame_console_card.h"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -27,7 +29,7 @@ struct Bus {
   std::map<uint32_t, MuPadStatus> pads[4];
   std::map<uint32_t, uint64_t> digests[4];
   int sends[4]{};
-  bool drop = false, lost = false, corrupt = false;
+  bool drop = false, lost = false, corrupt = false, echo_digest = false;
   uint64_t release = 0, now = 0;
   unsigned pumps = 0, responsive = 0;
 };
@@ -40,7 +42,7 @@ struct Loopback : SessionLink {
     const auto it = bus.pads[p - 1].find(f);
     return it == bus.pads[p - 1].end() ? std::nullopt : std::optional<MuPadStatus>(it->second);
   }
-  void send_digest(uint32_t f, uint64_t d) override { bus.digests[mine][f] = d; }
+  void send_digest(uint32_t f, uint64_t d) override { bus.digests[mine][f] = d; if (bus.echo_digest) bus.digests[1-mine][f] = d; }
   std::optional<uint64_t> digest(int p, uint32_t f) override {
     const auto it = bus.digests[p - 1].find(f);
     if (it == bus.digests[p - 1].end()) return {};
@@ -406,6 +408,45 @@ void missing_digest() {
   CHECK(!a.advance(hardware(1), {})); CHECK(!a.active());
   CHECK(logs.back() == "console: session ended: state digest timed out");
 }
+void menu_hint_and_stalls() {
+  ++cases;
+  for (bool lockstep : {false,true}) for (bool rollback : {false,true})
+    for (unsigned major : {1u,2u,8u,0x10u}) for (unsigned minor : {0u,1u,2u,3u})
+      for (size_t count : {2u,4u})
+        CHECK(honest_menu(lockstep,rollback,count,major,minor) ==
+              (lockstep && rollback && count == 2 && (major == 2 || major == 0x10) && minor <= 1));
+  CHECK(std::string(kMenuHint) == "Menus are delay-based for now. Matches use rollback.");
+  MenuHintAnimation hint;
+  CHECK(hint.alpha(false,1) == 0); CHECK(hint.alpha(true,2) == 0);
+  CHECK(hint.alpha(true,2.1) > 0 && hint.alpha(true,2.1) < 1);
+  CHECK(hint.alpha(true,2.75) > hint.alpha(true,2.375));
+  CHECK(hint.alpha(true,3.49) > hint.alpha(true,3.125));
+  CHECK(hint.alpha(true,3.5) == 1); CHECK(hint.alpha(false,4) == 0);
+  CHECK(hint.alpha(true,5) == 1); // repeated CSS entry never pulses again
+  ++cases;
+  Bus bus; Engine a; std::vector<std::string> logs, notices;
+  CHECK(a.begin(std::make_unique<Loopback>(bus,1),config(1,2),hooks(bus,logs,notices)));
+  bus.echo_digest = true;
+  CHECK(a.menus_lockstep());
+  auto run = [&](unsigned f,uint64_t at,uint64_t wait) {
+    bus.now = at; bus.release = at+wait; bus.pads[1][f] = {};
+    CHECK(a.advance(hardware(f),{}));
+  };
+  // Nonzero start avoids the rollback-tagged frame-zero digest from being checked here.
+  run(0,1,25);
+  run(1,30001,0); run(2,60001,40);
+  CHECK(std::count(logs.begin(),logs.end(),"console: menu stalls 2/min (longest 40 ms, delay 2)") == 1);
+  run(3,61001,0);
+  CHECK(std::count_if(logs.begin(),logs.end(),[](const std::string& s) { return s.find("console: menu stalls ") == 0; }) == 1);
+  run(4,120041,0);
+  CHECK(std::count(logs.begin(),logs.end(),"console: menu stalls 0/min (longest 0 ms, delay 2)") == 1);
+  CHECK(a.begin_match()); CHECK(!a.menus_lockstep());
+  run(5,180001,0);
+  CHECK(std::count_if(logs.begin(),logs.end(),[](const std::string& s) { return s.find("console: menu stalls ") == 0; }) == 2);
+  a.end_match(); CHECK(a.menus_lockstep());
+  run(6,240001,0); // a fresh menu window, excluding match time
+  CHECK(std::count_if(logs.begin(),logs.end(),[](const std::string& s) { return s.find("console: menu stalls ") == 0; }) == 2);
+}
 void card(const std::filesystem::path& root) {
   ++cases;
   auto data = root / ("console-engine-test-" + std::to_string(
@@ -444,7 +485,7 @@ int main(int argc, char** argv) {
     timeout_and_loss(false); timeout_and_loss(true); desync(); inert();
     sparse_ports_and_delay(); four_players(); reentrant_close(); missing_digest();
     retained_inputs(); terminal_wait_failure(); rollback_switches(); legacy_digest_layout();
-    rollback_test::all();
+    rollback_test::all(); menu_hint_and_stalls();
     if (argc > 1) card(argv[1]);
     std::cout << cases << " cases, " << assertions << " assertions passed\n"; return 0;
   } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }

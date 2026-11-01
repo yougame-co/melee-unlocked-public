@@ -12,12 +12,14 @@
 #include "yougame_agent_rumble.h"
 #include "yougame_ux.h"
 #include "yougame_friends.h"
+#include "yougame_slippi_link.h"
 #include "yougame_compatibility.h"
 #include "slippi_online.h"
 #include "yougame_exit_reason.h"
 #include "yougame_ranked.h"
 #include "yougame_room.h"
 #include "yougame_console_link.h"
+#include "yougame_console_card.h"
 #include "yougame_console_entry.h"
 #include "yougame_update.h"
 #include "yougame_blend.h"
@@ -520,7 +522,11 @@ json bridge_http(const json& body, int timeout_ms, const std::function<bool()>& 
   return j;
 }
 
+// The site's refusal code from this thread's last not-ok bridge() answer (letters and _ only, <= 24), empty when
+// the last call threw for another reason (no answer, cancelled). For logs that must never carry the error text.
+thread_local std::string g_bridge_refusal;
 json bridge(const json& body, int timeout_ms = 15000, const std::function<bool()>& cancelled = {}) {
+  g_bridge_refusal.clear();
   search_policy::BusyRetry local_retry;
   auto& retry = g_ticket_retry ? *g_ticket_retry : local_retry;
   json j;
@@ -530,6 +536,7 @@ json bridge(const json& body, int timeout_ms = 15000, const std::function<bool()
     // The app forwards the site's code, including HTTP 409. Text/status alone never gates a build.
     const auto& refused = update::refusal(j);
     if (update::required(refused)) {
+      g_bridge_refusal = "update_required";
       if ((cancelled && cancelled()) || search_stopped()) throw std::runtime_error("Cancelled");
       if (!search_stopped()) {
         g_update_notice.refuse();
@@ -549,10 +556,15 @@ json bridge(const json& body, int timeout_ms = 15000, const std::function<bool()
       j.count("result") && j["result"].is_object() && !ranked::str(j["result"], "room").empty();
   if (cancelled && cancelled() && !assigned) throw std::runtime_error("Cancelled");
   if (!j.value("ok", false)) {
+    g_bridge_refusal = ranked::str(j, "code");
+    if (g_bridge_refusal.empty() || g_bridge_refusal.size() > 24 ||
+        g_bridge_refusal.find_first_not_of("abcdefghijklmnopqrstuvwxyz_") != std::string::npos) g_bridge_refusal = "refused";
     std::string error = j.count("error") && j["error"].is_string() ? j["error"].get<std::string>() : "YouGame request failed";
     throw std::runtime_error(friends::version_request(body) && friends::version_reason(j) ? friends::kVersion :
                              body.value("ranked", false) ? ranked::ticket_error(j) : error);
   }
+  // Linking accepts the documented direct answer as well as the bridge result envelope.
+  if (body.value("type", "") == "slippiLink") return j;
   return j.count("result") ? j["result"] : json::object();
 }
 
@@ -1056,7 +1068,8 @@ std::string compatibility(int mode) {
 #endif
   const auto& build = slippi::online::local_build();
   return compatibility_key(v, build.mod_view, build.fingerprint, build.static_engine,
-                           slippi::online::ranked_rules_digest(mode));
+                           slippi::online::ranked_rules_digest(mode),
+                           compat_tag_with_test_timer(compat_tag, std::getenv("MELEE_ONLINE_TEST_TIMER")));
 }
 
 thread_local bool g_friend_search = false;
@@ -1165,6 +1178,7 @@ struct ConsoleBackend {
   std::mutex mutex;
   std::condition_variable cv;
   std::deque<json> incoming, outgoing;
+  size_t sending = 0; // guarded by mutex; outgoing may be empty while the worker is sending
   ENetSocket datagrams = ENET_SOCKET_NULL;
   int conn = 0;
   std::string session;
@@ -1174,7 +1188,7 @@ struct ConsoleBackend {
     if (!room->open_session("",ticket,code,&error,ms,session)) return false;
     conn = room->connection();
     worker = std::thread([this] {
-      uint64_t ping = now_ms();
+      uint64_t ping = now_ms(), next_card = 0;
       for (;;) {
         json m;
         if (!stop && room->next(m,10)) {
@@ -1184,9 +1198,18 @@ struct ConsoleBackend {
         }
         if (room->closed()) { closed = true; cv.notify_all(); break; }
         std::deque<json> send;
-        { std::lock_guard<std::mutex> lock(mutex); send.swap(outgoing); }
+        { std::lock_guard<std::mutex> lock(mutex); send.swap(outgoing); sending = send.size(); }
         if (now_ms()-ping >= 5000) { send.push_back({{"t","ping"},{"at",now_ms()}}); ping = now_ms(); }
-        for (const auto& value : send) if (!room->send(value)) { closed = true; cv.notify_all(); break; }
+        for (const auto& value : send) {
+          // Pace actual Room sends too: a delayed worker must not burst a queued save over 120/s.
+          if (value.count("d") && value["d"].is_object() && ranked::str(value["d"],"kind") == "mu-card") {
+            const auto now = now_ms();
+            if (now < next_card) std::this_thread::sleep_for(std::chrono::milliseconds(next_card-now));
+            next_card = now_ms()+12;
+          }
+          if (!room->send(value)) { closed = true; cv.notify_all(); break; }
+        }
+        { std::lock_guard<std::mutex> lock(mutex); sending = 0; cv.notify_all(); }
         if (closed || stop) break; // flush queued session-end notices before closing the stream
       }
     });
@@ -1202,6 +1225,12 @@ struct ConsoleBackend {
     std::lock_guard<std::mutex> lock(mutex);
     if (closed || outgoing.size() >= 256) return false;
     outgoing.push_back(m); return true;
+  }
+  bool flush(int ms) {
+    std::unique_lock<std::mutex> lock(mutex);
+    return cv.wait_for(lock,std::chrono::milliseconds(ms),[&] {
+      return closed || (outgoing.empty() && sending == 0);
+    }) && !closed;
   }
   bool attach(int ms) {
     if (ms <= 0) return false;
@@ -1255,11 +1284,25 @@ SessionIO console_io(const std::shared_ptr<ConsoleBackend>& b) {
   SessionIO io;
   // Console boots before the ordinary mod/card scan. Use native Direct's canonical
   // content key in both the waiting game and the fresh boot (no ranked rules).
+  // The suffix is the console session protocol: console2 = the host's save on every seat and a
+  // straight-to-VS boot (build 37.1). Seats on another protocol must never share a session.
 #ifdef MELEE_PORT_VERSION
-  io.compatibility = compatibility_key(MELEE_PORT_VERSION,false,"",false) + "-console1";
+  io.compatibility = compatibility_key(MELEE_PORT_VERSION,false,"",false) + "-console2";
 #else
-  io.compatibility = compatibility_key("dev",false,"",false) + "-console1";
+  io.compatibility = compatibility_key("dev",false,"",false) + "-console2";
 #endif
+  io.host_save = [] {
+    const auto read = yougame::console::host_save_reader.load(std::memory_order_acquire);
+    return read ? read() : Bytes{};
+  };
+  io.persist_card = [](const SessionConfig& c) {
+    const char* data = std::getenv("YOUGAME_DATA");
+    return data && stage_card(std::filesystem::u8path(data),c);
+  };
+  io.restore_card = [](SessionConfig& c) {
+    const char* data = std::getenv("YOUGAME_DATA");
+    return data && load_card(std::filesystem::u8path(data),c);
+  };
   io.exclusive = true;
   io.background_service = true;
   io.random = random64;
@@ -1273,11 +1316,25 @@ SessionIO console_io(const std::shared_ptr<ConsoleBackend>& b) {
       if (code.empty() || code.size() > 24 || code.find_first_not_of("abcdefghijklmnopqrstuvwxyz_") != std::string::npos) code = "unknown";
       return json{{"link",0},{"refused",code}};
     }
+    // A refused console room ticket: log the site's code (never its text) before start_session's catch,
+    // so "couldn't connect to your friend" before the friend has even accepted names a reason.
+    if (ranked::str(q,"type") == "mpTicket") {
+      try { return bridge(q,ms); }
+      catch (const update::Required&) { throw; }
+      catch (const std::runtime_error&) {
+        host::log("console: room ticket refused (%s)", g_bridge_refusal.empty() ? "no answer" : g_bridge_refusal.c_str());
+        // bridge() reports an update refusal as "Cancelled" when no search is running (Friends has none). The
+        // player needs the update notice, not "couldn't connect" (doubles-lead 11-01: a newer row went up mid-run).
+        if (g_bridge_refusal == "update_required") { g_update_notice.refuse(); throw update::Required(); }
+        throw;
+      }
+    }
     return bridge(q,ms);
   };
   io.open_room = [b](const std::string& ticket,const std::string& room,int ms) { return b->open(ticket,room,ms); };
   io.next_room = [b](json& m,int ms) { return b->next(m,ms); };
   io.send_room = [b](const json& m) { return b->send(m); };
+  io.flush_room = [b](int ms) { return b->flush(ms); };
   io.room_closed = [b] { return b->closed.load(); };
   io.connection = [b] { return b->conn; };
   io.attach = [b](int ms) { return b->attach(ms); };
@@ -1339,11 +1396,12 @@ void friends_entry(const std::string& room) {
       entry.status(text,ready);
       if (last != text) { host::log("console: %s",text.c_str()); last = text; }
     };
-    bool prepared = false; std::string prepared_session;
+    bool prepared = false; std::string prepared_session; int64_t handed_at = 0;
+    const bool relaunching = g_stdio && g_relaunch;
     io.prepared = [&](const SessionConfig& c) {
-      prepared_session = c.session_id;
+      prepared_session = c.session_id; handed_at = epoch_now();
       const char* data = std::getenv("YOUGAME_DATA");
-      prepared = handoff(c,g_stdio && g_relaunch,data ? std::filesystem::u8path(data) : std::filesystem::path(),
+      prepared = handoff(c,relaunching,data ? std::filesystem::u8path(data) : std::filesystem::path(),
           epoch_now(),current_build(), [](const json& q) { write_line("yg " + q.dump()); },
           [](const std::string& line) { host::log("%s",line.c_str()); },
           [](const char* text) { entry.status(text); });
@@ -1355,11 +1413,17 @@ void friends_entry(const std::string& room) {
       if (!g_broker || !g_direct) {
         error = "console sessions need the YouGame link helper";
         host::log("console: start failed: %s",error.c_str());
-      } else start_session({{"room",room},{"players",2}},c,error,std::move(io));
+      } else start_session({{"room",room},{"players",2},{"inputDelay",2}},c,error,std::move(io));
       if (!prepared && !error.empty() && !entry.cancelled())
-        entry.status(session_notice(error) ? session_notice(error) : "Couldn't start playing together: " + error);
+        entry.status(error == update::kMessage ? std::string(update::kMessage) :
+                     session_notice(error) ? session_notice(error) : "Couldn't start playing together: " + error);
       while (prepared && !entry.cancelled() && !host::exit_requested() && !b->closed) {
         json m; b->next(m,50);
+        // The app closes this game and starts the session; still here long after means it didn't.
+        if (relaunching && epoch_now() - handed_at >= 45000) {
+          host::log("console: no relaunch 45 s after the request; the app didn't start the session");
+          entry.status("Couldn't start playing together. Close the game and try again."); break;
+        }
         if (ranked::str(m,"t") == "sessionEnded" && ranked::str(m,"sessionId") == prepared_session) {
           const auto reason = friends::text(m,"reason",160);
           host::log("console: session ended: %s",reason.c_str());
@@ -1421,6 +1485,7 @@ void start() {
   g_bridge_url = take("YOUGAME_BRIDGE");
   g_bridge_token = take("YOUGAME_TOKEN");
   g_stdio = take("YOUGAME_STDIO") == "1";
+  slippi_linking::presentation.enabled = take("YOUGAME_SLIPPI_LINKABLE") == "1";
   host::test_env::yougame_session = active();
 #ifdef MELEE_LINUX_X11_EMBED
   // The shared X11 helper checks this non-secret flag at window attachment.
@@ -1599,6 +1664,15 @@ std::string status_line() {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_status = friends::expire_joined(g_status, g_status_since, now_ms());
   return g_update_notice.available() ? update::kMessage : g_status;
+}
+
+std::string slippi_link_status(const std::string& status) {
+  return status == slippi_linking::kSearching
+      ? slippi_linking::presentation.line(slippi_linking::Screen::Search) : status;
+}
+
+nlohmann::json request_slippi_link(const nlohmann::json& request, int timeout, const std::function<bool()>& cancelled) {
+  return bridge(request, timeout, cancelled);
 }
 
 std::string pick_friend_room(const std::function<bool()>& cancelled) {

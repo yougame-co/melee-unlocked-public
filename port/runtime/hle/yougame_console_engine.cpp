@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "yougame_console_engine.h"
+#include "yougame_console_card.h"
+#include "yougame_console_menu.h"
 #include "yougame_console_notice.h"
 #include <algorithm>
 #include <atomic>
@@ -13,6 +15,7 @@ namespace yougame::console {
 namespace {
 Engine global_engine;
 std::atomic<bool> global_active{false};
+std::atomic<bool> global_menu_visible{false};
 uint64_t monotonic_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -27,10 +30,12 @@ std::string hex(uint64_t v) {
 }
 }
 Engine& console_engine() { return global_engine; }
+bool console_menu_visible() { return global_menu_visible.load(std::memory_order_acquire); }
 bool console_active() { return global_active.load(std::memory_order_acquire); }
 bool prepare_card(const std::filesystem::path& data, const SessionConfig& config,
                   std::filesystem::path& card) {
   if (data.empty() || !Engine::valid(config)) return false;
+  if ((!config.card_digest.empty() || !config.card_bytes.empty()) && !card_bytes_ok(config)) return false;
   std::error_code ec;
   if (!std::filesystem::is_directory(data, ec) || ec) return false;
   auto path = data;
@@ -45,6 +50,11 @@ bool prepare_card(const std::filesystem::path& data, const SessionConfig& config
   }
   // Never erase/reuse a save, including an earlier launch with the same start id.
   if (!std::filesystem::is_empty(path, ec) || ec) return false;
+  if (!config.card_bytes.empty()) {
+    std::ofstream out(path / "GALE01-SuperSmashBros0110290334.gci",std::ios::binary);
+    out.write(reinterpret_cast<const char*>(config.card_bytes.data()),config.card_bytes.size()); out.close();
+    if (!out) return false;
+  }
   card = path; return true;
 }
 bool Engine::valid(const SessionConfig& c) {
@@ -81,6 +91,7 @@ bool Engine::begin(std::unique_ptr<SessionLink> link, const SessionConfig& c, En
 void Engine::end(const std::string& reason, bool desync) {
   if (!active_) return;
   active_ = false; ended_ = true;
+  if (this == &global_engine) global_menu_visible.store(false,std::memory_order_release);
   if (this == &global_engine) global_active.store(false, std::memory_order_release);
   match_ = body_clock_ = false;
   clocks_.clear(); candidates_.clear();
@@ -116,6 +127,13 @@ bool Engine::compare_digests() {
 }
 bool Engine::advance(const Pads& hardware, const MuStatePod& state) {
   if (!active_) return false;
+  if (this == &global_engine) global_menu_visible.store(
+      honest_menu(menus_lockstep(),rollback_enabled_,config_.ports.size(),state.scene_major,state.scene),
+      std::memory_order_release);
+  const bool menu = menus_lockstep();
+  if (menu && !menu_window_active_) {
+    menu_window_active_ = true; menu_window_ = hooks_.now_ms();
+  }
   if (started_) ++frame_;
   started_ = true;
   if (!frame_) log("console: frame 0");
@@ -159,7 +177,7 @@ bool Engine::advance(const Pads& hardware, const MuStatePod& state) {
       missing = p;
       // b=0 is confirmed. At most seven bodies can depend on an unresolved input;
       // the next admission waits before capture could evict the oldest required checkpoint.
-      if (!match_ || frame_ == match_origin_ || int64_t(frame_) - confirmed_[p - 1] > 7)
+      if (menus_lockstep() || frame_ == match_origin_ || int64_t(frame_) - confirmed_[p - 1] > 7)
         ready = false;
     }
     const auto waited = hooks_.now_ms() - began;
@@ -169,6 +187,15 @@ bool Engine::advance(const Pads& hardware, const MuStatePod& state) {
       retain_history();
       waited_ += waited; max_wait_ = std::max(max_wait_, waited);
       if (waited > 17) { ++long_waits_; long_port_ = missing; }
+      if (menu) {
+        if (waited > 17) { ++menu_stalls_; menu_longest_ = std::max(menu_longest_,waited); }
+        const auto now = hooks_.now_ms();
+        if (now - menu_window_ >= 60000) {
+          log("console: menu stalls " + std::to_string(menu_stalls_) + "/min (longest " +
+              std::to_string(menu_longest_) + " ms, delay " + std::to_string(config_.input_delay) + ")");
+          menu_stalls_ = menu_longest_ = 0; menu_window_ = now;
+        }
+      }
       if (frame_ && frame_ % 600 == 0) {
         const auto now = hooks_.now_ms(), wall = now > window_began_ ? now - window_began_ : 0;
         // Waiting is also where a frame idles until the peer's pad is due; only waits longer than a
@@ -228,6 +255,8 @@ void Engine::retain_history() {
 bool Engine::begin_match() {
   if (!rollback_enabled() || match_) return false;
   match_ = true;
+  menu_window_active_ = false; menu_stalls_ = menu_longest_ = 0;
+  if (this == &global_engine) global_menu_visible.store(false,std::memory_order_release);
   match_origin_ = started_ ? frame_ + 1 : 0;
   validated_boundary_ = match_origin_;
   ++match_epoch_;
@@ -237,6 +266,7 @@ bool Engine::begin_match() {
   return true;
 }
 void Engine::end_match() {
+  menu_window_active_ = false; menu_stalls_ = menu_longest_ = 0;
   match_ = body_clock_ = false;
   clocks_.clear(); candidates_.clear();
 }

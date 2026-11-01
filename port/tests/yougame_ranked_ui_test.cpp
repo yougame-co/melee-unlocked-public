@@ -231,8 +231,59 @@ static void update_after_reveal() {
     reveal_close();
 }
 
+// The winner's lines when the opponent left (CTO 11-01): only for a forfeit this seat won.
+static void forfeit_text() {
+    char headline[64], line[80], rating[48];
+    MuYgResult r{}; r.status=MU_YG_RESULT_RECORDED; r.reason=MU_YG_REASON_FORFEIT_WON;
+    r.before=10920; r.after=11110;
+    r.rank_before=standing("Silver I",2,8); r.rank_before.division=1;
+    r.rank_after=standing("Gold IV",3,9); r.rank_after.division=4;
+    CHECK(mu_rank_text_forfeit(headline,line,rating,&r,1,0));
+    CHECK(std::string(headline)=="Opponent left - you win the set 1:0");
+    CHECK(std::string(line)=="Promoted from Silver I to Gold IV");
+    CHECK(std::string(rating)=="Rating 1111  \x81\x7B" "19");
+    // No ASCII '+', '/', '>' or middle dot: the SIS encoder would eat them.
+    for (const char* s : {headline,line,rating}) CHECK(!std::strpbrk(s,"+/>()!?"));
+    r.rank_before=r.rank_after; r.before=11020; CHECK(mu_rank_text_forfeit(headline,line,rating,&r,2,1));
+    CHECK(std::string(line)=="Gold IV" && std::string(rating)=="Rating 1111  \x81\x7B" "9");
+    CHECK(std::string(headline)=="Opponent left - you win the set 2:1");
+    r.rank_before.placed=0; r.rank_before.matches=4; CHECK(mu_rank_text_forfeit(headline,line,rating,&r,0,0));
+    CHECK(std::string(line)=="Placed in Gold IV" && std::string(headline)=="Opponent left - you win the set");
+    r.rank_after=r.rank_before; r.rank_after.matches=5; r.rank_after.placed=0;
+    CHECK(mu_rank_text_forfeit(headline,line,rating,&r,1,0) && std::string(line)=="Placements 5 of 5");
+    // The longest line fits the stage panel (x 58..583 of 640) at .45, centered on 320.
+    r.rank_before=standing("Platinum IV",4,16); r.rank_after=standing("Diamond III",5,18);
+    CHECK(mu_rank_text_forfeit(headline,line,rating,&r,1,0));
+    CHECK(std::strlen(line)*20.5f*.45f<=2*(320-58) && std::strlen(headline)*20.5f*.55f<=2*(320-58));
+    for (unsigned reason : {MU_YG_REASON_NONE, MU_YG_REASON_FORFEIT_LOST}) {
+        r.reason=reason; CHECK(!mu_rank_text_forfeit(headline,line,rating,&r,1,0));
+    }
+    r.reason=MU_YG_REASON_FORFEIT_WON; r.status=MU_YG_RESULT_RECORDING;
+    CHECK(!mu_rank_text_forfeit(headline,line,rating,&r,1,0));
+    // A placed label never carries the '/' the encoder would eat.
+    MuYgRank odd=standing("Gold IV/Test",3,9); char label[32];
+    mu_rank_text_label(label,&odd); CHECK(std::string(label)=="Gold IV-Test");
+}
+
+// The setup screen draws the division numeral (build 31: the right badge's fell off screen).
+static void setup_numerals() {
+    MuYgRank gold=standing("Gold IV",3,9), bronze=standing("Bronze I",1,4);
+    gold.division=4; bronze.division=1;
+    for(int side=0;side<2;++side) {
+        auto* b=mu_rank_badge_create(nullptr,side ? 584 : 28,52,1.4f,side ? &bronze : &gold);
+        CHECK(b && !b->art_only && b->text->default_alignment==1);
+        const auto& row=b->text->rows[b->subtext];
+        CHECK(row.value==(side ? "I" : "IV"));
+        const float center=b->text->pos_x+row.x, half=row.value.size()*20.5f*b->text->x34.x/2;
+        CHECK(std::fabs(center-(b->x+12*b->size))<.01f); // centered under the art
+        CHECK(center-half>=0 && center+half<=640);       // on screen on both sides
+        CHECK(b->text->pos_y+row.y>b->y+12*b->size);     // below the art's middle
+        mu_rank_badge_free(b);
+    }
+}
+
 int main() {
-    unavailable_text_retries();placements_with_art();reveal_layout();update_after_reveal();
+    setup_numerals();forfeit_text();unavailable_text_retries();placements_with_art();reveal_layout();update_after_reveal();
     CHECK(text_count==0 && !badges);
     std::cout<<"ranked UI with real badges: "<<checks<<" checks passed\n";
 }

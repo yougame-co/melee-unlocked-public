@@ -32,20 +32,24 @@ class YouGameMergeTest(unittest.TestCase):
     def test_padback_remains_at_game_poll_boundary(self):
         window = source("port/runtime/host/window.cpp")
         self.assertEqual(window.count("void input_poll(PadState out[4]) {"), 1)
-        devices, poll = window.split("void input_poll(PadState out[4]) {", 1)
-        poll, sampler = poll.split("void input_read_devices(PadState out[4]) {", 1)
-        # The upstream sampler must neither consume the UI script nor inject its chord.
-        self.assertNotIn("pad_back.sample_for_ui", devices)
-        self.assertNotIn("pad_back.sample_for_ui", sampler)
-        hook = poll.index("pad_back.sample_for_ui")
-        self.assertLess(poll.index("~UiSnapshot()"), hook)
-        self.assertLess(poll.index("#ifdef YOUGAME_AGENT_TEST_HOOK"), hook)
-        self.assertLess(hook, poll.index("settings_shortcut::poll_z_start"))
-        self.assertLess(hook, poll.index("g_ui_capture.load()"))
-        self.assertIn("g_ui_agent_step = scripted.step;", poll)
-        # The fight sample now also passes the live input policy state and its log (agent-only rooms, 10-25).
-        self.assertIn("apply_fight(pads, yougame::agent_test::current_fight_sample,", poll)
-        self.assertIn("yougame::agent_test::live_input_state(slippi::online::session_mode())", poll)
+        from yougame_console_wiring_test import body
+        poll = body(window, "input_poll")
+        snapshot = window[window.index("struct UiSnapshot {"):window.index("void input_poll(PadState out[4])")]
+        # Preview/early samplers must neither consume the UI script nor inject its chord.
+        for name in ("read_devices", "input_read_devices"):
+            self.assertNotIn("pad_back.sample_for_ui", body(window, name))
+            self.assertNotIn("UiSnapshot", body(window, name))
+        for name in ("input_poll", "input_read_console_devices"):
+            self.assertIn("UiSnapshot ui{out};", body(window, name))
+        hook = snapshot.index("pad_back.sample_for_ui")
+        self.assertLess(snapshot.index("~UiSnapshot()"), hook)
+        self.assertLess(snapshot.index("#ifdef YOUGAME_AGENT_TEST_HOOK"), hook)
+        self.assertLess(hook, snapshot.index("settings_shortcut::poll_z_start"))
+        self.assertLess(hook, snapshot.index("g_ui_capture.load()"))
+        self.assertIn("g_ui_agent_step = scripted.step;", snapshot)
+        # Fight still passes the live input policy and its log (agent-only rooms, 10-25).
+        self.assertIn("apply_fight(pads, yougame::agent_test::current_fight_sample,", snapshot)
+        self.assertIn("yougame::agent_test::live_input_state(slippi::online::session_mode())", snapshot)
         # Upstream still observes the poll before reading scripts or physical devices.
         self.assertLess(poll.index("early_input::note_poll();"), poll.index("script_pads("))
         self.assertLess(poll.index("early_input::note_poll();"), poll.index("read_devices("))

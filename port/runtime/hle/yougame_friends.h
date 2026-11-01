@@ -234,6 +234,13 @@ class Events {
     std::lock_guard<std::mutex> lock(mutex_);
     return std::exchange(version_notice_, false);
   }
+  // A join waiting in a menu scene: the guest's panel shows it and Z cancels it. In a match
+  // it stays a toast, so a grab never cancels the invite.
+  bool join_pending() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !pending_.empty() && menu_scene_;
+  }
+  void menu_scene(bool safe) { std::lock_guard<std::mutex> lock(mutex_); menu_scene_ = safe; }
   std::string take_join(bool safe) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!safe) return {};
@@ -290,6 +297,7 @@ class Events {
   mutable std::mutex mutex_;
   InviteEdge edges_[4];
   std::string trigger_;
+  bool menu_scene_ = false;
   bool online_menu_ = false, friend_entry_ = false, version_notice_ = false, version_logged_ = false;
   bool hello_seen_ = false, host_requested_ = false;
   std::string pending_, toast_, current_room_, picker_error_;

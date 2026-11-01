@@ -176,7 +176,7 @@ int main() {
         area = ui[ui.index('const bool show_status ='):ui.index('ImGuiStyle launcher_saved_style;')]
         for text in ('!slippi::online::is_online_match()', '&& show_status',
                      'status == yougame::update::kMessage', 'ImGui::Begin("##yougame_friend_waiting"',
-                     'ImGui::TextUnformatted(status.c_str())'):
+                     'ImGui::TextUnformatted(yougame::slippi_link_status(status).c_str())'):
             self.assertIn(text, area)
     def test_visibility_is_independent_of_friends(self):
         think = literal_function(source('sourceport/game/shim/mu_slippi_menu.c'), 'mu_slippi_online_menu_think')
@@ -297,7 +297,7 @@ class ReleaseWiringTest(unittest.TestCase):
         self.assertIn('ImGui::Begin("##yougame_friend_waiting"', area)
         self.assertIn('status == yougame::update::kMessage', area)
         self.assertNotIn('version_line()', area)
-        self.assertIn('ImGui::TextUnformatted(status.c_str())', area)
+        self.assertIn('ImGui::TextUnformatted(yougame::slippi_link_status(status).c_str())', area)
         online = source("port/runtime/hle/slippi_online.cpp")
         self.assertIn('g_matchmaking->GetErrorMessage(), 120)', online)
 

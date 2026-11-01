@@ -83,6 +83,7 @@ inline host::controller_relay::Snapshot controller_snapshot(const Frame& frame) 
     s.family = capture_family(family);
     s.index = static_cast<int>(p.family_index);
     s.name = p.name;
+    s.keyboard_standin = p.kind == "other" && p.id == "virtual";
     // The page keyboard may play alone, but must not take automatic P1 from a connected pad.
     s.allow_fallback = !(has_real_pad && p.kind == "other" && p.id == "virtual");
     s.axes[0] = p.lx; s.axes[1] = p.ly; s.axes[2] = p.rx; s.axes[3] = p.ry;

@@ -27,7 +27,7 @@ struct HSD_Text {
     SisBuffer* alloc_data=nullptr;
     unsigned char* sis_buffer=nullptr;
     float pos_x, pos_y, pos_z, box_size_x, box_size_y;
-    int default_kerning, hidden;
+    int default_kerning, hidden, default_alignment;
     struct Vec { float x=1, y=1; } font_size, x34;
     GXColor bg_color;
     HSD_GObj* entity;

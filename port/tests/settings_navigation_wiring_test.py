@@ -159,6 +159,9 @@ int main() {
         nav = 'const bool nav_active = state.open || state.menu_open || practice_nav || state.fill_window;'
         start = ui.index('  // The PhobGCC menu reads the controller itself:')
         branch = ui[start:ui.index('  ImGui::NewFrame();', start)]
+        from yougame_console_wiring_test import body
+        helper = (ROOT / 'port/runtime/gx/settings_imgui_input.h').read_text()
+        mapping = body(helper, 'gamepad')
         menu.OnlineMenuTest().compile_fixture('settings-routed-nav', r'''
 #include <cstdio>
 #include <cstdlib>
@@ -176,7 +179,11 @@ struct State { bool open=false, menu_open=false, fill_window=false, practice_pad
 struct Pad { unsigned button; int stick_x,stick_y; };
 static int checks;
 #define CHECK(x) do { ++checks; if (!(x)) std::abort(); } while(0)
+namespace settings_input { void gamepad(IO& io, const Pad& pad) {
+''' + mapping + r'''
+} }
 static void feed(State state, bool practice_nav, bool have_pad, Pad pad) {
+  Pad navigation_pads[4] = {pad}; int nav_port = 0;
 ''' + nav + branch + r'''
 }
 int main() {
@@ -204,7 +211,7 @@ int main() {
         self.assertIn('int nav_port = practice_nav ? std::clamp(practice.controller_port, 0, 3) : followed;', frame)
         self.assertIn('else if (have_pad && nav_active && state.practice_pad_armed)', frame)
         self.assertIn('if (have_pad && nav_active && state.practice_pad_armed && phob_native_open())', frame)
-        self.assertIn('io.BackendFlags |= ImGuiBackendFlags_HasGamepad;', frame)
+        self.assertIn('settings_input::gamepad(io, navigation_pads[nav_port]);', frame)
         # Final state applies after even the small menu's resume action.
         final = frame.rindex('settings_input::navigation(')
         self.assertGreater(final, frame.index('if (action("##resume", "BACK TO GAME", 0))'))
@@ -214,7 +221,7 @@ int main() {
 
     def test_capture_keeps_ui_pads_and_neutralizes_all_game_ports(self):
         host = (ROOT / 'port/runtime/host/window.cpp').read_text()
-        start = host.index('      g_ui_pad = pads[0];')
+        start = host.index('    g_ui_pad = pads[0];')
         end = host.index('#ifdef YOUGAME_AGENT_TEST_HOOK', start)
         capture = host[start:end]
         menu.OnlineMenuTest().compile_fixture('settings-pad-capture', r'''
@@ -226,6 +233,7 @@ struct Pad { unsigned short button; signed char stick_x, stick_y, sub_x, sub_y;
              unsigned char trigger_l, trigger_r; signed char err; };
 static Pad pads[4], g_ui_pads[4], g_ui_pad;
 static bool g_ui_gamecube, g_ui_has_pad, gamecube;
+static constexpr bool console = false; // offline publisher still suppresses all gameplay ports
 static std::atomic<bool> g_ui_capture;
 static int checks;
 #define CHECK(x) do { ++checks; if (!(x)) std::abort(); } while(0)

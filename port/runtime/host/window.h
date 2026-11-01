@@ -12,11 +12,14 @@ constexpr uint32_t kSdlEventMessage = 0x7FFF0001u;
 #endif
 void window_set_message_callback(MessageCallback cb);
 void window_input_capture(bool capture);
+bool window_input_captured(); // shared by Windows, macOS and Linux; local console samples only
 struct PadState;
 bool window_ui_gamecube_pad(PadState& pad);
 // Last routed state for every in-game port, captured before UI input suppression. This lets an
 // overlay follow the controller port selected in Training instead of assuming port 1.
-bool window_ui_pads(PadState pads[4]);
+// Optional ImGui-only snapshot excludes bindings already handled by backend keyboard navigation.
+// Both copies are read atomically and share one agent-script acknowledgement.
+bool window_ui_pads(PadState pads[4], PadState navigation_pads[4] = nullptr);
 using ResizeCallback = std::function<void(int, int)>;
 #ifdef _WIN32
 void* window_create(int w, int h, const wchar_t* title, bool visible = true, bool flip = false);
@@ -58,9 +61,9 @@ bool window_take_fullscreen_toggle();   // true once per Alt+Enter press in the 
 // True once each time the game window comes back to the front: exclusive fullscreen, which Windows
 // leaves on Alt+Tab, is entered again then.
 bool window_take_activation();
-bool window_take_escape();              // true once per Esc press, like the F1 toggle (F1 under YouGame)
-// The key that opens the in-game menu: "Esc", or "F1" in the YouGame app, which keeps Esc for
-// itself (it is how players leave full screen everywhere on YouGame).
+bool window_take_escape();              // true once per game Esc press (also F1 under YouGame; Shift+Esc is app-only)
+// Host-specific menu shortcut hint. Plain Esc also opens/backs the embedded game menu;
+// Shift+Esc belongs to the app.
 const char* window_menu_key();
 bool window_take_settings_toggle();     // true once per F1 press (auto-repeat ignored), however late it is read
 bool window_take_legacy_settings_toggle(); // true once per F11 press (auto-repeat ignored)

@@ -285,12 +285,32 @@ int main() {
   match.local_index = 0; mu_ranked_rank_frame(); splash.clear();
   set.cur_game = 3; set.score[1] = 1; mu_ranked_rank_frame();
   CHECK(panel.text->rows[SET_SCORE] == "Game 3 - 1:1");
+  // A finished set says so (build 30): never "Game 2 - 2:0", as if game 2 were next.
+  set.score[0] = 2; mu_ranked_rank_frame(); CHECK(panel.text->rows[SET_SCORE] == "Set won 2:1");
+  match.local_index = 1; mu_ranked_rank_frame(); CHECK(panel.text->rows[SET_SCORE] == "Set lost 1:2");
+  set.cur_game = 2; set.score[1] = 0; mu_ranked_rank_frame(); CHECK(panel.text->rows[SET_SCORE] == "Set lost 0:2");
+  match.local_index = 0; mu_ranked_rank_frame(); CHECK(panel.text->rows[SET_SCORE] == "Set won 2:0");
+  set.max_games = 5; mu_ranked_rank_frame(); CHECK(panel.text->rows[SET_SCORE] == "Game 2 - 2:0");
+  set.max_games = 3; set.cur_game = 3; set.score[0] = set.score[1] = 1; mu_ranked_rank_frame();
+  CHECK(panel.text->rows[SET_SCORE] == "Game 3 - 1:1");
   bounds(); // both players and the score without the real badge renderer
   request = 1; const auto count = reads; tick(); CHECK(reads == count); request = 0;
   match.connection_state = MU_SLP_MM_MATCHMAKING; mu_ranked_rank_frame();
   CHECK(badge_count == 1 && panel.text->rows[OPP_TITLE].empty() && panel.text->rows[SET_SCORE].empty());
+  // Cut short (a leave or a dropped link, CTO 11-01): the CSS it returns to is idle.
   match.connection_state = MU_SLP_MM_IDLE; mu_ranked_rank_frame();
-  CHECK(panel.text->rows[SET_SCORE] == "Game 3 - 1:1");
+  CHECK(panel.text->rows[SET_SCORE] == "Set ended early 1:1");
+  set.cur_game = 2; set.score[1] = 0; mu_ranked_rank_frame();
+  CHECK(panel.text->rows[SET_SCORE] == "Set ended early 1:0");
+  match.local_index = 1; mu_ranked_rank_frame();
+  CHECK(panel.text->rows[SET_SCORE] == "Set ended early 0:1");
+  bounds(); // the longest score line still fits
+  match.local_index = 0; set.score[0] = 2; mu_ranked_rank_frame();
+  CHECK(panel.text->rows[SET_SCORE] == "Set won 2:0"); // a finished set wins over "ended early"
+  set.cur_game = 3; set.score[0] = set.score[1] = 1; mu_ranked_rank_frame();
+  match.connection_state = MU_SLP_MM_ERROR; mu_ranked_rank_frame();
+  CHECK(panel.text->rows[SET_SCORE].empty());
+  match.connection_state = MU_SLP_MM_IDLE; mu_ranked_rank_frame();
   const auto after = set; leave(); mu_ranked_rank_enter();
   CHECK(fetches == 1 && !std::memcmp(&after, &set, sizeof set)); leave();
   set = initial; mu_ranked_rank_enter(); CHECK(fetches == 1); leave();

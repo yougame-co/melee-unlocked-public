@@ -16,7 +16,7 @@ class FriendsMenuWiringTest(unittest.TestCase):
         strip = window.index("if (!(menu_buttons & 0x1000)) pads[i].button")
         self.assertLess(overlay, poll)
         self.assertLess(poll, strip)
-        self.assertIn("if (yougame::active() && !opened_here && !g_ui_capture.load())", window[overlay:poll])
+        self.assertIn("if (!console && yougame::active() && !opened_here && !g_ui_capture.load())", window[overlay:poll])
         self.assertIn("const uint16_t raw_buttons = pads[i].button;", window[:poll])
         ui = source("port/runtime/gx/pc_settings.cpp")
         self.assertNotIn("window_ui_gamecube_pad(friend_pad)", ui)
@@ -43,7 +43,7 @@ class FriendsMenuWiringTest(unittest.TestCase):
         self.assertLess(console, handoff.index("slippi::online::native_start_match"))
         panel = source("port/runtime/gx/pc_settings.cpp")
         self.assertIn('ImGui::Begin("##yougame_friend_waiting"', panel)
-        self.assertIn("yougame::console::entry.status()", panel)
+        self.assertIn("yougame::console::waiting_status()", panel)
         self.assertNotIn('##console_waiting', panel)
 
     def test_menu_publishes_selection_after_cursor_movement(self):

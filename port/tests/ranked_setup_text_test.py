@@ -109,7 +109,18 @@ int main() {
     for(unsigned local:{0u,1u}) {
         model.local_player=local;HSD_SisLib_804D1124[0]=nullptr;
         MuRankedWidgets w;header_text(&w,&model,&ms);header_score(&w,&model);
-        CHECK(w.text && w.names[0] && w.names[1] && w.text->rows.size()==6);
+        CHECK(w.text && w.names[0] && w.names[1] && w.text->rows.size()==9);
+        // Rows 6-8: the winner's lines when the opponent left, inside the stage panel (x 58..583,
+        // y 125..250, above "Press A"), stacked, at their longest.
+        text_set(w.text,6,"Opponent left - you win the set 1:0");
+        text_set(w.text,7,"Promoted from Platinum IV to Diamond III");
+        text_set(w.text,8,"Rating 1499.9  ++99.9");
+        for(unsigned row=6;row<9;++row) {
+            auto box=bounds(w.text,row);CHECK(box.l>=58 && box.r<=583 && box.t>=125 && box.b<=250);
+            if(row>6)CHECK(!collision(box,bounds(w.text,row-1)));
+            text_set(w.text,row,"");
+        }
+        CHECK(w.text->rows[6].sx==.55f && w.text->rows[7].sx==.45f && w.text->rows[8].sx==.45f);
         CHECK(w.text->pos_x==320 && w.text->pos_y==45 && w.text->rows[0].sx==.7f);
         CHECK(w.names[0]->rows[0].value==ms.names[local]);
         CHECK(w.names[1]->rows[0].value==ms.names[!local]);

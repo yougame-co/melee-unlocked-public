@@ -195,6 +195,6 @@ void pad_cases() {
 } // namespace
 int main() {
   pause_cases(); pause_event_cases(); pad_cases();
-  CHECK(std::string(yougame::parity::kMenuHint) == "Escape / YouGame menu (D-pad + Start)");
+  CHECK(std::string(yougame::parity::kMenuHint) == "Shift+Tab / YouGame menu (D-pad + Start)");
   std::puts("YouGame page pause and controller menu passed");
 }

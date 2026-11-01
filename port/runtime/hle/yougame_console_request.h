@@ -53,8 +53,11 @@ inline bool parse_request(const json& j, json& out) {
     if (room == "new") return false;
     for (auto key : {"port","seed","epochMs","inputDelay"}) if (!j.count(key)) return false;
   }
+  if (j.count("cardDigest") && (!j["cardDigest"].is_string() ||
+      j["cardDigest"].get<std::string>().size() != 64 ||
+      j["cardDigest"].get<std::string>().find_first_not_of("0123456789abcdef") != std::string::npos)) return false;
   out = {{"type", "consoleSession"}, {"room", room}, {"players", j["players"]}};
-  for (auto key : {"sessionId", "port", "seed", "epochMs", "inputDelay"})
+  for (auto key : {"sessionId", "port", "seed", "epochMs", "inputDelay", "cardDigest"})
     if (j.count(key)) out[key] = j[key];
   if (j.count("seed")) out["seed"] = seed;
   return true;

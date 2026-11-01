@@ -213,6 +213,7 @@ int mu_ranked_view_input(MuRankedSetupView* v, const MuRankedSetupModel* m, unsi
 #ifndef MU_NO_SLIPPI
 #include <mu_native.h>
 #include <mu_rank_badge.h>
+#include "mu_rank_text.h"
 #include <dolphin/dvd.h>
 #include <dolphin/os.h>
 #include <melee/gm/gm_1601.h>
@@ -263,7 +264,8 @@ struct MuRankedWidgets {
     Part labels[5], arrows[5], dialog;
     MuRankBadge* badges[2];
     HSD_Text *text, *names[2];
-    unsigned missing, canvas, ranks_frames;
+    unsigned missing, canvas, ranks_frames, forfeit_frames;
+    int forfeit;
 };
 
 static HSD_GObj* track(MuRankedWidgets* w, HSD_GObj* obj)
@@ -445,6 +447,13 @@ static void header_text(MuRankedWidgets* w, const MuRankedSetupModel* m, const M
         /* Pips are at pixel y 25.5, turn arrows at y 61; score sits below. */
         HSD_SisLib_803A6B98(w->text,0,92.0f-45.0f,"%s","");
         HSD_SisLib_803A7548(w->text,5,.45f,.45f);
+        /* 6-8: the winner's lines in DISCONNECTED's place when the opponent left (CTO 11-01).
+         * Glyph tops at about y 165, 195 and 218, above "Press A" at about y 262 (build 31). */
+        HSD_SisLib_803A6B98(w->text,0,101,"%s","");
+        HSD_SisLib_803A6B98(w->text,0,135,"%s","");
+        HSD_SisLib_803A6B98(w->text,0,158,"%s","");
+        HSD_SisLib_803A7548(w->text,6,.55f,.55f);
+        for (i=7; i<9; ++i) HSD_SisLib_803A7548(w->text,i,.45f,.45f);
     }
     for (i=0; i<2; ++i) {
         w->names[i]=text_create(w,i ? 575 : 65,39,.35f);
@@ -482,6 +491,27 @@ static void header_ranks(MuRankedWidgets* w, const MuRankedSetupModel* m)
         if (!w->badges[seat]) w->badges[seat]=mu_rank_badge_create(NULL,side ? 584 : 28,52,1.4f,r[seat]);
         else mu_rank_badge_set(w->badges[seat],r[seat]);
     }
+}
+/* The room gave this player the set because the opponent left (CTO 11-01): its lines replace
+ * DISCONNECTED. The result arrives after the leave, so poll at 4 Hz until it does; it is final. */
+static int forfeit_lines(MuRankedWidgets* w, const MuRankedSetupModel* m)
+{
+    MuYgRanks ranks;
+    char headline[64], standing[80], rating[48];
+    unsigned rgb;
+    GXColor white={255,255,255,255}, tier, chip={0x86,0xef,0xac,0xff};
+    if (w->forfeit || !w->text || !m->set || m->local_player>1) return w->forfeit;
+    if (w->forfeit_frames++ % 15) return 0;
+    memset(&ranks,0,sizeof ranks);
+    if (!mu_ranked_read_ranks(&ranks) || !mu_rank_text_forfeit(headline,standing,rating,&ranks.result,
+            m->set->score[m->local_player],m->set->score[!m->local_player])) return 0;
+    rgb=mu_rank_text_rgb(ranks.result.rank_after.tier);
+    tier=(GXColor){rgb >> 16,rgb >> 8,rgb,255};
+    if (ranks.result.after <= ranks.result.before) chip=white;
+    text_set(w->text,6,headline); HSD_SisLib_803A74F0(w->text,6,&white);
+    text_set(w->text,7,standing); HSD_SisLib_803A74F0(w->text,7,&tier);
+    text_set(w->text,8,rating); HSD_SisLib_803A74F0(w->text,8,&chip);
+    return w->forfeit=1;
 }
 MuRankedWidgets* mu_ranked_widgets_create(const MuRankedSetupModel* m)
 {
@@ -587,14 +617,17 @@ void mu_ranked_widgets_draw(MuRankedWidgets* w, const MuRankedSetupModel* m, con
     int local=s && s->player == m->local_player;
     int char_step=s && (s->type == MU_SETUP_COLOR || s->type == MU_SETUP_CHARACTER);
     int active=s != NULL, disconnected=m->status == MU_SETUP_DISCONNECTED || m->status == MU_SETUP_INVALID;
+    int forfeit;
     char timer[8], line[256];
     unsigned col=mu_ranked_timer_text(timer,s ? s->seconds : 0,m->frames,local);
     GXColor colors[3]={{255,255,255,255},{254,202,52,255},{255,50,50,255}};
     if (!w) return;
+    forfeit=m->status == MU_SETUP_DISCONNECTED && forfeit_lines(w,m);
     header_score(w,m);
+    if (forfeit) text_set(w->text,5,""); /* the headline has the games; not "Game 2 - 1:0" */
     text_set(w->text,0,active ? timer : "");
     if (w->text) HSD_SisLib_803A74F0(w->text,0,&colors[col]);
-    visibility(&w->disconnect,disconnected);
+    visibility(&w->disconnect,disconnected && !forfeit);
     if (disconnected && w->disconnect.root) tint(w->disconnect.root,1,(GXColor){255,0,0,255});
     material(&w->description,0,disconnected ? RETURN_CSS : s ? description(m,s) : GET_READY);
     visibility(&w->description,!active || !local || (!v->confirming && !v->dialog));

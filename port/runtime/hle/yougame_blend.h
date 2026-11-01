@@ -25,7 +25,7 @@ constexpr uint64_t kQueueWordMs = 3000;
 // The base listing's Unranked status line while it searches (the YouGame status the game shows over
 // the character select). Remixes keep plain "searching" and show neither.
 inline constexpr const char* kSearchBoth = "Searching Slippi + YouGame";
-inline constexpr const char* kSearchYouGameOnly = "Slippi not linked: searching YouGame only";
+inline constexpr const char* kSearchYouGameOnly = "Searching YouGame players";
 
 // The app's Slippi link line over the stdio bridge. Only the player's own connect code goes out, and
 // only the characters a code can have (never a quote or a control byte into the JSON).

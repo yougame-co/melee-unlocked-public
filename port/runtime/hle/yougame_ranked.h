@@ -824,6 +824,10 @@ class ResultsPanel {
     else if (order(rank) < order(before_rank)) change_ = "Demotion: " + label;
     else change_ = label;
     record_ = after.result_record();
+    // A set the room gave by a leave: the winner's setup screen says so (CTO 11-01).
+    if (str(event, "disposition") == "forfeit" && event.count("ranking") && event["ranking"].is_array() &&
+        !event["ranking"].empty())
+      record_.reason = event["ranking"][0] == participant ? MU_YG_REASON_FORFEIT_WON : MU_YG_REASON_FORFEIT_LOST;
     state_ = State::Rated;
     return true;
   }

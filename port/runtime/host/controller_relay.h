@@ -14,6 +14,7 @@ struct Sample {
   int16_t axes[4]{}; // Standard full-range axes; Y increases upwards.
   uint8_t left = 0, right = 0;
   std::string name;
+  bool keyboard_standin = false; // App page keyboard, not a physical controller.
   bool allow_fallback = true; // Explicit routes still work when automatic port 1 skips this pad.
 };
 struct Snapshot { std::array<Sample, 4> devices{}; };
@@ -44,6 +45,16 @@ inline bool sample(CaptureDevice family, int index, Sample& out) {
     out = device; return true;
   }
   return false;
+}
+inline CaptureDevice family_of(DeviceKind kind);
+// A live window-keyboard press uses its saved/default bindings even if the app
+// publishes an idle page-keyboard pad. Call only when keyboard actions are held;
+// otherwise the page pad still supplies its own relayed keys. Real pads keep their routes.
+inline PortSource console_source(PortSource source) {
+  Sample device;
+  if (sample(family_of(source.kind), source.index, device) && device.keyboard_standin)
+    return {DeviceKind::Keyboard, 0};
+  return source;
 }
 inline InputDeviceFacts fallback_facts(InputDeviceFacts facts) {
   const auto read = reader.load(std::memory_order_acquire);

@@ -91,7 +91,8 @@ void mu_slippi_load_match_state(void*) {} void mu_slippi_cleanup_connections() {
 int mu_ranked_setup_cpu() { return cpu; } int won_last_game(int i) { return i==0; }
 void mu_ranked_setup_game_result(int,int,int) {}
 int mu_ranked_setup_finish_game(int,unsigned) { return finish_result; }
-unsigned mu_yg_get16(const u8*) { return 8; }
+struct VsData { struct { struct { unsigned stkind=8; } rules; } start; } vs_data;
+VsData* gmVsMelee_GetVsData() { return &vs_data; }
 int mu_ranked_practice() { return cpu; }
 const MuRankedSet* mu_ranked_set() { return &set; }
 void mu_ranked_practice_control(int a) { practice_action=a; }

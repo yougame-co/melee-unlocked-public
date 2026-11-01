@@ -37,6 +37,7 @@ struct SessionIO {
   std::function<bool(const std::string&, const std::string&, int)> open_room;
   std::function<bool(json&, int)> next_room;
   std::function<bool(const json&)> send_room;
+  std::function<bool(int)> flush_room; // finish queued card sends before the app can relaunch
   std::function<bool()> room_closed;
   std::function<int()> connection;
   std::function<bool(int)> attach;
@@ -48,6 +49,10 @@ struct SessionIO {
   std::function<void(const std::string&,bool)> waiting;
   // Human entry freezes Rooms config, then relaunches; it never boots this running engine.
   std::function<void(const SessionConfig&)> prepared;
+  // Present for Friends; four-seat callers retain their existing startup contract.
+  std::function<Bytes()> host_save;
+  std::function<bool(const SessionConfig&)> persist_card;
+  std::function<bool(SessionConfig&)> restore_card;
   std::function<void(unsigned, const Bytes&)> send;
   std::function<bool(unsigned&, Bytes&)> receive;
   std::function<void(int)> wait;

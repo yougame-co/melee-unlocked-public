@@ -3,6 +3,8 @@
 #pragma once
 #include "native_online_policy.h"
 #include <cctype>
+#include <cstdint>
+#include <cstdlib>
 #include <string>
 
 #ifndef YOUGAME_COMPAT_TAG
@@ -11,6 +13,15 @@
 
 namespace yougame {
 inline constexpr const char* compat_tag = YOUGAME_COMPAT_TAG;
+// Tests only: MELEE_ONLINE_TEST_TIMER changes this seat's own match timer (slippi_online.cpp's
+// setup block), so a timer seat paired with a normal one hit "Time!" alone and desynced (11-01,
+// frame 3727). The timer joins the key: such seats only meet seats with the same timer. Same
+// conversion as the setup block (atoi), so the key always names the timer that is played.
+inline std::string compat_tag_with_test_timer(const std::string& tag, const char* test_timer) {
+  if (!test_timer) return tag;
+  const std::string timer = "t" + std::to_string((uint32_t)std::atoi(test_timer));
+  return tag.empty() ? timer : tag + "-" + timer;
+}
 inline std::string compatibility_key(const std::string& version, bool mod_view,
                                      const std::string& fingerprint, bool static_engine = false,
                                      const std::string& rules_digest = {},

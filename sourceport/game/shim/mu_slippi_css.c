@@ -247,6 +247,14 @@ int mu_slippi_css_inputs(unsigned int trigger)
         }
     }
 
+    /* Y is unused in searching/error states. Read only the existing mapped pad edge. */
+    if ((trigger & HSD_PAD_Y) && !(trigger & HSD_PAD_Z) &&
+        (m->connection_state == MU_SLP_MM_MATCHMAKING || m->connection_state == MU_SLP_MM_ERROR)) {
+        u8 action = 1;
+        mu_slippi_cmd(0xE7, &action, 1, NULL, 0, NULL);
+        return 0;
+    }
+
     switch (m->connection_state) {
     case MU_SLP_MM_IDLE:
         if (mu_online_p2p_menus()) {
@@ -525,6 +533,7 @@ static void text_think(HSD_GObj* gobj)
     MuMatchState* m = &dt.msrb;
     char opp_code[19] = "--//--//--//--//00";
     char opp_name[32];
+    char link_line[128] = { 0 };
     char rank_lines[6][128] = { { 0 } };
     const char* s;
     int idx, i;
@@ -536,6 +545,13 @@ static void text_think(HSD_GObj* gobj)
     int p2p_connecting = p2p && conn < MU_SLP_MM_CONNECTION_SUCCESS;
 
     (void) gobj;
+    if (conn == MU_SLP_MM_MATCHMAKING || conn == MU_SLP_MM_ERROR) {
+        u8 query = 0;
+        unsigned int got = 0;
+        if (mu_slippi_cmd(0xE7, &query, 1, (u8*) link_line, sizeof link_line, &got) != 0 || got != sizeof link_line)
+            link_line[0] = 0;
+        link_line[sizeof link_line - 1] = 0;
+    }
     if (st->mode == MU_SLP_MODE_RANKED) mu_slippi_ranked_lines(rank_lines);
     code_sjis18((u8*) opp_code);
 
@@ -613,7 +629,8 @@ static void text_think(HSD_GObj* gobj)
         int sub = ST_ERR1, line_idx = 0, line_len = 0, last_space = 0, start = 0;
         u8 c;
         memset(buf, 0, sizeof buf);
-        memcpy(buf, m->error, 241);
+        if (link_line[0]) memcpy(buf, link_line, sizeof link_line);
+        else memcpy(buf, m->error, 241);
         for (;;) {
             int set = 0;
             int pos = start + line_idx;
@@ -701,7 +718,8 @@ static void text_think(HSD_GObj* gobj)
                 set_text_fmt(idx, "Connecting to %s", opp_name[0] ? opp_name :
                              generic ? "opponent" : opp_code);
             } else {
-                set_text_fmt(idx, "Searching for %s", generic ? "opponent" : opp_code);
+                if (link_line[0]) set_text(idx, link_line);
+                else set_text_fmt(idx, "Searching for %s", generic ? "opponent" : opp_code);
             }
         }
         dt.spinner[2] = 1;

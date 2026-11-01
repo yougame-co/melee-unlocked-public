@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -112,9 +113,24 @@ inline std::vector<std::filesystem::path> settings_builds(const std::filesystem:
   return builds;
 }
 
-// The YouGame app names the Slippi sign-in file it found (YOUGAME_SLIPPI_USER_JSON): then exactly that
-// file is read, never written, and no launcher folder is searched. Empty when unset.
+// Process-local grant, shared by simulation, matchmaking and login threads. Only the answer to
+// this run's slippiLink request may install it; the first accepted file wins for the process.
+namespace detail {
+inline std::mutex app_sign_in_mutex;
+inline std::filesystem::path app_sign_in_override;
+}
+inline void set_app_sign_in(const std::filesystem::path& file) {
+  if (file.empty()) return;
+  std::lock_guard<std::mutex> lock(detail::app_sign_in_mutex);
+  if (detail::app_sign_in_override.empty()) detail::app_sign_in_override = file;
+}
+// The run's grant takes priority over the launch-time environment grant. Exactly that file is
+// read, never written, and no launcher folder is searched. Empty when neither is set.
 inline std::filesystem::path app_sign_in() {
+  {
+    std::lock_guard<std::mutex> lock(detail::app_sign_in_mutex);
+    if (!detail::app_sign_in_override.empty()) return detail::app_sign_in_override;
+  }
 #ifdef _WIN32
   wchar_t* value = nullptr;
   size_t length = 0;

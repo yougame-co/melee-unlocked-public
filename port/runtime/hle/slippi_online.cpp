@@ -12,6 +12,8 @@
 #include "yougame_ranked_rules.h"
 #include "yougame_ranked.h"
 #include "yougame_friends.h"
+#include "yougame_slippi_link.h"
+#include <future>
 #include "netplay_summary.h"
 #include "enet/yg_enet_socket.h"
 #include "native_slippi_bridge.h"
@@ -191,6 +193,9 @@ std::deque<std::unique_ptr<Savestate>> g_available_savestates;
 PlayerSelections g_local_selections;
 bool g_local_random_stage = false;
 Matchmaking::MatchSearchSettings g_last_search;
+yougame::slippi_linking::Flow g_slippi_link(yougame::slippi_linking::presentation);
+uint32_t g_link_scene = 0;
+bool g_link_menu = false;
 Matchmaking::MatchmakeResult g_recent_mm_result;
 std::vector<uint16_t> g_allowed_stages = {0x2, 0x3, 0x8, 0x1C, 0x1F, 0x20};
 std::vector<uint16_t> g_stage_pool;
@@ -457,6 +462,7 @@ bool discord_join_pending() {
 // `why` matters only to a YouGame ranked set (yougame_link.h Leave): the game's own cleanup command
 // is the player leaving, the checks below drop a connection that broke or a match they refuse.
 void cleanup_connection(yougame::Leave why = yougame::Leave::Lost) {
+  g_slippi_link.cancel([](const char* line) { host::log("%s", line); });
   finish_summary(why == yougame::Leave::Quit ? "quit" : "disconnected");
   host::log("slippi: connection cleanup");
   if (g_user) g_user->ResetOnlineCompatibility();
@@ -1157,6 +1163,18 @@ void prepare_online_match_state(std::vector<uint8_t>& q) {
   };
   q.clear();
   Matchmaking::ProcessState mm_state = !g_forced_error.empty() ? Matchmaking::ERROR_ENCOUNTERED : g_matchmaking->GetMatchmakeState();
+  {
+    // What the game reads as the match state, once per change: a set abandoned at the results screen
+    // because this was not CONNECTION_SUCCESS (11-01, game 1 of a Ranked set) must say so.
+    static int reported = -1;
+    if ((int)mm_state != reported) {
+      static const char* const names[] = {"idle", "initializing", "matchmaking", "opponent connecting", "connection success", "error"};
+      const int n = (int)mm_state;
+      host::log("slippi: match state %s -> %s%s", reported < 0 || reported > 5 ? "start" : names[reported],
+                n >= 0 && n <= 5 ? names[n] : "unknown", g_forced_error.empty() ? "" : " (forced error)");
+      reported = n;
+    }
+  }
   q.push_back((uint8_t)mm_state);
   uint8_t local_ready = g_local_selections.is_character_selected ? 1 : 0;
   uint8_t remote_ready = 0;
@@ -1775,6 +1793,7 @@ void init() {
 
 void flush_cmd_trace_at_exit();
 void shutdown() {
+  g_slippi_link.cancel([](const char* line) { host::log("%s", line); });
   flush_cmd_trace_at_exit();
   host::cosmetics::thaw_after_online_session();
   report::shutdown();
@@ -1783,6 +1802,27 @@ void shutdown() {
   g_active_savestates.clear();
   g_available_savestates.clear();
   host::discord::clear();   // no stale "In a match" left on the profile
+}
+
+void slippi_link_tick(uint8_t major, uint8_t minor, uint8_t mode) {
+  g_link_scene = (uint32_t(major) << 16) | (uint32_t(minor) << 8) | (major == 8 ? mode : 0);
+  g_slippi_link.tick(g_link_scene, g_in_online_match || g_play_session_active,
+      [] { if (g_user) g_user->AttemptLogin(true); },
+      [] {
+        // A main-menu refusal has no search yet. Its next confirm rechecks the grant.
+        if (g_link_menu) return;
+        uint8_t payload[19] = {};
+        payload[0] = uint8_t(g_last_search.mode);
+        std::memcpy(payload + 1, g_last_search.connect_code.data(), std::min<size_t>(18, g_last_search.connect_code.size()));
+        // Retire the old worker through the normal cleanup path before FindMatch owns a new thread.
+        const auto selections = g_local_selections;
+        const bool random_stage = g_local_random_stage;
+        cleanup_connection(yougame::Leave::Quit);
+        g_local_selections = selections;
+        g_local_random_stage = random_stage;
+        host::log("yougame: new search (Slippi link)");
+        start_find_match(payload);
+      }, [](const char* line) { host::log("%s", line); });
 }
 
 bool valid_command_payload(uint8_t cmd, const uint8_t* payload, uint32_t payload_len) {
@@ -1925,6 +1965,33 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
       return true;
     case CMD_FETCH_RANK: return true; // room pump receives the authoritative result asynchronously
     case CMD_GET_RANK_VISIBILITY: q.assign(1, yougame::active() ? yougame::rank_visibility() : 0); return true;
+    case CMD_YOUGAME_SLIPPI_LINK: {
+      using namespace yougame::slippi_linking;
+      auto screen = Screen::None;
+      const auto action = payload[0];
+      if (action == 4) {
+        g_slippi_link.cancel([](const char* line) { host::log("%s", line); });
+        return true;
+      }
+      if (action > 3) return false;
+      if (yougame::active() && host::gameplay::vanilla_only() && !g_in_online_match) {
+        if ((action == 2 || action == 3) && (g_link_scene >> 16) == 1) screen = Screen::Refusal;
+        else if (action <= 1 && (g_link_scene >> 8) == 0x800 && g_matchmaking) {
+          const auto state = g_matchmaking->GetMatchmakeState();
+          const auto error = g_forced_error.empty() ? g_matchmaking->GetErrorMessage() : g_forced_error;
+          if (g_last_search.mode == Matchmaking::UNRANKED && g_last_search.friend_room.empty() &&
+              state == Matchmaking::MATCHMAKING && yougame::status_line() == kSearching) screen = Screen::Search;
+          else if (state == Matchmaking::ERROR_ENCOUNTERED && error == kRefusal) screen = Screen::Refusal;
+        }
+      }
+      if (action == 1 || action == 3) {
+        if (g_slippi_link.press(screen, g_link_scene, yougame::request_slippi_link)) g_link_menu = action == 3;
+      }
+      auto line = presentation.line(screen);
+      if (screen == Screen::None) line.clear();
+      q.assign(line.begin(), line.end()); q.resize(128);
+      return true;
+    }
     case CMD_YOUGAME_FRIENDS_MENU:
       // Query only: the menu checks the local app-granted Slippi account before entry.
       // Do not publish Friends state, wait for identity, or contact either service.

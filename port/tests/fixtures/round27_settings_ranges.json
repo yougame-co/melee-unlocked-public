@@ -1,5 +1,17 @@
 [
   {
+    "before": "      ImGui::Begin(\"##yougame_friend_waiting\", nullptr, passive_flags);\n      ImGui::TextUnformatted(status.c_str());",
+    "after": "      ImGui::Begin(\"##yougame_friend_waiting\", nullptr, passive_flags);\n      ImGui::TextUnformatted(yougame::slippi_link_status(status).c_str());"
+  },
+  {
+    "before": "  const bool have_any_pad = host::window_ui_pads(pads);",
+    "after": "  host::PadState navigation_pads[4]{};\n  const bool have_any_pad = host::window_ui_pads(pads, navigation_pads);"
+  },
+  {
+    "before": "    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;\n    io.AddKeyEvent(ImGuiKey_GamepadStart, (pad.button & 0x1000) != 0);\n    io.AddKeyEvent(ImGuiKey_GamepadBack, (pad.button & 0x10) != 0);\n    io.AddKeyEvent(ImGuiKey_GamepadFaceDown, (pad.button & 0x100) != 0);\n    io.AddKeyEvent(ImGuiKey_GamepadFaceRight, (pad.button & 0x200) != 0);\n    io.AddKeyEvent(ImGuiKey_GamepadDpadUp, (pad.button & 8) || pad.stick_y > 40);\n    io.AddKeyEvent(ImGuiKey_GamepadDpadDown, (pad.button & 4) || pad.stick_y < -40);\n    io.AddKeyEvent(ImGuiKey_GamepadDpadLeft, (pad.button & 1) || pad.stick_x < -40);\n    io.AddKeyEvent(ImGuiKey_GamepadDpadRight, (pad.button & 2) || pad.stick_x > 40);",
+    "after": "    // Backend navigation keys (including Enter/KeypadEnter) never also become pad keys.\n    // Raw `pad` above still owns port following, neutral arming and release capture.\n    settings_input::gamepad(io, navigation_pads[nav_port]);"
+  },
+  {
     "before": "// The volume the settings file holds.",
     "after": "// App-installed update: centered in the game picture, independent of optional HUD readouts.\nstatic void draw_update_handoff_notice() {\n  if (!yougame::update_handoff_visible()) return;\n  const OverlayBounds bounds = overlay_bounds();\n  ImGui::SetNextWindowPos(ImVec2((bounds.left + bounds.right) * 0.5f,\n                               (bounds.top + bounds.bottom) * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));\n  ImGui::SetNextWindowBgAlpha(0.9f);\n  ImGui::Begin(\"YouGameUpdatingNotice\", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |\n      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);\n  ImGui::TextUnformatted(\"Updating...\");\n  ImGui::End();\n  yougame::update_notice_presented();\n}\n\n// The volume the settings file holds."
   },
@@ -38,5 +50,13 @@
   {
     "before": "      draw->AddText(ImVec2(p.x + 20, p.y + 144), IM_COL32(167, 162, 178, 255),\n                    app ? yougame::parity::kMenuHint : \"ESC  BACK TO GAME     F1  SETTINGS\");\n    } else {\n      const bool enter = ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);\n      if (action(\"##confirm_quit\", app ? \"BACK TO YOUGAME\" : \"QUIT\", 0) || enter) { state.menu_open = false; host::request_user_exit(); }\n      ImGui::SetItemDefaultFocus();\n      if (action(\"##cancel_quit\", \"CANCEL\", 1)) { state.menu_open = false; state.menu_quit = false; }\n      draw->AddText(ImVec2(p.x + 20, p.y + 144), IM_COL32(167, 162, 178, 255),\n                    app ? yougame::parity::kMenuHint : \"QUIT MELEE UNLOCKED?     ENTER  QUIT     ESC  CANCEL\");\n    }\n    ImGui::End();\n  }\n",
     "after": "      draw->AddText(ImVec2(p.x + 20, p.y + 144), IM_COL32(167, 162, 178, 255),\n                    app ? yougame::parity::kMenuHint : \"ESC  BACK TO GAME     F1  SETTINGS\");\n    } else {\n      if (action(\"##confirm_quit\", app ? \"BACK TO YOUGAME\" : \"QUIT\", 0)) { state.menu_open = false; state.menu_quit = false; host::request_user_exit(); }\n      ImGui::SetItemDefaultFocus();\n      if (action(\"##cancel_quit\", \"CANCEL\", 1)) { state.menu_open = false; state.menu_quit = false; }\n      draw->AddText(ImVec2(p.x + 20, p.y + 144), IM_COL32(167, 162, 178, 255),\n                    app ? yougame::parity::kMenuHint : \"ENTER  SELECT     ESC  CANCEL\");\n    }\n    ImGui::End();\n  }\n"
+  },
+  {
+    "before": "  screen_label::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y);",
+    "after": "  screen_label::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y, g_overlay_game_aspect);"
+  },
+  {
+    "before": "    const auto console_status = yougame::console::entry.status();",
+    "after": "    const auto console_status = yougame::console::waiting_status();"
   }
 ]

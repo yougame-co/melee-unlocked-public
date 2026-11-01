@@ -4791,7 +4791,8 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   // UI navigation is armed only after the selected pad has returned to neutral. A held A that
   // opened no UI cannot click Start, Cancel, or acknowledge a later disconnect.
   host::PadState pads[4]{};
-  const bool have_any_pad = host::window_ui_pads(pads);
+  host::PadState navigation_pads[4]{};
+  const bool have_any_pad = host::window_ui_pads(pads, navigation_pads);
   if (!have_any_pad) for (host::PadState& p : pads) p.err = -1;
   host::settings_nav::Pad nav_pads[4];
   for (int i = 0; i < 4; ++i)
@@ -4868,22 +4869,16 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       io.AddKeyEvent(k, false);
   } else if (have_pad && nav_active && state.practice_pad_armed) {
     auto& io = ImGui::GetIO();
-    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
-    io.AddKeyEvent(ImGuiKey_GamepadStart, (pad.button & 0x1000) != 0);
-    io.AddKeyEvent(ImGuiKey_GamepadBack, (pad.button & 0x10) != 0);
-    io.AddKeyEvent(ImGuiKey_GamepadFaceDown, (pad.button & 0x100) != 0);
-    io.AddKeyEvent(ImGuiKey_GamepadFaceRight, (pad.button & 0x200) != 0);
-    io.AddKeyEvent(ImGuiKey_GamepadDpadUp, (pad.button & 8) || pad.stick_y > 40);
-    io.AddKeyEvent(ImGuiKey_GamepadDpadDown, (pad.button & 4) || pad.stick_y < -40);
-    io.AddKeyEvent(ImGuiKey_GamepadDpadLeft, (pad.button & 1) || pad.stick_x < -40);
-    io.AddKeyEvent(ImGuiKey_GamepadDpadRight, (pad.button & 2) || pad.stick_x > 40);
+    // Backend navigation keys (including Enter/KeypadEnter) never also become pad keys.
+    // Raw `pad` above still owns port following, neutral arming and release capture.
+    settings_input::gamepad(io, navigation_pads[nav_port]);
   }
   ImGui::NewFrame();
   if (yougame::active() || slippi::online::online_status_visible()) {
     const auto now = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     const auto toast = yougame::friends::events.toast(now);
-    const auto console_status = yougame::console::entry.status();
+    const auto console_status = yougame::console::waiting_status();
     const auto status = console_status.empty() ? yougame::status_line() : console_status;
     const auto screen = ImGui::GetIO().DisplaySize;
     const auto passive_flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
@@ -4905,7 +4900,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     if (!slippi::online::is_online_match() && show_status) {
       ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, screen.y - 60), ImGuiCond_Always, ImVec2(0.5f, 1));
       ImGui::Begin("##yougame_friend_waiting", nullptr, passive_flags);
-      ImGui::TextUnformatted(status.c_str());
+      ImGui::TextUnformatted(yougame::slippi_link_status(status).c_str());
       if (status == yougame::friends::kWaiting || !console_status.empty()) ImGui::TextDisabled("Z: cancel");
       ImGui::End();
     }
@@ -5160,7 +5155,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                          ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y);
   net_overlay::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y);
   replay_bar::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y, state.open || state.menu_open || state.practice_open || state.fill_window);
-  screen_label::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y);
+  screen_label::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y, g_overlay_game_aspect);
   // Start on the controller closes the panel from any page (the open chord is Start + Down + Z,
   // which the input layer swallows whole, so this never fires on the press that opened it).
   if (state.open && !phob_native_open() && ImGui::IsKeyPressed(ImGuiKey_GamepadStart, false) &&

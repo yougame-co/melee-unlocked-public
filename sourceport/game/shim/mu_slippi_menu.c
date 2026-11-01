@@ -104,6 +104,7 @@ static int p2p_auto_direct;
  * or the host stops the page picker it opened for that press (friends: cancelled, the invite still
  * goes out and the friend waits for a room nobody hosts). Menu-only, like p2p_auto_direct. */
 static int friends_confirm_hold;
+static int slippi_link_notice;
 
 MuSlippiMenuState* mu_slippi_state(void)
 {
@@ -514,6 +515,7 @@ void mu_slippi_main_menu_loaded(void)
 {
     u8 friends_menu = 0;
     friends_confirm_hold = 0;
+    slippi_link_notice = 0;
     mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &friends_menu, 1, NULL, 0, NULL);
     if (!mu_slippi_menus_enabled()) {
         return;
@@ -621,6 +623,24 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         input[port][2] = gm_801A36C0((u8) port);
     }
     buttons = mn_80229624(4);
+    /* The refusal owns Y until an actual navigation/back/confirm leaves it. Cooldown and
+     * focus changes never withdraw the context of an open app sheet. */
+    if (slippi_link_notice) {
+        if (buttons & (MenuInput_Back | MenuInput_Up | MenuInput_Down | MenuInput_Confirm)) {
+            u8 leave = 4;
+            slippi_link_notice = 0;
+            mu_slippi_cmd(0xE7, &leave, 1, NULL, 0, NULL);
+        } else {
+            for (port = 0; port < 4; ++port) {
+                if (accepts_input && (input[port][1] & 0x0800)) {
+                    u8 press = 3; /* mapped GameCube Y, never a plain keyboard key */
+                    mu_slippi_cmd(0xE7, &press, 1, NULL, 0, NULL);
+                    break;
+                }
+            }
+            mu_slippi_signin_notice(gp);
+        }
+    }
     if (p2p_auto_direct && accepts_input) {
         /* Once per run: confirm Direct as a press on this frame would, whatever the pads hold. */
         p2p_auto_direct = 0;
@@ -664,6 +684,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
                !upstream_slippi_available()) {
         mn_804D6BC8.cooldown = 5;
         sfxBack();
+        slippi_link_notice = 1;
         mu_slippi_signin_notice(gp);
     } else if (buttons & MenuInput_Confirm) {
         mn_804D6BC8.cooldown = 5;
@@ -956,9 +977,11 @@ static void vs_decide(GameModeState* state)
             int w0 = won_last_game(0), w1 = won_last_game(1);
             mu_ranked_setup_game_result(w0 != w1 ? (w0 ? 0 : 1) : -1, me->outcome, 0);
         }
+        /* The stage the game ran, from its own VS data (the same game_info + 0xE): a failed
+         * post-game read zeroes last_match, and the stage enters the set's DSR history. */
         result = mu_ranked_setup_finish_game(
             last_match.connection_state == MU_SLP_MM_CONNECTION_SUCCESS,
-            mu_yg_get16(last_match.game_info + 0xE));
+            gmVsMelee_GetVsData()->start.rules.stkind);
         /* asm main.asm:617-741: only conclusive games score; a tie reuses cur_game. */
         if (result == MU_SETUP_NEXT_GAME || result == MU_SETUP_TIEBREAK) {
             next = MU_SLP_STATE_GAME_SETUP;

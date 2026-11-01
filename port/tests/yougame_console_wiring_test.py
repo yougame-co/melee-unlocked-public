@@ -177,6 +177,40 @@ class ConsoleWiring(unittest.TestCase):
         self.assertIn('g_game.run', begin)  # reject a late entry after game initialization
         self.assertIn('prepare_card(', begin)
 
+    def test_friends_save_hint_and_stall_wiring(self):
+        link = read('port/runtime/hle/yougame_link.cpp')
+        self.assertIn('start_session({{"room",room},{"players",2},{"inputDelay",2}}', link)
+        for call in ('host_save_reader.load(', 'stage_card(', 'load_card('):
+            self.assertIn(call, link)
+        # The runtime library is built without MELEE_SOURCE_PORT: the save read can't hide behind it.
+        self.assertNotIn('MELEE_SOURCE_PORT', body(link, 'console_io'))
+        self.assertIn('host_save_reader.store(&source_port::console_host_save', self.host)
+        # 30.x seats (console1: no shared save, intro boot) must never share a session with these.
+        self.assertEqual(body(link, 'console_io').count('+ "-console2";'), 2)
+        self.assertNotIn('-console1"', link)
+        self.assertIn('atomic_load(&g_console_host_snapshot)', body(self.host, 'console_host_save'))
+        self.assertIn('card_find("SuperSmashBros0110290334")', body(self.host, 'card_refresh_snapshot'))
+        # The snapshot outlives Melee's unmount (Friends reads it at START); every card change refreshes it.
+        self.assertIn('card_refresh_snapshot();', body(self.host, 'card_mount_files'))
+        self.assertNotIn('g_console_host_snapshot', body(self.host, 'card_reset_mount'))
+        for function in ('h_card_delete', 'h_card_rename', 'h_card_format'):
+            self.assertIn('card_refresh_snapshot();', body(self.host, function))
+        save = body(self.host, 'card_save')
+        self.assertLess(save.index('if (g_console_boot) return;'), save.index('_wfopen('))
+        for function in ('h_card_delete', 'h_card_rename', 'h_card_format'):
+            self.assertIn('if (!g_console_boot) std::filesystem::remove', body(self.host, function))
+        engine = read('port/runtime/hle/yougame_console_engine.cpp')
+        advance = body(engine, 'advance')
+        self.assertIn('honest_menu(menus_lockstep(),rollback_enabled_', advance)
+        self.assertIn('if (menus_lockstep() || frame_ == match_origin_', advance)
+        self.assertIn('const bool menu = menus_lockstep();', advance)
+        self.assertIn('console: menu stalls ', advance)
+        draw = body(read('port/runtime/gx/replay_bar.cpp').split('namespace screen_label {')[1], 'draw')
+        self.assertIn('console_menu_visible()', draw)
+        self.assertIn('picture_height*0.027f', draw)
+        self.assertIn('g_overlay_game_aspect);', read('port/runtime/gx/pc_settings.cpp'))
+        self.assertIn('IM_COL32(255,239,170', draw)
+
     def test_settings_and_page_cannot_mutate_console_simulation(self):
         for name in ('h_game_options', 'h_game_options2', 'h_game_options3',
                      'h_audio_options', 'h_display_options', 'h_mod_flags', 'h_match_override',

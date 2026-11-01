@@ -194,10 +194,20 @@ void mu_ranked_rank_frame(void)
     }
     set = mu_ranked_set();
     if (set->cur_game > 1 && set->max_games &&
-        (ms->connection_state == MU_SLP_MM_IDLE || matched))
+        (ms->connection_state == MU_SLP_MM_IDLE || matched)) {
         /* By port in the set; the local player's count first, as on the setup screen. */
-        sprintf(score, "Game %u - %u:%u", (unsigned) set->cur_game,
-                (unsigned) set->score[(ms->local_index & 3) == 1],
-                (unsigned) set->score[(ms->local_index & 3) != 1]);
+        const unsigned me = (ms->local_index & 3) == 1, need = (set->max_games + 1u) / 2u;
+        const unsigned mine = set->score[me], theirs = set->score[!me];
+        /* Build 30 (11-01): a finished set read "Game 2 - 2:0", as if game 2 were next.
+         * START resets the set, so this shows only on the CSS the set returned to. */
+        if (mine >= need || theirs >= need)
+            sprintf(score, "Set %s %u:%u", mine >= need ? "won" : "lost", mine, theirs);
+        else if (ms->connection_state == MU_SLP_MM_IDLE)
+            /* CTO 11-01: between games a set goes to the setup scene, never this CSS, so an
+             * idle CSS below the win count means a player left or the link dropped. */
+            sprintf(score, "Set ended early %u:%u", mine, theirs);
+        else
+            sprintf(score, "Game %u - %u:%u", (unsigned) set->cur_game, mine, theirs);
+    }
     line(SET_SCORE, score);
 }

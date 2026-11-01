@@ -706,7 +706,9 @@ void tick() {
   }
 
   const auto major = current_major(), minor = current_minor();
+  slippi::online::slippi_link_tick(major, minor, online_mode());
   if (major != 1) yougame::friends::events.online_menu(false);
+  yougame::friends::events.menu_scene(yougame::friends::menu_safe(major, minor));
   if (yougame::active() && !slippi::playback::enabled()) {
     if (major == kOnlineMajor) g_friend_handoff = false;
     // Wait for the main menu's initialization/cleanup. Never interrupt a local or online match.

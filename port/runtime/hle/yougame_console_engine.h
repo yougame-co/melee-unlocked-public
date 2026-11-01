@@ -34,6 +34,7 @@ public:
   }
   bool rollback_enabled() const { return active_ && rollback_enabled_; }
   bool match_active() const { return active_ && match_; }
+  bool menus_lockstep() const { return active_ && !match_; }
   bool needs_sample() const {
     return active_ && !local_.count((started_ ? frame_ + 1 : 0) + config_.input_delay);
   }
@@ -123,6 +124,8 @@ private:
   // Per 600 frames: wall time (is the session at 60 fps?), and waits longer than one frame, by port.
   uint64_t window_began_ = 0, long_waits_ = 0;
   int long_port_ = 0;
+  uint64_t menu_window_ = 0, menu_stalls_ = 0, menu_longest_ = 0;
+  bool menu_window_active_ = false;
 };
 
 Engine& console_engine(); // simulation-thread owner

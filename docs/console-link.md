@@ -70,7 +70,7 @@ All traffic uses the existing app broker and helper; there is no native socket f
 The ticket shape remains:
 
 ```json
-{"type":"mpTicket","room":"new","players":4,"mode":"console","ranked":false,"lobby":{"version":1,"minPlayers":4,"maxLocalPlayers":1,"compatibility":"<Direct compatibility>-console1"}}
+{"type":"mpTicket","room":"new","players":4,"mode":"console","ranked":false,"lobby":{"version":1,"minPlayers":4,"maxLocalPlayers":1,"compatibility":"<Direct compatibility>-console2"}}
 ```
 
 Joining uses the room code. The answer supplies ticket and room. Console uses the canonical native

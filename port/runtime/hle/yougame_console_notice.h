@@ -9,6 +9,7 @@ inline const char* session_notice(const std::string& reason) {
   if (reason == "left" || reason == "away" || reason == "kicked") return "Your friend left.";
   if (reason == "host_ended") return "The host ended the session.";
   if (reason == kBootTimeout) return "Your friend's game didn't start.";
+  if (reason == "Couldn't get your friend's save") return "Couldn't get your friend's save";
   if (reason == kMixedBuilds) return kMixedBuilds;
   return nullptr;
 }

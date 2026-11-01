@@ -1,6 +1,8 @@
 // Console lockstep transport; no simulation, native sockets, or Slippi protocol.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "yougame_console_link.h"
+#include "yougame_console_card.h"
+#include "yougame_update.h"
 #include <array>
 #include <iomanip>
 #include <sstream>
@@ -75,7 +77,7 @@ struct PadRing {
 struct Peer {
   int port; unsigned link; std::string connection;
   uint64_t heard = 0, sent = 0, resent = 0, late = 0, rtt = 0, opened = 0, retry_at = 0;
-  uint32_t ack = kNone, digest_ack = kNone, next = 0, next_digest = 0;
+  uint32_t ack = kNone, digest_ack = kNone, next = 0, next_digest = 0, last_heard_frame = kNone;
   bool bad_version = false, dirty = true, up_logged = false, sampled = false;
   int reopened = 0;
   std::string path;
@@ -210,7 +212,16 @@ class Link final : public SessionLink {
         io.log("console: all peers at frame 0; liveness armed");
       }
       if (!armed_ && ready_since_ && now - *ready_since_ >= 60000) end(kBootTimeout);
-      for (const auto& p : peers) if (io.state(p.link) == 3 || (armed_ && now - p.heard >= 5000)) end("your friend disconnected");
+      for (const auto& p : peers) {
+        const bool closed = io.state(p.link) == 3;
+        const auto silent = now >= p.heard ? now - p.heard : 0;
+        if (closed || (armed_ && silent >= 5000)) {
+          io.log("console: port " + std::to_string(p.port) + " silent " + std::to_string(silent) +
+              " ms (last heard frame " + (p.last_heard_frame != kNone ? std::to_string(p.last_heard_frame) : std::string("-1")) +
+              "): " + (closed ? "transport closed" : "no receive for 5 s"));
+          end("your friend disconnected"); break;
+        }
+      }
       transmit(); paths();
       if (committed && config.my_port == host_port && io.clock() < choice_until && io.clock() >= control_at) {
         broadcast(6, worst_rtt, chosen_delay); control_at = io.clock()+50;
@@ -362,6 +373,8 @@ class Link final : public SessionLink {
     const uint32_t ack = uint32_t(get(b,at,4)), da = uint32_t(get(b,at,4));
     if (ack != kNone && (newest_ == kNone || ack > newest_)) return;
     if (da != kNone && da >= digest_serial_) return;
+    // Receive clock, independent of simulation frames: production service() pumps
+    // this transport on its worker throughout loading, stalls and slow gameplay.
     p.heard = io.clock();
     if (ack != kNone && (p.ack == kNone || ack > p.ack)) {
       auto i = p.outgoing.find(ack); if (i != p.outgoing.end()) p.rtt = io.clock() - i->second.first_sent;
@@ -372,12 +385,14 @@ class Link final : public SessionLink {
     for (int n = 0; n < b[2]; ++n) {
       const uint32_t f = uint32_t(get(b,at,4)); const auto value = get_pad(b,at);
       if (f == kNone || uint64_t(f) + kHistory < p.next || uint64_t(f) >= uint64_t(p.next) + kHistory) continue;
+      if (p.last_heard_frame == kNone || f > p.last_heard_frame) p.last_heard_frame = f;
       if (!p.pads.find(f)) { if (f < p.next) continue; if (f != p.next) ++p.late; p.pads.insert(f,value); }
       while (p.pads.find(p.next)) ++p.next;
     }
     for (int n = 0; n < b[3]; ++n) {
       const uint32_t serial = uint32_t(get(b,at,4)), frame = uint32_t(get(b,at,4)); const auto value = get(b,at,8);
       if (serial < p.next_digest || uint64_t(serial) >= uint64_t(p.next_digest) + kHistory) continue;
+      if (p.last_heard_frame == kNone || frame > p.last_heard_frame) p.last_heard_frame = frame;
       p.digest_order.emplace(serial,Digest{frame,value});
       while (p.digest_order.count(p.next_digest)) {
         const auto d = p.digest_order.at(p.next_digest); p.digests.emplace(d.frame,d.value);
@@ -411,7 +426,11 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
   error.clear();
   auto link = std::make_unique<Link>(std::move(io));
   auto& i = link->io;
-  auto fail = [&](const char* why) -> std::unique_ptr<SessionLink> { error = why; i.log("console: start failed: " + error); return nullptr; };
+  // Which stage a throw came from, for the log below (never the exception's text: it can carry a ticket).
+  const char* step = "request";
+  auto fail = [&](const char* why) -> std::unique_ptr<SessionLink> {
+    error = why; i.log("console: start failed: " + error + " (at " + step + ")"); return nullptr;
+  };
   json request;
   if (!parse_request(input,request)) return fail("invalid console session request");
   if (i.exclusive && !requests.claim()) return fail("a console session is already running");
@@ -422,12 +441,14 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
     const auto code = host_new ? new_room_code(i.random ? i.random() : i.clock()) : request["room"].get<std::string>();
     const json ticket_request = {{"type","mpTicket"},{"room",code},{"players",players},{"mode","console"},{"ranked",false},
       {"lobby",{{"version",1},{"minPlayers",players},{"maxLocalPlayers",1},{"compatibility",i.compatibility}}}};
+    step = "ticket";
     const auto ticket = i.request(ticket_request,10000);
     const auto room = friends::room(ticket);
     if (room.empty() || code != room) {
       i.log("console: ticket for room " + code + " came back " + (room.empty() ? std::string("without a room") : "for room " + room));
       return fail("couldn't open your friend's room");
     }
+    step = "room";
     if (!i.open_room(str(ticket,"ticket"),room,10000)) { i.log("console: room " + room + " socket didn't open"); return fail("couldn't open your friend's room"); }
 #ifdef YOUGAME_AGENT_TEST_HOOK
     if (host_new) i.log("agent: console host room " + room);
@@ -440,6 +461,9 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
     const uint64_t seats_until = i.clock() + 300000;
     const bool rejoin = request.count("sessionId");
     const auto delay = request.value("inputDelay",3);
+    Bytes host_card; std::string host_digest; bool card_read = false;
+    const bool sync_card = players == 2 && bool(i.host_save);
+    step = "seats";
     while (i.clock() < seats_until) {
       if (i.cancelled()) return fail("cancelled");
       json m;
@@ -465,12 +489,27 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
       const bool full = valid_roster(r.participants,players,true,true), host = r.me == r.host_connection;
       if (i.waiting) i.waiting(full ? (host ? "Press START to play together" : "Waiting for the host") : friends::kWaiting, full && host);
       if (!rejoin && full && host && i.confirm_start() && i.clock() >= next_begin) {
-        if (!i.send_room({{"t","begin"},{"revision",r.revision},{"console",true},{"inputDelay",delay},{"settingsDigest",""}})) return fail("couldn't start your friend's room");
+        json begin = {{"t","begin"},{"revision",r.revision},{"console",true},{"inputDelay",delay},{"settingsDigest",""}};
+        if (sync_card) {
+          step = "card read";
+          if (!card_read) {
+            card_read = true; host_card = i.host_save();
+            // Never refuse START over the save: without a shareable one, the begin carries no
+            // cardDigest and every seat boots the same fresh card (default unlocks).
+            if (melee_gci(host_card)) host_digest = card_sha(host_card);
+            else { i.log("console: couldn't share the host's save (" + std::to_string(host_card.size()) + " bytes); every seat starts with default unlocks"); host_card.clear(); }
+          }
+          if (!host_digest.empty()) begin["cardDigest"] = host_digest;
+          step = "seats";
+        }
+        if (!i.send_room(begin)) return fail("couldn't start your friend's room");
         next_begin = i.clock() + 2000;
       }
       if (i.clock() - ping >= 5000) { i.send_room({{"t","ping"},{"at",i.clock()}}); ping = i.clock(); }
     }
     if (start.is_null()) return fail("your friend didn't join");
+    const auto frozen_at = i.clock();
+    step = "start";
     if (!start.count("console") || !start["console"].is_object()) return fail("invalid console session start");
     const auto& s = start["console"];
     uint64_t start_seed = 0;
@@ -486,6 +525,10 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
     SessionConfig c; c.room = room; c.my_port = my_port; c.session_id = s["sessionId"]; c.seed = start_seed;
     c.epoch_ms = s["startedAt"].get<int64_t>(); c.input_delay = s["inputDelay"].get<int>();
     c.settings_digest = s["settingsDigest"].get<std::string>();
+    c.card_digest = str(s,"cardDigest");
+    if (!c.card_digest.empty() && !card_hash(c.card_digest)) return fail(kCardFailure);
+    if (sync_card && c.card_digest.empty()) i.log("console: no shared save in the start; this seat starts with default unlocks");
+    if (request.count("cardDigest") && request["cardDigest"] != c.card_digest) return fail(kCardFailure);
     for (const auto& p : s["participants"]) c.ports.push_back(p["port"].get<int>());
     std::sort(c.ports.begin(),c.ports.end());
     for (auto key : {"sessionId","seed","epochMs","inputDelay","port"}) {
@@ -499,6 +542,77 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
     if (link->host_port < 1) return fail("invalid console session start");
     if (rejoin) i.log("console: rejoined session " + c.session_id);
     if (i.cancelled()) return fail("cancelled");
+    if (!c.card_digest.empty()) {
+      step = "card transfer";
+      const auto until_card = frozen_at + 20000;
+      const auto sha8 = c.card_digest.substr(0,8);
+      auto card_log = [&](size_t n,const char* result) {
+        i.log("console: card received " + std::to_string(n) + " chunks sha " + sha8 + " " + result);
+      };
+      if (rejoin) {
+        if (!i.restore_card || !i.restore_card(c) || !card_bytes_ok(c)) return fail(kCardFailure);
+      } else if (c.my_port == link->host_port) {
+        c.card_bytes = std::move(host_card);
+        if (!card_bytes_ok(c)) { card_log(0,"mismatch"); return fail(kCardFailure); }
+        const size_t n = (c.card_bytes.size()+kCardChunk-1)/kCardChunk;
+        for (const auto& peer : link->frozen) if (str(peer,"connectionId") != r.me) {
+          for (size_t chunk = 0; chunk < n; ++chunk) {
+            if (i.cancelled()) return fail("cancelled");
+            if (i.clock() >= until_card) { card_log(n,"timeout"); return fail(kCardFailure); }
+            const size_t offset = chunk*kCardChunk, size = std::min(kCardChunk,c.card_bytes.size()-offset);
+            if (!i.send_room({{"t","msg"},{"to",peer["connectionId"]},{"d",{{"kind","mu-card"},{"v",1},
+                {"match",c.session_id},{"i",chunk},{"n",n},{"data",card_encode(c.card_bytes.data()+offset,size)}}}})) return fail(kCardFailure);
+            // The direct datagram helper is not attached until AFTER relaunch. Pace through the
+            // room, preserving interruption messages, rather than waiting on its absent socket.
+            const auto paced_until = std::min(until_card,i.clock()+12);
+            while (i.clock() < paced_until) {
+              if (i.cancelled()) return fail("cancelled");
+              json m;
+              if (i.next_room(m,int(paced_until-i.clock()))) link->room_message(m);
+              if (i.room_closed() || link->lost()) return fail(kCardFailure);
+            } // <=84 messages/s, below Rooms' 120/s relay budget
+          }
+        }
+        if (i.clock() >= until_card || (i.flush_room && !i.flush_room(int(until_card-i.clock())))) {
+          card_log(n,i.clock() >= until_card ? "timeout" : "mismatch"); return fail(kCardFailure);
+        }
+        i.log("console: card sent " + std::to_string(n) + " chunks sha " + sha8);
+      } else {
+        std::vector<Bytes> chunks; size_t total = 0, received = 0;
+        const auto host = str(*std::find_if(link->frozen.begin(),link->frozen.end(),[&](const json& p) {
+          return p["port"] == link->host_port;
+        }),"connectionId");
+        while (chunks.empty() || received < chunks.size()) {
+          if (i.cancelled()) return fail("cancelled");
+          if (i.clock() >= until_card) { card_log(received,"timeout"); return fail(kCardFailure); }
+          if (i.room_closed()) return fail(kCardFailure);
+          json m;
+          if (!i.next_room(m,int(std::min<uint64_t>(50,until_card-i.clock())))) continue;
+          if (str(m,"t") != "msg" || str(m,"from") != host || !m.count("d") || !m["d"].is_object()) continue;
+          const auto& d = m["d"];
+          if (str(d,"kind") != "mu-card" || str(d,"match") != c.session_id) continue;
+          if (d.value("v",json()) != 1 || !number(d,"n",1,(kCardLimit+kCardChunk-1)/kCardChunk) ||
+              !number(d,"i",0,d["n"].get<size_t>()-1)) return fail(kCardFailure);
+          const size_t n = d["n"].get<size_t>(), index = d["i"].get<size_t>();
+          if (chunks.empty()) chunks.resize(n);
+          if (chunks.size() != n || !d.count("data") || !d["data"].is_string()) return fail(kCardFailure);
+          Bytes bytes;
+          if (!card_decode(d["data"].get<std::string>(),bytes) || bytes.empty()) return fail(kCardFailure);
+          if (!chunks[index].empty()) { if (chunks[index] != bytes) return fail(kCardFailure); continue; }
+          total += bytes.size();
+          if (total > kCardLimit) return fail(kCardFailure);
+          chunks[index] = std::move(bytes); ++received;
+        }
+        for (const auto& bytes : chunks) c.card_bytes.insert(c.card_bytes.end(),bytes.begin(),bytes.end());
+        const bool ok = card_bytes_ok(c);
+        card_log(chunks.size(),ok ? "ok" : "mismatch");
+        if (!ok) return fail(kCardFailure);
+      }
+      if (i.clock() >= until_card) { card_log(0,"timeout"); return fail(kCardFailure); }
+      if (!rejoin && (!i.persist_card || !i.persist_card(c))) return fail(kCardFailure);
+      if (i.clock() >= until_card) { card_log(0,"timeout"); return fail(kCardFailure); }
+      link->config = c;
+    }
     if (i.prepared) { i.prepared(c); return nullptr; }
     i.log("console: start session " + c.session_id + " seed " + hex(c.seed) + " delay " + std::to_string(c.input_delay));
     // A relaunching seat can be absent for ~60 s. Rendezvous through Rooms before
@@ -518,6 +632,7 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
         i.send_room({{"t","msg"},{"to",p["connectionId"]},{"d",transport::candidate(true,i.compatibility,"",c.session_id,"","","")}});
       candidate_at = i.clock()+1000;
     };
+    step = "rendezvous";
     if (rejoin) {
       const auto rendezvous_until = i.clock()+65000;
       while (i.clock() < rendezvous_until && candidates.size()+1 < c.ports.size()) {
@@ -550,7 +665,9 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
       return reply;
     };
     // The app may take seconds to map the helper's ring (Friends waits 10 s); every step logs why it stopped.
+    step = "attach";
     if (!i.attach(std::min(10000,budget()))) { i.log("console: link helper attach failed"); return fail("couldn't connect to your friend"); }
+    step = "open";
     for (const auto& p : link->frozen) {
       const auto conn = str(p,"connectionId"); if (conn == r.me) continue;
       if (!budget()) { i.log("console: no time left to open a link"); return fail("couldn't connect to your friend"); }
@@ -565,6 +682,7 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
       Peer peer{}; peer.port = p["port"].get<int>(); peer.link = id; peer.connection = conn; peer.heard = i.clock(); peer.opened = opened; link->peers.push_back(std::move(peer));
       link->startup_work();
     }
+    step = "links";
     while (budget()) {
       if (i.cancelled()) return fail("cancelled");
       link->startup_work();
@@ -604,6 +722,7 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
       }
       if (up) {
         for (auto& p : link->peers) p.heard = i.clock();
+        step = "delay";
         if (!link->agree_delay()) {
           if (link->lost()) return fail(link->lost()->c_str());
           return fail(i.cancelled() ? "cancelled" : "couldn't agree on a delay");
@@ -617,6 +736,17 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
       i.log("console: links not up in 20 s (candidates " + std::to_string(candidates.size()) + " of " + std::to_string(link->peers.size()) + ";" + states + ")");
     }
     return fail("couldn't connect to your friend");
-  } catch (...) { i.log("console: link setup threw"); return fail("couldn't connect to your friend"); } // never print bridge exception text/tickets
+  } catch (const update::Required&) {   // this build is no longer the listing's current one: say so, as Unranked does
+    i.log(std::string("console: setup threw at ") + step + " (update_required)");
+    i.log("console: update required"); return fail(update::kMessage);
+  } catch (const json::exception&) {
+    i.log(std::string("console: setup threw at ") + step + " (json)"); return fail(std::string(step).find("card") == 0 ? kCardFailure : "couldn't connect to your friend");
+  } catch (const std::runtime_error&) {
+    i.log(std::string("console: setup threw at ") + step + " (runtime_error)"); return fail(std::string(step).find("card") == 0 ? kCardFailure : "couldn't connect to your friend");
+  } catch (const std::exception&) {
+    i.log(std::string("console: setup threw at ") + step + " (exception)"); return fail(std::string(step).find("card") == 0 ? kCardFailure : "couldn't connect to your friend");
+  } catch (...) {   // never print bridge exception text or tickets: the stage and category only
+    i.log(std::string("console: setup threw at ") + step + " (other)"); return fail(std::string(step).find("card") == 0 ? kCardFailure : "couldn't connect to your friend");
+  }
 }
 } // namespace yougame::console

@@ -39,6 +39,9 @@ static void abort_setup(void)
     MuYgU8 mode = 1;
     if (ended) return;
     ended = 1;
+    /* The set ends here, as a SET_ABORTED game would end it: its result reveal releases the
+     * update gate. A conclusive game whose link is gone now gets here, not to finish_game's abort. */
+    update_result_pending = 1;
     mu_ranked_setup_disconnect(&model);
     mu_slippi_cmd(0xC2, &mode, 1, NULL, 0, NULL);
     mu_slippi_cleanup_connections();
@@ -188,8 +191,11 @@ int mu_ranked_setup_finish_game(int connected, MuYgU16 stage)
 {
     MuRankedSet* set = mu_ranked_set_mut();
     unsigned game = set->cur_game;
-    int result = mu_ranked_setup_record_game(set, result_winner, result_end,
-                                            stage, result_disconnect || !connected);
+    /* Slippi scores a conclusive game and ends the set only on its disconnect winner (-3, shown
+     * during the game; asm main.asm:617-741). The setup scene checks the link on every frame and
+     * ends the set there if it is really gone. 11-01: a post-game read that said "not connected"
+     * abandoned the set after a conclusive game 1, so that read no longer decides; it is logged. */
+    int result = mu_ranked_setup_record_game(set, result_winner, result_end, stage, result_disconnect);
     if (result == MU_SETUP_SET_OVER || result == MU_SETUP_SET_ABORTED) update_result_pending = 1;
     if (result == MU_SETUP_NEXT_GAME || result == MU_SETUP_TIEBREAK || result == MU_SETUP_SET_OVER ||
         result == MU_SETUP_SET_ABORTED) {
@@ -205,6 +211,25 @@ int mu_ranked_setup_finish_game(int connected, MuYgU16 stage)
             result == MU_SETUP_NEXT_GAME ? "setup" : result == MU_SETUP_TIEBREAK ? "tiebreak" :
             result == MU_SETUP_SET_OVER ? "set over" : "abandoned");
         mu_online_abi_log(line);
+        if (!connected && result != MU_SETUP_SET_ABORTED) {
+            snprintf(line, sizeof line, "ranked set: game %u counted although the link read state %u "
+                     "after it; the next screen checks the link again\n", game,
+                     (unsigned)mu_slippi_match_state()->connection_state);
+            mu_online_abi_log(line);
+        }
+        if (result == MU_SETUP_SET_ABORTED) {
+            /* Which of record_game's conditions ended it (11-01: the set died after a conclusive
+             * game 1; only the post-game link read can have said "disconnected"). */
+            const MuMatchState* ms = mu_slippi_match_state();
+            snprintf(line, sizeof line, "ranked set: abandoned after game %u: disconnect shown %d, "
+                     "link state %u (%s), winner %d\n", game, result_disconnect,
+                     (unsigned)ms->connection_state, connected ? "connected" : "not connected", result_winner);
+            mu_online_abi_log(line);
+            if (ms->error[0]) {
+                snprintf(line, sizeof line, "ranked set: link error: %.120s\n", ms->error);
+                mu_online_abi_log(line);
+            }
+        }
         if (result == MU_SETUP_SET_OVER) {
             snprintf(line, sizeof line, "ranked set: over %u-%u, practice %d\n",
                      (unsigned)set->score[local], (unsigned)set->score[!local], practice);

@@ -37,7 +37,8 @@ class LocalBuildEngineWiringTest(unittest.TestCase):
     def test_shared_room_key_reads_engine(self):
         link = source("port/runtime/hle/yougame_link.cpp")
         self.assertIn("compatibility_key(v, build.mod_view, build.fingerprint, build.static_engine,\n"
-                      "                           slippi::online::ranked_rules_digest(mode))", link)
+                      "                           slippi::online::ranked_rules_digest(mode),\n"
+                      "                           compat_tag_with_test_timer(compat_tag, std::getenv(\"MELEE_ONLINE_TEST_TIMER\")))", link)
         self.assertIn("const std::string compat = compatibility(search.mode);", link)
 
     def test_peer_engine_uses_ignored_capability_bit(self):

@@ -24,6 +24,8 @@ int yg_embed_x11_event(yg_embed_x11 *e, const XEvent *ev);
 void yg_embed_x11_detach(yg_embed_x11 *e);
 /* Returns 1 and the current pixel size, or 0 when absent/dead. Nullable outputs. */
 int yg_embed_x11_size(const yg_embed_x11 *e, int *w, int *h);
+/* Current server focus, not a possibly stale SDL focus notification. */
+int yg_embed_x11_focused(const yg_embed_x11 *e);
 /* Accepted rect/view intersection and explicit show/hide intent. */
 int yg_embed_x11_visible(const yg_embed_x11 *e);
 

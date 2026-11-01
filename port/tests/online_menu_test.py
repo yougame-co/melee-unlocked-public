@@ -48,9 +48,10 @@ static AnimLoopSettings mn_803EB57C[] = {{0},{1},{2}}, mn_803EB5A0[] = {{3},{4},
 struct { int selection_count; AnimLoopSettings* anim_loop; int start_frame; u16* description_indices; void(*think)(HSD_GObj*); } mn_803EB6B0[9];
 static u16 mn_803EB66C[3];
 void mu_slippi_online_menu_think(HSD_GObj*);
-static int ranked_supported, ranked_offered, friends_offered, slippi_submenu, boot_oneshot, p2p_auto_direct, friends_confirm_hold;
+static int ranked_supported, ranked_offered, friends_offered, slippi_submenu, boot_oneshot, p2p_auto_direct, friends_confirm_hold, slippi_link_notice;
 static int pending_buttons, entered, last_mode = -1, published, installs, switched_menu, switched_row;
 static int p2p, cpu, granted = 1, grant_queries, notices, grant_error, grant_short;
+static int link_requests, link_leaves;
 void mu_slippi_signin_notice(HSD_GObj*) { ++notices; }
 int mu_slippi_menu_count(); int mu_slippi_menu_option(int); int mu_slippi_option_unlocked(int);
 int mu_slippi_first_unlocked();
@@ -95,6 +96,10 @@ void mn_80229894(int menu, int row, int) {
 int mu_slippi_cmd(unsigned cmd, const void* p, unsigned, void* out, unsigned, unsigned* got) {
     if (cmd == CMD_YOUGAME_FRIENDS_MENU && *(const u8*)p == 8) {
         ++grant_queries; *(u8*)out = (u8)granted; *got = grant_short ? 0 : 1; return grant_error;
+    }
+    if (cmd == 0xE7) {
+        if (*(const u8*)p == 3) ++link_requests;
+        if (*(const u8*)p == 4) ++link_leaves;
     }
     if (cmd == CMD_YOUGAME_FRIENDS_MENU) published = *(const u8*)p;
     return 0;
@@ -167,8 +172,24 @@ int main() {
             CHECK(slippi_submenu && mu_slippi_menu_count() == 3 && mu_slippi_option_unlocked(row));
             CHECK(slp.mode == old_mode && last_mode == old_content && published == 4);
             CHECK(mn_804D6BC8.cooldown == 5);
+            CHECK(slippi_link_notice);
+            const int before_link = link_requests;
+            pending_buttons = 0; cached_input[0][1] = 0x0800;
+            mu_slippi_online_menu_think(nullptr); // cooldown never launches or withdraws the sheet
+            CHECK(slippi_link_notice && link_requests == before_link && entered == before);
+            mn_804D6BC8.cooldown = 0;
+            mu_slippi_online_menu_think(nullptr);
+            CHECK(link_requests == before_link + 1 && entered == before && slp.mode == old_mode);
+            for (u64 button : {0x0010ULL, 0x0400ULL}) { // Z and X are free too
+                cached_input[0][1] = button; mu_slippi_online_menu_think(nullptr);
+                CHECK(link_requests == before_link + 1 && entered == before);
+            }
+            cached_input[0][1] = 0;
         }
-        press(MenuInput_Up); CHECK(mn_804A04F0.hovered_selection == 1);
+        const int leaves = link_leaves;
+        press(MenuInput_Up); CHECK(link_leaves == leaves + 1 && !slippi_link_notice);
+        CHECK(mn_804A04F0.hovered_selection == 1);
+ CHECK(mn_804A04F0.hovered_selection == 1);
         press(MenuInput_Back); CHECK(!slippi_submenu && switched_row == 3);
     }
     granted = 1; grant_error = grant_short = 0;
@@ -285,6 +306,7 @@ ROUTE_STUBS = r'''#include <cstdio>
 #include <random>
 #include "yougame_search.h"
 #include "yougame_blend.h"
+#include "yougame_slippi_link.h"
 static unsigned long long time_ms() { return 123; }
 static bool active, granted, login, vanilla, compatible = true, cancelled;
 static std::function<void()> on_account_read;
@@ -478,7 +500,7 @@ NOTICE_STUBS = r'''#include <cstdio>
 #include <string>
 #include <initializer_list>
 #include "MU_LABEL_HEADER"
-using u8 = unsigned char;
+using u8 = unsigned char; using u32 = unsigned;
 struct Pair { float x, y; };
 struct SisBuffer { u8* end; u8* data; unsigned size, count; };
 struct HSD_Text {
@@ -486,6 +508,12 @@ struct HSD_Text {
     Pair font_size, x34; int default_kerning, default_alignment;
     u8* sis_buffer; u8* x60; SisBuffer* alloc_data;
 };
+static const char* link_status;
+int mu_slippi_cmd(unsigned,const void*,unsigned,void* out,unsigned cap,unsigned* got) {
+    if (!link_status) { *got=0; return -1; }
+    if (cap!=128) std::abort();
+    std::memset(out,0,cap);std::memcpy(out,link_status,std::strlen(link_status));*got=cap;return 0;
+}
 struct MainMenuData { HSD_Text* description; };
 struct HSD_GObj { MainMenuData* user_data; };
 static bool enabled, yougame;
@@ -530,7 +558,11 @@ NOTICE_CASES = r'''int main() {
         CHECK(data.description==&text);
     }
     CHECK(notice=="Sign in to Slippi to play Direct, Teams and Party");
-    for(const char* message:{"Invite a friend to play.","Ranked isn't on for this game yet.","Sign in to Slippi to play Direct, Teams and Party"}) {
+    for(const char* message:{"Invite a friend to play.","Ranked isn't on for this game yet.","Sign in to Slippi to play Direct, Teams and Party",
+        "Direct, Teams and Party need Slippi - Y: Link Slippi",
+        "Link Slippi: finish in the YouGame window",
+        "Slippi linked - it starts next time you open the game",
+        "Slippi linked - choose a mode to play"}) {
         mu_slippi_menu_description(&text,message);
         CHECK(data.description==&text);
         HSD_Text params=text;
@@ -1004,7 +1036,8 @@ static std::vector<std::string> lines;
 namespace yougame {
 bool active() { return app_active; }
 std::string status_line() { return link_message; }
-namespace console { struct Entry { std::string status() { return console_message; } } entry; }
+std::string slippi_link_status(const std::string& status) { return status; }
+namespace console { std::string waiting_status() { return console_message; } }
 }
 namespace slippi::online {
 bool online_status_visible() { return online_visible; }

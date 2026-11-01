@@ -29,6 +29,22 @@ int main() {
   CHECK(panel.receive(event, "me") && panel.record().status == MU_YG_RESULT_RECORDED);
   CHECK(panel.record().before == 12406 && panel.record().after == 12345);
   CHECK(panel.record().rank_before.order == 11 && panel.record().rank_after.order == 9);
+  CHECK(panel.record().reason == MU_YG_REASON_NONE);
+  // A set the room gave by a leave says to whom (the winner's setup screen, CTO 11-01).
+  for (int won = 0; won < 2; ++won) {
+    ResultsPanel forfeit; forfeit.pending("set"); auto e = event; e["disposition"] = "forfeit";
+    e["ranking"] = won ? json::array({"me", "them"}) : json::array({"them", "me"});
+    CHECK(forfeit.receive(e, "me") && forfeit.record().status == MU_YG_RESULT_RECORDED);
+    CHECK(forfeit.record().reason == (won ? MU_YG_REASON_FORFEIT_WON : MU_YG_REASON_FORFEIT_LOST));
+    const auto bytes = rank_record_response(local.record(), remote.record(), forfeit.record());
+    MuYgRanks decoded{}; CHECK(mu_yg_ranks_decode(&decoded, bytes.data(), bytes.size()));
+    CHECK(decoded.result.reason == forfeit.record().reason && decoded.result.after == 12345);
+  }
+  for (const char* disposition : {"completed", "void"}) {
+    ResultsPanel done; done.pending("set"); auto e = event; e["disposition"] = disposition;
+    e["ranking"] = json::array({"me", "them"});
+    CHECK(done.receive(e, "me") && done.record().reason == MU_YG_REASON_NONE);
+  }
   CHECK(local.result(event, "me") && local.rank_before() == before);
   CHECK(local.rank_object()["division"] == 4);
   CHECK(local.response().size() == 16 && local.response()[1] == 1);

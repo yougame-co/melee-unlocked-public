@@ -11,7 +11,7 @@
 
 namespace yougame::parity {
 inline constexpr const char* kSettingsHint = "F1: game settings";
-inline constexpr const char* kMenuHint = "Escape / YouGame menu (D-pad + Start)";
+inline constexpr const char* kMenuHint = "Shift+Tab / YouGame menu (D-pad + Start)";
 #if defined(_WIN32) || defined(__linux__)
 inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\"]}";
 #else
@@ -23,6 +23,18 @@ inline constexpr const char* kReady = "yg {\"ready\":true}";
 inline constexpr const char* kDown = "yg {\"overlay\":\"down\"}";
 inline constexpr const char* kUp = "yg {\"overlay\":\"up\"}";
 inline constexpr const char* kCancel = "yg {\"overlay\":\"cancel\"}";
+
+// Embedded Escape is handled before ImGui on every host. Return only the key state
+// needed to cancel a rebind; neither bindings nor ImGui NavCancel get a second action.
+// Shift+Escape belongs to the app even during capture; plain Escape only cancels capture.
+template <class Relay, class Back>
+bool embedded_escape(bool down, bool shift, bool repeat, bool capturing, Relay relay, Back back) {
+  if (!down || repeat) return false;
+  if (shift) relay("shift-escape");
+  else if (capturing) return true;
+  else { relay("escape"); back(); }
+  return false;
+}
 
 class Signals {
  public:

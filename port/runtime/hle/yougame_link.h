@@ -97,8 +97,8 @@ void refresh_identity();
 // would draw Slippi's "log in" screen; a slow app must not stall the game thread again and again).
 Identity wait_identity(int ms);
 
-// A key the YouGame page owns, pressed while the game has the keyboard ("escape": the page leaves
-// full screen). Sent over the stdio bridge as `yg {"key":"escape"}`.
+// A key relayed while the game has the keyboard: "shift-escape" leaves app full screen.
+// Plain "escape" is also sent for older apps. Sent as `yg {"key":"shift-escape"}`.
 void relay_key(const char* key);
 
 // The page pause's state for the page (yougame_ux.h PagePause::Result), sent over the stdio bridge as
@@ -108,6 +108,7 @@ void pause_event(bool pausable, bool paused, const char* reason);
 // The host picker runs off the simulation thread while code entry remains visible.
 // Throws on cancellation, a page error, or an invalid answer; opens no room.
 std::string pick_friend_room(const std::function<bool()>& cancelled);
+std::string slippi_link_status(const std::string& status);
 
 // Retire any previous YouGame room before selecting plain UDP for a Slippi search.
 bool prepare_slippi_match(const std::function<bool()>& cancelled, uint64_t epoch = 0);

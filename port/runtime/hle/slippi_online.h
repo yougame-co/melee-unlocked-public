@@ -29,6 +29,8 @@ void init();
 void load_ranked_rules();
 std::string ranked_rules_digest(int mode); // only a verified YouGame remix Ranked session
 void shutdown();
+// Simulation tick: scene/mode changes and match starts cancel a linking sheet.
+void slippi_link_tick(uint8_t major, uint8_t minor, uint8_t mode);
 // Each engine sets this before its game starts; Static mod discs use OtherMod.
 void set_native_gameplay_profile(NativeGameplayProfile profile);
 

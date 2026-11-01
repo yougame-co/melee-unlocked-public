@@ -186,18 +186,31 @@ void handle_event(const SDL_Event& e) {
     return;
   }
   if (g_closed) return;
+  if (g_x11_embed && e.type == SDL_WINDOWEVENT &&
+      (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST || e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)) {
+    // Parent/child focus changes can queue an obsolete SDL loss/gain pair. Check
+    // the server before clearing held keys or telling ImGui the game lost focus.
+    const bool focused = yg_embed_x11_focused(g_x11_embed) != 0;
+    if ((e.window.event == SDL_WINDOWEVENT_FOCUS_LOST) == focused) return;
+  }
   if (g_x11_embed && (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) &&
       (!g_embed_focus_requested || !linux_compat::window_focused())) return;
 #endif
+  // Embedded Escape bypasses native fullscreen handling, ImGui NavCancel and pad bindings.
+  // SDL's KMOD_SHIFT includes either Shift, just as the overlay Tab path below does.
+  if ((yougame::stdio_bridge()
 #ifdef __APPLE__
-  // The page owns Escape before fullscreen handling, ImGui or the game menu.
-  if ((yougame::stdio_bridge() || mac_embed::active()) && (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) &&
+       || mac_embed::active()
+#endif
+      ) && (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) &&
       e.key.keysym.scancode == SDL_SCANCODE_ESCAPE) {
-    if (e.type == SDL_KEYDOWN && !e.key.repeat) yougame::relay_key("escape");
-    std::lock_guard<std::mutex> lock(g_keys_mutex); set_key(VK_ESCAPE, false);
+    const bool capture_key = yougame::parity::embedded_escape(
+        e.type == SDL_KEYDOWN, (e.key.keysym.mod & KMOD_SHIFT) != 0,
+        e.key.repeat != 0, g_capturing.load(),
+        [](const char* key) { yougame::relay_key(key); }, [] { g_escape_press.store(true); });
+    std::lock_guard<std::mutex> lock(g_keys_mutex); set_key(VK_ESCAPE, capture_key);
     return;
   }
-#endif
   if (e.type == SDL_MOUSEMOTION) {
     g_pointer_moved = GetTickCount64();
     g_pointer_rested = false;
@@ -310,14 +323,7 @@ void handle_event(const SDL_Event& e) {
           case SDL_SCANCODE_F6: g_trace_mark.store(2); break;
           case SDL_SCANCODE_F7: g_trace_mark.store(3); break;
           case SDL_SCANCODE_F9: g_trace_mark.store(4); break;
-          case SDL_SCANCODE_ESCAPE:
-#ifdef MELEE_LINUX_X11_EMBED
-            if (g_x11_embed && yougame::stdio_bridge()) {
-              if (!g_capturing.load()) yougame::relay_key("escape");
-              break;
-            }
-#endif
-            g_escape_press.store(true); break;
+          case SDL_SCANCODE_ESCAPE: g_escape_press.store(true); break; // Standalone only; embedded handled above.
           default: break;
         }
       }
@@ -591,9 +597,12 @@ void window_input_capture(bool capture) {
   g_ui_capture.store(capture);
 }
 bool window_ui_gamecube_pad(PadState& pad) { std::lock_guard<std::mutex> lock(g_ui_pad_mutex); pad = g_ui_pad; return g_ui_gamecube; }
-bool window_ui_pads(PadState pads[4]) {
+bool window_ui_pads(PadState pads[4], PadState navigation_pads[4]) {
   std::lock_guard<std::mutex> lock(g_ui_pad_mutex);
-  for (int i = 0; i < 4; ++i) pads[i] = g_ui_pads[i];
+  for (int i = 0; i < 4; ++i) {
+    pads[i] = g_ui_pads[i];
+    if (navigation_pads) navigation_pads[i] = g_ui_navigation_pads[i];
+  }
   return g_ui_has_pad;
 }
 void window_set_resize_callback(ResizeCallback cb) { g_on_resize = std::move(cb); }

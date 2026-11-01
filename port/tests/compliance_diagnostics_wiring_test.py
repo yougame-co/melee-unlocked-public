@@ -48,12 +48,15 @@ class ComplianceDiagnosticsTest(unittest.TestCase):
     def test_trace_is_guarded_and_observes_final_poll(self):
         window = source("port/runtime/host/window.cpp")
         self.assertTrue(hook_guarded(window, 'yougame::agent_test::pad_trace.poll('))
-        poll = window[window.index("void input_poll(PadState out[4])"):]
-        self.assertLess(poll.index("if (g_ui_capture.load())"), poll.index("yougame::agent_test::pad_trace.poll("))
-        self.assertLess(poll.index("yougame::agent_test::pad_trace.poll("), poll.index("} ui{out};"))
+        poll = window[window.index("struct UiSnapshot {"):window.index("void input_poll(PadState out[4])")]
+        self.assertLess(poll.index("if (!console && g_ui_capture.load())"), poll.index("yougame::agent_test::pad_trace.poll("))
+        self.assertLess(poll.index("yougame::agent_test::pad_trace.poll("), poll.rindex("};"))
         self.assertIn('source = "relayed slot " + std::to_string(slot + 1)', poll)
         self.assertIn('device.index == src.index', poll)
         self.assertIn('!input_script_active()', poll)
+        for name in ("input_poll", "input_read_console_devices"):
+            from yougame_console_wiring_test import body
+            self.assertIn("UiSnapshot ui{out};", body(window, name))
         agent = source("port/runtime/hle/yougame_agent_test.h")
         self.assertTrue(hook_guarded(agent, 'if (key == "padTrace")'))
         self.assertTrue(hook_guarded(agent, "std::string pad_trace;"))

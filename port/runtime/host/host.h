@@ -277,6 +277,7 @@ void input_poll(PadState out[4]);
 void input_read_devices(PadState out[4]);
 // Console sessions: same devices, with empty routes disconnected and keyboard fallback behind
 // every connected controller (including an adapter plugged into physical port 2-4).
+// Publishes live UI/chords from this one read, before console_hardware applies capture.
 void input_read_console_devices(PadState out[4]);
 // Scripted runs (--script): true while a script is driving the pads, and the pads the script will
 // deliver at retrace `retrace` (no state is changed by asking).

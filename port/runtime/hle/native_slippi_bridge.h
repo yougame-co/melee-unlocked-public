@@ -22,6 +22,7 @@ enum Cmd : uint8_t {
   // Fixed-size versioned replies, documented field-by-field in mu_ranked_wire.h.
   CMD_YOUGAME_DATA = MU_YG_COMMAND,
   CMD_YOUGAME_FRIENDS_MENU = 0xE6,
+  CMD_YOUGAME_SLIPPI_LINK = 0xE7, // 0 CSS query, 1 Y; 2 menu refusal query, 3 Y; 4 leave
 };
 
 // Results of a native command call, mirrored by the host ABI comment in mu_host.h.
@@ -46,7 +47,7 @@ inline bool command_payload_valid(uint8_t cmd, const uint8_t* payload, uint32_t 
     case CMD_CAPTURE_SAVESTATE: case CMD_LOAD_SAVESTATE: expected = 32; break;
     case CMD_FIND_OPPONENT: expected = 19; break;
     case CMD_SET_MATCH_SELECTIONS: expected = 9; break;
-    case CMD_YOUGAME_FRIENDS_MENU: expected = 1; break;
+    case CMD_YOUGAME_FRIENDS_MENU: case CMD_YOUGAME_SLIPPI_LINK: expected = 1; break;
     case CMD_YOUGAME_DATA:
       expected = 1;
 #if defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH

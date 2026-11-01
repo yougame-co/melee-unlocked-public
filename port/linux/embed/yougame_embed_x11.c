@@ -78,7 +78,7 @@ static void focus(yg_embed_x11 *e, int force)
     int revert;
     if (!e->focus || !e->mapped || !e->viewable) return;
     XGetInputFocus(e->dpy, &current, &revert);
-    if (force || current == e->parent || current == e->game)
+    if (current != e->game && (force || current == e->parent))
         XSetInputFocus(e->dpy, e->game, RevertToParent, CurrentTime);
 }
 
@@ -290,7 +290,9 @@ int yg_embed_x11_event(yg_embed_x11 *e, const XEvent *ev)
         return YG_EMBED_IGNORED;
     begin(e->dpy);
     if (refresh(e)) {
-        if (e->mapped) XRaiseWindow(e->dpy, e->game);
+        /* Focus notifications must not restack the child: the parent/SDL can
+         * answer that with another focus transition, clearing every held key. */
+        if (ev->type == MapNotify && e->mapped) XRaiseWindow(e->dpy, e->game);
         /* Never pull keyboard focus back from another application. */
         if (ev->type != FocusOut) focus(e, 0);
     }
@@ -345,6 +347,14 @@ int yg_embed_x11_size(const yg_embed_x11 *e, int *w, int *h)
     if (w) *w = e->w;
     if (h) *h = e->h;
     return 1;
+}
+
+int yg_embed_x11_focused(const yg_embed_x11 *e)
+{
+    Window current;
+    int revert;
+    if (!e || e->dead || !e->focus || !e->mapped || !e->viewable) return 0;
+    return XGetInputFocus(e->dpy, &current, &revert) && current == e->game;
 }
 
 int yg_embed_x11_visible(const yg_embed_x11 *e)
