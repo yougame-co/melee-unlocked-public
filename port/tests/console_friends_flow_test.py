@@ -212,6 +212,7 @@ enum { GM_VS=2,GM_DEBUG_VS=6 };
 int console, replay, test, queries;
 int mu_console_active() { ++queries;return console; }
 int mu_replay_on() { return replay; } int mu_online_is_test_run() { return test; }
+int mu_tourney_boot() { return 0; } // no tourneyMatch in ordinary Friends startup
 void boot(u8* mode) {
 ''' + body(source, 'mu_replay_boot_mode') + r'''
 }

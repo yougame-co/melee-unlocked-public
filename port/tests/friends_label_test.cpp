@@ -12,13 +12,14 @@ struct HSD_TObj { HSD_TObj* next; HSD_ImageDesc* imagedesc; HSD_ImageDesc** imag
 struct HSD_MObj { HSD_TObj* tobj; unsigned color; };
 struct HSD_DObj { HSD_DObj* next; HSD_MObj* mobj; };
 struct HSD_JObj { union { HSD_DObj* dobj; } u; };
-static int menus, offered, submenu;
+static int menus, offered, submenu, tournament;
 static int mu_slippi_menus_enabled() { return menus; }
 static int mu_slippi_yougame_menu() { return offered; }
 static int mu_slippi_menu_label_kind(int row) {
     if (!offered) return 0;
     if (submenu) return row >= 0 && row < 3 ? row + 3 : 0;
-    return row == 0 ? 6 : row == 1 ? 7 : row == 2 ? 1 : row == 3 ? 2 : 0;
+    return row == 0 ? 6 : row == 1 ? 7 : row == 2 ? 1 :
+           tournament && row == 3 ? 8 : row == (tournament ? 4 : 3) ? 2 : 0;
 }
 #define DISC_SET(slot, value) ((slot) = (value))
 #include "friends_label_adapter.inc"
@@ -103,6 +104,15 @@ int main() {
         texture.imagedesc=&native[0];mu_slippi_friends_label(&label,8,0,0);
         CHECK(texture.imagedesc==&native[0]);
     }
+    menus=offered=tournament=1; submenu=0;
+    texture.imagedesc=&native[3]; mu_slippi_friends_label(&label,8,3,0);
+    CHECK(texture.imagedesc->image_ptr==mu_baked_tournament);
+    CHECK(texture.imagedesc->width==176 && texture.imagedesc->height==30);
+    texture.imagedesc=&native[4]; mu_slippi_friends_label(&label,8,4,0);
+    CHECK(texture.imagedesc->image_ptr==mu_baked_slippi);
+    CHECK(texture.imagetbl==table);
+    tournament=0; texture.imagedesc=&native[3]; mu_slippi_friends_label(&label,8,3,0);
+    CHECK(texture.imagedesc->image_ptr==mu_baked_slippi);
     mu_slippi_friends_label(nullptr,8,0,0);
     std::printf("native/baked labels: %d checks passed (8 originals, every top/submenu row, restore, IA4 AA/padding/guards)\n",checks);
 }

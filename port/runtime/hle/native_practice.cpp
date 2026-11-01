@@ -11,6 +11,7 @@
 #include "yougame_unranked.h"
 #include "yougame_ux.h"
 #include "yougame_friends.h"
+#include "../abi/mu_tourney.h"
 #include "slippi_playback.h"
 #include "../gx/render_options.h"
 
@@ -658,6 +659,7 @@ void submit_acknowledge_failure() {
 }
 
 void tick() {
+  if (g_bridge && yougame::tournament_active()) g_bridge(MU_TOURNEY_TICK_OP, nullptr, 0);
   // Room and picker workers publish state; only this simulation thread touches scenes/CSS.
   auto& friends_lobby = yougame::friends::lobby;
   const bool shared_active = yougame::console::console_active();
@@ -722,7 +724,7 @@ void tick() {
   // This tick runs at retrace even while the scene is frozen. No game state is
   // accessed by the stdin reader; online sessions never touch these pause flags.
   if (yougame::stdio_bridge()) {
-    const bool online = slippi::online::session_mode() >= 0;
+    const bool online = slippi::online::session_mode() >= 0 || yougame::tournament_active();
     int32_t a[3] = {-1, 0, 0};
     if (!online && !slippi::playback::enabled()) {
       if (g_bridge) g_bridge(OP_PAGE_PAUSE, a, 3);
@@ -779,6 +781,12 @@ void tick() {
     else g_friend_menu_ticks = 0;
     const bool safe = yougame::friends::menu_safe(major, minor) &&
                       (major != 1 || g_friend_menu_ticks >= 120);
+    // The ordinary menu path requests identity as before. Only its validated first hello
+    // can schedule a bracket game; boot never waits or consumes the identity wait budget.
+    if (g_bridge && major == 1 && safe && yougame::tournament_pending()) {
+      g_bridge(MU_TOURNEY_BOOT_OP, nullptr, 0);
+      return;
+    }
     // Only the Online Friends row owns the page picker.
     const bool picker_scene = major == 1;
     if (g_friend_picker.valid() && (!picker_scene || !safe || !yougame::friends::events.picker_context())) {

@@ -609,7 +609,7 @@ void mu_pad_motor(int port, int on);                                 /* shim/mu_
 #define MU_OPTION_SLIPPI_MENUS 0x8u
 enum { MU_SLP_MODE_RANKED, MU_SLP_MODE_UNRANKED, MU_SLP_MODE_DIRECT, MU_SLP_MODE_TEAMS,
        MU_SLP_MODE_PARTY };
-enum { MU_SLP_OPT_LOGIN = 5, MU_SLP_OPT_LOGOUT = 6, MU_SLP_OPT_UPDATE = 7, MU_SLP_OPT_FRIENDS = 8, MU_SLP_OPT_SLIPPI = 9, MU_SLP_OPT_COUNT = 10 };
+enum { MU_SLP_OPT_LOGIN = 5, MU_SLP_OPT_LOGOUT = 6, MU_SLP_OPT_UPDATE = 7, MU_SLP_OPT_FRIENDS = 8, MU_SLP_OPT_SLIPPI = 9, MU_SLP_OPT_TOURNAMENT = 10, MU_SLP_OPT_COUNT = 11 };
 enum { MU_SLP_APP_LOGGED_OUT, MU_SLP_APP_LOGGED_IN, MU_SLP_APP_UPDATE };
 enum { MU_SLP_MM_IDLE, MU_SLP_MM_INITIALIZING, MU_SLP_MM_MATCHMAKING, MU_SLP_MM_OPPONENT_CONNECTING,
        MU_SLP_MM_CONNECTION_SUCCESS, MU_SLP_MM_ERROR };
@@ -688,6 +688,7 @@ void mu_slippi_title_panel_update(struct HSD_GObj* panel, int canvas);
 void mu_slippi_signin_notice(struct HSD_GObj* menu);
 struct HSD_Text;
 void mu_slippi_menu_description(struct HSD_Text* text, const char* message);
+void mu_slippi_tournament_notice(struct HSD_GObj* menu, const char* message);
 struct HSD_JObj;
 void mu_slippi_friends_label(struct HSD_JObj* label, int menu_kind, int selection, int capture); /* shim/mu_menu_label.c */
 struct StaticModelSyms;

@@ -13,6 +13,8 @@
 #include <melee/mn/types.h>
 #include <melee/pl/player.h>
 #include "mu_yougame_pause.h"
+#include "mu_tourney.h"
+#include "mu_tourney_game.h"
 #include <dolphin/os.h>
 #include <melee/ft/fighter.h>
 #include <melee/ft/types.h>
@@ -47,6 +49,7 @@ int mu_practice_resolve_pending_mode(int requested)
 
 void mu_practice_enter_mode(int mode)
 {
+    mu_tourney_enter_mode(mode);
     if (practice_pending_mode >= 0 && mode != practice_origin_mode) {
         practice_pending_mode = practice_origin_mode = -1;
     }
@@ -80,6 +83,18 @@ int mu_practice_bridge(int op, int* a, int n)
         if (gm_GetCurrentGameMode() == GM_MENU) return 0;
         a[0] = GM_MENU;
         return mu_practice_bridge(MU_PR_REQUEST_MAJOR,a,1);
+    case MU_TOURNEY_TICK_OP:
+        mu_tourney_poll();
+        return 0;
+    case MU_TOURNEY_QUIT_OP:
+        mu_tourney_quit();
+        return 0;
+    case MU_TOURNEY_BOOT_OP: {
+        int major = GM_VS;
+        /* A late first hello may enter only from the main menu, using its normal unload. */
+        if (gm_GetCurrentGameMode() != GM_MENU || !mu_tourney_boot()) return -1;
+        return mu_practice_bridge(MU_PR_REQUEST_MAJOR, &major, 1);
+    }
     case MU_PR_PAGE_PAUSE:
         return mu_yougame_page_pause(a, n);
     case MU_PR_SCENE:

@@ -147,8 +147,38 @@ std::filesystem::path g_loaded_game_path;std::string g_dll="fallback/melee_game_
 struct Dl_info { const char* dli_fname; };
 int dladdr(void*,Dl_info* out){out->dli_fname="loaded/melee_game_compat.so";return 1;}
 int GetModuleFileNameA(void*,char* out,int){std::strcpy(out,"loaded/melee_game_compat.dll");return 1;}
+std::filesystem::path game_library_file(const std::string& path){return std::filesystem::path("exe-dir")/path;}
 int main(){
 ''' + code + '\nif(g_loaded_game_path.empty())std::abort();puts("library path: ' + platform + ' branch compiled and executed");}\n')
+
+    def test_sandboxed_windows_library_path_is_beside_the_program(self):
+        # In the AppContainer the mapped image is not in the loader list and the working directory is
+        # the data folder, so a bare g_dll must resolve beside the program, as map_game_image reads it
+        # (11-02: "handoff: refused: cannot open game library" in every phase).
+        from yougame_0962_merge_test import conditional_source
+        source = read('port/app/source_host.cpp')
+        start = source.index('#ifdef __APPLE__\n  g_loaded_game_path = g_dll;')
+        end = source.index('  g_update_ranked_busy', start)
+        code = conditional_source(source[start:end], {'_WIN32'})
+        helper = source[source.index('static std::filesystem::path game_library_file'):source.index('static HMODULE map_game_image')]
+        self.assertIn('game_library_file(path)', body(source, 'map_game_image'))
+        self.compile('38b-path-sandboxed', r'''
+#include <filesystem>
+#include <string>
+#include <cstring>
+#include <cstdlib>
+#include <cwchar>
+#include <cstdio>
+constexpr int MAX_PATH=260;void* module=(void*)1;void* entry=(void*)2;
+std::filesystem::path g_loaded_game_path;std::string g_dll="melee_game.dll";
+int GetModuleFileNameA(void*,char*,int){return 0;}
+int GetModuleFileNameW(void*,wchar_t* out,int){std::wcscpy(out,L"C:/app/win-unpacked/melee_source.exe");return 1;}
+''' + helper + r'''
+int main(){
+''' + code + r'''
+if(g_loaded_game_path!=std::filesystem::path(L"C:/app/win-unpacked")/"melee_game.dll")std::abort();
+puts("sandboxed library path: beside the program");}
+''')
 
     def test_script_p1_drives_only_this_seats_local_sample(self):
         window = read('port/runtime/host/window.cpp')

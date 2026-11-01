@@ -220,24 +220,45 @@ void forfeits_and_leaving() {
   CHECK(quitter.set.leaves_at_once());
   const auto last = quitter.set.flush();
   CHECK(last.size() == 1 && last[0] == json({{"t", "finish"}, {"matchId", "set-1"}, {"winner", "participant-a"}}));
-  // The other player's connection broke instead: it claims the set (never concedes it).
+  // The connection broke instead: both games see the same break, so neither claims (or concedes)
+  // the set. It stays for the room, whose leave rule forfeits the game that left the room.
   FakeRoom stayer(0); stayer.start();
   stayer.game(1); stayer.tick(); stayer.receipt("g1-t0", 1);
   stayer.set.lost();
-  CHECK(stayer.tick()[0]["winner"] == "participant-a" && !stayer.set.leaves_at_once());
-  // Lost with its own game report still waiting: the claim waits for the receipt, which may decide.
+  CHECK(stayer.tick().empty() && !stayer.set.decided() && !stayer.set.leaves_at_once());
+  CHECK(stayer.set.needs_drain());
+  stayer.now += yougame::ranked::kLostCallOffMs - 1;
+  CHECK(stayer.tick().empty() && !stayer.set.decided());
+  CHECK(stayer.set.receive({{"t", "result"}, {"matchId", "set-1"}}));   // the room's forfeit
+  CHECK(stayer.tick().empty() && !stayer.set.needs_drain());
+  // Still in the room with no result when the call-off comes: neither game left, the set is void.
+  FakeRoom both(1); both.host = false; both.start();
+  both.game(1); both.tick(); both.receipt("g1-t0", 1);
+  both.set.lost();
+  both.tick();
+  both.now += yougame::ranked::kLostCallOffMs;
+  CHECK(both.tick()[0] == json({{"t", "finish"}, {"matchId", "set-1"}, {"void", true}}));
+  static_assert(yougame::ranked::kLostCallOffMs < 30000, "the call-off is sent inside the 30 s drain");
+  // close_room stamps the break: the call-off counts from it even if the pump skipped due() while
+  // the room socket reconnected (review, 43b).
+  FakeRoom stamped(0); stamped.start();
+  stamped.game(1); stamped.tick(); stamped.receipt("g1-t0", 1);
+  stamped.set.lost(stamped.now);
+  stamped.now += yougame::ranked::kLostCallOffMs;
+  CHECK(stamped.tick()[0] == json({{"t", "finish"}, {"matchId", "set-1"}, {"void", true}}));
+  // Lost with its own game report still waiting: the receipt may still decide the set.
   FakeRoom race(1); race.host = false; race.start();
   race.game(0); race.tick(); race.receipt("g1-t0", 0);
   race.game(0); race.tick();
   race.set.lost();
   CHECK(!race.set.decided());
   race.receipt("g2-t0", 0);
-  CHECK(race.tick()[0]["winner"] == "participant-a");   // first-to-2, not the claim for B
+  CHECK(race.tick()[0]["winner"] == "participant-a");   // first-to-2 still finishes the set
   // Status 40 before any game: nothing to concede. No match started: nothing to drain.
   FakeRoom unplayed; unplayed.set.quit(); CHECK(unplayed.tick().empty() && !unplayed.set.needs_drain());
   FakeRoom nomatch; nomatch.host = false; nomatch.set.start_game(); nomatch.set.quit();
   CHECK(!nomatch.set.needs_drain() && nomatch.set.flush().empty());
-  std::puts("yougame_ranked: No Contest forfeits, quit concedes at once, lost claims after its receipts ok");
+  std::puts("yougame_ranked: No Contest forfeits, quit concedes at once, lost waits for the room ok");
 }
 
 void quit_after_config_and_receipts() {
@@ -867,16 +888,17 @@ void sim_leaving() {
     CHECK(sim.rooms.result["ranking"][0] == "participant-a" && sim.rooms.result["disposition"] == "completed");
   }
   // Addendum A/B: B quits between games (concedes, closes at once); A's game sees the pair break
-  // and claims. Both finals agree: completed for A at once, not void.
+  // and waits (a lost link claims nothing). B's concession and the leave rule give A the set once
+  // B's grace runs out, inside A's drain; never void.
   {
     Sim sim;
     sim.play(1);
     sim.close(sim.b, 0);
     sim.run(500);
     sim.close(sim.a, 1);
-    sim.run(3000);
-    CHECK(sim.rooms.result["ranking"][0] == "participant-a" && sim.rooms.result["disposition"] == "completed");
-    CHECK(sim.now < 20000);
+    sim.run(kGameGraceMs + 3000);
+    CHECK(sim.rooms.result["ranking"][0] == "participant-a" && sim.rooms.result["void"] == false);
+    CHECK(sim.a.set.settled() && sim.now < 25000);
   }
   // B quits but A's game says nothing (it froze): the leave rule gives A the set after 15 s.
   {
@@ -886,7 +908,7 @@ void sim_leaving() {
     sim.run(20000);
     CHECK(sim.rooms.result["ranking"][0] == "participant-a" && sim.rooms.result["disposition"] == "forfeit");
   }
-  // B's game vanishes between games (no message at all); A claims: the leave rule gives A the set.
+  // B's game vanishes between games (no message at all); A waits: the leave rule gives A the set.
   {
     Sim sim;
     sim.play(1);
@@ -905,13 +927,28 @@ void sim_leaving() {
     sim.run(20000);
     CHECK(sim.rooms.result["void"] == true);
   }
-  // The link between the games breaks while both stay in the room: both claim, the set is void.
+  // The link between the games breaks while both stay in the room: neither claims, nobody left,
+  // so both call it off at kLostCallOffMs and the set is void (run 2 voided at once: both claimed).
   {
     Sim sim;
     sim.play(0);
     sim.close(sim.a, 1); sim.close(sim.b, 1);
-    sim.run(20000);
+    sim.run(kLostCallOffMs - 1000);
+    CHECK(!sim.rooms.result.is_object());
+    sim.run(3000);
     CHECK(sim.rooms.result["void"] == true);
+  }
+  // Run 2 on build 42b: B's app stops after game 1. Both games see the link break first; B's game
+  // exits 5 s later (its socket closes), A's stays. Neither claims; the leave rule gives A the set.
+  for (int leaver_won_game1 : {0, 1}) {
+    Sim sim;
+    sim.play(leaver_won_game1 ? 1 : 0);
+    sim.close(sim.a, 1); sim.close(sim.b, 1);
+    sim.run(5000);
+    sim.leave(sim.b);
+    sim.run(kGameGraceMs + 2000);
+    CHECK(sim.rooms.result["ranking"][0] == "participant-a" && sim.rooms.result["disposition"] == "forfeit");
+    CHECK(sim.a.set.settled() && !sim.a.open);
   }
   // The link dies mid-game 2 with both still in the room: each game ends it as a No Contest naming
   // its opponent (mu_online.c end_game), so each claims the game and the set: void, never inverted.

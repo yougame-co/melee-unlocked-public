@@ -184169,7 +184169,7 @@ index dc6746eee..f1bb81a6b 100644
 +        int option = mu_slippi_menu_option(i);
 +        /* Top-level previews/help follow native slots 0..3; submenu uses modes 2/3/4. */
 +        int source = option == MU_SLP_OPT_FRIENDS ? MU_SLP_MODE_DIRECT :
-+                     option == MU_SLP_OPT_SLIPPI ? MU_SLP_MODE_TEAMS : option;
++                     option == MU_SLP_OPT_SLIPPI ? MU_SLP_MODE_TEAMS : option == MU_SLP_OPT_TOURNAMENT ? MU_SLP_MODE_PARTY : option;
 +        anim[i] = original[source];
 +        descriptions[i] = source_descriptions[source];
 +    }

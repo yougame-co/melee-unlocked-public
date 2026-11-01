@@ -54,6 +54,10 @@ constexpr uint64_t kGameGraceMs = 15000;
 // An unconfirmed game ends the set; it never admits the next game.
 constexpr uint64_t kRecoveryWaitMs = 30000;
 constexpr uint64_t kPairCleanupMs = 30000;
+// A lost link names no leaver: the room's leave rule forfeits whichever game left the room
+// (after kGameGraceMs). If both games are still in the room this long after the link broke,
+// neither left, and the set is called off as void. Under kDrainMs, so the call-off is sent.
+constexpr uint64_t kLostCallOffMs = kGameGraceMs + 10000;
 // A set whose room has not started its match this long after its first game began cannot be
 // recorded: the pair breaks up instead of playing unrated games under Ranked.
 constexpr uint64_t kStartWaitMs = kBeginTries * kRetryMs + 5000;
@@ -247,10 +251,13 @@ class Set {
     quit_ = true;
     decide();
   }
-  // The connection to the opponent broke (their game left, or the link died).
-  void lost() {
+  // The connection to the opponent broke (their game left, or the link died). Both games see the
+  // same break, so neither claims an undecided set: the room's leave rule decides it.
+  // `now` starts the call-off with the drain (the pump may not run due() while the room reconnects).
+  void lost(uint64_t now = 0) {
     if (!started_ || quit_ || lost_) return;
     lost_ = true;
+    lost_at_ = now;
     decide();
   }
   // A quitter whose concession is already decided leaves at once (sends what it owes, then closes),
@@ -263,6 +270,7 @@ class Set {
   std::vector<json> due(uint64_t now, bool host, int revision) {
     std::vector<json> out;
     now_ = now;
+    if (lost_ && !lost_at_) lost_at_ = now;
     for (const auto& [id, p] : games_) {
       if (!settled_ && !closed_ && p.refused && !p.received && now >= p.recovery_until) {
         // No authoritative outcome/deadline is exposed by this room protocol.
@@ -409,9 +417,11 @@ class Set {
   // that never started its match.
   bool over() const { return final_requested_ || settled_ || closed_ || orphaned_; }
   // GameSetup may still need to send C2 after first-to-two or after a fast room result.
-  // Explicit leave, lost link and dead rooms can always escape the presentation fence.
+  // Explicit leave, lost link and dead rooms can always escape the presentation fence. A lost
+  // link already broke the pair, decided or not (the room decides the set).
   bool release_pair() const {
-    if (cleanup_ || closed_ || orphaned_ || quit_ || lost_) return over();
+    if (lost_) return true;
+    if (cleanup_ || closed_ || orphaned_ || quit_) return over();
     return game_setup_ ? c2_ >= 0 && settled_ : over();
   }
   // A report still waits for its game-result: no next game may start yet.
@@ -476,7 +486,7 @@ class Set {
       conceded_ = true;
       return finish(valid_port(local_) ? 1 - local_ : -1);
     }
-    if (lost_) return finish(valid_port(local_) ? local_ : -1);
+    if (lost_ && lost_at_ && now_ >= lost_at_ + kLostCallOffMs) return finish(-1);
   }
   struct Pending {
     json start, message;
@@ -516,7 +526,7 @@ class Set {
   bool started_ = false, in_game_ = false, game_setup_ = false, quit_ = false, lost_ = false, conceded_ = false;
   bool begin_dead_ = false, final_requested_ = false, final_sent_ = false, final_dead_ = false;
   bool settled_ = false, closed_ = false, orphaned_ = false, cleanup_ = false, recovery_failed_ = false;
-  uint64_t begin_at_ = 0, final_at_ = 0, waiting_since_ = 0, now_ = 0, cleanup_at_ = 0;
+  uint64_t begin_at_ = 0, final_at_ = 0, waiting_since_ = 0, now_ = 0, cleanup_at_ = 0, lost_at_ = 0;
   json final_;
 };
 

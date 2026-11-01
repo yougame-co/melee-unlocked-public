@@ -346,7 +346,7 @@ bool online_session_pending() {
   return slippi::online::session_mode() >= 0 && slippi::online::in_online_menus();
 }
 
-void apply(host::PadState pads[4]) {
+void apply(host::PadState pads[4], bool allow_automatic) {
   const bool want_indicator = indicator_enabled();
   const bool want_auto = automatic_enabled() && !host::gameplay::vanilla_only();
   // Default state: not one guest read, not one byte changed, so the game is bit for bit the game.
@@ -357,7 +357,7 @@ void apply(host::PadState pads[4]) {
     // PADRead called twice inside one retrace: replay the decision instead of taking a new one, so
     // the two reads cannot disagree about what the player pressed.
     for (int p = 0; p < 4; ++p)
-      if (g_ports[p].cached_inject) pads[p].trig_l = std::max(pads[p].trig_l, g_ports[p].cached_value);
+      if (allow_automatic && g_ports[p].cached_inject) pads[p].trig_l = std::max(pads[p].trig_l, g_ports[p].cached_value);
     return;
   }
   g_last_retrace = retrace;
@@ -368,7 +368,7 @@ void apply(host::PadState pads[4]) {
   const uint8_t press = inject_value(cal);
   const int window = lcancel_window_of(view);
   const char* suppressed = auto_suppressed_mode();
-  const bool auto_allowed = policy::automatic_allowed(slippi::online::session_mode(), want_auto);
+  const bool auto_allowed = allow_automatic && policy::automatic_allowed(slippi::online::session_mode(), want_auto);
   // With the automatic press actually doing the L-cancel there is nothing to report, so the flash
   // is off entirely rather than merely never firing. It comes back the moment the press is
   // suppressed (a matchmaking mode), which is exactly when the player wants the feedback again.

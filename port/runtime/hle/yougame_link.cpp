@@ -3,6 +3,9 @@
 #include "test_env.h"
 #include "yougame_link.h"
 #include "yougame_udp.h"
+#include "yougame_tourney.h"
+#include "yougame_tourney_queue.h"
+#include "yougame_tourney_delivery.h"
 #include "yougame_embed_toplevel.h"
 #include "opponent_display.h"
 #include "yougame_parity.h"
@@ -63,6 +66,24 @@ using json = nlohmann::json;
 
 namespace yougame {
 namespace {
+std::timed_mutex g_tourney_mutex;
+tourney::Session g_tourney;
+tourney::Queue g_tourney_queue;
+std::shared_future<void> g_tourney_delivery;
+std::atomic<int64_t> g_tourney_delivery_until{0};
+uint64_t g_tourney_generation = 0;
+std::atomic<bool> g_tourney_cleanup_pending{false};
+
+// Caller holds g_tourney_mutex. Deferred cleanup keeps scene teardown from waiting on a lock.
+void release_tournament_locked() {
+  if (!g_tourney_cleanup_pending.exchange(false)) return;
+  ++g_tourney_generation;
+  g_tourney.release();
+  g_tourney_delivery = {};
+}
+std::atomic<bool> g_tourney_launched{false};
+class BridgeNoAnswer : public std::runtime_error { public: using std::runtime_error::runtime_error; };
+
 
 #ifdef _WIN32
 using SocketLength = int;
@@ -203,6 +224,49 @@ void write_line(const std::string& line) {
   DWORD wrote = 0;
   // One WriteFile per line, so nothing else written to stdout can land inside it.
   if (out && out != INVALID_HANDLE_VALUE) WriteFile(out, data.data(), (DWORD)data.size(), &wrote, nullptr);
+}
+
+// Only tournament writes use this cancellable path; ordinary SDK requests keep write_line.
+bool tournament_write_line(const std::string& line, tourney::Deadline deadline) {
+  std::packaged_task<bool()> task([data = line + "\n", deadline] {
+    std::unique_lock<std::mutex> lock(g_io.write_mutex, std::defer_lock);
+    if (!tourney::lock_until(lock, deadline) || tourney::DeliveryClock::now() >= deadline) return false;
+#ifdef _WIN32
+    HANDLE cancel = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &cancel,
+                         0, FALSE, DUPLICATE_SAME_ACCESS)) return false;
+    std::promise<void> finished;
+    auto complete = finished.get_future().share();
+    try {
+      std::thread([complete, cancel, deadline] {
+        // Repeat cancellation closes the check/WriteFile registration race. The retained
+        // thread handle cannot refer to a reused ID, and shutdown never joins this watcher.
+        if (complete.wait_until(deadline) != std::future_status::ready) {
+          do { CancelSynchronousIo(cancel); }
+          while (complete.wait_for(std::chrono::milliseconds(10)) != std::future_status::ready);
+        }
+        CloseHandle(cancel);
+      }).detach();
+    } catch (...) { CloseHandle(cancel); return false; }
+    struct Complete { std::promise<void>& done; ~Complete() { done.set_value(); } } signal{finished};
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD wrote = 0;
+    return out && out != INVALID_HANDLE_VALUE &&
+           WriteFile(out, data.data(), (DWORD)data.size(), &wrote, nullptr) && wrote == data.size();
+#else
+    return tourney::pipe_write_until(STDOUT_FILENO, data, deadline);
+#endif
+  });
+  auto done = task.get_future().share();
+  std::thread(std::move(task)).detach();
+  return done.wait_until(deadline) == std::future_status::ready && done.get();
+}
+
+std::unique_lock<std::mutex> tournament_io_lock(tourney::Deadline deadline) {
+  std::unique_lock<std::mutex> lock(g_io.mutex, std::defer_lock);
+  if (deadline == tourney::Deadline::max()) lock.lock();
+  else if (!tourney::lock_until(lock, deadline)) throw BridgeNoAnswer("Tournament delivery deadline");
+  return lock;
 }
 
 std::mutex g_relay_rumble_mutex;
@@ -419,19 +483,31 @@ void read_stdin() {
   host::request_exit(0);
 }
 
-json bridge_stdio(const json& body, int timeout_ms, const std::function<bool()>& cancelled = {}) {
-  if (g_io.eof) throw std::runtime_error("The YouGame app is not answering");
+json bridge_stdio(const json& body, int timeout_ms, const std::function<bool()>& cancelled = {},
+                  tourney::Deadline absolute = tourney::Deadline::max()) {
+  if (g_io.eof) throw BridgeNoAnswer("The YouGame app is not answering");
   int64_t id;
   {
-    std::lock_guard<std::mutex> lock(g_io.mutex);
+    auto lock = tournament_io_lock(absolute);
     id = g_io.next_id++;
     g_io.pending_requests.insert(id);
   }
+  struct Cleanup {
+    int64_t id;
+    bool tournament;
+    ~Cleanup() {
+      if (!tournament) return;
+      std::unique_lock<std::mutex> lock(g_io.mutex, std::try_to_lock);
+      if (lock.owns_lock()) { g_io.pending_requests.erase(id); g_io.answers.erase(id); }
+    }
+  } cleanup{id, absolute != tourney::Deadline::max()};
   json request = body;
   request["id"] = id;
-  write_line("yg " + request.dump());
-  std::unique_lock<std::mutex> lock(g_io.mutex);
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  const std::string line = "yg " + request.dump();
+  if (absolute == tourney::Deadline::max()) write_line(line);
+  else if (!tournament_write_line(line, absolute)) throw BridgeNoAnswer("Tournament stdout deadline");
+  auto lock = tournament_io_lock(absolute);
+  const auto deadline = std::min(absolute, std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
   while (!g_io.answers.count(id) && !g_io.eof) {
     if (cancelled && cancelled()) {
       g_io.pending_requests.erase(id);
@@ -439,12 +515,12 @@ json bridge_stdio(const json& body, int timeout_ms, const std::function<bool()>&
     }
     if (std::chrono::steady_clock::now() >= deadline) {
       g_io.pending_requests.erase(id);
-      throw std::runtime_error("The YouGame app did not answer");
+      throw BridgeNoAnswer("The YouGame app did not answer");
     }
     g_io.cv.wait_until(lock, std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(50)));
   }
   g_io.pending_requests.erase(id);
-  if (!g_io.answers.count(id)) throw std::runtime_error("The YouGame app is not answering");
+  if (!g_io.answers.count(id)) throw BridgeNoAnswer("The YouGame app is not answering");
   json answer = std::move(g_io.answers[id]);
   g_io.answers.erase(id);
   return answer;
@@ -495,7 +571,7 @@ json bridge_http(const json& body, int timeout_ms, const std::function<bool()>& 
   HINTERNET session = http_session();
   if (!session) throw std::runtime_error("Networking is unavailable");
   HINTERNET conn = WinHttpConnect(session, u.host.c_str(), u.port, 0);
-  if (!conn) throw std::runtime_error("The YouGame app is not answering");
+  if (!conn) throw BridgeNoAnswer("The YouGame app is not answering");
   HINTERNET req = WinHttpOpenRequest(conn, L"POST", u.path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
   std::string result;
   bool sent = false;
@@ -519,7 +595,7 @@ json bridge_http(const json& body, int timeout_ms, const std::function<bool()>& 
   }
   WinHttpCloseHandle(conn);
   if (!sent && cancelled && cancelled()) throw std::runtime_error("Cancelled");
-  if (!sent) throw std::runtime_error("The YouGame app is not answering");
+  if (!sent) throw BridgeNoAnswer("The YouGame app is not answering");
   json j = json::parse(result, nullptr, false);
   if (j.is_discarded() || !j.is_object()) throw std::runtime_error("The YouGame app sent an invalid answer");
   return j;
@@ -569,6 +645,19 @@ json bridge(const json& body, int timeout_ms = 15000, const std::function<bool()
   // Linking accepts the documented direct answer as well as the bridge result envelope.
   if (body.value("type", "") == "slippiLink") return j;
   return j.count("result") ? j["result"] : json::object();
+}
+
+// Every attempt and reconnect shares one deadline, including locks and stdout.
+json tournament_bridge(const json& body, tourney::Deadline deadline, int answer_ms) {
+  if (tourney::DeliveryClock::now() >= deadline) throw BridgeNoAnswer("Tournament delivery deadline");
+  auto done = tourney::detached([body, deadline, answer_ms] {
+    if (tourney::DeliveryClock::now() >= deadline) throw BridgeNoAnswer("Tournament delivery deadline");
+    json j = g_stdio ? bridge_stdio(body, answer_ms, {}, deadline) : bridge_http(body, answer_ms);
+    if (!j.value("ok", false)) throw std::runtime_error("Tournament result refused");
+    return j;
+  });
+  if (done.wait_until(deadline) != std::future_status::ready) throw BridgeNoAnswer("Tournament delivery deadline");
+  return done.get();
 }
 
 // ------------------------------------------------------------------ WebSocket (WinHTTP)
@@ -935,6 +1024,9 @@ ranked::RankRead g_rank_read;
 ranked::ResultsPanel g_rank_results;
 bool g_rank_result_visible = false;
 std::string g_rank_opponent, g_rank_score;
+// The last ranked room's opponent standing: its DISCONNECTED and result screens still draw the
+// opponent's badge after close_room has dropped the room (build 42b run 2).
+ranked::RankCache g_rank_opponent_rank;
 int g_rank_local = 0;
 constexpr uint64_t kDrainMs = 30000;   // a ranked room stays open this long at most for its result
 
@@ -962,6 +1054,7 @@ transport::RoomIO room_io(Room& r) {
   io.result = [&r](const json& m) {
     if (!g_rank_results.receive(m, r.set.local_participant())) g_rank_results.result_error();
     g_rank_result_visible = true;
+    g_rank_score = r.set.score_text();   // "Final score": a leave-rule result arrives after close_room
     g_rank_read.recovery_at = 0;
     const bool won = m.count("ranking") && m["ranking"].is_array() && !m["ranking"].empty() &&
                      m["ranking"][0] == r.set.local_participant();
@@ -1015,7 +1108,7 @@ uint64_t close_room(Leave why) {
     bool at_once = true;
     if (r->ranked) {
       if (why == Leave::Quit) r->set.quit();
-      else if (why == Leave::Lost) r->set.lost();
+      else if (why == Leave::Lost) r->set.lost(now_ms());
       at_once = r->set.leaves_at_once() || !r->set.needs_drain();
       if (r->set.leaves_at_once()) host::log("yougame: ranked set concession: the opponent won");
       host::log("yougame: leaving the ranked room (%s)%s", why == Leave::Quit ? "quit" : why == Leave::Lost ? "connection lost" : "set over",
@@ -1126,6 +1219,14 @@ Identity fetch_identity(const std::function<bool()>& cancelled = nullptr) {
       if (console::requests.pending()) parity::signals.console_boot_ready();
       if (hello.count("caps")) console::read_caps(hello, g_relaunch);
     }
+    std::string diagnostic;
+    {
+      std::lock_guard<std::timed_mutex> lock(g_tourney_mutex);
+      release_tournament_locked();
+      diagnostic = g_tourney.hello(hello);
+      g_tourney_queue.hello(hello);
+    }
+    if (!diagnostic.empty()) host::log("%s", diagnostic.c_str());
 #ifdef _WIN32
     const auto mode = transport::Mode::hello(hello);
     {
@@ -1991,6 +2092,139 @@ Identity wait_identity(int ms) {
   }
 }
 
+// Native game's private CPU-bracket command. The site's SDK remains the only request path.
+bool tournament_active() { return g_tourney_launched.load(); }
+// All SDK traffic runs off the simulation thread. The policy reserves each request
+// under the same mutex before starting work, including a leave queued during join.
+void tournament_queue_tick() {
+  std::string kind;
+  {
+    std::lock_guard<std::timed_mutex> lock(g_tourney_mutex);
+    release_tournament_locked();
+    g_tourney_queue.tick(now_ms());
+    kind = g_tourney_queue.request(now_ms());
+  }
+  if (kind.empty()) return;
+  std::thread([kind] {
+    json state, launch;
+    bool failed = false;
+    try {
+      state = bridge({{"type", kind}}, 5000);
+      if (kind == "tourney.state" && state.is_object() && state.count("phase") &&
+          (state["phase"] == "ready" || state["phase"] == "playing"))
+        launch = bridge({{"type", "hello"}}, 5000);
+    }
+    catch (const std::exception&) { failed = true; }
+    std::lock_guard<std::timed_mutex> lock(g_tourney_mutex);
+    release_tournament_locked();
+    g_tourney_queue.answer(kind, state, now_ms(), failed);
+    const auto offered = g_tourney_queue.assignment(launch);
+    if (!offered.is_null()) g_tourney.assignment(offered);
+  }).detach();
+}
+bool tournament_pending() {
+  tournament_queue_tick();
+  bool refresh = false, pending = false;
+  {
+    std::lock_guard<std::timed_mutex> lock(g_tourney_mutex);
+    release_tournament_locked();
+    pending = g_tourney.pending();
+    // Only a previously completed tournament polls for another assignment, from the safe menu.
+    static auto next = tourney::DeliveryClock::time_point{};
+    const auto now = tourney::DeliveryClock::now();
+    if (!g_tourney_queue.visible() && g_tourney.awaiting() && now >= next) { refresh = true; next = now + std::chrono::seconds(5); }
+  }
+  if (refresh) refresh_identity();
+  return pending;
+}
+
+bool tournament_command(const uint8_t* p, uint32_t n, std::vector<uint8_t>& reply) {
+  if (!active() || !p || !n) return true;
+  if (n == 1 && (p[0] == MU_TOURNEY_MENU || p[0] == MU_TOURNEY_JOIN || p[0] == MU_TOURNEY_LEAVE)) {
+    {
+      std::lock_guard<std::timed_mutex> lock(g_tourney_mutex);
+      if (p[0] == MU_TOURNEY_JOIN) g_tourney_queue.join();
+      if (p[0] == MU_TOURNEY_LEAVE) {
+        g_tourney_queue.leave();
+        if (!tournament_active() && g_tourney.pending()) g_tourney.release();
+      }
+      g_tourney_queue.tick(now_ms());
+      reply.assign(2 + 128, 0);
+      reply[0] = g_tourney_queue.available(); reply[1] = g_tourney_queue.visible();
+      const auto text = g_tourney_queue.text();
+      std::copy_n(text.begin(), std::min<size_t>(text.size(), 127), reply.begin() + 2);
+    }
+    tournament_queue_tick();
+    return true;
+  }
+  if (p[0] == MU_TOURNEY_LAUNCH && n == 1) {
+    std::lock_guard<std::timed_mutex> lock(g_tourney_mutex);
+    // The first hello arrives on the identity worker. Never start/wait for identity here:
+    // a pending tournament can also enter from the main menu after that answer arrives.
+    if (const auto m = g_tourney.launch()) {
+      g_tourney_launched = true;
+      host::set_emulation_speed(1.0);
+      reply = {1, (uint8_t)(m->stage >> 8), (uint8_t)m->stage, (uint8_t)m->character, (uint8_t)m->level};
+    } else if (g_tourney.expired()) host::log("tournament: past deadline");
+    return true;
+  }
+  if (!tournament_active()) return true;
+  if (p[0] == MU_TOURNEY_STATUS && n == 1) {
+    std::lock_guard<std::timed_mutex> lock(g_tourney_mutex);
+    reply = {uint8_t(g_tourney.expired() ? 0 : g_tourney.finished() ? 2 : 1)};
+    return true;
+  }
+  if (p[0] == MU_TOURNEY_RESULT && n == 1 + MU_TOURNEY_RESULT_SIZE) {
+    const auto deadline = tourney::delivery_deadline();
+    std::unique_lock<std::timed_mutex> lock(g_tourney_mutex, std::defer_lock);
+    if (!lock.try_lock_until(deadline)) return true;
+    const auto report = g_tourney.finish(p + 1, n - 1);
+    if (report.is_null()) return true;
+    g_tourney_delivery_until = deadline.time_since_epoch().count();
+    // Detached packaged work has no joining future destructor, even if the page stops reading.
+    const auto generation = g_tourney_generation;
+    g_tourney_delivery = tourney::detached([report, deadline, generation] {
+      auto request = [deadline](const json& body) {
+        try { (void)tournament_bridge(body, deadline, 1500); host::log("tourney: result answered"); }
+        catch (const BridgeNoAnswer&) { return tourney::Reply::NoAnswer; }
+        catch (const std::exception&) { host::log("tourney: result refused"); }
+        return tourney::Reply::Answer;
+      };
+      const int attempts = tourney::deliver(report, request, [deadline] {
+        try { (void)tournament_bridge({{"type", "hello"}}, deadline, 1000); return true; }
+        catch (const std::exception&) { return false; }
+      });
+      {
+        std::unique_lock<std::timed_mutex> lock(g_tourney_mutex, std::defer_lock);
+        if (lock.try_lock_until(deadline) && generation == g_tourney_generation) g_tourney.answered();
+      }
+      host::log("tourney: result delivery finished (%d attempt%s)", attempts, attempts == 1 ? "" : "s");
+    });
+    return true;
+  }
+  if (p[0] == MU_TOURNEY_EXIT && n == 1) {
+    // Called only after the scene and major mode have unloaded. The process stays open.
+    tournament_drain();
+    g_tourney_cleanup_pending = true;
+    g_tourney_launched = false;
+    std::unique_lock<std::timed_mutex> lock(g_tourney_mutex, std::try_to_lock);
+    if (lock.owns_lock()) release_tournament_locked();
+  }
+  return true;
+}
+
+void tournament_drain() {
+  const tourney::Deadline deadline{tourney::DeliveryClock::duration(g_tourney_delivery_until.load())};
+  if (deadline <= tourney::DeliveryClock::now()) return;
+  std::shared_future<void> delivery;
+  {
+    std::unique_lock<std::timed_mutex> lock(g_tourney_mutex, std::defer_lock);
+    if (!lock.try_lock_until(deadline)) return;
+    delivery = g_tourney_delivery;
+  }
+  if (delivery.valid()) delivery.wait_until(deadline);
+}
+
 void relay_key(const char* key) {
   if (g_stdio) write_line(std::string("yg {\"key\":\"") + key + "\"}");
 }
@@ -2209,7 +2443,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     ranked::set_contract(request);
     {
       std::lock_guard<std::mutex> lock(g_mutex);
-      g_rank_opponent.clear(); g_rank_score.clear();
+      g_rank_opponent.clear(); g_rank_score.clear(); g_rank_opponent_rank = {};
       g_rank_results = {}; g_rank_result_visible = false;
       g_rank_read.recovery_at = 0;
       if (!g_rank_read.enabled) g_rank_read.enter(); // the agent harness bypasses the CSS
@@ -2694,6 +2928,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     return out;
   }
   Room* raw = room.get();
+  g_rank_opponent_rank = {};
   if (raw->ranked) {
     ++g_ranked_rooms;
     g_rank_local = my_seat;
@@ -2701,6 +2936,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     if (local.known()) g_rank.update(local);
     const auto opponent = ranked::roster_rank(participants, 1 - my_seat);
     g_rank_opponent = opponent.known() ? opponent.header().substr(9) : "Unknown";
+    g_rank_opponent_rank = opponent;
     g_rank_score = raw->set.score_text();
     g_rank_results = {};
     g_rank_read.recovery_at = 0;
@@ -2896,12 +3132,13 @@ std::array<std::string, 6> ranked_lines() {
 }
 uint8_t opponent_rank() {
   std::lock_guard<std::mutex> lock(g_mutex);
-  return g_room && g_room->ranked ? ranked::roster_rank_byte(g_room->participants, 1 - g_rank_local) : 0xFF;
+  if (g_room && g_room->ranked) return ranked::roster_rank_byte(g_room->participants, 1 - g_rank_local);
+  return g_rank_opponent_rank.known() ? g_rank_opponent_rank.rank() : 0xFF;
 }
 
 std::vector<uint8_t> rank_record_response() {
   std::lock_guard<std::mutex> lock(g_mutex);
-  const auto opponent = g_room && g_room->ranked ? ranked::roster_rank(g_room->participants, 1 - g_rank_local) : ranked::RankCache();
+  const auto opponent = g_room && g_room->ranked ? ranked::roster_rank(g_room->participants, 1 - g_rank_local) : g_rank_opponent_rank;
   return ranked::rank_record_response(g_rank.record(), opponent.record(), g_rank_results.record());
 }
 

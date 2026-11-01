@@ -30,7 +30,8 @@ void set_log_path(const std::string& path);
 // Called from HLE(PADRead) with the freshly polled pads, before the guest sees them. Observes the
 // local fighters, raises the analog L trigger when the automatic press is enabled and allowed, and
 // flashes red on a missed L-cancel or green on success, according to the chosen feedback mode.
-void apply(host::PadState pads[4]);
+// Ranked CPU brackets suppress injection while retaining the display-only feedback.
+void apply(host::PadState pads[4], bool allow_automatic = true);
 // The native game keeps its fighters in its own layout, so it hands the values this helper reads
 // over itself (MuGameApi.lcancel_view). Unset, they are read from guest memory (recompiled build).
 void set_native_view(void (*fill)(MuLcancelView* out));

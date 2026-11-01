@@ -74,6 +74,7 @@ def main():
     if args.test:
         targets += ['linux_gc_adapter_test', 'linux_input_script_test', 'port_yougame_sysgen_test',
                     'port_handoff_state_test', 'port_handoff_agent_hook_test', 'port_handoff_agent_off_test',
+                    'port_handoff_delta_test', 'port_friends_handoff_join_test',
                     'port_sdl_video_thread_test',
                     'port_settings_mouse_test', 'port_keyboard_navigation_test', 'port_controller_profiles_test',
                     'port_settings_profile_bindings_test', 'port_dolphin_profile_test',
@@ -97,6 +98,7 @@ def main():
                     'port_ranked_setup_online_hook_test', 'port_ranked_setup_online_off_test', 'port_yougame_ranked_r1_test', 'port_yougame_mode_policy_test', 'port_yougame_display_defaults_test', 'port_yougame_display_defaults_agent_test', 'port_settings_nav_test', 'port_friends_input_test', 'port_friends_label_test', 'port_session_logs_test',
                     'port_yougame_blend_test', 'port_yougame_release_default_test', 'port_yougame_release_mixed_test',
                     'port_yougame_search_test', 'port_yougame_http_cancel_test',
+                    'port_yougame_tourney_test',
                     'port_practice_ghost_placeholders_test', 'port_yougame_pad_trace_hook_test',
                     'port_yougame_pad_trace_off_test',
                     'port_yougame_console_integration_test', 'port_yougame_console_engine_test',

@@ -92,5 +92,23 @@ int main() {
   ++tick; lcancel::apply(pads); CHECK(pads[0].trig_l == 0 && lcancel::automatic_enabled());
   lcancel::apply(pads); CHECK(pads[0].trig_l == 0);
   host::gameplay::vanilla_only_session = false;
-  std::puts("native and Static feedback, vanilla-only input policy and unchanged saved choices passed");
+  // A native CPU bracket keeps the saved automatic setting, but never injects, including
+  // a repeated read in a retrace that had cached an ordinary offline injection.
+  view.port[0].present = 0; ++tick; lcancel::apply(pads);
+  view.port[0].present = 1; std::memset(pads, 0, sizeof pads);
+  ++tick; lcancel::apply(pads); CHECK(pads[0].trig_l > 0);
+  std::memset(pads, 0, sizeof pads); std::memcpy(original, pads, sizeof pads);
+  lcancel::apply(pads, false); CHECK(std::memcmp(original, pads, sizeof pads) == 0);
+  lcancel::set_flash_mode(MU_LCFLASH_MU_BOTH);
+  for (uint32_t since : {6u, 7u}) {
+    view.port[0].motion_id = 65; view.port[0].ground_or_air = 1;
+    ++tick; lcancel::apply(pads, false);
+    lcancel::apply(pads, false); CHECK(std::memcmp(original, pads, sizeof pads) == 0);
+    view.port[0].motion_id = 70; view.port[0].ground_or_air = 0;
+    view.port[0].frames_since_trigger = since;
+    ++tick; lcancel::apply(pads, false);
+    CHECK(amount > 0 && (since < 7 ? green > .9f && red < .2f : red > .9f && green < .1f));
+    CHECK(std::memcmp(original, pads, sizeof pads) == 0 && lcancel::automatic_enabled());
+  }
+  std::puts("native and Static feedback, vanilla and tournament input policies, unchanged saved choices passed");
 }

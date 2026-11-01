@@ -37,6 +37,7 @@
 #include <sysdolphin/baselib/random.h>
 #include <mu_native.h>
 #include <mu_online_menu.h>
+#include "mu_tourney.h"
 #include <mu_ranked.h>
 #include <mu_ranked_setup_online.h>
 
@@ -137,6 +138,54 @@ static void put32(u8* p, u32 v) { p[0] = (u8) (v >> 24); p[1] = (u8) (v >> 16); 
 
 /* UserDisplayFunctions FetchSlippiAppState: B9, 42 bytes {app state, name[31], code[10]}; the
  * app state goes to r13-0x505F. */
+static int tournament_visible, tournament_back_ticks;
+static char tournament_text[128];
+static void tournament_query(unsigned char op)
+{
+    unsigned char reply[2 + 128] = { 0 };
+    unsigned int got = 0;
+    mu_slippi_cmd(MU_TOURNEY_COMMAND, &op, 1, reply, sizeof reply, &got);
+    tournament_offered = got == sizeof reply && reply[0] != 0;
+    tournament_visible = got == sizeof reply && reply[1] != 0;
+    memcpy(tournament_text, reply + 2, 127); tournament_text[127] = 0;
+}
+
+/* A waiting view owns the game's menu input until it is left or a match starts. */
+static int tournament_menu_think(HSD_GObj* gp, u32 buttons)
+{
+    int offered = tournament_offered, was_visible = tournament_visible, port, back = 0;
+    tournament_query(MU_TOURNEY_MENU);
+    if (offered != tournament_offered && ranked_supported && !slippi_submenu) {
+        mu_mnmain_install_online_menu();
+        mn_80229894(MENU_KIND_8, (u16) mu_slippi_first_unlocked(), 1);
+        return 1;
+    }
+    if (!tournament_visible && was_visible) {
+        slp.force_clear = 1;
+        mn_80229894(MENU_KIND_8, (u16) mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_TOURNAMENT), 1);
+        return 1;
+    }
+    if (!tournament_visible && tournament_back_ticks >= 0) return 0;
+    for (port = 0; port < 4; ++port)
+        if (gm_GetButtonsPressed((u8) port) & 0x0200) back = 1; /* mapped GameCube B */
+    if (buttons & MenuInput_Back) back = 1;
+    /* Finishing a leave consumes B until release, keeping the player on Online. */
+    if (tournament_back_ticks < 0) {
+        if (back) return 1;
+        tournament_back_ticks = 0;
+        return 0;
+    }
+    tournament_back_ticks = back ? tournament_back_ticks + 1 : 0;
+    if (tournament_back_ticks >= 30) {
+        tournament_query(MU_TOURNEY_LEAVE);
+        tournament_back_ticks = -1;
+        sfxBack();
+        slp.force_clear = 1;
+        mn_80229894(MENU_KIND_8, (u16) mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_TOURNAMENT), 1);
+    } else mu_slippi_tournament_notice(gp, tournament_text);
+    return 1;
+}
+
 int mu_slippi_fetch_app_state(void)
 {
     u8 osb[OSB_SIZE];
@@ -148,6 +197,7 @@ int mu_slippi_fetch_app_state(void)
     memcpy(user_code, osb + 32, 10);
     user_code[10] = 0;
     ranked_offered = mu_slippi_ranked_header(NULL, 0);
+    tournament_query(MU_TOURNEY_MENU);
     return slp.app_state;
 }
 
@@ -222,7 +272,7 @@ int mu_slippi_menu_label_kind(int row)
     return option == MU_SLP_OPT_FRIENDS ? 1 : option == MU_SLP_OPT_SLIPPI ? 2 :
            option == MU_SLP_MODE_DIRECT ? 3 : option == MU_SLP_MODE_TEAMS ? 4 :
            option == MU_SLP_MODE_PARTY ? 5 : option == MU_SLP_MODE_RANKED ? 6 :
-           option == MU_SLP_MODE_UNRANKED ? 7 : 0;
+           option == MU_SLP_MODE_UNRANKED ? 7 : option == MU_SLP_OPT_TOURNAMENT ? 8 : 0;
 }
 
 
@@ -473,6 +523,13 @@ int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned c
     if (!mu_slippi_menus_enabled()) {
         return 0;
     }
+    if (previous_mode == GM_VS && tournament_visible) {
+        slippi_submenu = 0;
+        mu_mnmain_install_online_menu();
+        *menu_kind = MENU_KIND_8;
+        *hovered = (u8) mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_TOURNAMENT);
+        return 1;
+    }
     if (friends_return) {
         friends_return = 0;
         if (previous_mode == GM_BOOT) boot_oneshot = 0;
@@ -647,6 +704,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         input[port][2] = gm_801A36C0((u8) port);
     }
     buttons = mn_80229624(4);
+    if (ranked_supported && tournament_menu_think(gp, buttons)) return;
     /* The refusal owns Y until an actual navigation/back/confirm leaves it. Cooldown and
      * focus changes never withdraw the context of an open app sheet. */
     if (slippi_link_notice) {
@@ -688,7 +746,14 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
     selected_row = mn_804A04F0.hovered_selection;
     selected_option = mu_slippi_menu_option(selected_row);
     mn_804A04F0.buttons = buttons;
-    if ((buttons & MenuInput_Confirm) && friends_visible &&
+    if ((buttons & MenuInput_Confirm) && ranked_supported && tournament_offered &&
+        selected_option == MU_SLP_OPT_TOURNAMENT) {
+        tournament_query(MU_TOURNEY_JOIN);
+        friends_visible = 0;
+        mn_804D6BC8.cooldown = 5;
+        sfxForward();
+        mu_slippi_tournament_notice(gp, tournament_text);
+    } else if ((buttons & MenuInput_Confirm) && friends_visible &&
         mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_FRIENDS)
     {
         /* A and START both confirm Friends. The host keeps the menu here until the
@@ -753,7 +818,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         mu_mnmain_install_online_menu();
         mn_804D6BC8.cooldown = 5;
         sfxBack();
-        mn_80229894(MENU_KIND_8, MU_YG_ROW_SLIPPI, 3);
+        mn_80229894(MENU_KIND_8, mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_SLIPPI), 3);
         slp.force_clear = 1;
     } else if (buttons & MenuInput_Back) {
         friends_visible = 0;

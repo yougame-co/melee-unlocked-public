@@ -150,6 +150,18 @@ add_test(NAME port_pacing_diagnostics COMMAND port_pacing_diagnostics_test)
 add_test(NAME port_pacing_diagnostics_wiring COMMAND "${Python3_EXECUTABLE}"
   "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/pacing_diagnostics_wiring_test.py")
 
+find_package(Threads REQUIRED)
+add_executable(port_yougame_tourney_test port/tests/yougame_tourney_test.cpp)
+target_include_directories(port_yougame_tourney_test PRIVATE port/runtime/hle port/third_party)
+target_compile_features(port_yougame_tourney_test PRIVATE cxx_std_17)
+target_link_libraries(port_yougame_tourney_test PRIVATE Threads::Threads)
+add_test(NAME port_yougame_tourney COMMAND port_yougame_tourney_test)
+add_test(NAME port_yougame_tourney_wiring COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_tourney_wiring_test.py")
+
+add_test(NAME port_yougame_tourney_scene COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_tourney_scene_test.py")
+
 include(port/tests/relay_output.cmake)
 
 # Window-free compliance and hook diagnostics, available before Linux's return().

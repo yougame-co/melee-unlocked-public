@@ -69,6 +69,7 @@
 #include "disc_archive.h"
 #include "user_gecko.h"
 #include "mu_host.h"
+#include "../runtime/abi/mu_tourney.h"
 #include "ppc.h"
 #include "render_observer.h"
 #include "native_state_layout.h"
@@ -1069,9 +1070,17 @@ void rollback_frame_callback() {
     rollback_log();
   }
 }
+// Both normal returns and a guarded ExitRequested must finish before shutdown closes the SDK.
+void finish_tournament_before_exit() {
+  if (!yougame::tournament_active()) return;
+  if (g_game.practice) g_game.practice(MU_TOURNEY_QUIT_OP, nullptr, 0);
+  yougame::tournament_drain();
+}
+
 template <class F> void guarded(F&& f) {
   try { f(); } catch (const ExitRequested& stop) {
     g_exit_code = stop.code;
+    finish_tournament_before_exit();
     write_replay_recording();
 #ifndef MELEE_NO_SLIPPI
     slippi::spectate::stop();
@@ -1332,6 +1341,7 @@ constexpr uint32_t kPracticeLabBits = MU_GAME_OPTION_LAB | MU_GAME_OPTION_LAB_BU
 uint32_t te_words_mask2() { return mods::status().te_owned ? 0xFFFFFFFFu : hp_te_words() ? kHpTeOptions2 : 0u; }
 uint32_t h_game_options2() {
   if (yougame::console::console_active()) return 0;
+  if (yougame::tournament_active()) return 0; // Ranked-style play, no offline CPU/TE modifiers
   if (host::gameplay::vanilla_only()) return 0;
   if (g_replaying) return g_replay_feature_options2;
   return (gx::RenderOptions::live_te_options2() & te_words_mask2() & ~(MU_GAME_OPTION2_STADIUM_FROZEN | MU_GAME_OPTION2_ARCADE_PACK)) |
@@ -1361,6 +1371,7 @@ uint32_t h_audio_options() {
 
 uint32_t h_game_options3() {
   if (yougame::console::console_active()) return MU_GAME_OPTION3_LOCKED_CONTENT;
+  if (yougame::tournament_active()) return 0;
   if (g_replaying) return g_replay_feature_options3;
   return (host::gameplay::vanilla_only() ? 0u :
           (gx::RenderOptions::live_cpu_training() & MU_GAME_OPTION3_CPU_ALL) | hackpack::stage_bits()) |
@@ -1377,15 +1388,15 @@ uint32_t h_game_options() {
           MU_GAME_OPTION_LANGUAGE_MASK) |   // the player's language choice: text, names and voices only
          (host::options.vanilla_game ? MU_GAME_OPTION_VANILLA : 0u) |
          (g_slippi_menus ? MU_GAME_OPT_SLIPPI_MENUS : 0u) |
-         (!host::gameplay::vanilla_only() && mods::status().tmce && !g_replaying ? MU_GAME_OPTION_TMCE : 0u) |
-         (host::gameplay::vanilla_only() ? 0u : g_replaying ? g_replay_feature_options
+         (!host::gameplay::vanilla_only() && !yougame::tournament_active() && mods::status().tmce && !g_replaying ? MU_GAME_OPTION_TMCE : 0u) |
+         ((host::gameplay::vanilla_only() || yougame::tournament_active()) ? 0u : g_replaying ? g_replay_feature_options
                    : gx::RenderOptions::live_te_options() & te_words_mask1()) |
          // The Practice panel's Training tools (D-pad save states and recording, hitboxes, the loop)
          // are the native lab's bits (shim/mu_lab.c), set from the practice settings by
          // apply_practice_tools. The mask above passes only 20XX TE's own bits, so since the panel
          // came in these switches never reached the game. The lab itself acts only in an offline
          // Training match outside a replay; never sent in a network session or during playback.
-         (host::gameplay::vanilla_only() || g_replaying || slippi::online::session_mode() >= 0 || source_p2p::requested()
+         (host::gameplay::vanilla_only() || yougame::tournament_active() || g_replaying || slippi::online::session_mode() >= 0 || source_p2p::requested()
               ? 0u : gx::RenderOptions::live_te_options() & kPracticeLabBits);
   // (Only 20XX TE's own bits, and only with its save, or the Hack Pack's share of them with the pack.
   // The old Training Lab's own rows (dummy DI, reactions, tech) are not offered any more: Training
@@ -2285,6 +2296,7 @@ int32_t h_slippi_command(uint8_t command, const uint8_t* payload, uint32_t paylo
         // CPU prep uses the ordinary B3/B5/BF/C0/C1 bridge, entirely locally.
         if (yougame::ranked_cpu::intercept(c, p, n, reply, yougame::active())) return true;
 #endif
+        if (c == MU_TOURNEY_COMMAND) return yougame::tournament_command(p, n, reply);
         // Music: the game hands its songs to the jukebox as the static recomp's Slippi codes do
         // (StartSong D6, Stop D7, VolumeChange D8; shim/mu_audio.c).
         if (c == 0xD6 && n == 8) {
@@ -2816,8 +2828,9 @@ void h_pad_read(MuPadStatus out[4]) {
 #ifdef YOUGAME_AGENT_TEST_HOOK
   current_fight_sample = {};
 #endif
-  lcancel::apply(pads);   // auto L-cancel, upstream of the game exactly as in the recompiled build
-  slippi::native_practice::apply_pads(pads);   // Training after an online session, the requeue prompt
+  lcancel::apply(pads, !yougame::tournament_active()); // Ranked brackets keep display-only feedback
+  if (!yougame::tournament_active())
+    slippi::native_practice::apply_pads(pads);   // Training after an online session, the requeue prompt
   bool offline_gameplay = false;
   if (gx::RenderOptions::live_offline_delay() && !g_replaying &&
       slippi::online::session_mode() < 0 && g_game.lcancel_view) {
@@ -2828,7 +2841,7 @@ void h_pad_read(MuPadStatus out[4]) {
   host::offline_delay::apply(pads, offline_gameplay);
   // The player's data-only Gecko codes, once per frame. Offline only: the writer in the game
   // library also refuses during an online match, whichever kind.
-  if (slippi::online::session_mode() < 0 && !g_replaying) user_gecko::apply();
+  if (slippi::online::session_mode() < 0 && !g_replaying && !yougame::tournament_active()) user_gecko::apply();
   // A pasted always-display hitbox code turns on the Arcade look switches its lines stand for.
   gx::set_arcade_display(gx::ArcadeSource::Codes, user_gecko::arcade_bits_of_codes());
   // Hidden test hook: MELEE_TEST_INSTALL_LOOK=<0 Diet, 1 Animelee, 2 Animelee x DBZ> starts that one-click install once.
@@ -4410,14 +4423,18 @@ static bool in_app_container() {
   return ok && is != 0;
 }
 
-static HMODULE map_game_image(const std::string& path, std::string* error) {
-  // Found as LoadLibrary would: a bare name sits beside the program (the working directory is the
-  // sandbox's data folder).
+// Found as LoadLibrary would: a bare name sits beside the program (the working directory is the
+// sandbox's data folder).
+static std::filesystem::path game_library_file(const std::string& path) {
   std::filesystem::path file_path = std::filesystem::u8path(path);
   if (file_path.is_relative()) {
     wchar_t exe[MAX_PATH];
     if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) file_path = std::filesystem::path(exe).parent_path() / file_path;
   }
+  return file_path;
+}
+static HMODULE map_game_image(const std::string& path, std::string* error) {
+  const std::filesystem::path file_path = game_library_file(path);
   std::ifstream in(file_path, std::ios::binary);
   std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   const auto* dos = (const IMAGE_DOS_HEADER*)file.data();
@@ -4708,7 +4725,9 @@ int run(void (*shutdown)(int)) {
 #ifdef _WIN32
   char loaded_path[MAX_PATH]{};
   if (GetModuleFileNameA(module,loaded_path,MAX_PATH)) g_loaded_game_path = loaded_path;
-  else g_loaded_game_path = g_dll; // The sandbox's custom mapper is not in the loader list.
+  // The sandbox's custom mapper is not in the loader list, and the working directory is the data
+  // folder: the handoff identity and the snapexcl must read the file the mapper read.
+  else g_loaded_game_path = game_library_file(g_dll);
 #else
   Dl_info game_info{};
   if (entry && dladdr(reinterpret_cast<void*>(entry), &game_info) && game_info.dli_fname)
@@ -4779,6 +4798,8 @@ int run(void (*shutdown)(int)) {
 #else
   guarded([&] { code = g_game.run(); });
 #endif
+  // An orderly window close before Game End is a quit, sampled by the game before unloading.
+  finish_tournament_before_exit();
   rollback_log(true);
   log_native_pose_bridge_stats();
   gx::set_native_pose_capture_enabled(false);

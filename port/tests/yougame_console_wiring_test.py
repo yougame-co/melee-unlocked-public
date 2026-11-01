@@ -520,6 +520,11 @@ _Static_assert(MU_DISPLAY_NO_KO_EXPLOSIONS == MU_DISPLAY_OPTION_NO_KO_EXPLOSIONS
         old, new = baseline(path), read(path)
         # Round A moved the predictor verbatim into an include, preserving its OFF branches.
         new += read('sourceport/game/shim/mu_online_prediction.inc')
+        # Tournament play opts into the same online gameplay codes. With that
+        # explicit feature branch disabled, all preexisting bodies stay identical.
+        tourney = "\n#ifndef MU_NO_SLIPPI\n        && !mu_tourney_playing()\n#endif\n    "
+        self.assertEqual(new.count(tourney), 1)
+        new = new.replace(tourney, "")
         # Round A's explicit console branches are already independently pinned above; these
         # pin the untouched Slippi routines, including extracted predictor helpers.
         names = (

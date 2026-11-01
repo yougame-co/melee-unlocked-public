@@ -22,7 +22,7 @@
 void mu_slippi_friends_label(HSD_JObj* label, int menu_kind, int selection, int capture)
 {
     static HSD_ImageDesc* native[8];
-    static HSD_ImageDesc image[2];
+    static HSD_ImageDesc image[3];
     int kind = mu_slippi_menu_label_kind(selection), slot;
     HSD_DObj* dobj;
     if (!mu_slippi_menus_enabled() || !mu_slippi_yougame_menu() ||
@@ -49,6 +49,10 @@ void mu_slippi_friends_label(HSD_JObj* label, int menu_kind, int selection, int 
                     DISC_SET(image[kind - 1].image_ptr,
                              kind == 1 ? mu_baked_friends : mu_baked_slippi);
                     replacement = &image[kind - 1];
+                } else if (kind == 8) {
+                    image[2] = *original;
+                    DISC_SET(image[2].image_ptr, mu_baked_tournament);
+                    replacement = &image[2];
                 } else if (kind >= 3 && kind <= 5) {
                     replacement = native[2 + selection];
                 } else if ((kind == 6 || kind == 7) &&
@@ -135,6 +139,12 @@ void mu_slippi_menu_description(HSD_Text* text, const char* message)
     text->alloc_data = alloc;
     text->sis_buffer = alloc->data;
     text->x60 = NULL;
+}
+
+void mu_slippi_tournament_notice(HSD_GObj* menu, const char* message)
+{
+    MainMenuData* data = menu ? menu->user_data : NULL;
+    if (data) mu_slippi_menu_description(data->description, message);
 }
 
 void mu_slippi_signin_notice(HSD_GObj* menu)

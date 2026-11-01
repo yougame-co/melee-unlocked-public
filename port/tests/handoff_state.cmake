@@ -33,6 +33,9 @@ if(NOT TARGET port_handoff_delta_test)
   add_test(NAME port_handoff_delta COMMAND port_handoff_delta_test)
   add_test(NAME port_handoff_quiescence COMMAND "${Python3_EXECUTABLE}" -B
     "${CMAKE_CURRENT_LIST_DIR}/handoff_quiescence_test.py")
+  if(CMAKE_C_COMPILER)
+    set_tests_properties(port_handoff_quiescence PROPERTIES ENVIRONMENT "CC=${CMAKE_C_COMPILER}")
+  endif()
 endif()
 if(NOT TARGET port_friends_handoff_join_test)
   add_executable(port_friends_handoff_join_test "${CMAKE_CURRENT_LIST_DIR}/yougame_console_link_test.cpp"

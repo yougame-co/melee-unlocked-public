@@ -10,6 +10,7 @@
 #include <mu_bm.h>
 #endif
 #include <string.h>
+#include "mu_tourney_game.h"
 #include <melee/cm/camera.h>
 #include <melee/cm/types.h>
 #include <melee/ft/fighter.h>
@@ -132,6 +133,8 @@ void mu_replay_boot_mode(u8* mode)
     }
     if (mu_replay_on() || mu_online_is_test_run()) {
         *mode = GM_DEBUG_VS;
+    } else if (mu_tourney_boot()) {
+        *mode = GM_VS;
     }
 }
 
@@ -354,6 +357,8 @@ void mu_replay_start_melee(StartMeleeData* data)
 /* ---- IncrementFrameIndex (8016d294) and FetchGameFrame (8016d298), fn_8016CFE0 ---- */
 void mu_replay_scene_think(int match_result)
 {
+    mu_tourney_tick();
+    mu_tourney_report(match_result);
     if (!mu_replay_on() && !recording_active) {
         return;
     }
@@ -731,6 +736,7 @@ static void emit_game_end(int end_method);
 
 void mu_replay_match_exit(void)
 {
+    mu_tourney_report(gmVs_GetSceneState()->match_result);
     if (recording_active) {
         /* The scene ends without the game end having been sent (a reset, a disconnect): end the
          * recording here with what the scene knows. */

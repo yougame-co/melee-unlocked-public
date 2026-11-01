@@ -1,4 +1,5 @@
 """Exercise the actual shim event queue/accessor with an offline host stub."""
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -46,6 +47,7 @@ int main(void) {
 '''
 with tempfile.TemporaryDirectory(prefix="handoff-queue-") as work:
     binary = Path(work) / "test"
-    subprocess.run(["cc", "-std=c11", "-x", "c", "-", "-o", str(binary)],
+    # ctest passes the configured C compiler; a build box may have no plain `cc` on PATH.
+    subprocess.run([os.environ.get("CC") or "cc", "-std=c11", "-x", "c", "-", "-o", str(binary)],
                    input=stub + events + test, text=True, check=True)
     subprocess.run([str(binary)], check=True)

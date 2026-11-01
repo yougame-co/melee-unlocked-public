@@ -97,6 +97,12 @@ void refresh_identity();
 // would draw Slippi's "log in" screen; a slow app must not stall the game thread again and again).
 Identity wait_identity(int ms);
 
+// Private native-game CPU bracket bridge (mu_tourney.h). No-op outside a YouGame launch.
+bool tournament_active();
+bool tournament_pending();
+bool tournament_command(const uint8_t* payload, uint32_t size, std::vector<uint8_t>& reply);
+void tournament_drain();
+
 // A key relayed while the game has the keyboard: "shift-escape" leaves app full screen.
 // Plain "escape" is also sent for older apps. Sent as `yg {"key":"shift-escape"}`.
 void relay_key(const char* key);

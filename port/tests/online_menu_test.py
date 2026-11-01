@@ -33,9 +33,10 @@ using u8 = unsigned char; using s8 = signed char; using u16 = unsigned short; us
 using u64 = unsigned long long;
 static constexpr u64 PAD_ANY_UP = 1ULL << 36, PAD_ANY_DOWN = 1ULL << 37;
 enum { MU_SLP_MODE_RANKED, MU_SLP_MODE_UNRANKED, MU_SLP_MODE_DIRECT, MU_SLP_MODE_TEAMS, MU_SLP_MODE_PARTY,
-       MU_SLP_OPT_LOGIN, MU_SLP_OPT_LOGOUT, MU_SLP_OPT_UPDATE, MU_SLP_OPT_FRIENDS, MU_SLP_OPT_SLIPPI };
+       MU_SLP_OPT_LOGIN, MU_SLP_OPT_LOGOUT, MU_SLP_OPT_UPDATE, MU_SLP_OPT_FRIENDS, MU_SLP_OPT_SLIPPI, MU_SLP_OPT_TOURNAMENT };
 #include "mu_online_menu.h"
-enum { MENU_KIND_8 = 8, MENU_KIND_1P = 1, SEL_1P_2 = 2, GM_HANYU_CSS = 8, GM_BOOT = 0,
+enum { MENU_KIND_8 = 8, MENU_KIND_1P = 1, SEL_1P_2 = 2, GM_HANYU_CSS = 8, GM_BOOT = 0, GM_VS = 2,
+       MU_TOURNEY_COMMAND = 0xeb, MU_TOURNEY_MENU = 4, MU_TOURNEY_JOIN = 5, MU_TOURNEY_LEAVE = 6,
        MU_SLP_APP_LOGGED_IN = 1, MU_SLP_APP_UPDATE = 2, MU_SLP_WINNER_NULL = -1,
        MenuInput_Confirm = 1, MenuInput_Back = 2, MenuInput_Up = 4, MenuInput_Down = 8,
        CMD_YOUGAME_FRIENDS_MENU = 0xe6, CMD_OPEN_LOGIN = 0xb6, CMD_UPDATE_APP = 0xb8, PAD_CONFIRM = 0x1100 };
@@ -52,6 +53,9 @@ static int ranked_supported, ranked_offered, friends_offered, slippi_submenu, bo
 static int pending_buttons, entered, last_mode = -1, published, installs, switched_menu, switched_row;
 static int p2p, cpu, granted = 1, grant_queries, notices, grant_error, grant_short;
 static int link_requests, link_leaves;
+static int tournament_visible, tournament_back_ticks, queue_available, queue_visible, joins, leaves, queue_notices;
+static char tournament_text[128];
+void mu_slippi_tournament_notice(HSD_GObj*, const char*) { ++queue_notices; }
 void mu_slippi_signin_notice(HSD_GObj*) { ++notices; }
 int mu_slippi_menu_count(); int mu_slippi_menu_option(int); int mu_slippi_option_unlocked(int);
 int mu_slippi_first_unlocked();
@@ -94,6 +98,12 @@ void mn_80229894(int menu, int row, int) {
     mn_804A04F0.cur_menu = menu; mn_804A04F0.hovered_selection = row;
 }
 int mu_slippi_cmd(unsigned cmd, const void* p, unsigned, void* out, unsigned, unsigned* got) {
+    if (cmd == MU_TOURNEY_COMMAND) {
+        if (*(const u8*)p == MU_TOURNEY_JOIN) { ++joins; queue_visible = 1; }
+        if (*(const u8*)p == MU_TOURNEY_LEAVE) { ++leaves; queue_visible = 0; }
+        std::memset(out, 0, 130); ((u8*)out)[0] = queue_available; ((u8*)out)[1] = queue_visible;
+        *got = 130; return 0;
+    }
     if (cmd == CMD_YOUGAME_FRIENDS_MENU && *(const u8*)p == 8) {
         ++grant_queries; *(u8*)out = (u8)granted; *got = grant_short ? 0 : 1; return grant_error;
     }
@@ -297,6 +307,35 @@ int main() {
     // Confirm wins over a simultaneous direction: this submenu highlight has no directional cause.
     mn_804A04F0.hovered_selection = 3; press(MenuInput_Confirm | MenuInput_Down);
     CHECK(highlight_lines == std::vector<std::string>{"online menu: row 0 (option 2) highlighted; frame 1935, input none; yougame 1, submenu 1, ranked offered 1, friends offered 1, app state 1\n"});
+    // A late hello inserts a focusable Tournament between Friends and Slippi.
+    for (int p=0;p<4;++p) for (int i=0;i<3;++i) cached_input[p][i]=0;
+    slippi_submenu = 0; queue_available = 1; press(0);
+    CHECK(mu_slippi_menu_count() == 5 && mn_803EB6B0[8].selection_count == 5);
+    CHECK(mu_slippi_menu_option(2) == MU_SLP_OPT_FRIENDS);
+    CHECK(mu_slippi_menu_option(3) == MU_SLP_OPT_TOURNAMENT);
+    CHECK(mu_slippi_menu_label_kind(3) == 8 && mu_slippi_option_unlocked(3));
+    CHECK(mu_slippi_menu_option(4) == MU_SLP_OPT_SLIPPI);
+    CHECK(mn_803EB6B0[8].anim_loop[3].tag == 4);
+    mn_804A04F0.hovered_selection = 3; press(MenuInput_Confirm);
+    CHECK(joins == 1 && queue_visible && queue_notices);
+    for (int i=0;i<90;++i) press(MenuInput_Confirm);
+    CHECK(joins == 1 && !leaves);
+    // Ordinary mapped B must be held; no keyboard shortcut is involved.
+    cached_input[0][0]=0x0200;
+    for (int i=0;i<29;++i) press(MenuInput_Back);
+    CHECK(!leaves && queue_visible); press(MenuInput_Back);
+    CHECK(leaves == 1 && !queue_visible);
+    const int held_menu = mn_804A04F0.cur_menu;
+    for (int i=0;i<60;++i) press(MenuInput_Back);
+    CHECK(leaves == 1 && mn_804A04F0.cur_menu == held_menu);
+    cached_input[0][0]=0; press(0);
+    // Return from a bracket game restores the waiting view's row.
+    queue_visible = 1; tournament_query(MU_TOURNEY_MENU);
+    CHECK(mu_slippi_menu_enter(GM_VS, &menu, &hovered));
+    CHECK(menu == MENU_KIND_8 && hovered == 3);
+    queue_visible = 0; queue_available = 0; press(0);
+    CHECK(mu_slippi_menu_count() == 4 && mu_slippi_menu_option(3) == MU_SLP_OPT_SLIPPI);
+    for (int r=0;r<mu_slippi_menu_count();++r) CHECK(mu_slippi_menu_option(r)!=MU_SLP_OPT_TOURNAMENT);
     std::printf("online menu: %d checks passed\n", checks);
 }
 '''
@@ -668,7 +707,7 @@ class OnlineMenuTest(unittest.TestCase):
         self.assertIn('Sign in to Slippi to play Direct, Teams and Party', label)
         disabled = re.search(r'#if 0(.*?)#endif', header, re.S)[1]
         self.assertEqual(re.findall(r'MU_SLP_OPT_\w+', disabled),
-                         ['MU_SLP_OPT_DOUBLES', 'MU_SLP_OPT_TOURNAMENT'])
+                         ['MU_SLP_OPT_DOUBLES'])
 
     def test_ranked_description_and_plain_hud_wiring(self):
         patch = (ROOT / 'sourceport/patches/melee-native.patch').read_text()
@@ -709,7 +748,7 @@ int main() {
 
     def test_production_entry_cursor_submenu_and_standalone(self):
         source = (ROOT / 'sourceport/game/shim/mu_slippi_menu.c').read_text()
-        names = ['mu_slippi_menu_count', 'mu_slippi_menu_option',
+        names = ['tournament_query', 'tournament_menu_think', 'mu_slippi_menu_count', 'mu_slippi_menu_option',
                  'mu_slippi_menu_label_kind', 'mu_slippi_option_unlocked', 'mu_slippi_first_unlocked',
                  'mu_slippi_menu_enter', 'mu_slippi_switch_to_online_menu', 'upstream_slippi_available', 'confirm_port',
                  'log_online_highlight', 'mu_slippi_online_menu_think']
@@ -755,7 +794,7 @@ int main() {
 #include <cstdlib>
 enum { MU_SLP_MODE_RANKED, MU_SLP_MODE_UNRANKED, MU_SLP_MODE_DIRECT, MU_SLP_MODE_TEAMS,
        MU_SLP_MODE_PARTY, MU_SLP_OPT_LOGIN, MU_SLP_OPT_LOGOUT, MU_SLP_OPT_UPDATE,
-       MU_SLP_OPT_FRIENDS, MU_SLP_OPT_SLIPPI };
+       MU_SLP_OPT_FRIENDS, MU_SLP_OPT_SLIPPI, MU_SLP_OPT_TOURNAMENT };
 #include "HEADER"
 int ranked_supported=1, slippi_submenu=0, calls=0, checks=0;
 void mu_slippi_friends_label(void*,int,int,int) { ++calls; }

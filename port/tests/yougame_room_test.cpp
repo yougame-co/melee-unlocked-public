@@ -197,13 +197,14 @@ static void lobby_start_links() {
   f.stop_at(9); f.run(); CHECK(f.b.count("directClose")==1);
 }
 static void departure_keeps_ranked_pump() {
-  // Owed game report -> receipt -> claim/final -> result, after definitive departure/link close.
+  // Owed game report -> receipt -> the room's result (a lost link claims nothing), after definitive
+  // departure/link close.
   for (const char* reason : {"left","kicked","link"}) {
     Fixture f; f.ranked(); f.report(); f.r.set.lost(); f.r.links.ids={257};
     if (std::string(reason)=="link") {f.b.link_state=3;f.tick();}
     else f.b.push({{"t","leave"},{"player",{{"id","b"}}},{"reason",reason}});
     f.b.at(101,[&]{CHECK(f.b.disabled==1 && !f.r.set.closed() && f.b.messages("game-report")==1);f.b.push({{"t","game-result"},{"matchId","set-1"},{"id","g1-t0"},{"ranking",{"a","b"}}});});
-    f.b.at(201,[&]{CHECK(f.b.messages("finish")==1 && !f.r.set.closed());f.b.push({{"t","result"},{"matchId","set-1"},{"ranking",{"a","b"}}});});
+    f.b.at(201,[&]{CHECK(f.b.messages("finish")==0 && !f.r.set.closed());f.b.push({{"t","result"},{"matchId","set-1"},{"ranking",{"a","b"}}});});
     f.stop_at(301); f.run(); CHECK(f.r.set.settled() && !f.r.set.closed());
   }
   for (const char* reason : {"left","kicked"}) {

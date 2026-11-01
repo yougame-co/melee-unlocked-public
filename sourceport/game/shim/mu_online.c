@@ -16,6 +16,9 @@
  * record of which frames were predicted or confirmed.
  */
 #include <string.h>
+#ifndef MU_NO_SLIPPI
+#include "mu_tourney_game.h"
+#endif
 #include <math.h>
 char* getenv(const char* name);
 #include <dolphin/pad.h>
@@ -284,7 +287,11 @@ int mu_online_resim_active(void)
  * online match plays with every gameplay code in them, whatever this game was booted with. */
 unsigned int mu_online_codes(void)
 {
-    if (!mu_online.active && !mu_online.pending) {
+    if (!mu_online.active && !mu_online.pending
+#ifndef MU_NO_SLIPPI
+        && !mu_tourney_playing()
+#endif
+    ) {
         return 0;
     }
     return MU_RC_INIT_STAGE_DATA | MU_RC_INIT_PLAYER_DATA | MU_RC_OFFSCREEN_DAMAGE | MU_RC_DEAD_UP_FALL |
@@ -1147,6 +1154,9 @@ static int singles_winner(int end_method)
     }
     return -1;
 }
+
+/* The tournament uses the exact existing singles winner, without changing online reports. */
+int mu_online_singles_winner(int end_method) { return singles_winner(end_method); }
 
 /* InitOnlinePlay's FN_HandleGameCompleted, called once the game can no longer be rolled back: the
  * game report (CMD_REPORT_GAME). Slippi runs CreateMatchEndData first only for the winner callback,

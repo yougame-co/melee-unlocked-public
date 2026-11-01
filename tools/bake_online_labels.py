@@ -120,7 +120,7 @@ def header():
              '#ifndef MU_MENU_LABEL_ART_H', '#define MU_MENU_LABEL_ART_H',
              'enum { MU_LABEL_W = 176, MU_LABEL_H = 30, MU_LABEL_BYTES = 176 * 32 };']
     for symbol, word, title in [('friends', 'Friends', False), ('slippi', 'Slippi', False),
-                                ('slippi_title', 'Slippi', True)]:
+                                ('slippi_title', 'Slippi', True), ('tournament', 'Tournament', False)]:
         lines.append('static const unsigned char mu_baked_' + symbol +
                      '[MU_LABEL_BYTES] __attribute__((aligned(32))) = {')
         data = tiled(word, title)
