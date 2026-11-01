@@ -48,7 +48,7 @@ static AnimLoopSettings mn_803EB57C[] = {{0},{1},{2}}, mn_803EB5A0[] = {{3},{4},
 struct { int selection_count; AnimLoopSettings* anim_loop; int start_frame; u16* description_indices; void(*think)(HSD_GObj*); } mn_803EB6B0[9];
 static u16 mn_803EB66C[3];
 void mu_slippi_online_menu_think(HSD_GObj*);
-static int ranked_supported, ranked_offered, friends_offered, slippi_submenu, boot_oneshot, p2p_auto_direct;
+static int ranked_supported, ranked_offered, friends_offered, slippi_submenu, boot_oneshot, p2p_auto_direct, friends_confirm_hold;
 static int pending_buttons, entered, last_mode = -1, published, installs, switched_menu, switched_row;
 static int p2p, cpu, granted = 1, grant_queries, notices, grant_error, grant_short;
 void mu_slippi_signin_notice(HSD_GObj*) { ++notices; }
@@ -125,6 +125,13 @@ int main() {
     for (int i = 1; i <= 4; ++i) { press(MenuInput_Down); CHECK(mn_804A04F0.hovered_selection == i % 4); CHECK(published == (i == 2 ? 6 : 5)); }
     mn_804A04F0.hovered_selection = 2; press(MenuInput_Confirm);
     CHECK(entered == 0 && published == 6 && mn_804D6BC8.cooldown == 5);
+    // Friends' own confirm cooldown keeps the row selected, so the host keeps the picker that press
+    // opened (quality 11-01, build 30: it published 5, "friends: cancelled", the friend waited alone).
+    for (int i = 0; i < 4; ++i) { pending_buttons = 0; mu_slippi_online_menu_think(nullptr); CHECK(published == 6 && friends_confirm_hold); }
+    pending_buttons = 0; mn_804D6BC8.cooldown = 0; mu_slippi_online_menu_think(nullptr);
+    CHECK(published == 6 && !friends_confirm_hold);
+    // The entry cooldown alone still hides the selection: a press carried in must not open the picker.
+    pending_buttons = 0; mn_804D6BC8.cooldown = 5; mu_slippi_online_menu_think(nullptr); CHECK(published == 5);
     mn_804A04F0.hovered_selection = 3; press(MenuInput_Confirm);
     CHECK(slippi_submenu == 1 && mu_slippi_menu_count() == 3 && switched_row == 0 && slp.force_clear);
     CHECK(entered == 0 && published == 4);

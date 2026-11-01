@@ -100,6 +100,10 @@ static int first_boot = 1;    /* OnMenuLoad's DOFST_IS_FIRST_BOOT */
  * by itself. Set in the boot menu entry and cleared by that menu's think a few frames later, both
  * before any match exists, so every rollback snapshot holds 0 and a load cannot arm it again. */
 static int p2p_auto_direct;
+/* Friends was just confirmed: its confirm cooldown must not read as "Friends no longer selected",
+ * or the host stops the page picker it opened for that press (friends: cancelled, the invite still
+ * goes out and the friend waits for a room nobody hosts). Menu-only, like p2p_auto_direct. */
+static int friends_confirm_hold;
 
 MuSlippiMenuState* mu_slippi_state(void)
 {
@@ -509,6 +513,7 @@ int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned c
 void mu_slippi_main_menu_loaded(void)
 {
     u8 friends_menu = 0;
+    friends_confirm_hold = 0;
     mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &friends_menu, 1, NULL, 0, NULL);
     if (!mu_slippi_menus_enabled()) {
         return;
@@ -645,6 +650,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         /* A and START both confirm Friends. The host keeps the menu here until the
          * picker returns; still apply the ordinary confirm cooldown. */
         mn_804D6BC8.cooldown = 5;
+        friends_confirm_hold = 1;
     } else if ((buttons & MenuInput_Confirm) && ranked_supported &&
                mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_SLIPPI) {
         slippi_submenu = 1;
@@ -746,8 +752,17 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
     }
     /* Publish after Up/Down so the next PADRead sees the row now under the cursor. */
     {
-        u8 friends_menu = !friends_visible ? 0 :
-            accepts_input && mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_FRIENDS ? 2 : 1;
+        /* The entry cooldown still hides the row's selection (a press carried in from the main
+         * menu must not open the picker); only the cooldown after a Friends confirm keeps it. */
+        const int friends_hovered =
+            mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_FRIENDS;
+        u8 friends_menu;
+        /* Released on the first frame that takes input with no cooldown pending (not the confirm
+         * frame itself, which sets the cooldown above), so there is no frame without selection. */
+        if (!friends_visible || !friends_hovered || (accepts_input && mn_804D6BC8.cooldown == 0))
+            friends_confirm_hold = 0;
+        friends_menu = !friends_visible ? 0 :
+            (accepts_input || friends_confirm_hold) && friends_hovered ? 2 : 1;
         /* Track Online even with the Friends row hidden; bit 2 is status-area visibility. */
         if (online_visible) friends_menu |= 4;
         mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &friends_menu, 1, NULL, 0, NULL);

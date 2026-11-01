@@ -52,8 +52,17 @@ class FriendsMenuWiringTest(unittest.TestCase):
         send = think.index("CMD_YOUGAME_FRIENDS_MENU, &friends_menu, 1")
         self.assertGreater(send, think.index("mn_804A04F0.hovered_selection++;"))
         self.assertGreater(send, think.index("mn_804A04F0.hovered_selection--;"))
-        self.assertIn("mn_804D6BC8.cooldown = 5;", think[:think.index("} else if ((buttons & MenuInput_Confirm) && ranked_supported")])
+        friends_confirm = think[:think.index("} else if ((buttons & MenuInput_Confirm) && ranked_supported")]
+        self.assertIn("mn_804D6BC8.cooldown = 5;", friends_confirm)
         self.assertEqual(think.count("friends_visible = 0;"), 3)  # Confirm elsewhere and Back
+        # Quality 11-01 (build 30): Friends' own confirm cooldown published "not selected", so the
+        # host stopped the picker that press opened ("friends: cancelled") while the invite still went out.
+        self.assertIn("friends_confirm_hold = 1;", friends_confirm)
+        publish = think[think.index("/* Publish after Up/Down"):send]
+        self.assertIn("(accepts_input || friends_confirm_hold) && friends_hovered ? 2 : 1", publish)
+        self.assertIn("(accepts_input && mn_804D6BC8.cooldown == 0)", publish)
+        loaded = menu[menu.index("void mu_slippi_main_menu_loaded"):menu.index("/* OnlineModeOptionSelected")]
+        self.assertIn("friends_confirm_hold = 0;", loaded)
 
     def test_css_exit_is_logged_before_menu_cleanup(self):
         menu = source("sourceport/game/shim/mu_slippi_menu.c")
