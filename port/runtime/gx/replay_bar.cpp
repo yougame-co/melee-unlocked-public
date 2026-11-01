@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "replay_bar.h"
 #include "yougame_console_menu.h"
+#include "yougame_friends_lobby.h"
+#include "yougame_parity.h"
 #include "replay_control.h"
+#include "render_options.h"
 #include "host.h"
 #include <imgui.h>
 #include <windows.h>
@@ -60,13 +63,15 @@ void draw(float width, float height, bool menu_open) {
     if (front && GetWindowThreadProcessId(front, &pid) && pid == GetCurrentProcessId())
       h_down = (GetAsyncKeyState('H') & 0x8000) != 0;
   }
+  // "Clean replays" (Overlays) starts it hidden: H then shows it, and H again hides it.
+  const bool clean = gx::RenderOptions::live_clean_replays().load(std::memory_order_relaxed);
   if (h_down && !h_was_down) {
     hidden = !hidden;
-    hidden_note = hidden ? now : 0.0;
-    if (!hidden) mouse_time = now;   // show it at once
+    hidden_note = hidden != clean ? now : 0.0;
+    if (hidden == clean) mouse_time = now;   // show it at once
   }
   h_was_down = h_down || menu_open;
-  if (hidden) {
+  if (hidden != clean) {
     g_cursor.store(false, std::memory_order_relaxed);
     if (hidden_note > 0.0 && now - hidden_note < 2.0) {
       // Said once, briefly, so the key that brings it back is not a secret.
@@ -171,6 +176,32 @@ void show(const char* text, double seconds) {
   g_until = host::now_seconds() + seconds;
 }
 
+namespace {
+struct CornerHint { float font; ImVec2 at, size, min, max; };
+CornerHint corner_hint(float width, float height, float aspect, bool local_friends = false) {
+  const float ph = std::min(height,width/std::max(aspect,0.1f));
+  const float pw = ph*std::max(aspect,0.1f), left = (width-pw)*0.5f, top = (height-ph)*0.5f;
+  const float margin = std::min(7.0f,pw*0.01f);
+  // CSS already has a compact Friends header in the top margin. Match that scale so
+  // the two hint rows fit above the retail header rather than covering its title.
+  const bool compact = local_friends || yougame::console::console_menu_visible();
+  float fs = compact ? ph*9.0f/480.0f : std::clamp(ph/38.0f,12.0f,18.0f);
+  auto* font = ImGui::GetFont();
+  auto size = font->CalcTextSizeA(fs,FLT_MAX,0,yougame::parity::kMenuHint);
+  const float available = std::max(0.1f,pw-4*margin);
+  if (size.x > available) { fs *= available/size.x; size = font->CalcTextSizeA(fs,FLT_MAX,0,yougame::parity::kMenuHint); }
+  const float pad = compact ? ph/480.0f : 1.0f;
+  const ImVec2 at(left+pw-size.x-2*margin,top+(compact ? ph*0.003f : std::min(10.0f,ph*0.02f)));
+  return {fs,at,size,ImVec2(at.x-margin,at.y-3*pad),ImVec2(at.x+size.x+margin,at.y+fs+4*pad)};
+}
+}
+void draw_corner_hint(float width, float height, float aspect) {
+  const auto h = corner_hint(width,height,aspect,yougame::friends::lobby.host());
+  auto* dl = ImGui::GetForegroundDrawList();
+  dl->AddRectFilled(h.min,h.max,IM_COL32(9,11,22,190),5);
+  dl->AddText(ImGui::GetFont(),h.font,h.at,IM_COL32(236,238,246,235),yougame::parity::kMenuHint);
+}
+
 void draw(float width, float height, float game_aspect) {
   static yougame::console::MenuHintAnimation animation;
   const float alpha = animation.alpha(yougame::console::console_menu_visible(),host::now_seconds());
@@ -180,17 +211,36 @@ void draw(float width, float height, float game_aspect) {
     // Use the actual presentation aspect (73:60, 16:9, etc.), including letterboxing.
     const float picture_height = std::min(height,width/std::max(game_aspect,0.1f));
     const float top = (height-picture_height)*0.5f;
-    const float font_size = picture_height*9.0f/480.0f;
+    float font_size = picture_height*9.0f/480.0f;
     const auto* hint = yougame::console::kMenuHint;
     ImFont* font = ImGui::GetFont();
-    const ImVec2 size = font->CalcTextSizeA(font_size,FLT_MAX,0,hint);
-    const ImVec2 at((width-size.x)*0.5f,top+picture_height*0.027f);
+    ImVec2 size = font->CalcTextSizeA(font_size,FLT_MAX,0,hint);
+    if (size.x > width*0.96f) { font_size *= width*0.96f/size.x; size = font->CalcTextSizeA(font_size,FLT_MAX,0,hint); }
+    // Both draws use the same measured rectangle, independent of their submission order.
+    // Reserve the corner hint's full background plus a scaled margin.
+    const auto corner = corner_hint(width,height,game_aspect);
+    const ImVec2 at((width-size.x)*0.5f,std::max(top+picture_height*0.027f,corner.max.y+2+picture_height/480.0f));
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     const ImVec2 heading = font->CalcTextSizeA(font_size,FLT_MAX,0,"Friends");
     dl->AddText(font,font_size,ImVec2((width-heading.x)*0.5f,top+picture_height*0.003f),
                 IM_COL32(236,240,246,int(255*alpha)),"Friends");
     dl->AddRectFilled(ImVec2(at.x-5,at.y-2),ImVec2(at.x+size.x+5,at.y+size.y+2),IM_COL32(10,12,18,int(170*alpha)),3);
     dl->AddText(font,font_size,at,IM_COL32(255,239,170,int(255*alpha)),hint);
+  }
+  // With the app's lobby-lines cap the page draws this line outside the picture.
+  const auto friends_line = yougame::friends::page_lobby_lines.load(std::memory_order_acquire) ? std::string() :
+                            yougame::friends::lobby.line();
+  if (!friends_line.empty()) {
+    const float ph = std::min(height,width/std::max(game_aspect,0.1f));
+    const auto corner = corner_hint(width,height,game_aspect,true);
+    auto* font = ImGui::GetFont();
+    float fs = ph*9.0f/480.0f;
+    auto size = font->CalcTextSizeA(fs,FLT_MAX,0,friends_line.c_str());
+    if (size.x > width*.96f) { fs *= width*.96f/size.x; size = font->CalcTextSizeA(fs,FLT_MAX,0,friends_line.c_str()); }
+    const ImVec2 at((width-size.x)*.5f,corner.max.y+2+ph/480.0f);
+    auto* dl = ImGui::GetForegroundDrawList();
+    dl->AddRectFilled(ImVec2(at.x-3,at.y-1),ImVec2(at.x+size.x+3,at.y+size.y+1),IM_COL32(10,12,18,180),2);
+    dl->AddText(font,fs,at,IM_COL32(255,239,170,255),friends_line.c_str());
   }
   std::string text;
   {

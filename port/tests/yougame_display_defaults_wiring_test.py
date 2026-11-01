@@ -15,7 +15,7 @@ class DisplayDefaultsWiringTest(unittest.TestCase):
     def setUp(self):
         self.settings = (ROOT / "port/runtime/gx/pc_settings.cpp").read_text(encoding="utf-8-sig")
         self.load = function(self.settings, "void load_pc_settings(RenderOptions& options, int& volume) {")
-        self.write = function(self.settings, "static bool write_settings_file(const SettingsState& state, const RenderOptions& options) {")
+        self.write = function(self.settings, "static bool write_settings_file_impl(const SettingsState& state, const RenderOptions& options) {")
 
     def test_load_reads_both_keys_and_applies_the_policy_after_the_file(self):
         self.assertIn('else if (key == "vsync_yougame") saved_vsync_yougame = value == "1";', self.load)
@@ -55,7 +55,9 @@ class DisplayDefaultsWiringTest(unittest.TestCase):
         flag = main.index("yougame::display_defaults::agent_test_run = agent_test.agent_file;")
         practice = main.index("yougame::ranked_cpu::practice_allowed = agent_test.agent_file;")
         self.assertLess(flag, practice)
-        self.assertNotIn("\n", main[flag:practice].rstrip())
+        # Build 39a also disables Launcher discovery for runtime agent runs.
+        self.assertIn("host::test_env::agent_run = agent_test.agent_file;", main[flag:practice])
+        self.assertNotIn("#", main[flag:practice])
         guards = []
         for line in main[:practice].splitlines():
             if line.startswith("#if"):

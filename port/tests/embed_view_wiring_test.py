@@ -4,6 +4,9 @@ import json
 import re
 import unittest
 
+# Include the Mac contract in the existing CTest wiring entry.
+from mac_embed_view_wiring_test import MacEmbedViewTest
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -49,17 +52,19 @@ class EmbedViewWiringTest(unittest.TestCase):
         self.assertIn('yg_embed_x11_size(g_x11_embed, &w, &h)', sdl)
         self.assertIn('(w != g_client_w || h != g_client_h)', sdl)
 
-    def test_caps_only_on_windows_and_linux(self):
+    def test_caps_on_windows_linux_and_mac(self):
         header = source("port/runtime/hle/yougame_parity.h")
-        # The exact guard prevents Mac (and other platforms) from advertising view.
         match = re.search(r'#if defined\(_WIN32\) \|\| defined\(__linux__\)\s*'
+                          r'inline constexpr const char\* kCaps = ("[^\n]+?");\s*'
+                          r'#elif defined\(__APPLE__\)\s*'
                           r'inline constexpr const char\* kCaps = ("[^\n]+?");\s*'
                           r'#else\s*inline constexpr const char\* kCaps = ("[^\n]+?");\s*#endif', header)
         self.assertIsNotNone(match)
-        supported, mac = (json.loads(json.loads(value)[3:])["caps"] for value in match.groups())
+        supported, mac, other = (json.loads(json.loads(value)[3:])["caps"] for value in match.groups())
         self.assertEqual(supported, ["ready", "overlay", "join", "notice", "pads", "rumble", "chat", "settings", "view", "volume"])
-        self.assertEqual(mac, ["ready", "overlay", "join", "notice", "pads", "rumble", "chat", "settings"])
-        self.assertEqual(header.count('kCaps ='), 2)
+        self.assertEqual(mac, ["ready", "overlay", "join", "notice", "pads", "rumble", "chat", "settings", "view", "volume", "screenshot"])
+        self.assertEqual(other, ["ready", "overlay", "join", "notice", "pads", "rumble", "chat", "settings"])
+        self.assertEqual(header.count('kCaps ='), 3)
 
     def test_proof_logs(self):
         for path in ("port/runtime/host/window.cpp", "port/linux/embed/yougame_embed_x11.c"):
@@ -79,6 +84,25 @@ class EmbedViewWiringTest(unittest.TestCase):
         handler = window.index('yougame::set_box_handler([window]')
         self.assertNotIn('audio_set_volume(', window[handler:window.index('});', handler)])
         self.assertNotIn('audio_set_volume(', source("port/linux/window_sdl.inl"))
+
+    def test_volume_on_mac(self):
+        # Mac advertises volume too: its box handler acts on it before the inbox's commands.
+        embed = source("port/mac/embed_mac.mm")
+        self.assertIn('#include "../runtime/hle/yougame_embed_volume.h"', embed)
+        handler = embed.split('yougame::set_box_handler([inbox]', 1)[1].split('parse_command(line)', 1)[0]
+        self.assertIn('const int volume = yg_embed_volume(line.c_str());', handler)
+        self.assertIn('host::audio_set_page_volume(volume);', handler)
+        self.assertIn('embed: got volume %d', handler)
+        # A master here too: the Mac embed never calls the player's own audio_set_volume.
+        self.assertNotIn('audio_set_volume(', embed)
+
+    def test_mac_app_nap_off_while_embedded(self):
+        # The game is never the active app: without the activity, macOS throttled it in the app's full screen.
+        embed = source("port/mac/embed_mac.mm")
+        self.assertRegex(embed, r'NSActivityUserInitiatedAllowingIdleSystemSleep \| NSActivityIdleDisplaySleepDisabled \|\s*'
+                                r'NSActivityLatencyCritical')
+        self.assertIn('[NSProcessInfo.processInfo endActivity:surface->awake];', embed)
+        self.assertIn('embed: panel occlusion %s', embed)
 
 
 if __name__ == "__main__":

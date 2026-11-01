@@ -1,7 +1,9 @@
 // Console lockstep transport; no simulation, native sockets, or Slippi protocol.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "yougame_console_link.h"
+#include "yougame_friends_lobby.h"
 #include "yougame_console_card.h"
+#include "yougame_console_io.h"
 #include "yougame_update.h"
 #include <array>
 #include <iomanip>
@@ -10,6 +12,7 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <future>
 
 namespace yougame::console {
 namespace {
@@ -74,6 +77,23 @@ struct PadRing {
   }
   void insert(uint32_t frame,const MuPadStatus& value) { values[frame % kHistory] = std::make_pair(frame,value); }
 };
+json open_link(const transport::Request& request, int connection, const std::string& peer, int ms) {
+  return request({{"type","directOpen"},{"conn",connection},{"peer",peer}},ms);
+}
+// A bounded bridge request must not hold the transport mutex or the game thread.
+// An abandoned answer owns its cleanup, including when Leave beats the answer.
+struct Reopen {
+  transport::Request request;
+  std::mutex mutex;
+  std::optional<json> reply;
+  explicit Reopen(transport::Request r) : request(std::move(r)) {}
+  ~Reopen() {
+    if (reply) try {
+      const auto id = reply->value("link",0u);
+      if (id && id <= 65534) request({{"type","directClose"},{"link",id}},250);
+    } catch (...) {}
+  }
+};
 struct Peer {
   int port; unsigned link; std::string connection;
   uint64_t heard = 0, sent = 0, resent = 0, late = 0, rtt = 0, opened = 0, retry_at = 0;
@@ -87,14 +107,21 @@ struct Peer {
   std::map<uint32_t, uint64_t> digests;
   std::map<uint32_t, Digest> digest_order;
   std::map<uint32_t, Pad> outgoing;
+  bool away = false, relinking = false, opening = false, held = false;
+  uint64_t lost_at = 0, reopen_at = 0;
+  int room_connection = 0;
+  std::shared_ptr<Reopen> reopen;
+  std::string opening_connection;
 };
 class Link final : public SessionLink {
  public:
   SessionIO io;
   SessionConfig config;
   json frozen;
+  json identities; // account/slot authority from the start; never replaced by lobby arrivals
   std::vector<Peer> peers;
   bool claimed = false;
+  bool handoff_preparation = false;
   int host_port = 1;
   uint64_t worst_rtt = 0, choice_until = 0, control_at = 0;
   int chosen_delay = 0;
@@ -103,6 +130,7 @@ class Link final : public SessionLink {
   std::set<int> delay_acks;
   explicit Link(SessionIO i) : io(std::move(i)) { frame_zero_barrier = true; }
   void service() {
+    running_ = true;
     if (!io.background_service) return;
     worker_ = std::thread([this] {
       while (!stop_) {
@@ -115,7 +143,7 @@ class Link final : public SessionLink {
   ~Link() override {
     stop_ = true;
     if (worker_.joinable()) worker_.join();
-    if (!peers.empty() && !reason_) end("your friend disconnected");
+    if (!handoff_preparation && !peers.empty() && !reason_) end("your friend disconnected");
     for (const auto& p : peers) { try { io.request({{"type","directClose"},{"link",p.link}}, 1000); } catch (...) {} }
     if (io.close) io.close();
     if (claimed) requests.release();
@@ -123,11 +151,13 @@ class Link final : public SessionLink {
   void end(const std::string& why, bool announce = true) {
     if (reason_) return;
     reason_ = why; io.log("console: session ended: " + why);
-    if (announce) for (const auto& p : peers)
+    if (announce && !handoff_preparation) for (const auto& p : peers)
       io.send_room({{"t","msg"},{"to",p.connection},{"d",{{"kind","mu-console-end"},{"v",1},{"sessionId",config.session_id},{"reason",why}}}});
   }
   void room_message(const json& m) {
     const auto t = str(m,"t");
+    const auto closed = friends::closed_line(m);
+    if (!closed.empty()) { end(closed,false); return; }
     if (t == "sessionEnded") {
       if (str(m,"sessionId") == config.session_id) {
         const auto why = friends::text(m,"reason",160);
@@ -135,14 +165,15 @@ class Link final : public SessionLink {
       }
       return;
     }
-    // Lobby presence can change during grace/reconnect or next-session admission.
-    // Only sessionEnded interrupts the frozen roster; never replace its identities.
+    // Keep the frozen ports/accounts. Only the authenticated room may replace the
+    // transport identity for the SAME held seat, including on a rejoin welcome.
+    if (running_) presence(m);
     if (t == "msg" && m.count("d") && m["d"].is_object()) {
       const auto& d = m["d"];
       if (std::none_of(frozen.begin(), frozen.end(), [&](const json& p) { return str(p,"connectionId") == str(m,"from"); })) return;
       if (str(d,"kind") == "mu-console-end" && d.value("v",json()) == 1 && str(d,"sessionId") == config.session_id) {
         const auto why = str(d,"reason");
-        if (!friends::text(d,"reason",160).empty()) end(why);
+        if (!friends::text(d,"reason",160).empty()) end(why == kSelfLeft ? "left" : why);
       }
     }
   }
@@ -181,6 +212,16 @@ class Link final : public SessionLink {
     return {};
   }
   std::optional<std::string> lost() const override { std::lock_guard<std::mutex> lock(mutex_); return reason_; }
+  bool reconnecting() const override {
+    std::lock_guard<std::mutex> lock(mutex_); return relink_since_.has_value();
+  }
+  uint64_t liveness_clock(uint64_t) const override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Sample time and recovery under ONE lock, so a concurrent completion cannot
+    // make this clock go backwards between the Engine's deadline comparisons.
+    return (relink_since_ ? *relink_since_ : io.clock()) - relink_total_;
+  }
+  json open_peer(const std::string& peer, int ms) { return open_link(io.request,io.connection(),peer,ms); }
   void startup_work() {
     // A peer may finish its other links later than ours. Keep its established links
     // alive, and ACK any frame-zero inputs already queued, throughout the mesh setup.
@@ -198,7 +239,13 @@ class Link final : public SessionLink {
       bool received = false;
       json m;
       for (int n = 0; n < 64 && io.next_room(m,0); ++n) room_message(m);
-      if (io.room_closed()) end("your friend disconnected");
+      // The room's own leave/sessionEnded tells the friend; "you left" over the link would hide the notice.
+      if (io.cancelled()) end(kSelfLeft,false);
+      if (io.room_closed()) {
+        for (const auto& p : peers) if (p.relinking) { gave_up(p,"room closed"); break; }
+        end("your friend disconnected");
+      }
+      if (reason_) return false;
       unsigned id; Bytes b;
       for (int n = 0; n < 256 && io.receive(id,b); ++n) {
         received = true;
@@ -211,16 +258,22 @@ class Link final : public SessionLink {
         for (auto& p : peers) p.heard = now;
         io.log("console: all peers at frame 0; liveness armed");
       }
-      if (!armed_ && ready_since_ && now - *ready_since_ >= 60000) end(kBootTimeout);
-      for (const auto& p : peers) {
+      if (!armed_ && ready_since_ && !relink_since_ && now - *ready_since_ >= 60000 + relink_total_) end(kBootTimeout);
+      for (auto& p : peers) {
         const bool closed = io.state(p.link) == 3;
         const auto silent = now >= p.heard ? now - p.heard : 0;
+        if (running_ && !p.relinking && p.room_connection != io.connection()) lose(p,now);
+        if (p.relinking) { relink(p,now); continue; }
         if (closed || (armed_ && silent >= 5000)) {
+          if (running_) { lose(p,now); relink(p,now); continue; }
           io.log("console: port " + std::to_string(p.port) + " silent " + std::to_string(silent) +
               " ms (last heard frame " + (p.last_heard_frame != kNone ? std::to_string(p.last_heard_frame) : std::string("-1")) +
               "): " + (closed ? "transport closed" : "no receive for 5 s"));
           end("your friend disconnected"); break;
         }
+      }
+      if (relink_since_ && std::none_of(peers.begin(),peers.end(),[](const Peer& p) { return p.relinking; })) {
+        relink_total_ += now-*relink_since_; relink_since_.reset();
       }
       transmit(); paths();
       if (committed && config.my_port == host_port && io.clock() < choice_until && io.clock() >= control_at) {
@@ -301,10 +354,124 @@ class Link final : public SessionLink {
   std::atomic<bool> stop_{false};
   std::thread worker_;
   bool armed_ = false;
+  bool running_ = false;
+  uint64_t relink_total_ = 0;
+  std::optional<uint64_t> relink_since_;
   std::optional<uint64_t> ready_since_;
   std::optional<std::string> reason_;
   uint32_t newest_ = kNone, digest_serial_ = 0;
   std::map<uint32_t, Digest> out_digests_;
+  void gave_up(const Peer& p, const char* why) {
+    if (reason_) return;
+    io.log("console: relink gave up after " + std::to_string(io.clock()-p.lost_at) + " ms (" + why + ")");
+    end("your friend disconnected");
+  }
+  void lose(Peer& p, uint64_t now) {
+    if (p.relinking || reason_) return;
+    p.relinking = true; p.held = false; p.lost_at = now; p.reopen_at = now;
+    if (!relink_since_) relink_since_ = now;
+    io.log("console: link to port " + std::to_string(p.port) + " lost; waiting for the room to come back");
+  }
+  void presence(const json& m) {
+    if (str(m,"t") == "welcome") {
+      const auto room = m.find("room");
+      const json* c = m.count("console") && m["console"].is_object() ? &m["console"] :
+        room != m.end() && room->is_object() && room->count("console") && (*room)["console"].is_object() ? &(*room)["console"] : nullptr;
+      // Rejoining after expiry can miss sessionEnded. A complete welcome must
+      // still hold THIS session; lobby membership alone cannot revive its game.
+      if (!c || str(*c,"sessionId") != config.session_id) { end("your friend disconnected"); return; }
+    }
+    const json* roster = nullptr;
+    if (m.count("matchParticipants") && m["matchParticipants"].is_array()) roster = &m["matchParticipants"];
+    else if (m.count("participants") && m["participants"].is_array()) roster = &m["participants"];
+    else if (m.count("players") && m["players"].is_array()) roster = &m["players"];
+    else if (str(m,"t") == "welcome") {
+      const auto room = m.find("room");
+      const json* c = m.count("console") && m["console"].is_object() ? &m["console"] :
+        room != m.end() && room->is_object() && room->count("console") && (*room)["console"].is_object() ? &(*room)["console"] : nullptr;
+      if (c && str(*c,"sessionId") == config.session_id && c->count("participants") && (*c)["participants"].is_array()) roster = &(*c)["participants"];
+    }
+    if (!roster) return; // partial controls are not evidence that a seat was released
+    for (auto& p : peers) {
+      auto frozen_seat = std::find_if(frozen.begin(),frozen.end(),[&](const json& s) { return s["port"] == p.port; });
+      if (frozen_seat == frozen.end()) continue;
+      const auto identity = std::find_if(identities.begin(),identities.end(),[&](const json& s) { return s["port"] == p.port; });
+      if (identity == identities.end()) continue;
+      auto seat = std::find_if(roster->begin(),roster->end(),[&](const json& s) {
+        const auto conn = str(s,"connectionId").empty() ? str(s,"id") : str(s,"connectionId");
+        const auto slot = s.count("slot") ? s["slot"] : s.value("seat",json());
+        if (!slot.is_null() && slot != (*identity)["slot"]) return false;
+        if (s.count("user") && identity->count("user") && s["user"] != (*identity)["user"]) return false;
+        if (conn == p.connection) return true;
+        return slot == (*identity)["slot"] && !str(*identity,"user").empty() &&
+            str(s,"user") == str(*identity,"user");
+      });
+      if (seat == roster->end()) { end("your friend disconnected"); return; }
+      const auto conn = str(*seat,"connectionId").empty() ? str(*seat,"id") : str(*seat,"connectionId");
+      if (conn.empty()) continue;
+      const json* player = &*seat;
+      if (m.count("players") && m["players"].is_array()) {
+        const auto& players = m["players"];
+        auto found = std::find_if(players.begin(),players.end(),[&](const json& s) { return str(s,"id") == conn; });
+        if (found == players.end()) { end("your friend disconnected"); return; }
+        player = &*found;
+      }
+      p.away = player->value("away",json()) == true;
+      if (p.away) p.held = true;
+      if (conn != p.connection) {
+        if (io.rebound) io.rebound(p.connection,conn);
+        lose(p,io.clock()); p.connection = conn; (*frozen_seat)["connectionId"] = conn;
+        p.held = true; // the room re-seated the same account
+      }
+    }
+  }
+  void relink(Peer& p, uint64_t now) {
+    if (reason_) return;
+    // The loss timestamp is never extended by rosters, refused opens or retries.
+    if (now-p.lost_at >= 75000) { gave_up(p,p.away || io.room_rejoining() ? "room did not return" : "link did not come up"); return; }
+    if (p.away || io.room_rejoining()) p.held = true;
+    // Without an away/rejoin/re-seat sign the friend's seat is not being held for them.
+    if (!p.held && !p.opening && now-p.lost_at >= 20000) { gave_up(p,"seat not held"); return; }
+    if (p.reopen) {
+      std::optional<json> reply;
+      { std::lock_guard<std::mutex> lock(p.reopen->mutex); reply.swap(p.reopen->reply); }
+      if (!reply) return;
+      p.reopen.reset();
+      const auto id = reply->value("link",0u);
+      if (id && id <= 65534) { p.link = id; p.opening = true; }
+      else {
+        const auto code = str(*reply,"refused");
+        if (code == "no_direct" || code == "ended") { gave_up(p,"direct links unavailable"); return; }
+        p.reopen_at = now+1000; return;
+      }
+    }
+    if (p.opening) {
+      if (p.opening_connection != p.connection || p.room_connection != io.connection() || p.away || io.room_rejoining()) {
+        p.opening = false; p.reopen_at = now;
+      } else if (io.state(p.link) == 2) {
+        p.opening = p.relinking = false; p.heard = now; p.dirty = true; p.retry_at = now;
+        for (auto& kv : p.outgoing) kv.second.sends = 0; // retry every unacknowledged frame immediately
+        auto route = io.route(p.link);
+        if (route != "lan" && route != "direct" && route != "relay") route = "unknown";
+        p.path = route;
+        io.log("console: link to port " + std::to_string(p.port) + " reopened via " + route + " after " + std::to_string(now-p.lost_at) + " ms");
+        return;
+      } else if (io.state(p.link) == 3) { p.opening = false; p.reopen_at = now+1000; }
+      else return;
+    }
+    if (p.away || io.room_rejoining() || now < p.reopen_at) return;
+    p.room_connection = io.connection(); p.opening_connection = p.connection;
+    p.reopen = std::make_shared<Reopen>(io.request);
+    auto work = [attempt = p.reopen, conn = p.room_connection, peer = p.connection, old = p.link] {
+      json reply = json::object();
+      try {
+        attempt->request({{"type","directClose"},{"link",old}},250);
+        reply = open_link(attempt->request,conn,peer,1000);
+      } catch (...) {} // bounded retry; never log bridge exception text
+      std::lock_guard<std::mutex> lock(attempt->mutex); attempt->reply = std::move(reply);
+    };
+    if (io.background_service) std::thread(std::move(work)).detach(); else work();
+  }
   Bytes header(const Peer& p) const {
     Bytes b; put(b,kWireVersion,1); put(b,config.my_port,1); put(b,0,1); put(b,0,1);
     put(b,tag(config.session_id),8); put(b,p.next ? p.next - 1 : kNone,4); put(b,p.next_digest ? p.next_digest - 1 : kNone,4);
@@ -314,6 +481,7 @@ class Link final : public SessionLink {
     if (reason_) return;
     const auto now = io.clock();
     for (auto& p : peers) {
+      if (p.relinking) continue;
       // New samples and ACKs must not reset another frame's retry deadline.
       // Batch retries independently of new samples/ACKs. This also coalesces
       // staggered holes instead of perpetually retrying the same small groups.
@@ -428,7 +596,28 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
   auto& i = link->io;
   // Which stage a throw came from, for the log below (never the exception's text: it can carry a ticket).
   const char* step = "request";
+  std::shared_ptr<handoff_join::Channel> live;
+  SessionConfig fallback_config;
+  auto relaunch = [&]() -> std::unique_ptr<SessionLink> {
+    if (live) {
+      live->cancelled.store(true,std::memory_order_release);
+      // Main restores B before publishing paused=false. Never race prepared() with imported memory.
+      while (live->working.load(std::memory_order_acquire)) i.wait(1);
+    }
+    for (const auto& p : link->peers) { try { i.request({{"type","directClose"},{"link",p.link}},1000); } catch (...) {} }
+    link->peers.clear();
+    error.clear(); i.prepared(fallback_config); return nullptr;
+  };
   auto fail = [&](const char* why) -> std::unique_ptr<SessionLink> {
+    if (live) {
+      i.log(std::string("handoff-join: refuse ") + (i.cancelled() ? "cancelled" : "link-setup-failed"));
+      for (const auto& p : link->frozen) if (p["port"] != fallback_config.my_port) {
+        try { i.send_room({{"t","msg"},{"to",p["connectionId"]},{"d",{{"kind","mu-hj-refuse"},{"v",1},
+            {"match",fallback_config.session_id},{"reason","link-setup-failed"}}}}); } catch (...) {}
+      }
+      try { if (i.flush_room && !i.room_closed()) i.flush_room(1000); } catch (...) {}
+      return relaunch();
+    }
     error = why; i.log("console: start failed: " + error + " (at " + step + ")"); return nullptr;
   };
   json request;
@@ -439,8 +628,9 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
     const int players = request["players"].get<int>();
     const bool host_new = request["room"].get<std::string>() == "new";
     const auto code = host_new ? new_room_code(i.random ? i.random() : i.clock()) : request["room"].get<std::string>();
-    const json ticket_request = {{"type","mpTicket"},{"room",code},{"players",players},{"mode","console"},{"ranked",false},
+    json ticket_request = {{"type","mpTicket"},{"room",code},{"players",players},{"mode","console"},{"ranked",false},
       {"lobby",{{"version",1},{"minPlayers",players},{"maxLocalPlayers",1},{"compatibility",i.compatibility}}}};
+    if (i.friends_lobby) ticket_request["queue"] = "private";
     step = "ticket";
     const auto ticket = i.request(ticket_request,10000);
     const auto room = friends::room(ticket);
@@ -449,10 +639,14 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
       return fail("couldn't open your friend's room");
     }
     step = "room";
-    if (!i.open_room(str(ticket,"ticket"),room,10000)) { i.log("console: room " + room + " socket didn't open"); return fail("couldn't open your friend's room"); }
+    if (!i.open_room(str(ticket,"ticket"),room,10000)) {
+      i.log("console: room " + room + " socket didn't open");
+      return fail(i.room_mismatch && i.room_mismatch() ? kMixedBuilds : "couldn't open your friend's room");
+    }
 #ifdef YOUGAME_AGENT_TEST_HOOK
     if (host_new) i.log("agent: console host room " + room);
 #endif
+    if (i.opened) i.opened(room);
     Roster r; r.size = players; json start;
     bool seat_logged = false;
     uint64_t next_begin = 0, ping = i.clock();
@@ -464,36 +658,45 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
     Bytes host_card; std::string host_digest; bool card_read = false;
     const bool sync_card = players == 2 && bool(i.host_save);
     step = "seats";
-    while (i.clock() < seats_until) {
+    while (i.friends_lobby || i.clock() < seats_until) {
       if (i.cancelled()) return fail("cancelled");
       json m;
-      if (i.next_room(m,int(std::min<uint64_t>(50,seats_until-i.clock())))) {
+      if (i.next_room(m,i.friends_lobby ? 50 : int(std::min<uint64_t>(50,seats_until-i.clock())))) {
         const auto t = str(m,"t");
         if (t == "welcome") r.me = str(m,"me");
         transport::read_roster(r,m);
+        const auto closed = friends::closed_line(m);
+        if (!closed.empty()) return fail(closed.c_str());
+        if (i.roster && !r.me.empty()) i.roster(room,r.participants,r.me,r.revision);
         if (t == "command-error" && str(m,"action") == "begin" && str(m,"code") == "console_mixed_builds") {
           i.log("console: command-error console_mixed_builds"); return fail(kMixedBuilds);
         }
         if (t == "error" || t == "ended" || t == "kicked" || t == "command-error") return fail("couldn't start your friend's room");
-        if (t == "sessionEnded" && (!rejoin || str(m,"sessionId") == str(request,"sessionId"))) {
+        if (t == "sessionEnded" && !i.held_reenter && (!rejoin || str(m,"sessionId") == str(request,"sessionId"))) {
           const auto why = friends::text(m,"reason",160);
           i.log("console: session ended: " + why);
           return fail(why.empty() ? "your friend disconnected" : why.c_str());
         }
         if (!m.count("console") && m.count("room") && m["room"].is_object() && m["room"].count("console")) m["console"] = m["room"]["console"];
-        if (m.count("console") && m["console"].is_object()) { start = m; break; }
+        if (!i.previous_session_active() && m.count("console") && m["console"].is_object()) { start = m; break; }
       }
       if (i.room_closed()) { i.log("console: room " + room + " closed while waiting for seats"); return fail("couldn't open your friend's room"); }
       const auto seat = transport::connection_seat(r.participants,r.me);
       if (!seat_logged && seat >= 0) { i.log("console: room " + room + " seat " + std::to_string(seat) + " of " + std::to_string(players)); seat_logged = true; }
       const bool full = valid_roster(r.participants,players,true,true), host = r.me == r.host_connection;
-      if (i.waiting) i.waiting(full ? (host ? "Press START to play together" : "Waiting for the host") : friends::kWaiting, full && host);
-      if (!rejoin && full && host && i.confirm_start() && i.clock() >= next_begin) {
+      if (!i.friends_lobby && i.waiting) i.waiting(full ? (host ? "Press START to play together" : "Waiting for the host") : friends::kWaiting, full && host);
+      if (!rejoin && !i.previous_session_active() && full && host && (i.friends_lobby ? i.css_ready() : i.confirm_start()) && i.clock() >= next_begin) {
         json begin = {{"t","begin"},{"revision",r.revision},{"console",true},{"inputDelay",delay},{"settingsDigest",""}};
+        if (i.freeze_pick) {
+          std::string name;
+          for (const auto& p : r.participants) if (str(p,"connectionId") != r.me) { name = friends::text(p,"name",40); break; }
+          begin["settingsDigest"] = i.freeze_pick(name);
+        }
         if (sync_card) {
           step = "card read";
           if (!card_read) {
-            card_read = true; host_card = i.host_save();
+            card_read = true;
+            host_card = card_io_until(i.clock,i.cancelled,i.friends_lobby ? i.clock()+20000 : std::min(seats_until,i.clock()+20000),Bytes{},i.host_save);
             // Never refuse START over the save: without a shareable one, the begin carries no
             // cardDigest and every seat boots the same fresh card (default unlocks).
             if (melee_gci(host_card)) host_digest = card_sha(host_card);
@@ -537,122 +740,314 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
         std::string(key) == "epochMs" ? json(c.epoch_ms) : s[key];
       if (request[key] != value) return fail("console session start changed");
     }
-    link->config = c; link->frozen = seats(s["participants"],true);
+    link->config = c; link->frozen = seats(s["participants"],true); link->identities = s["participants"];
     link->host_port = connection_port(link->frozen,r.host_connection);
     if (link->host_port < 1) return fail("invalid console session start");
+    if (i.committed) i.committed(c);
     if (rejoin) i.log("console: rejoined session " + c.session_id);
     if (i.cancelled()) return fail("cancelled");
+    if (rejoin) {
+      bool restored = false;
+      try { restored = i.restore_card && i.restore_card(c) && card_bytes_ok(c); }
+      catch (const std::exception&) { /* unreadable local state fails open */ }
+      if (!restored) {
+        c.default_card = true; c.card_digest.clear(); c.card_bytes.clear();
+        i.log("console: save choice missing/default/unreadable; proposing default unlocks");
+      }
+    }
+    // Agreement is scoped to the live two-seat Friends preparation, never boot/rejoin or queues.
+    std::unique_ptr<handoff_join::Agreement> hj;
+    const bool hj_host = c.my_port == link->host_port;
+    if (i.friends_lobby && i.prepared && !rejoin && players == 2) {
+      for (const auto& peer : link->frozen) if (str(peer,"connectionId") != r.me)
+        hj = std::make_unique<handoff_join::Agreement>(hj_host,i.handoff_join,i.handoff_info,
+            c.session_id,str(peer,"connectionId"),i.send_room,i.log);
+    }
     if (!c.card_digest.empty()) {
       step = "card transfer";
       const auto until_card = frozen_at + 20000;
+      const auto until_verdict = frozen_at + 25000;
       const auto sha8 = c.card_digest.substr(0,8);
       auto card_log = [&](size_t n,const char* result) {
         i.log("console: card received " + std::to_string(n) + " chunks sha " + sha8 + " " + result);
       };
       if (rejoin) {
-        if (!i.restore_card || !i.restore_card(c) || !card_bytes_ok(c)) return fail(kCardFailure);
-      } else if (c.my_port == link->host_port) {
-        c.card_bytes = std::move(host_card);
-        if (!card_bytes_ok(c)) { card_log(0,"mismatch"); return fail(kCardFailure); }
-        const size_t n = (c.card_bytes.size()+kCardChunk-1)/kCardChunk;
-        for (const auto& peer : link->frozen) if (str(peer,"connectionId") != r.me) {
-          for (size_t chunk = 0; chunk < n; ++chunk) {
-            if (i.cancelled()) return fail("cancelled");
-            if (i.clock() >= until_card) { card_log(n,"timeout"); return fail(kCardFailure); }
-            const size_t offset = chunk*kCardChunk, size = std::min(kCardChunk,c.card_bytes.size()-offset);
-            if (!i.send_room({{"t","msg"},{"to",peer["connectionId"]},{"d",{{"kind","mu-card"},{"v",1},
-                {"match",c.session_id},{"i",chunk},{"n",n},{"data",card_encode(c.card_bytes.data()+offset,size)}}}})) return fail(kCardFailure);
-            // The direct datagram helper is not attached until AFTER relaunch. Pace through the
-            // room, preserving interruption messages, rather than waiting on its absent socket.
-            const auto paced_until = std::min(until_card,i.clock()+12);
-            while (i.clock() < paced_until) {
-              if (i.cancelled()) return fail("cancelled");
-              json m;
-              if (i.next_room(m,int(paced_until-i.clock()))) link->room_message(m);
-              if (i.room_closed() || link->lost()) return fail(kCardFailure);
-            } // <=84 messages/s, below Rooms' 120/s relay budget
-          }
-        }
-        if (i.clock() >= until_card || (i.flush_room && !i.flush_room(int(until_card-i.clock())))) {
-          card_log(n,i.clock() >= until_card ? "timeout" : "mismatch"); return fail(kCardFailure);
-        }
-        i.log("console: card sent " + std::to_string(n) + " chunks sha " + sha8);
+        // Already restored from the game-local choice; rendezvous agrees all seats below.
       } else {
-        std::vector<Bytes> chunks; size_t total = 0, received = 0;
         const auto host = str(*std::find_if(link->frozen.begin(),link->frozen.end(),[&](const json& p) {
           return p["port"] == link->host_port;
         }),"connectionId");
-        while (chunks.empty() || received < chunks.size()) {
-          if (i.cancelled()) return fail("cancelled");
-          if (i.clock() >= until_card) { card_log(received,"timeout"); return fail(kCardFailure); }
-          if (i.room_closed()) return fail(kCardFailure);
-          json m;
-          if (!i.next_room(m,int(std::min<uint64_t>(50,until_card-i.clock())))) continue;
-          if (str(m,"t") != "msg" || str(m,"from") != host || !m.count("d") || !m["d"].is_object()) continue;
+        const bool am_host = c.my_port == link->host_port;
+        const auto until_final = frozen_at + (am_host ? 30000 : 40000);
+        std::map<std::string,bool> verdicts;
+        std::string final;
+        uint64_t final_at = 0;
+        bool final_conflict = false;
+        // Control messages may arrive during chunk pacing or before a guest has all chunks.
+        // Only the frozen host/guest identities and this exact session can decide the save.
+        auto control = [&](const json& m) {
+          link->room_message(m);
+          if (hj) hj->receive(m,i.clock());
+          if (str(m,"t") != "msg" || !m.count("d") || !m["d"].is_object()) return;
           const auto& d = m["d"];
-          if (str(d,"kind") != "mu-card" || str(d,"match") != c.session_id) continue;
-          if (d.value("v",json()) != 1 || !number(d,"n",1,(kCardLimit+kCardChunk-1)/kCardChunk) ||
-              !number(d,"i",0,d["n"].get<size_t>()-1)) return fail(kCardFailure);
-          const size_t n = d["n"].get<size_t>(), index = d["i"].get<size_t>();
-          if (chunks.empty()) chunks.resize(n);
-          if (chunks.size() != n || !d.count("data") || !d["data"].is_string()) return fail(kCardFailure);
-          Bytes bytes;
-          if (!card_decode(d["data"].get<std::string>(),bytes) || bytes.empty()) return fail(kCardFailure);
-          if (!chunks[index].empty()) { if (chunks[index] != bytes) return fail(kCardFailure); continue; }
-          total += bytes.size();
-          if (total > kCardLimit) return fail(kCardFailure);
-          chunks[index] = std::move(bytes); ++received;
+          if (d.value("v",json()) != 1 || str(d,"match") != c.session_id) return;
+          const auto from = str(m,"from");
+          if (am_host && i.clock() < until_verdict && from != r.me && connection_port(link->frozen,from) &&
+              str(d,"kind") == "mu-card-verdict" && d.count("ok") && d["ok"].is_boolean())
+            verdicts.emplace(from,d["ok"].get<bool>());
+          if (!am_host && (!final.empty() || i.clock() < until_final) && from == host && str(d,"kind") == "mu-card-final" &&
+              (str(d,"use") == "host" || str(d,"use") == "default")) {
+            // Only an opted-in host adds this field. Both switches off keep the old wire/time trace.
+            if (hj && d.value("handoffJoin",json()) == 1) hj->expect(i.clock());
+            if (final.empty()) { final = str(d,"use"); final_at = i.clock(); }
+            else if (final != str(d,"use")) final_conflict = true;
+          }
+        };
+        auto persist = [&] {
+          if (!i.persist_card) return false;
+          return card_io_until(i.clock,i.cancelled,until_card,false,[write = i.persist_card, card = c] { return write(card); });
+        };
+        bool ok = true;
+        if (am_host) {
+          c.card_bytes = std::move(host_card);
+          ok = card_bytes_ok(c);
+          const size_t n = (c.card_bytes.size()+kCardChunk-1)/kCardChunk;
+          if (!ok) card_log(0,"mismatch");
+          for (const auto& peer : link->frozen) if (str(peer,"connectionId") != r.me) {
+            for (size_t chunk = 0; ok && chunk < n; ++chunk) {
+              if (i.cancelled()) return fail("cancelled");
+              if (i.clock() >= until_card) { card_log(n,"timeout"); ok = false; break; }
+              const size_t offset = chunk*kCardChunk, size = std::min(kCardChunk,c.card_bytes.size()-offset);
+              if (!i.send_room({{"t","msg"},{"to",peer["connectionId"]},{"d",{{"kind","mu-card"},{"v",1},
+                  {"match",c.session_id},{"i",chunk},{"n",n},{"data",card_encode(c.card_bytes.data()+offset,size)}}}})) { ok = false; break; }
+              // <=84 chunks/s, below Rooms' 120/s relay budget; no datagram helper yet.
+              const auto paced_until = std::min(until_card,i.clock()+12);
+              while (i.clock() < paced_until) {
+                if (i.cancelled()) return fail("cancelled");
+                json m;
+                if (i.next_room(m,int(paced_until-i.clock()))) control(m);
+                if (i.room_closed() || link->lost()) { ok = false; break; }
+              }
+            }
+          }
+          if (ok && (i.clock() >= until_card || (i.flush_room && !i.flush_room(int(until_card-i.clock()))))) {
+            card_log(n,i.clock() >= until_card ? "timeout" : "mismatch"); ok = false;
+          }
+          if (ok) i.log("console: card sent " + std::to_string(n) + " chunks sha " + sha8);
+          if (ok) ok = persist();
+          const size_t guests = link->frozen.size()-1;
+          auto failed_verdict = [&] {
+            return std::any_of(verdicts.begin(),verdicts.end(),[](const auto& v) { return !v.second; });
+          };
+          while (verdicts.size() < guests && !failed_verdict() && i.clock() < until_verdict) {
+            if (i.cancelled()) return fail("cancelled");
+            if (i.room_closed() || link->lost()) { ok = false; break; }
+            json m;
+            if (i.next_room(m,int(std::min<uint64_t>(50,until_verdict-i.clock())))) control(m);
+          }
+          if (i.cancelled()) return fail("cancelled");
+          if (i.room_closed() || link->lost()) ok = false;
+          const auto good = std::count_if(verdicts.begin(),verdicts.end(),[](const auto& v) { return v.second; });
+          final = ok && size_t(good) == guests ? "host" : "default";
+          i.log("console: card verdicts " + std::to_string(good) + "/" + std::to_string(guests) + " ok; using " + final);
+          for (int copy = 0; copy < 2; ++copy) {
+            for (const auto& peer : link->frozen) if (str(peer,"connectionId") != r.me) {
+              json d = {{"kind","mu-card-final"},{"v",1},{"match",c.session_id},{"use",final}};
+              if (hj && i.handoff_join) d["handoffJoin"] = 1;
+              if (!i.send_room({{"t","msg"},{"to",peer["connectionId"]},{"d",d}})) final = "default";
+            }
+            if (i.clock() >= until_final || (i.flush_room && !i.flush_room(int(until_final-i.clock()))) ||
+                i.clock() >= until_final || i.room_closed() || link->lost()) { final = "default"; break; }
+            if (copy == 0) {
+              const auto repeat_at = i.clock()+1000;
+              while (i.clock() < repeat_at) {
+                if (i.cancelled()) return fail("cancelled");
+                if (i.clock() >= until_final || i.room_closed() || link->lost()) { final = "default"; break; }
+                json m;
+                if (i.next_room(m,int(std::min<uint64_t>(50,repeat_at-i.clock())))) control(m);
+              }
+            }
+          }
+          // Best effort downgrade; if delivery failed, the relaunch digest rendezvous below
+          // compares this default choice with the peer's staged host choice and vetoes both.
+          if (final == "default") for (const auto& peer : link->frozen) if (str(peer,"connectionId") != r.me)
+            i.send_room({{"t","msg"},{"to",peer["connectionId"]},{"d",{{"kind","mu-card-final"},
+                {"v",1},{"match",c.session_id},{"use","default"}}}});
+        } else {
+          std::vector<Bytes> chunks; size_t total = 0, received = 0;
+          while (chunks.empty() || received < chunks.size()) {
+            if (i.cancelled()) return fail("cancelled");
+            if (i.room_closed() || link->lost()) { ok = false; break; }
+            if (i.clock() >= until_card) { card_log(received,"timeout"); ok = false; break; }
+            json m;
+            if (!i.next_room(m,int(std::min<uint64_t>(50,until_card-i.clock())))) continue;
+            control(m);
+            if (final == "default") { ok = false; break; }
+            if (str(m,"t") != "msg" || str(m,"from") != host || !m.count("d") || !m["d"].is_object()) continue;
+            const auto& d = m["d"];
+            if (str(d,"kind") != "mu-card" || str(d,"match") != c.session_id) continue;
+            if (d.value("v",json()) != 1 || !number(d,"n",1,(kCardLimit+kCardChunk-1)/kCardChunk) ||
+                !number(d,"i",0,d["n"].get<size_t>()-1)) { ok = false; break; }
+            const size_t n = d["n"].get<size_t>(), index = d["i"].get<size_t>();
+            if (chunks.empty()) chunks.resize(n);
+            if (chunks.size() != n || !d.count("data") || !d["data"].is_string()) { ok = false; break; }
+            Bytes bytes;
+            if (!card_decode(d["data"].get<std::string>(),bytes) || bytes.empty()) { ok = false; break; }
+            if (!chunks[index].empty()) { if (chunks[index] != bytes) { ok = false; break; } continue; }
+            total += bytes.size();
+            if (total > kCardLimit) { ok = false; break; }
+            chunks[index] = std::move(bytes); ++received;
+          }
+          if (ok) {
+            for (const auto& bytes : chunks) c.card_bytes.insert(c.card_bytes.end(),bytes.begin(),bytes.end());
+            ok = card_bytes_ok(c);
+            card_log(chunks.size(),ok ? "ok" : "mismatch");
+            if (ok) ok = persist();
+          }
+          if (i.cancelled()) return fail("cancelled");
+          if (i.room_closed() || link->lost()) ok = false;
+          if (!i.send_room({{"t","msg"},{"to",host},{"d",{{"kind","mu-card-verdict"},
+              {"v",1},{"match",c.session_id},{"ok",ok}}}})) ok = false;
+          i.log(std::string("console: card verdict ") + (ok ? "ok" : "fail") + " sent");
+          // Keep reading through the host's one-second repeat before handing off. The first
+          // final decides; an identical repeat is harmless and a conflicting one selects defaults.
+          while (!final_conflict && i.clock() < until_final && (final.empty() || i.clock() < final_at+1500)) {
+            if (i.cancelled()) return fail("cancelled");
+            if (i.room_closed() || link->lost()) { ok = false; break; }
+            json m;
+            if (i.next_room(m,int(std::min<uint64_t>(50,until_final-i.clock())))) control(m);
+          }
+          // Persistence can outlast the repeat window when a final arrived during chunks.
+          // Drain already queued controls before handoff so that cannot hide a conflicting repeat.
+          json queued;
+          // A busy/malicious room must not keep START in a zero-wait drain forever.
+          int drained = 0;
+          while (drained < 256 && i.clock() < until_final && i.next_room(queued,0)) { control(queued); ++drained; }
+          if (drained == 256 || i.clock() >= until_final) ok = false;
+          if (i.cancelled()) return fail("cancelled");
+          if (final_conflict || final.empty() || !ok || i.room_closed() || link->lost()) final = "default";
+          // A missing/conflicting final or failed verdict is a local default vote. Even when
+          // the host already handed off, both launches exchange their original chosen digest
+          // before boot: unequal digests mean default on BOTH, including a seat with the final.
         }
-        for (const auto& bytes : chunks) c.card_bytes.insert(c.card_bytes.end(),bytes.begin(),bytes.end());
-        const bool ok = card_bytes_ok(c);
-        card_log(chunks.size(),ok ? "ok" : "mismatch");
-        if (!ok) return fail(kCardFailure);
+        i.log("console: card final " + final);
+        if (final == "default") {
+          // Cleanup is best effort, within the final deadline. Its worker owns the card
+          // and callback: a stalled filesystem cannot hold START or access this session later.
+          if (i.discard_card && !card_io_until(i.clock,i.cancelled,
+              std::min(until_final,i.clock()+1000),false,
+              [discard = i.discard_card, card = c] { discard(card); return true; }))
+            i.log("console: couldn't remove staged save; default launch ignores it");
+          c.default_card = true; c.card_bytes.clear(); c.card_digest.clear();
+          i.log(std::string("console: ") + kDefaultCard);
+        }
       }
-      if (i.clock() >= until_card) { card_log(0,"timeout"); return fail(kCardFailure); }
-      if (!rejoin && (!i.persist_card || !i.persist_card(c))) return fail(kCardFailure);
-      if (i.clock() >= until_card) { card_log(0,"timeout"); return fail(kCardFailure); }
-      link->config = c;
     }
-    if (i.prepared) { i.prepared(c); return nullptr; }
+    link->config = c;
+    if (i.friends_lobby && i.prepared && i.handoff_join && players != 2)
+      i.log("handoff-join: refuse requires-one-guest");
+    // Finish card choice first: negotiation must never consume its deadlines or change its result.
+    // No game body is paused here. Only accepted live preparations proceed through the existing mesh setup.
+    if (hj && (i.handoff_join || hj->engaged())) {
+      try {
+        if (hj_host && i.handoff_join) hj->begin(i.clock(),i.handoff_css(),!c.card_digest.empty());
+        if (!hj_host && i.handoff_join && !hj->engaged()) hj->refuse("peer-not-offering");
+        while (hj->waiting()) {
+          hj->tick(i.clock());
+          if (!hj->waiting()) break;
+          if (i.cancelled()) { hj->refuse("cancelled"); break; }
+          if (i.room_closed() || link->lost()) { hj->refuse("room-closed"); break; }
+          json m;
+          if (i.next_room(m,int(std::min<uint64_t>(50,hj->remaining(i.clock()))))) {
+            link->room_message(m); hj->receive(m,i.clock());
+          }
+        }
+        if (hj->engaged() && i.flush_room && !i.room_closed()) i.flush_room(1000);
+      } catch (...) { hj->refuse("protocol-error"); }
+    }
+    if (hj && hj->accepted() && (c.default_card || !card_bytes_ok(c))) hj->refuse("shared-card-required");
+    if (hj && hj->accepted() && i.handoff_begin) {
+      live = i.handoff_begin();
+      if (live) {
+        fallback_config = c; link->handoff_preparation = true;
+        if (!hj_host) {
+          auto q = std::make_shared<handoff_join::Request>(); q->serial = 1;
+          q->operation = handoff_join::Operation::GuestCSS; q->seed = c.seed;
+          std::shared_ptr<const handoff_join::Request> immutable = std::move(q);
+          std::atomic_store_explicit(&live->request,std::move(immutable),std::memory_order_release);
+        }
+      }
+    }
+    if (i.prepared && !live) {
+      if (hj && hj->accepted()) hj->refuse("start-at-N-unavailable");
+      i.prepared(c); return nullptr;
+    }
     i.log("console: start session " + c.session_id + " seed " + hex(c.seed) + " delay " + std::to_string(c.input_delay));
     // A relaunching seat can be absent for ~60 s. Rendezvous through Rooms before
     // starting the shared 20 s mesh budget; never send another begin for this session.
     std::set<std::string> candidates; uint64_t candidate_at = 0;
+    const auto restored_digest = c.card_digest;
+    bool default_vote = c.default_card;
+    // Rendezvous counters for the failure log: room ids only (8 chars), never tokens.
+    int cand_sent = 0, room_in = 0, cand_unknown = 0; std::string unknown_from;
+    auto id8 = [](const std::string& id) { return id.substr(0,8); };
+    auto rendezvous_log = [&](const char* how) {
+      std::string expects;
+      for (const auto& p : link->frozen) if (str(p,"connectionId") != r.me) expects += (expects.empty() ? "" : ",") + id8(str(p,"connectionId"));
+      i.log(std::string("console: rendezvous ") + how + ": me " + id8(r.me) + " expects " + expects + ", sent " +
+          std::to_string(cand_sent) + ", room messages in " + std::to_string(room_in) + ", candidates " +
+          std::to_string(candidates.size()) + ", from unknown seats " + std::to_string(cand_unknown) +
+          (unknown_from.empty() ? "" : " (" + unknown_from + ")"));
+    };
     auto candidate = [&](const json& m) {
       if (str(m,"t") != "msg" || !m.count("d") || !m["d"].is_object()) return true;
       const auto& d = m["d"];
       if (str(d,"kind") != "mu-cand" || d.value("v",json()) != 2 || str(d,"match") != c.session_id) return true;
-      if (str(m,"from") == r.me || std::none_of(link->frozen.begin(),link->frozen.end(),[&](const json& p) { return str(p,"connectionId") == str(m,"from"); })) return true;
+      if (str(m,"from") == r.me) return true;
+      if (std::none_of(link->frozen.begin(),link->frozen.end(),[&](const json& p) { return str(p,"connectionId") == str(m,"from"); })) {
+        ++cand_unknown; unknown_from = id8(str(m,"from")); return true;
+      }
       if (str(d,"compat") != i.compatibility) return false;
+      if ((sync_card || rejoin) && str(d,"cardDigest") != restored_digest) default_vote = true;
       candidates.insert(str(m,"from")); return true;
     };
     auto send_candidates = [&] {
       if (i.clock() < candidate_at) return;
-      for (const auto& p : link->frozen) if (str(p,"connectionId") != r.me)
-        i.send_room({{"t","msg"},{"to",p["connectionId"]},{"d",transport::candidate(true,i.compatibility,"",c.session_id,"","","")}});
+      for (const auto& p : link->frozen) if (str(p,"connectionId") != r.me) {
+        auto d = transport::candidate(true,i.compatibility,"",c.session_id,"","","");
+        if (sync_card || rejoin) d["cardDigest"] = restored_digest;
+        i.send_room({{"t","msg"},{"to",p["connectionId"]},{"d",d}}); ++cand_sent;
+      }
       candidate_at = i.clock()+1000;
     };
     step = "rendezvous";
-    if (rejoin) {
+    if (rejoin || sync_card) {
       const auto rendezvous_until = i.clock()+65000;
       while (i.clock() < rendezvous_until && candidates.size()+1 < c.ports.size()) {
         if (i.cancelled()) return fail("cancelled");
         send_candidates(); json m;
         if (i.next_room(m,50)) {
+          ++room_in;
           link->room_message(m);
-          if (!candidate(m)) return fail(kMixedBuilds);
+          if (!candidate(m)) { rendezvous_log("mixed builds"); return fail(kMixedBuilds); }
         }
-        if (link->lost()) return fail(link->lost()->c_str());
-        if (i.room_closed()) return fail("couldn't connect to your friend");
+        if (link->lost()) { rendezvous_log("lost"); return fail(link->lost()->c_str()); }
+        if (i.room_closed()) { rendezvous_log("room closed"); return fail("couldn't connect to your friend"); }
       }
-      if (candidates.size()+1 < c.ports.size()) return fail("couldn't connect to your friend");
+      if (candidates.size()+1 < c.ports.size()) { rendezvous_log("timed out"); return fail("couldn't connect to your friend"); }
+      rendezvous_log("done");
+      if (default_vote) {
+        c.default_card = true; c.card_digest.clear(); c.card_bytes.clear();
+        i.log(std::string("console: ") + kDefaultCard);
+      }
+      link->config = c;
     }
     const auto link_at = i.clock(), until = link_at+20000;
     auto budget = [&] { return int(until > i.clock() ? until-i.clock() : 0); };
     // The app refuses an open as not_peer while the peer's seat is briefly absent (mid-relaunch, or its
     // join not seen yet). Keep the room pumping and try again about once a second while time remains.
     auto open_link = [&](const std::string& peer) {
-      json reply = i.request({{"type","directOpen"},{"conn",i.connection()},{"peer",peer}},budget());
+      json reply = link->open_peer(peer,budget());
       while (!reply.value("link",0u) && str(reply,"refused") == "not_peer" && budget() > 1500 && !i.cancelled()) {
         const auto retry_at = i.clock()+1000;
         while (i.clock() < retry_at) {
@@ -660,7 +1055,7 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
           if (i.next_room(m,int(retry_at-i.clock()))) { link->room_message(m); candidate(m); }
           if (i.room_closed()) return reply;
         }
-        reply = i.request({{"type","directOpen"},{"conn",i.connection()},{"peer",peer}},budget());
+        reply = link->open_peer(peer,budget());
       }
       return reply;
     };
@@ -679,7 +1074,8 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
         i.log("console: link open to port " + std::to_string(p["port"].get<int>()) + " refused (" + (code.empty() ? "link " + std::to_string(id) : code) + ")");
         return fail("couldn't connect to your friend");
       }
-      Peer peer{}; peer.port = p["port"].get<int>(); peer.link = id; peer.connection = conn; peer.heard = i.clock(); peer.opened = opened; link->peers.push_back(std::move(peer));
+      Peer peer{}; peer.port = p["port"].get<int>(); peer.link = id; peer.connection = conn; peer.heard = i.clock(); peer.opened = opened;
+      peer.room_connection = i.connection(); link->peers.push_back(std::move(peer));
       link->startup_work();
     }
     step = "links";
@@ -726,6 +1122,10 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
         if (!link->agree_delay()) {
           if (link->lost()) return fail(link->lost()->c_str());
           return fail(i.cancelled() ? "cancelled" : "couldn't agree on a delay");
+        }
+        if (live) {
+          handoff_join::transfer(i,hj_host,link->peers.front().connection,link->config,live);
+          return relaunch();
         }
         config = link->config; link->service(); return link;
       }

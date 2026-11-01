@@ -14,7 +14,7 @@ namespace yougame::console {
 using HostSaveReader = std::vector<uint8_t> (*)();
 inline std::atomic<HostSaveReader> host_save_reader{nullptr};
 inline constexpr const char* kCardFailure = "Couldn't get your friend's save";
-// A 2-seat session whose start carries no cardDigest: every seat boots the same fresh card.
+// A 2-seat session without a shared save: every seat boots the same fresh card.
 inline constexpr const char* kDefaultCard = "Couldn't share the host's save, playing with default unlocks";
 inline constexpr size_t kCardLimit = 2 * 1024 * 1024;
 // 12 KiB base64 alone fills Rooms' 16 KiB limit; leave space for the JSON envelope.
@@ -87,6 +87,36 @@ inline bool card_session_dir(const std::filesystem::path& data, const std::strin
   }
   return true;
 }
+// Atomic, session-keyed handoff. Missing/unreadable/consumed records always mean defaults.
+inline bool write_card_choice(const std::filesystem::path& data, const SessionConfig& c) {
+  std::filesystem::path dir;
+  if (!card_session_dir(data,c.session_id,dir)) return false;
+  const auto path = dir / "save-choice.json", temp = dir / "save-choice.tmp";
+  std::error_code ec;
+  if (std::filesystem::is_symlink(path,ec) || std::filesystem::is_symlink(temp,ec)) return false;
+  nlohmann::json record = {{"sessionId",c.session_id},{"digest",c.default_card ? "" : c.card_digest}};
+  std::ofstream out(temp,std::ios::binary|std::ios::trunc);
+  if (!out) return false;
+  out << record.dump(); out.close();
+  if (!out) return false;
+  // On Windows rename cannot replace an existing file. Remove only the old record first;
+  // readers see either a complete new record or a missing record (safe defaults).
+  std::filesystem::remove(path,ec); ec.clear();
+  std::filesystem::rename(temp,path,ec); return !ec;
+}
+inline bool take_card_choice(const std::filesystem::path& data, const SessionConfig& c) {
+  std::filesystem::path dir;
+  if (!card_session_dir(data,c.session_id,dir)) return false;
+  std::error_code ec; const auto path = dir / "save-choice.json";
+  if (std::filesystem::is_symlink(path,ec) || !std::filesystem::is_regular_file(path,ec) ||
+      std::filesystem::file_size(path,ec) > 256 || ec) return false;
+  std::ifstream in(path,std::ios::binary);
+  auto record = nlohmann::json::parse(in,nullptr,false); in.close();
+  // Deletion is part of consumption; a failed delete must not authorize a repeated host save.
+  if (!std::filesystem::remove(path,ec) || ec) return false;
+  return record.is_object() && record.value("sessionId",nlohmann::json()) == c.session_id &&
+      card_hash(c.card_digest) && record.value("digest",nlohmann::json()) == c.card_digest;
+}
 inline bool stage_card(const std::filesystem::path& data, const SessionConfig& c) {
   std::filesystem::path dir;
   if (!card_bytes_ok(c) || !card_session_dir(data,c.session_id,dir)) return false;
@@ -97,6 +127,17 @@ inline bool stage_card(const std::filesystem::path& data, const SessionConfig& c
   std::ofstream out(path,std::ios::binary);
   out.write(reinterpret_cast<const char*>(c.card_bytes.data()),c.card_bytes.size()); out.close();
   return bool(out);
+}
+// Remove only the transfer staging file; never touch the session's mounted card directory.
+inline bool discard_staged_card(const std::filesystem::path& data, const SessionConfig& c) {
+  std::filesystem::path dir;
+  if (!card_session_dir(data,c.session_id,dir)) return false;
+  std::error_code ec;
+  const auto path = dir / "incoming.gci";
+  if (std::filesystem::is_symlink(path,ec)) return false;
+  ec.clear();
+  std::filesystem::remove(path,ec);
+  return !ec;
 }
 inline bool load_card(const std::filesystem::path& data, SessionConfig& c) {
   std::filesystem::path dir;

@@ -36,7 +36,17 @@ static int checks, reads, publishes, overlay_polls, entry_polls, friends_polls;
 namespace yougame {
 bool active() { return true; } bool stdio_bridge() { return true; }
 namespace parity { struct Signals { void emit(int) {} } signals; }
-namespace console { struct Entry { bool poll(int,bool,uint16_t&) { ++entry_polls; return false; } } entry; }
+namespace console {
+bool shared_active=true, consume_friends=false;
+bool entry_connected[4]{};
+bool console_active() { return shared_active; }
+struct Config { int my_port=2; };
+struct Engine { const Config& config() const { static Config c; return c; } };
+Engine& console_engine() { static Engine e; return e; }
+struct Entry { bool poll(int port,bool connected,uint16_t& buttons) {
+ ++entry_polls;entry_connected[port]=connected;
+ return consume_friends && connected && (buttons & (0x10|0x200));
+} } entry; }
 namespace friends { struct Events { void poll_pad(int,bool,uint16_t&) { ++friends_polls; } } events; }
 }
 namespace host {
@@ -46,6 +56,7 @@ enum class DeviceKind { None, Keyboard, GCAdapter, HidPad };
 #ifdef YOUGAME_AGENT_TEST_HOOK
 int g_ui_agent_step=-1;
 bool input_script_active() { return false; }
+void input_console_script(PadState*,int port) { CHECK(port==2); }
 void log(const char*,...) {}
 bool agent_input_allowed(yougame::agent_test::InputKey) { return true; }
 bool relay_owns_hid() { return false; }
@@ -85,6 +96,7 @@ bool window_input_captured() {
 }
 struct ConsolePad { uint16_t button; int8_t stick_x,stick_y,sub_x,sub_y; uint8_t trigger_l,trigger_r,analog_a,analog_b; int8_t err; };
 namespace yougame::console { using Pads=std::array<ConsolePad,4>; }
+int g_console_host_pad = -1;
 yougame::console::Pads console_hardware() {
 ''' + body(source, 'console_hardware') + r'''
 }
@@ -162,6 +174,13 @@ int main() {
  CHECK(neutral(scripted[0]) && g_ui_pads[0].button==0);
  pad_back.arm(0,PadBack::Clock::now());
 #endif
+ // Friends carries the host's physical CSS pad into the shared virtual port.
+ for(auto& p:hardware)p={};g_ui_capture=false;frame();
+ g_console_host_pad=2;hardware[2].button=0x100;
+ auto selected=frame();CHECK(selected[2].button==0x100 && selected[2].err==0);
+ for(int port:{0,1,3})CHECK(selected[port].err==-1);
+ CHECK(g_ui_pads[1].err==0); // UI still sees the full device poll before selection
+ g_console_host_pad=-1;
  // Offline still uses the same publisher with capture suppression and entry/Friends polling.
  PadState offline[4]{};
  g_ui_capture=true;
@@ -170,6 +189,12 @@ int main() {
  g_ui_capture=false;
  { UiSnapshot ui{offline}; }
  CHECK(entry_polls==4 && friends_polls==4);
+ // A stopped shared session reuses this hardware boundary in local CSS: restore Z/B.
+ yougame::console::shared_active=false; yougame::console::consume_friends=true;
+ for(auto& p:hardware)p={}; feeding[0]={DeviceKind::GCAdapter,0}; hardware[0].button=0x10;
+ auto invite=console_hardware();CHECK(invite[0].button==0 && yougame::console::entry_connected[0]);
+ hardware[0].button=0x200;auto leave=console_hardware();CHECK(leave[0].button==0);
+ g_ui_capture=true;console_hardware();CHECK(!yougame::console::entry_connected[0]);
  std::printf("console input: %d checks, %d frames/reads, real UI/chords before capture, independent release latches, offline behavior\n",checks,reads);
 }
 '''

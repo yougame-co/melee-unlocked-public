@@ -277,7 +277,9 @@ static void setup_numerals() {
         const float center=b->text->pos_x+row.x, half=row.value.size()*20.5f*b->text->x34.x/2;
         CHECK(std::fabs(center-(b->x+12*b->size))<.01f); // centered under the art
         CHECK(center-half>=0 && center+half<=640);       // on screen on both sides
-        CHECK(b->text->pos_y+row.y>b->y+12*b->size);     // below the art's middle
+        // Smaller than the art's .35 text and placed so its glyph (about 35*scale below the row)
+        // sits between the art and the setup header's bottom border (build 37).
+        CHECK(std::fabs(row.sx-.25f*b->size)<.001f && std::fabs(row.y-11.4f*b->size)<.001f);
         mu_rank_badge_free(b);
     }
 }

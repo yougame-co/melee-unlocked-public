@@ -144,10 +144,14 @@ void failures() {
     c.searching(1, 100);
     CHECK(c.take_start_slippi());
     c.take_log();
+    CHECK(!c.yougame_only());
     c.failed(Side::Slippi, 2000);
+    CHECK(c.yougame_only());
+    c.searching(1, 2100); // another queue word must not restart the stopped side
     c.tick(60000);
     CHECK(!c.over() && !c.live(Side::Slippi) && c.live(Side::YouGame) && !c.take_start_slippi() && said(c, {}));
     CHECK(c.matched(Side::YouGame, 61000));
+    CHECK(!c.yougame_only());
     CHECK(said(c, {"matched on YouGame after 61000 ms; the other was not searching"}));
   }
   {  // Both fail, Slippi first: the search is over.
@@ -391,6 +395,11 @@ void link_line() {
   }
   CHECK(std::string(yougame::blend::kSearchBoth) == "Searching Slippi + YouGame");
   CHECK(std::string(yougame::blend::kSearchYouGameOnly) == "Searching YouGame players");
+  CHECK(yougame::blend::slippi_stop_reason("Could not check Slippi version. Try again.") == "Slippi isn't reachable right now");
+  CHECK(yougame::blend::slippi_stop_reason("Lost connection to the mm server") == "Slippi isn't reachable right now");
+  CHECK(yougame::blend::slippi_stop_reason("Invalid match details from the mm server") == "Slippi sent an invalid reply");
+  CHECK(yougame::blend::slippi_stop_reason("Sign in to Slippi before playing online.") == "Sign in to Slippi to search its players");
+  CHECK(yougame::blend::slippi_stop_reason("Slippi 3.6.5 is out. Update Melee Unlocked") == "Slippi 3.6.5 is out. Update Melee Unlocked");
   ++cases;
 }
 }  // namespace

@@ -22,9 +22,12 @@
 enum { MU_PR_SCENE, MU_PR_GET_PLAYER, MU_PR_SET_PLAYER, MU_PR_GET_STAGE, MU_PR_SET_STAGE,
        MU_PR_SET_EVENT_BACKUP, MU_PR_REQUEST_MAJOR, MU_PR_SET_ONLINE_MODE, MU_PR_GET_ONLINE_MODE,
        MU_PR_DIRECT_FIRST_MATCH, MU_PR_FRAME_PAUSE, MU_PR_CPU_MOVE, MU_PR_TRAINING_PICK,
-       MU_PR_TRAINING_STAGE, MU_PR_UNLOCKED, MU_PR_PAGE_PAUSE };
+       MU_PR_TRAINING_STAGE, MU_PR_UNLOCKED, MU_PR_PAGE_PAUSE, MU_PR_CSS_PICK, MU_PR_FRIENDS_RETURN };
 
 extern StaticPlayer player_slots[];
+int mu_friends_css_pick(int* a);
+void mu_friends_css_reset(void);
+void mu_slippi_return_to_friends(void);
 struct gm_80479D58_t* mu_gm_engine_state(void);
 
 /* An explicit practice handoff owns one pending destination while the origin scene runs
@@ -49,10 +52,34 @@ void mu_practice_enter_mode(int mode)
     }
 }
 
+int mu_practice_bridge(int op, int* a, int n);
+void mu_friends_css_enter(CSSData* css)
+{
+    static int applied;
+    unsigned char query = 10, response[4];
+    unsigned int got = 0;
+    int a[3];
+    int mu_online_abi_command(unsigned int, const unsigned char*, unsigned int, unsigned char*, unsigned int, unsigned int*);
+    if (applied || mu_online_abi_command(0xE6, &query, 1, response, 4, &got) != 0 || got != 4) return;
+    applied = 1;
+    a[0] = response[0]; a[1] = response[1]; a[2] = response[2];
+    mu_practice_bridge(MU_PR_SET_EVENT_BACKUP, a, 3);
+    css->vs.start.players[response[3] - 1].ckind = response[0];
+    css->vs.start.players[response[3] - 1].color = response[1];
+}
+
 int mu_practice_bridge(int op, int* a, int n)
 {
     MuSlippiMenuState* slp = mu_slippi_state();
     switch (op) {
+    case MU_PR_CSS_PICK:
+        if (n < 3 || gm_GetCurrentGameMode() != GM_VS || gm_GetCurrentSceneIndex() != 0) return -1;
+        return mu_friends_css_pick(a);
+    case MU_PR_FRIENDS_RETURN:
+        mu_slippi_return_to_friends();
+        if (gm_GetCurrentGameMode() == GM_MENU) return 0;
+        a[0] = GM_MENU;
+        return mu_practice_bridge(MU_PR_REQUEST_MAJOR,a,1);
     case MU_PR_PAGE_PAUSE:
         return mu_yougame_page_pause(a, n);
     case MU_PR_SCENE:
@@ -106,6 +133,7 @@ int mu_practice_bridge(int op, int* a, int n)
         /* Leave the current scene for `major`: the pending mode plus the engine's leave flag, so a
          * Training minor that never ends on its own runs its decide path on the next frame. */
         if (n < 1) return -1;
+        if (a[0] == GM_VS) mu_friends_css_reset();
         practice_origin_mode = gm_GetCurrentGameMode();
         practice_pending_mode = a[0];
         gm_ChangeGameModeAfterCurrentScene(a[0]);

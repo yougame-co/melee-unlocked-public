@@ -41,37 +41,58 @@ std::string g_iso_hash;
 // ---- HTTP (WinHTTP)
 std::wstring widen(const std::string& s) { int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0); std::wstring w(n ? n - 1 : 0, 0); if (n) MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n); return w; }
 
+thread_local HttpFailure http_failure{"http-get", 0};
 bool http(const char* method, const std::string& url, const std::wstring& headers, const std::string& body, int* status, std::string* response) {
+  http_failure = {"http-get", 0};
+  if (status) *status = 0;
+  const auto failed = [](const char* step) {
+    const DWORD code = GetLastError(); // capture before closing handles changes it
+    http_failure = {step, code};
+    host::log("slippi http: %s %lu", step, (unsigned long)code);
+    return false;
+  };
   std::wstring wurl = widen(url);
   URL_COMPONENTS uc{}; uc.dwStructSize = sizeof uc;
   wchar_t host[256]{}, path[2048]{};
   uc.lpszHostName = host; uc.dwHostNameLength = 256; uc.lpszUrlPath = path; uc.dwUrlPathLength = 2048;
-  if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) return false;
+  if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) return failed("crack-url");
   HINTERNET session = WinHttpOpen(USER_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-  if (!session) return false;
-  WinHttpSetTimeouts(session, 5000, 5000, 15000, 15000);
+  if (!session) return failed("open-session");
   bool ok = false;
+  if (!WinHttpSetTimeouts(session, 5000, 5000, 15000, 15000)) {
+    failed("set-timeouts"); WinHttpCloseHandle(session); return false;
+  }
   HINTERNET conn = WinHttpConnect(session, host, uc.nPort, 0);
-  if (conn) {
+  if (!conn) failed("connect");
+  else {
     std::wstring wmethod = widen(method);
     HINTERNET req = WinHttpOpenRequest(conn, wmethod.c_str(), path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
-    if (req) {
-      if (WinHttpSendRequest(req, headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(), headers.empty() ? 0 : (DWORD)-1,
-                             body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.data(), (DWORD)body.size(), (DWORD)body.size(), 0) &&
-          WinHttpReceiveResponse(req, nullptr)) {
+    if (!req) failed("open-request");
+    else {
+      if (!WinHttpSendRequest(req, headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(), headers.empty() ? 0 : (DWORD)-1,
+                             body.empty() ? WINHTTP_NO_REQUEST_DATA : (LPVOID)body.data(), (DWORD)body.size(), (DWORD)body.size(), 0)) failed("send-request");
+      else if (!WinHttpReceiveResponse(req, nullptr)) failed("receive-response");
+      else {
         DWORD code = 0, size = sizeof code;
-        WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &code, &size, WINHTTP_NO_HEADER_INDEX);
-        if (status) *status = (int)code;
-        std::string out;
-        for (;;) {
-          DWORD avail = 0;
-          if (!WinHttpQueryDataAvailable(req, &avail) || !avail) break;
-          std::string chunk(avail, 0); DWORD got = 0;
-          if (!WinHttpReadData(req, chunk.data(), avail, &got)) break;
-          out.append(chunk.data(), got);
+        if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &code, &size, WINHTTP_NO_HEADER_INDEX)) failed("query-status");
+        else {
+          if (status) *status = (int)code;
+          if (code / 100 != 2) {
+            http_failure = {"http-status", code};
+            host::log("slippi http: http-status %lu", (unsigned long)code);
+          }
+          std::string out;
+          for (;;) {
+            DWORD avail = 0;
+            if (!WinHttpQueryDataAvailable(req, &avail)) { failed("query-data"); break; }
+            if (!avail) { ok = true; break; }
+            std::string chunk(avail, 0); DWORD got = 0;
+            if (!WinHttpReadData(req, chunk.data(), avail, &got)) { failed("read-data"); break; }
+            if (!got) { ok = true; break; }
+            out.append(chunk.data(), got);
+          }
+          if (ok && response) *response = std::move(out);
         }
-        if (response) *response = out;
-        ok = true;
       }
       WinHttpCloseHandle(req);
     }
@@ -82,6 +103,7 @@ bool http(const char* method, const std::string& url, const std::wstring& header
 }
 
 }  // namespace
+HttpFailure last_http_failure() { return http_failure; }
 bool http_get(const std::string& url, std::string* response, int* status) { return http("GET", url, L"", "", status, response); }
 namespace {
 // A member of a JSON object, or null when j is not an object or has no such key. Never throws.

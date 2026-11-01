@@ -27,6 +27,8 @@ void init(const std::string& iso_path, const std::string& cache_dir);   // start
 void shutdown();                                                         // flushes queued reports (one attempt each)
 void log_game(const GameReport& report);
 // Plain GET with this client's identification, for the user profile API. Blocking; call off the sim thread.
+struct HttpFailure { const char* step; unsigned long code; };
+HttpFailure last_http_failure(); // thread local; no URL, credentials or response text
 bool http_get(const std::string& url, std::string* response, int* status);
 
 }  // namespace slippi::report

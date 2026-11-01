@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-#define MU_HOST_API_VERSION 26
+#define MU_HOST_API_VERSION 27
 #define MU_GAME_API_VERSION 9
 #define MU_SLIPPI_RESPONSE_CAPACITY 4096u
 
@@ -410,6 +410,11 @@ typedef struct MuHostApi {
     /* Version 25. Non-advancing clock domains for console rollback alarm scheduling.
      * Zero preserves the ordinary SDK clock path (including console rollback OFF). */
     int32_t (*console_alarm_clock)(uint64_t* simulation, uint64_t* hardware);
+
+    /* Version 27. Screen shake strength (VIDEO > Screen shake): the camera's quake offset is scaled
+     * by this, 1 the game's own. Read live offline; network sessions keep the game's own scale.
+     * "Disable screen shake" still zeroes the offset. */
+    float (*screen_shake_scale)(void);
 } MuHostApi;
 
 /* Start each new sound in the sound frame being mixed now instead of the next one (5 ms sooner):
@@ -442,6 +447,10 @@ typedef struct MuHostApi {
  * projection, eye straight in front of the action, its tracking and zoom) as with that build's disc.
  * The host sends it only offline; online the renderer's flat projection stands in for it. */
 #define MU_DISPLAY_OPTION_ARCADE_CAMERA 0x200u
+/* "Hide KO explosions": the blast-zone explosion is spawned far below anything a camera shows, so
+ * it still runs in full (its particles draw random numbers, some only as its model is drawn) and
+ * the match is the same; it is only out of sight. Online and in replays too. */
+#define MU_DISPLAY_OPTION_NO_KO_EXPLOSIONS 0x400u
 
 #define MU_MOD_ASSETS_PRESENT 0x1u
 /* The 20XX Hack Pack's disc files are among the overlays (StageSwapTable.bin, numbered music,
@@ -677,6 +686,8 @@ enum {
     MU_PRACTICE_TRAINING_PICK = 12,     /* a[0] slot (0 player, 1 CPU), a[1] character, a[2] costume: Training's select starts there */
     MU_PRACTICE_FRAME_PAUSE = 10,       /* a[0] pause (1), run (0) or ask (-1); a[1] step one frame; a[0] out: paused */
     MU_PRACTICE_UNLOCKED = 14,          /* out a[0]: bit per character kind the memory card has unlocked */
+    MU_PRACTICE_CSS_PICK = 16,     /* out [0] live CSS fighter, [1] costume, [2] physical pad */
+    MU_PRACTICE_FRIENDS_RETURN = 17, /* leave to Online, Friends row highlighted */
     MU_PRACTICE_PAGE_PAUSE = 15,    /* in [0] -1 query, 0 resume, 1 pause; out [0] flag,
                                       [1] live match, [2] scene frame counter */
 };

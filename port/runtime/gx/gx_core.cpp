@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "gx_core.h"
 #include "gx_retro.h"
+#include "render_options.h"   // clean_replay_active() reads its live switch, Linux too
 #ifdef _WIN32
 #include "pc_settings_shared.h"
 #else
@@ -392,8 +393,11 @@ uint32_t decode_vertices(const VertexDesc& d, const uint8_t* src, uint32_t count
       if (!d.col[i].type) { continue; }
       const uint8_t* q = fetch(d.col[i], col_view[i], csize[d.col[i].format]);
       uint8_t* dst = i ? out.col1 : out.col0;
+      // The format alone decides the alpha (read_color: 255 for the formats without one), as in
+      // Dolphin's vertex loader. The declared count (RGB or RGBA) does not: forcing 255 when it
+      // said RGB drew Animelee's character select name bars, an RGBA format with zero alpha
+      // declared RGB, as solid black over the bottom of the first two rows of icons.
       if (q) read_color(q, d.col[i].format, dst);
-      if (!d.col[i].count) dst[3] = 255;
     }
     // texcoords
     for (int t = 0; t < tex_count; ++t) {
@@ -996,7 +1000,12 @@ void set_arcade_display(ArcadeSource source, uint32_t bits) {
 uint32_t arcade_display() {
   uint32_t bits = 0;
   for (const auto& source : g_arcade_display) bits |= source.load(std::memory_order_relaxed);
+  if (clean_replay_active()) bits &= ~(kArcadeHitboxes | kArcadeProjectileHitboxes | kArcadeHitboxesBehind | kArcadeComboCounter);
   return bits;
+}
+
+bool clean_replay_active() {
+  return RenderOptions::live_clean_replays().load(std::memory_order_relaxed) && replay_control::active();
 }
 
 void set_native_hud_player(int slot, bool present, int damage, int stocks, float tag_x, float tag_y,

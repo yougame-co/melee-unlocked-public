@@ -20,6 +20,7 @@ enum { LOCAL_TITLE, LOCAL_DETAIL, OPP_TITLE, OPP_DETAIL, SET_SCORE,
 static struct {
     HSD_Text* text;
     MuRankBadge* badges[2];
+    float badge_x[2];
     MuYgRank shown[2];
     char lines[LINE_COUNT][64];
     unsigned frames;
@@ -77,19 +78,8 @@ static void rank_panel(int player, const MuYgRank* rank, int status)
     }
     if (!player && status == 0 && rank->known) strcat(detail, " - Loading...");
     if (!player && status == 2) strcpy(detail, "Rank unavailable");
-    if (!panel.badges[player]) {
-        /* 25.2 CSS units square, centered at y 89/202 across the three rows.
-         * Leave a four-unit gap after the label and keep local art below x 70. */
-        panel.badges[player] = mu_rank_badge_create(NULL, panel_x(player ? 230 : 40),
-            panel_y(player ? 189.4f : 76.4f), 0.105f, &display);
-        mu_rank_badge_art_only(panel.badges[player]);
-        panel.shown[player] = display;
-    } else if (memcmp(&panel.shown[player], &display, sizeof display) != 0) {
-        mu_rank_badge_set(panel.badges[player], &display);
-        panel.shown[player] = display;
-    }
-    /* The full label carries the division beside the CSS art. */
     {
+        /* The full label carries the division beside the CSS art. */
         int label_id = player ? OPP_LABEL : LOCAL_LABEL;
         const char* value = rank->known ? display.label : "";
         /* Measured advance: 20.5 CSS units at scale 1. Fit all wire labels,
@@ -97,6 +87,29 @@ static void rank_panel(int player, const MuYgRank* rank, int status)
         float width = (float)strlen(value) * 20.5f;
         float available = player ? 156.0f : 148.0f;
         float scale = width > available / .5f ? available / width : .5f;
+        /* 25.2 CSS units square on the title's line, four units after the wider of the title
+         * ("Your rank") and the label, and never past x 40 / 230 (local art stays below x 70).
+         * At a fixed x 40 it floated next to "Character selected", away from "Gold IV" (build 37). */
+        float left = player ? 70.0f : -112.0f;
+        float end = left + (float)strlen(panel.lines[player ? OPP_TITLE : LOCAL_TITLE]) * 20.5f * .4f;
+        float x = left + width * scale;
+        if (x < end) x = end;
+        x += 4;
+        if (x > (player ? 230.0f : 40.0f)) x = player ? 230.0f : 40.0f;
+        if (panel.badges[player] && panel.badge_x[player] != x) {
+            mu_rank_badge_free(panel.badges[player]);
+            panel.badges[player] = NULL;
+        }
+        if (!panel.badges[player]) {
+            panel.badges[player] = mu_rank_badge_create(NULL, panel_x(x),
+                panel_y(player ? 189.4f : 76.4f), 0.105f, &display);
+            mu_rank_badge_art_only(panel.badges[player]);
+            panel.badge_x[player] = x;
+            panel.shown[player] = display;
+        } else if (memcmp(&panel.shown[player], &display, sizeof display) != 0) {
+            mu_rank_badge_set(panel.badges[player], &display);
+            panel.shown[player] = display;
+        }
         HSD_SisLib_803A7548(panel.text, label_id, scale, scale);
         line(label_id, value);
     }

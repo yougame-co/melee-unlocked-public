@@ -1,4 +1,5 @@
-// dropRoomAfter parsing in both build modes, and the real pump against the room-test fakes.
+// dropRoomAfter/dropRoomOnce parsing in both build modes, the real pump against the room-test fakes, and the
+// dropRoomOnce character-select gate.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "yougame_agent_test.h"
 #include "yougame_room.h"
@@ -46,6 +47,25 @@ static void mapping(const char* scratch) {
       CHECK(settings.arguments.empty() && settings.environment.empty());
       CHECK(settings.log == "agent-test.json; invalid/unknown or inapplicable keys ignored");
     }
+  }
+  for (auto engine : {Engine::Source, Engine::Static}) {
+    const auto settings = map_keys({{"dropRoomOnce", true}}, engine);
+    CHECK(settings.arguments.empty());
+#ifdef YOUGAME_AGENT_TEST_HOOK
+    if (engine == Engine::Source) {
+      CHECK(settings.environment == (std::vector<std::pair<std::string, std::string>>{
+          {"MELEE_ONLINE_TEST_DROP_ROOM_ONCE", "1"}}));
+      CHECK(settings.log == "agent-test.json applied default keys: dropRoomOnce");
+      continue;
+    }
+#endif
+    CHECK(settings.environment.empty());
+    CHECK(settings.log == "agent-test.json; invalid/unknown or inapplicable keys ignored");
+  }
+  for (const json& value : {json(false), json(1), json("true"), json(nullptr), json::object()}) {
+    const auto settings = map_keys({{"dropRoomOnce", value}}, Engine::Source);
+    CHECK(settings.arguments.empty() && settings.environment.empty());
+    CHECK(settings.log == "agent-test.json; invalid/unknown or inapplicable keys ignored");
   }
   std::filesystem::remove_all(directory);
 }
@@ -275,6 +295,34 @@ static void first_open_survives_reconnect() {
   CHECK(socket.stream.open("ticket-new", "abcdef", 100));
   CHECK(socket.agent_test_first_open_at() == 0);
 }
+static json console_roster(bool second_agent) {
+  json b = {{"id","b"},{"connectionId","b"},{"slot",1}};
+  if (second_agent) b["hn"] = true;
+  return {{"me","a"},{"participants",json::array({{{"id","a"},{"connectionId","a"},{"slot",0},{"hn",true}}, b})}};
+}
+static void drop_once_at_css() {
+  std::vector<std::string> logs;
+  const auto log = [&](const char* s) { logs.emplace_back(s); };
+  CHECK(agent_drop_room_once_enabled("1"));
+  for (const char* bad : {(const char*)nullptr, "", "0", "11", "true", " 1"}) CHECK(!agent_drop_room_once_enabled(bad));
+  agent_drop_room_once_attempted = false;
+  CHECK(!agent_drop_room_once_due(false, 900, console_roster(true), log));
+  CHECK(!agent_drop_room_once_due(true, 299, console_roster(true), log));
+  CHECK(logs.empty() && !agent_drop_room_once_attempted);
+  CHECK(agent_drop_room_once_due(true, 300, console_roster(true), log));
+  CHECK(logs == std::vector<std::string>({"agent-test: dropped the room socket (dropRoomOnce at character select)"}));
+  CHECK(!agent_drop_room_once_due(true, 301, console_roster(true), log) && logs.size() == 1);
+  // A seat without the server's agent marker refuses, once, and never drops later in the process.
+  for (const json& roster : {console_roster(false), json::object(), json(nullptr),
+       json{{"me","a"},{"participants",json::array({{{"id","a"},{"connectionId","a"},{"hn",true}}})}},
+       json{{"me","z"},{"participants",console_roster(true)["participants"]}}}) {
+    logs.clear(); agent_drop_room_once_attempted = false;
+    CHECK(!agent_drop_room_once_due(true, 300, roster, log));
+    CHECK(logs == std::vector<std::string>({"agent-test: dropRoomOnce refused: not an agent-only room"}));
+    CHECK(!agent_drop_room_once_due(true, 300, console_roster(true), log) && logs.size() == 1);
+  }
+  agent_drop_room_once_attempted = false;
+}
 static void environment_bounds() {
   CHECK(agent_drop_room_seconds(nullptr) == 0);
   for (const char* bad : {"", "329", "901", "-330", "+330", "330.0", "330s", " 330", "330 ",
@@ -302,6 +350,7 @@ int main(int argc, char** argv) {
   refuses_unsafe_rooms();
   waits_for_live_match();
   first_open_survives_reconnect();
+  drop_once_at_css();
   CHECK(unsetenv(drop_env) == 0);
 #endif
   std::puts("yougame_drop_room: mapping, build gating, elapsed time, once per process, agent-only gate and recovery passed");

@@ -6,6 +6,8 @@ BUILD = ROOT / 'build-mac-full'
 DEFAULT_GAME_LIBRARY = ROOT / 'build-mac-input' / 'melee_game.so'
 GAME_LIBRARY = Path(os.environ.get('MELEE_GAME_LIBRARY', str(DEFAULT_GAME_LIBRARY))).resolve()
 SDL = ROOT.parent / 'deps/sdl2'
+# Mirrors CMake's option(YOUGAME_RANKED_BRANCH ... ON): the Online menu offers Ranked (port/runtime/hle/yougame_mode_policy.h).
+RANKED_BRANCH = True
 
 def build_dir(agent_test_hook=False):
     return ROOT / ('build-mac-full-hook' if agent_test_hook else 'build-mac-full')
@@ -65,7 +67,7 @@ def main():
         'port/linux/renderer_presenter.cpp', 'port/mac/mac_gl.mm', 'port/mac/elf_loader.cpp', str(BUILD.relative_to(ROOT)/'gen/FObjHost.cpp'),
         'port/app/main.cpp', 'port/app/source_host.cpp', 'port/app/source_guest_boundary.cpp', 'port/app/source_p2p.cpp']]
     sources += sorted(Path('port/linux/full').glob('*.cpp'))
-    sources += [Path('port/mac/embed_mac.mm')]
+    sources += [Path('port/mac/embed_mac.mm'), Path('port/mac/gx_metal.mm')]
     sources += sorted(Path('port/third_party/enet').glob('*.c'))
     sources += sorted(Path('port/third_party/monocypher').glob('*.c'))
     sources += [Path('port/third_party/imgui', p) for p in ['imgui.cpp','imgui_draw.cpp','imgui_tables.cpp',
@@ -94,11 +96,18 @@ def main():
             # AppKit must not see the Win32 compatibility typedefs/macros.
             opts = [*flags, '-std=c++17', '-fblocks', '-fno-objc-arc',
                     '-I'+str(SDL/'include'), '-I'+str(SDL/'include/SDL2')]
+        if source.name == 'gx_metal.mm':
+            # Metal/Foundation must not see the forced Win32 compatibility header.
+            opts = [*flags, '-std=c++17', '-fblocks', '-fno-objc-arc', '-DMELEE_LINUX',
+                    '-DGX_PC_SETTINGS', *[p for p in cpp if p.startswith('-I')]]
         if args.agent_test_hook and (str(source).startswith(('port/runtime/', 'port/app/',
                                                             'port/linux/', 'port/mac/')) or
                                     source == Path('port/third_party/slippilib/SlippiGame.cpp')):
             # Include runtime platform replacements and host app units, as in CMake.
             opts += ['-DYOUGAME_AGENT_TEST_HOOK']
+        if RANKED_BRANCH and str(source).startswith(('port/runtime/', 'port/app/', 'port/linux/', 'port/mac/')):
+            # CMake's YOUGAME_RANKED_BRANCH (ON: 10-31, Friends + Ranked on the main build) for the same host units.
+            opts += ['-DYOUGAME_RANKED_BRANCH=1']
         if source.as_posix() != 'port/app/main.cpp':
             opts += ['-mavx2', '-mfma']
         fingerprint = hashlib.sha256(repr(opts).encode()).hexdigest()
@@ -126,7 +135,8 @@ def main():
         library.unlink()  # ar must not retain objects removed from the source list
     subprocess.run(['/usr/bin/ar', 'rcs', str(library), *[p for p in paths if p not in app_objects]], check=True)
     subprocess.run(['/usr/bin/clang++',*flags,*app_objects,str(library),'-L'+str(SDL/'lib'),'-lSDL2-2.0.0','-lcurl','-liconv',
-                    '-framework','OpenGL','-framework','AppKit','-framework','CoreGraphics','-framework','Security','-Wl,-pagezero_size,0x10000',
+                    '-framework','OpenGL','-framework','Metal','-framework','QuartzCore',
+                    '-framework','AppKit','-framework','CoreGraphics','-framework','Security','-Wl,-pagezero_size,0x10000',
                     '-Wl,-rpath,@executable_path/../Frameworks','-Wl,-rpath,'+str(SDL/'lib'),
                     '-o',str(BUILD/'MeleeUnlocked')],check=True)
     (BUILD/'build-manifest.json').write_text(json.dumps({'version':version,

@@ -73,6 +73,8 @@ int main() {
     CHECK(t.local_player_index == 2);
     CHECK(t.remote_ips.size() == 3);
     CHECK(t.remote_ips[0] == "5.6.7.8:42000" && t.remote_ips[1] == "192.168.0.3:43000" && t.remote_ips[2] == "1.2.3.4:44000");
+    CHECK(t.public_fallbacks.size() == t.remote_ips.size());
+    CHECK(t.public_fallbacks[0].empty() && t.public_fallbacks[1] == "1.2.3.4:43000" && t.public_fallbacks[2].empty());
     CHECK((t.stages == std::vector<uint16_t>{0x3, 0x8, 0x1C, 0x1F, 0x20}));
     CHECK(t.is_host && t.items == 0);
   }

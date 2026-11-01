@@ -59,6 +59,8 @@ int main() {
   }
 #if defined(_WIN32) || defined(__linux__)
   CHECK(std::string(yougame::parity::kCaps) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\"]}");
+#elif defined(__APPLE__)
+  CHECK(std::string(yougame::parity::kCaps) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\",\"screenshot\"]}");
 #else
   CHECK(std::string(yougame::parity::kCaps) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\"]}");
 #endif
@@ -135,8 +137,20 @@ int main() {
   CHECK(!own.push({{"type", "join"}, {"room", "Ab12"}}, 4));
   CHECK(own.take_join(false).empty());
   CHECK(own.take_join(true) == "OtherRoom"); // own push cannot displace a different invite
-  own.current_room({}); // cleanup permits joining that room again
-  CHECK(own.push({{"type", "join"}, {"room", "Ab12"}}, 5));
+  own.current_room({}); // stale old-room pushes must not displace the next invite
+  CHECK(!own.push({{"type", "join"}, {"room", "Ab12"}}, 5));
+  CHECK(own.push({{"type", "join"}, {"room", "NewRoom"}}, 6));
+  CHECK(!own.push({{"type", "join"}, {"room", "Ab12"}}, 7));
+  CHECK(own.take_join(true) == "NewRoom");
+  // A fresh invite can revive a retired room, but cannot replace another queued invite.
+  CHECK(own.push({{"type","notice"},{"kind","invite"},{"from","Friend"},{"text","Play again"},{"room","Ab12"}},8));
+  CHECK(own.push({{"type","join"},{"room","NewerRoom"}},9));
+  CHECK(!own.push({{"type","join"},{"room","Ab12"}},10));
+  CHECK(own.take_join(true) == "NewerRoom");
+  CHECK(!own.push({{"type","join"},{"room","Ab12"}},11)); // fresh acceptance was consumed
+  CHECK(own.push({{"type","notice"},{"kind","invite"},{"from","Friend"},{"text","Play again"},{"room","Ab12"}},12));
+  CHECK(own.push({{"type","join"},{"room","Ab12"}},13));
+  CHECK(own.take_join(true) == "Ab12");
   own.current_room("Ab12"); // discard an own-room push queued just before ticket request
   CHECK(own.take_join(true).empty());
   own.hello({{"room", "Ab12"}});
@@ -182,6 +196,7 @@ int main() {
   CHECK(native_ready(false, 2, "", ""));
   CHECK(native_ready(true, 2, "NAME#123", ""));
   for (int mode : {0, 1, 3}) CHECK(native_ready(true, mode, "", ""));
+  CHECK(menu_safe(2, 0)); CHECK(menu_safe(2, 1));
   CHECK(menu_safe(1, 0));
   CHECK(menu_safe(8, 0));
   CHECK(menu_safe(8, 1));

@@ -195,7 +195,7 @@ class NetplayClient {
   enum class DisconnectReason : uint32_t { UNSPECIFIED = 0, POOR_PERFORMANCE = 1 };
 
   NetplayClient(std::vector<std::string> addrs, std::vector<uint16_t> ports, uint8_t remote_player_count, uint16_t local_port,
-                bool is_decider, uint8_t player_idx, bool own_udp = false);
+                bool is_decider, uint8_t player_idx, bool own_udp = false, std::vector<std::string> public_fallbacks = {});
   ~NetplayClient();
 
   bool IsDecider() const { return is_decider_; }
@@ -286,6 +286,7 @@ class NetplayClient {
   std::unique_ptr<yougame::udp::EnetIngress> own_udp_ingress_;
   bool own_udp_port_unavailable_ = false;
   std::vector<_ENetPeer*> server_;
+  std::vector<std::string> public_fallbacks_; // parallel to remote seats, never additional players
   std::thread thread_;
   uint8_t remote_player_count_ = 0;
   std::atomic<bool> do_loop_{true};
@@ -339,6 +340,7 @@ class Matchmaking {
     std::vector<UserInfo> players;          // in the ticket's order
     int local_player_index = 0;             // the local player's port - 1
     std::vector<std::string> remote_ips;    // "ip:port" per remote, in the ticket's order
+    std::vector<std::string> public_fallbacks; // same shape; empty when no same-router fallback
     bool is_host = false;
     std::vector<uint16_t> stages;
     uint32_t items = 0;
@@ -443,6 +445,7 @@ class Matchmaking {
   // Matchmaking thread only.
   int host_port_ = 0;
   std::vector<std::string> remote_ips_;
+  std::vector<std::string> public_fallbacks_;
   bool is_host_ = false;
 };
 

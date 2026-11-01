@@ -1,0 +1,58 @@
+[
+ {
+  "before": "  options.freeze_fd = false;\n  options.unlock_all = true;   // a file without the key: on\n",
+  "after": "  options.freeze_fd = false;\n  options.hide_ko_explosions = false;\n  options.unlock_all = true;   // a file without the key: on\n"
+ },
+ {
+  "before": "      else if (key == \"settingsreminder\") options.settings_hint = value != \"0\";\n      else if (key == \"advancedvideo\") g_advanced_open[0] = value == \"1\";\n",
+  "after": "      else if (key == \"settingsreminder\") options.settings_hint = value != \"0\";\n      else if (key == \"skin_online_notice\") options.skin_online_notice = value != \"0\";\n      else if (key == \"advancedvideo\") g_advanced_open[0] = value == \"1\";\n"
+ },
+ {
+  "before": "      else if (key == \"freeze_fd\") options.freeze_fd = value == \"1\";\n      else if (key == \"unlock_all\") options.unlock_all = value != \"0\";\n",
+  "after": "      else if (key == \"freeze_fd\") options.freeze_fd = value == \"1\";\n      else if (key == \"hide_ko_explosions\") options.hide_ko_explosions = value == \"1\";\n      else if (key == \"unlock_all\") options.unlock_all = value != \"0\";\n"
+ },
+ {
+  "before": "  host::g_freeze_fd.store(options.freeze_fd, std::memory_order_relaxed);\n  RenderOptions::live_unlock_all() = options.unlock_all;\n",
+  "after": "  host::g_freeze_fd.store(options.freeze_fd, std::memory_order_relaxed);\n  host::g_hide_ko_explosions.store(options.hide_ko_explosions, std::memory_order_relaxed);\n  RenderOptions::live_unlock_all() = options.unlock_all;\n"
+ },
+ {
+  "before": "       << \"\\nsettingsreminder \" << (options.settings_hint ? 1 : 0)\n       << \"\\nadvancedvideo \" << (g_advanced_open[0] ? 1 : 0)\n",
+  "after": "       << \"\\nsettingsreminder \" << (options.settings_hint ? 1 : 0)\n       << \"\\nskin_online_notice \" << (options.skin_online_notice ? 1 : 0)\n       << \"\\nadvancedvideo \" << (g_advanced_open[0] ? 1 : 0)\n"
+ },
+ {
+  "before": "       << \"\\nfreeze_fd \" << (options.freeze_fd ? 1 : 0)\n       << \"\\nunlock_all \" << (options.unlock_all ? 1 : 0)\n",
+  "after": "       << \"\\nfreeze_fd \" << (options.freeze_fd ? 1 : 0)\n       << \"\\nhide_ko_explosions \" << (options.hide_ko_explosions ? 1 : 0)\n       << \"\\nunlock_all \" << (options.unlock_all ? 1 : 0)\n"
+ },
+ {
+  "before": "#endif\n  // Test runs (MELEE_TEST_PHOB): the PhobGCC menu opens on adapter socket 1 with the panel.\n  {\n",
+  "after": "#endif\n  // Test runs (MELEE_TEST_PHOB): the PhobGCC menu opens on adapter socket 1 with the panel\n  // (\"panel\": only the Controls tab on that socket, with its Controller test and PhobGCC entries).\n  {\n"
+ },
+ {
+  "before": "    static bool phob_test_opened = false;\n    if (!phob_test_opened && state.open && host::test_env::getenv(\"MELEE_TEST_PHOB\")) { phob_test_opened = true; phob_native_request(0); }  }\n  if (!state.open && phob_native_open()) phob_native_close();\n",
+  "after": "    static bool phob_test_opened = false;\n    const char* phob_test = host::test_env::getenv(\"MELEE_TEST_PHOB\");\n    if (!phob_test_opened && state.open && phob_test && std::strcmp(phob_test, \"panel\") != 0) { phob_test_opened = true; phob_native_request(0); }  }\n  if (!state.open && phob_native_open()) phob_native_close();\n"
+ },
+ {
+  "before": "    }\n\n",
+  "after": "    }\n    // The explosion still runs, out of sight (ft_0D31.c, host.cpp apply_ko_explosions): its particles\n    // draw random numbers, so leaving it out would change the match.\n    if (settings_toggle(\"Hide KO explosions\", &options.hide_ko_explosions)) {\n      host::g_hide_ko_explosions.store(options.hide_ko_explosions, std::memory_order_relaxed);\n      changed = true;\n    }\n    if (ImGui::IsItemHovered())\n      ImGui::SetTooltip(\"No burst of colour when a fighter is KO'd off the side, top or bottom.\\n\"\n                        \"The match is exactly the same, so it also works online and in replays.\\n\"\n                        \"Picture only, yours alone. Both engines. Takes effect from the next KO.\");\n\n"
+ },
+ {
+  "before": "        }\n        if (tab_kind == host::CaptureDevice::GCAdapter && settings_widgets::CollapsingHeader(\"PhobGCC\")) {\n",
+  "after": "        }\n        // Every controller on the adapter, PhobGCC or not: the PhobScope screens on their own.\n        if (tab_kind == host::CaptureDevice::GCAdapter) {\n          ImGui::Spacing();\n          ImGui::PushID(\"controller_test\");\n          draw_controller_test(tab_index);\n          ImGui::PopID();\n        }\n        if (tab_kind == host::CaptureDevice::GCAdapter && settings_widgets::CollapsingHeader(\"PhobGCC\")) {\n"
+ },
+ {
+  "before": "    if (ImGui::IsItemHovered()) ImGui::SetTooltip(\"%s\", yougame::stdio_bridge() ? yougame::parity::kSettingsHint : \"F1, or Start + D-pad Down + Z on a GameCube controller, opens settings.\");\n#ifndef MELEE_NO_SLIPPI   // no matchmaking panel in the build without that layer\n",
+  "after": "    if (ImGui::IsItemHovered()) ImGui::SetTooltip(\"%s\", yougame::stdio_bridge() ? yougame::parity::kSettingsHint : \"F1, or Start + D-pad Down + Z on a GameCube controller, opens settings.\");\n    changed |= settings_toggle(\"Show the note when skins are off online\", &options.skin_online_notice);\n    if (ImGui::IsItemHovered())\n      ImGui::SetTooltip(\"In an online mode, skins and stage mods that could change more than looks show as the\\n\"\n                        \"standard ones, and a note says so for 15 seconds. Off: no note (Settings > Mods still lists them).\");\n#ifndef MELEE_NO_SLIPPI   // no matchmaking panel in the build without that layer\n"
+ },
+ {
+  "before": "        } else if (built_in)\n          engine_only_reason(\"Built in: \\\"%s\\\" above is the switch that applies here.\", built_in);\n        else if (!runs_here)\n",
+  "after": "        } else if (built_in)\n          engine_only_reason(\"Built in: \\\"%s\\\" is the switch that applies here.\", built_in);\n        else if (!runs_here)\n"
+ },
+ {
+  "before": "        } else if (built_in)\n          engine_only_reason(\"Built into the Source Port: \\\"%s\\\" above is the switch that applies here.\\n\"\n                             \"This one is your setting for the Static Recomp.\", built_in);\n",
+  "after": "        } else if (built_in)\n          engine_only_reason(\"Built into the Source Port: \\\"%s\\\" is the switch that applies here.\\n\"\n                             \"This one is your setting for the Static Recomp.\", built_in);\n"
+ },
+ {
+  "before": "      draw_discord_invite_overlay();\n      draw_skin_online_notice();\n    }\n",
+  "after": "      draw_discord_invite_overlay();\n      if (options.skin_online_notice) draw_skin_online_notice();\n    }\n"
+ }
+]

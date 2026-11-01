@@ -42,8 +42,38 @@ int main() {
   CHECK(events.take_host());
   CHECK(!events.take_host());
   CHECK(!events.poll_pad(3, true, 0x100));
+  // An open picker counts as away: the A or START that closed it must be let go first.
+  CHECK(!events.poll_pad(3, true, 0));
+  events.picker_open(true);
+  CHECK(!events.poll_pad(3, true, 0x100));
+  CHECK(!events.take_host());
+  events.picker_open(false);
+  CHECK(!events.poll_pad(3, true, 0x100));  // still held from the picker
+  CHECK(!events.poll_pad(3, true, 0));
+  CHECK(events.poll_pad(3, true, 0x100));
+  CHECK(events.take_host());
+  events.notice("Signing in to YouGame...", 100);
+  CHECK(events.toast(101) == "Signing in to YouGame...");
+  CHECK(events.toast(6100).empty());
   CHECK(events.push({{"type", "notice"}, {"reason", "version"}}, 10));
   CHECK(events.toast(11) == kVersion);
+  // A chat message is display only: its own line, never an invite, never a join.
+  const json message = {{"slug", "melee-unlocked"}, {"type", "notice"}, {"kind", "message"}, {"id", "m1"},
+                        {"from", "Ada"}, {"text", std::string(140, 'x')}};
+  CHECK(events.push(message, 20));
+  CHECK(events.message(21) == "Ada: " + std::string(140, 'x'));
+  CHECK(events.toast(21) == kVersion);  // the version toast stays
+  CHECK(!events.push(message, 30));     // same id and line: dropped
+  CHECK(events.push({{"type", "notice"}, {"kind", "message"}, {"id", "m1"}, {"from", "Ada"}, {"text", "again"}}, 30));
+  CHECK(events.message(31) == "Ada: again");  // the page restarted its counter
+  CHECK(events.push(message, 32));
+  CHECK(events.message(6031).size() == 145 && events.message(6032).empty());
+  CHECK(events.take_join(true).empty());
+  CHECK(!events.push({{"type", "notice"}, {"kind", "message"}, {"id", "m2"}, {"from", "Ada"}, {"text", std::string(141, 'x')}}, 40));
+  CHECK(!events.push({{"type", "notice"}, {"kind", "message"}, {"id", "m3"}, {"from", "Ada"}, {"text", "a\nb"}}, 40));
+  CHECK(!events.push({{"type", "notice"}, {"kind", "message"}, {"id", "m4"}, {"text", "hi"}}, 40));
+  CHECK(events.push({{"type", "notice"}, {"kind", "message"}, {"id", "m5"}, {"from", "Bo"}, {"text", "hi"}, {"room", "ABCD"}}, 50));
+  CHECK(events.message(51) == "Bo: hi" && events.take_join(true).empty());
   CHECK(events.report_version());
   CHECK(!events.report_version());
   CHECK(events.take_version());

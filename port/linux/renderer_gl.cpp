@@ -29,7 +29,11 @@
 #define GL_SILENCE_DEPRECATION
 #include <OpenGL/gl3.h>
 #include <OpenGL/gl3ext.h>
+#include <OpenGL/OpenGL.h>
 #include "../mac/platform_paths.h"
+#include "../mac/embed_mac.h"
+#include "../mac/embed_mac_pixels.h"
+#include "../mac/embed_mac_screenshot.h"
 #else
 #include <GL/glew.h>
 #endif
@@ -255,6 +259,10 @@ class Renderer final : public gx::Backend {
       : window_(window), cache_(cache / ("gx-gl-v5-s" + std::to_string(std::clamp(scale, 1, 6)))), scale_(std::clamp(scale, 1, 6)),
 #endif
         width_(gx::EFB_WIDTH * scale_), height_(gx::EFB_HEIGHT * scale_) {
+#if defined(__APPLE__) && defined(GX_PC_SETTINGS)
+    int rw = 0, rh = 0;
+    embed_scale_.active = mac_embed::retina_size(window_, &rw, &rh);
+#endif
     std::filesystem::create_directories(cache_);
     context_ = SDL_GL_CreateContext(window_);
     if (!context_) throw std::runtime_error(std::string("SDL OpenGL context: ") + SDL_GetError());
@@ -310,9 +318,16 @@ void main() {
     binaries_ = formats > 0;
 #ifdef __APPLE__
     seed_cache();
+    start_compiler();
     boot_prewarm_ = true;
-#endif
+    try { prewarm(); }
+    catch (...) {
+      stop_compiler(); translations_.stop();
+      throw;
+    }
+#else
     prewarm();
+#endif
 #ifdef __APPLE__
     boot_prewarm_ = false;
     std::fprintf(stderr, "opengl: shader translation %s; frame compile budget %.1f ms\n",
@@ -324,6 +339,7 @@ void main() {
     yougame::agent_present::recorder().stop(); // Drain evidence before the host's exit path.
 #endif
 #ifdef __APPLE__
+    stop_compiler();
     translations_.stop(); // Finish the active helper before any captured renderer state is destroyed.
     report_skips(true);
     std::fprintf(stderr, "opengl: shader cache: %zu hits, %zu translation misses (%s)\n",
@@ -335,6 +351,11 @@ void main() {
     stop_translators();
 #endif
     if (!context_) return;
+#ifdef __APPLE__
+    if (shot_fence_) glDeleteSync(shot_fence_);
+    if (shot_pbo_) glDeleteBuffers(1, &shot_pbo_);
+    if (shot_id_) mac_embed::screenshot_failed(shot_id_);
+#endif
     save_recipes();
     for (auto& p : attribute_locations_) glDeleteVertexArrays(1, &p.second.vao);
     for (auto& p : programs_) glDeleteProgram(p.second);
@@ -345,7 +366,16 @@ void main() {
     glDeleteProgram(copy_program_); glDeleteTextures(1, &color_); glDeleteTextures(1, &depth_);
     glDeleteTextures(1, &last_color_); glDeleteFramebuffers(1, &last_frame_);
     glDeleteFramebuffers(1, &efb_); glDeleteBuffers(1, &vertices_); glDeleteBuffers(1, &indices_);
-    glDeleteBuffers(2, uniform_); glDeleteVertexArrays(1, &vao_); SDL_GL_DeleteContext(context_);
+    glDeleteBuffers(2, uniform_); glDeleteVertexArrays(1, &vao_);
+#ifdef __APPLE__
+    // No further GL calls by this renderer. A late reader retains CGL until it releases
+    // the mapped storage, then unmaps/deletes there; normal presents clean up above.
+    CGLSetCurrentContext(nullptr);
+#endif
+    SDL_GL_DeleteContext(context_);
+#ifdef __APPLE__
+    shot_mapping_.reset();
+#endif
   }
   void presentation_stats(uint32_t* frames, uint32_t* pipes, uint32_t* textures) const override {
     if (frames) *frames = presented_;
@@ -366,9 +396,13 @@ void main() {
     Clock::time_point probe_start;
     if (probe_.on) { probe_.reset(); probe_start = Clock::now(); }
     compile_spent_ms_ = 0;
+    upload_ms_ = 0; upload_count_ = 0; upload_bytes_ = 0;
     drain_programs();
 #endif
     if (hooks_.frame_begin) { hooks_.frame_begin(frame); invalidate_state(); }
+#if defined(__APPLE__) && defined(GX_PC_SETTINGS)
+    update_embed_scale();
+#endif
     widenable_scene_ = gx::frame_has_widenable_scene(frame);   // as the D3D backends: 16:9 reaches the screen
     const int lightweight = hooks_.options ? hooks_.options->lightweight : 0;
     gx::set_lightweight_level(lightweight);
@@ -458,6 +492,11 @@ void main() {
     }
     trim();
 #ifdef __APPLE__
+    if (upload_ms_ > 4 && texture_logs_ < 200) {
+      ++texture_logs_;
+      shader_log("textures: frame %u uploaded %u textures (%u KB) in %.1f ms",
+                 presented_, upload_count_, unsigned((upload_bytes_ + 1023) / 1024), upload_ms_);
+    }
     report_skips(false);
     if (probe_.on) {
       probe_.total = milliseconds(probe_start);
@@ -507,10 +546,18 @@ void main() {
   // The window as it is about to be shown (picture, border art, the settings and practice menus).
   void capture_window(const std::filesystem::path& path) {
     int w = 0, h = 0; SDL_GL_GetDrawableSize(window_, &w, &h);
+#if defined(__APPLE__) && defined(GX_PC_SETTINGS)
+    mac_embed::gl_retina_size(window_, &w, &h);
+#endif
     if (w <= 0 || h <= 0) return;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     std::vector<uint8_t> pixels(static_cast<size_t>(w) * h * 3);
     glPixelStorei(GL_PACK_ALIGNMENT, 1); glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, pixels.data());
+#if defined(__APPLE__) && defined(GX_PC_SETTINGS)
+    int rw = 0, rh = 0;
+    const auto output = mac_embed::limit_capture(pixels, w, h, mac_embed::retina_size(window_, &rw, &rh));
+    w = output.w; h = output.h;
+#endif
     std::ofstream f(path, std::ios::binary); f << "P6\n" << w << " " << h << "\n255\n";
     for (int y = h - 1; y >= 0; --y) f.write(reinterpret_cast<char*>(pixels.data()) + size_t(y) * w * 3, size_t(w) * 3);
     if (!f) throw std::runtime_error("Cannot write frame capture: " + path.string());
@@ -554,6 +601,198 @@ void main() {
     clockwise_front_ = saved; submit_frame(frame);
   }
  private:
+#ifdef __APPLE__
+  // A mapped buffer is ordinary read-only CPU memory after its fence signals. The
+  // conversion worker calls no GL API and the buffer is never mutated/reused. Shared
+  // ownership plus release/acquire keeps unmap after the last worker read. Retaining
+  // CGL also covers shutdown: after the renderer relinquishes its context, the last
+  // owner can clean up without accessing a destroyed renderer or SDL window.
+  struct ShotMapping {
+    CGLContextObj context;
+    GLuint pbo;
+    std::atomic<bool> done{false};
+    ShotMapping(GLuint buffer) : context(CGLGetCurrentContext()), pbo(buffer) { CGLRetainContext(context); }
+    void release() {
+      if (!pbo) return;
+      const auto previous = CGLGetCurrentContext();
+      CGLSetCurrentContext(context);
+      GLint old = 0; glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &old);
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
+      glUnmapBuffer(GL_PIXEL_PACK_BUFFER); glDeleteBuffers(1, &pbo);
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, old == GLint(pbo) ? 0 : old);
+      pbo = 0;
+      CGLSetCurrentContext(previous);
+    }
+    ~ShotMapping() { release(); CGLReleaseContext(context); }
+  };
+  void screenshot_poll() {
+    if (!shot_id_ && !shot_mapping_) return;
+    const GLenum prior = glGetError();
+    if (prior != GL_NO_ERROR) {
+      mac_embed::screenshot_failed(shot_id_); shot_id_ = 0;
+      throw std::runtime_error("OpenGL GX frame failed with error " + std::to_string(prior));
+    }
+    if (shot_mapping_) {
+      if (!shot_mapping_->done.load(std::memory_order_acquire)) return;
+      // Release explicitly BEFORE dropping our reference. The worker may still be
+      // returning from its done store; its last shared_ptr release must do no GL.
+      shot_mapping_->release();
+      shot_mapping_.reset(); // unmap/delete on the render thread on a later present
+      while (glGetError() != GL_NO_ERROR) { } // cleanup cannot fail game rendering
+    }
+    if (!shot_id_) return;
+    const auto ready = glClientWaitSync(shot_fence_, 0, 0); // poll only; never wait on the GPU
+    if (ready == GL_TIMEOUT_EXPIRED) return;
+    GLint old = 0; glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &old);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, shot_pbo_);
+    const auto* mapped = ready == GL_WAIT_FAILED ? nullptr : static_cast<const uint8_t*>(
+        glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, size_t(shot_w_) * shot_h_ * 4, GL_MAP_READ_BIT));
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, old);
+    glDeleteSync(shot_fence_); shot_fence_ = nullptr;
+    bool ok = mapped != nullptr;
+    while (glGetError() != GL_NO_ERROR) ok = false;
+    if (mapped) {
+      try {
+        shot_mapping_ = std::make_shared<ShotMapping>(shot_pbo_);
+        shot_pbo_ = 0; // now exclusively owned by the lease
+        auto lease = shot_mapping_;
+        std::shared_ptr<const void> owner(mapped, [lease](const void*) {
+          lease->done.store(true, std::memory_order_release);
+        });
+        if (ok) mac_embed::screenshot_submit(shot_id_, shot_w_, shot_h_, size_t(shot_w_) * 4,
+                                            false, true, std::move(owner), mapped);
+      } catch (...) { ok = false; }
+    }
+    if (!ok) mac_embed::screenshot_failed(shot_id_);
+    if (shot_pbo_) { // allocation failure before ownership transfer (possibly mapped)
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, shot_pbo_);
+      if (mapped) glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+      glDeleteBuffers(1, &shot_pbo_); shot_pbo_ = 0;
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, old);
+    }
+    while (glGetError() != GL_NO_ERROR) { }
+    shot_id_ = 0;
+  }
+  void screenshot_start(int w, int h) {
+    if (shot_id_ || shot_mapping_) return; // never replace storage still owned by the GPU/worker
+    if (!mac_embed::screenshot_take_requested()) return;
+    const auto id = mac_embed::screenshot_take();
+    if (!id) return;
+    const auto capped = mac_embed::shot::readback_size(w, h);
+    if (!capped.w) { mac_embed::screenshot_failed(id); return; }
+    const GLenum prior = glGetError();
+    if (prior != GL_NO_ERROR) {
+      mac_embed::screenshot_failed(id);
+      throw std::runtime_error("OpenGL GX frame failed with error " + std::to_string(prior));
+    }
+    // The finished back buffer includes bars/UI. Cap on the GPU BEFORE PBO allocation.
+    GLint fbo = 0, draw = 0, renderbuffer = 0, pack = 0, alignment = 0, row = 0, rows = 0, pixels = 0, swap = 0, lsb = 0;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &fbo); glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+    glGetIntegerv(GL_RENDERBUFFER_BINDING, &renderbuffer); glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack);
+    glGetIntegerv(GL_PACK_ALIGNMENT, &alignment); glGetIntegerv(GL_PACK_ROW_LENGTH, &row);
+    glGetIntegerv(GL_PACK_SKIP_ROWS, &rows); glGetIntegerv(GL_PACK_SKIP_PIXELS, &pixels);
+    glGetIntegerv(GL_PACK_SWAP_BYTES, &swap); glGetIntegerv(GL_PACK_LSB_FIRST, &lsb);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    GLint read = 0; glGetIntegerv(GL_READ_BUFFER, &read); glReadBuffer(GL_BACK);
+    GLuint target = 0, color = 0;
+    bool allocated = true;
+    if (capped.w != w || capped.h != h) {
+      glGenFramebuffers(1, &target); glGenRenderbuffers(1, &color);
+      glBindFramebuffer(GL_DRAW_FRAMEBUFFER, target); glBindRenderbuffer(GL_RENDERBUFFER, color);
+      glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, capped.w, capped.h);
+      glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, color);
+      allocated = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+      if (allocated) {
+        const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+        glDisable(GL_SCISSOR_TEST);
+        glBlitFramebuffer(0, 0, w, h, 0, 0, capped.w, capped.h, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        if (scissor) glEnable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, target); glReadBuffer(GL_COLOR_ATTACHMENT0);
+      }
+    }
+    glGenBuffers(1, &shot_pbo_); glBindBuffer(GL_PIXEL_PACK_BUFFER, shot_pbo_);
+    glBufferData(GL_PIXEL_PACK_BUFFER, size_t(capped.w) * capped.h * 4, nullptr, GL_STREAM_READ);
+    GLint64 capacity = 0; glGetBufferParameteri64v(GL_PIXEL_PACK_BUFFER, GL_BUFFER_SIZE, &capacity);
+    allocated = allocated && capacity == GLint64(capped.w) * capped.h * 4;
+    if (allocated) {
+      glPixelStorei(GL_PACK_ALIGNMENT, 1); glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+      glPixelStorei(GL_PACK_SKIP_ROWS, 0); glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+      glPixelStorei(GL_PACK_SWAP_BYTES, GL_FALSE); glPixelStorei(GL_PACK_LSB_FIRST, GL_FALSE);
+      glReadPixels(0, 0, capped.w, capped.h, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+      shot_fence_ = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0); glReadBuffer(read);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw);
+    glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer); glBindBuffer(GL_PIXEL_PACK_BUFFER, pack);
+    if (target) glDeleteFramebuffers(1, &target);
+    if (color) glDeleteRenderbuffers(1, &color);
+    glPixelStorei(GL_PACK_ALIGNMENT, alignment); glPixelStorei(GL_PACK_ROW_LENGTH, row);
+    glPixelStorei(GL_PACK_SKIP_ROWS, rows); glPixelStorei(GL_PACK_SKIP_PIXELS, pixels);
+    glPixelStorei(GL_PACK_SWAP_BYTES, swap); glPixelStorei(GL_PACK_LSB_FIRST, lsb);
+    bool failed = !allocated || !shot_fence_;
+    while (glGetError() != GL_NO_ERROR) failed = true;
+    if (failed) {
+      if (shot_fence_) { glDeleteSync(shot_fence_); shot_fence_ = nullptr; }
+      glDeleteBuffers(1, &shot_pbo_); shot_pbo_ = 0; mac_embed::screenshot_failed(id); return;
+    }
+    shot_id_ = id; shot_w_ = capped.w; shot_h_ = capped.h;
+  }
+#endif
+#if defined(__APPLE__) && defined(GX_PC_SETTINGS)
+  void update_embed_scale() {
+    int w = 0, h = 0;
+    if (!hooks_.options) return;
+    const bool retina = mac_embed::gl_retina_size(window_, &w, &h);
+    if (!embed_scale_.update(retina, w, h, [this](int& w, int& h) { SDL_GetWindowSize(window_, &w, &h); })) return;
+    const int next = mac_embed::efb_scale(hooks_.options->efb_scale, h, hooks_.options->ssaa);
+    if (next == scale_) return;
+    // Resolve before resizing the textures and retire the old-sized MSAA attachments.
+    const int samples = msaa_samples_;
+    resolve_msaa();
+    if (msaa_fbo_) apply_msaa(1);
+    // Preserve color/depth and the last displayed EFB across monitor/theater changes. Copy textures keep their
+    // contents and are recreated at the new scale on the next GX copy, as on an ordinary size change.
+    const int nw = gx::EFB_WIDTH * next, nh = gx::EFB_HEIGHT * next;
+    const auto replace = [&](GLuint& fbo, GLuint& color, GLuint* depth) {
+      GLuint nf = 0, nc = 0, nd = 0;
+      glGenFramebuffers(1, &nf); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, nf);
+      const auto attach = [&](GLuint& texture, GLint format, GLenum kind, GLenum attachment) {
+        glGenTextures(1, &texture); glBindTexture(GL_TEXTURE_2D, texture);
+        glTexImage2D(GL_TEXTURE_2D, 0, format, nw, nh, 0, kind, GL_FLOAT, nullptr);
+        const GLint filter = depth && attachment == GL_COLOR_ATTACHMENT0 ? GL_LINEAR : GL_NEAREST;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, attachment, GL_TEXTURE_2D, texture, 0);
+      };
+      attach(nc, GL_RGBA8, GL_RGBA, GL_COLOR_ATTACHMENT0);
+      if (depth) attach(nd, GL_DEPTH_COMPONENT32F, GL_DEPTH_COMPONENT, GL_DEPTH_ATTACHMENT);
+      if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        throw std::runtime_error("OpenGL Retina EFB resize incomplete");
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo); glDisable(GL_SCISSOR_TEST);
+      glBlitFramebuffer(0, 0, width_, height_, 0, 0, nw, nh,
+                        GL_COLOR_BUFFER_BIT | (depth ? GL_DEPTH_BUFFER_BIT : 0), GL_NEAREST);
+      glDeleteFramebuffers(1, &fbo); glDeleteTextures(1, &color);
+      if (depth) { glDeleteTextures(1, depth); *depth = nd; }
+      fbo = nf; color = nc;
+    };
+    replace(efb_, color_, &depth_); replace(last_frame_, last_color_, nullptr);
+    scale_ = next; width_ = nw; height_ = nh;
+    if (samples > 1) {
+      apply_msaa(samples);
+      if (msaa_fbo_) {
+        // Equal-sized single-to-multisample blit seeds every sample with the preserved EFB.
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, efb_);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, msaa_fbo_);
+        glDisable(GL_SCISSOR_TEST);
+        glBlitFramebuffer(0, 0, nw, nh, 0, 0, nw, nh,
+                          GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+      }
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, draw_fbo()); invalidate_state();
+    host::log("embed: OpenGL EFB x%d for %dx%d px", scale_, w, h);
+  }
+#endif
   // A linked program as the driver stores it; the next start loads it without compiling. A driver
   // update changes the format or rejects the data, and the program is then built from GLSL again.
   GLuint load_binary(const std::filesystem::path& path) {
@@ -608,6 +847,11 @@ void main() {
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0); glReadBuffer(GL_BACK); glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px.data());
     glBindFramebuffer(GL_READ_FRAMEBUFFER, efb_);
+#if defined(__APPLE__) && defined(GX_PC_SETTINGS)
+    int rw = 0, rh = 0;
+    const auto output = mac_embed::limit_capture(px, w, h, mac_embed::retina_size(window_, &rw, &rh));
+    w = output.w; h = output.h;
+#endif
     if (all) {
       // Flushed per line: an automated run can end without unwinding statics.
       hashes << presented_ << ' ' << std::hex << gx::hash_bytes(px.data(), px.size()) << std::dec << std::endl;
@@ -616,6 +860,21 @@ void main() {
     std::ofstream f(dir / ("present-" + std::to_string(presented_) + ".ppm"), std::ios::binary);
     f << "P6\n" << w << ' ' << h << "\n255\n";
     for (int y = h - 1; y >= 0; --y) f.write(reinterpret_cast<const char*>(px.data() + size_t(y) * w * 3), std::streamsize(w) * 3);
+#ifdef __APPLE__
+    // MELEE_TEST_SHOT_METADATA=1 opts into shots.txt and its extra RGB hash.
+    // Hash the PPM's top-to-bottom RGB payload. Keep the existing PPM bytes and
+    // :all bottom-to-top hash convention unchanged.
+    f.close();
+    const char* metadata = host::test_env::getenv("MELEE_TEST_SHOT_METADATA");
+    if (f && metadata && std::strcmp(metadata, "1") == 0) {
+      for (int y = 0; y < h / 2; ++y)
+        std::swap_ranges(px.begin() + size_t(y) * w * 3, px.begin() + size_t(y + 1) * w * 3,
+                         px.begin() + size_t(h - 1 - y) * w * 3);
+      std::ofstream shots(dir / "shots.txt", std::ios::app);
+      shots << presented_ << ' ' << capture_sequence_ << ' ' << w << 'x' << h << ' '
+            << std::hex << gx::hash_bytes(px.data(), px.size()) << std::endl;
+    }
+#endif
   }
 #ifdef __APPLE__
   static bool parse_recipes(const std::string& data, std::vector<ProgramRecipe>& out) {
@@ -664,10 +923,8 @@ void main() {
     }
     shader_log("opengl: shader seed added %zu shaders and %zu program recipes", copied, added);
   }
-  // Every recorded program is built again at start. macOS keeps no program binaries, so a big cache (or the shipped
-  // seed) would hold the first frame for seconds: there the start builds what fits in MELEE_PREWARM_BOOT_MS (500),
-  // the player's own programs first, and the rest are built between frames, MELEE_PREWARM_FRAME_MS (4) per frame.
-  // Missing translations are queued; ready GLSL shares the per-frame compile budget. Elsewhere all recipes are visited at start.
+  // With a shared context, all recorded recipes enter the worker queue at boot, with no time cap.
+  // If context creation fails, preserve the old boot/frame budgets and asynchronous translation path.
   void prewarm() {
     std::vector<ProgramRecipe> list;
     if (!parse_recipes(read_text(cache_ / "recipes.bin"), list)) return;
@@ -675,6 +932,21 @@ void main() {
       if (recipe_hashes_.insert(gx::hash_bytes(&r, sizeof r)).second) recipes_.push_back(r);
     saved_recipes_ = recipes_.size();
     pending_ = recipes_; pending_next_ = 0;
+    if (compiler_on_) {
+      // Queue the entire recorded set without waiting for any GL compile or link. Source generation and the cached
+      // GLSL reads still run here, before the first frame: the log says how long, so a pacing run can see it.
+      const auto start = Clock::now();
+      prewarming_ = true;
+      for (const auto& r : pending_) {
+        gx::DrawCall dc{}; dc.components = r.components; dc.bp = r.bp;
+        std::memcpy(dc.xf_regs, r.xf, sizeof r.xf);
+        program(dc);
+      }
+      prewarming_ = false;
+      shader_log("opengl: queued %zu recipes for the background compiler in %.1f ms", pending_.size(), milliseconds(start));
+      pending_next_ = pending_.size();
+      return;
+    }
     const double boot_ms = env_ms("MELEE_PREWARM_BOOT_MS", 500);
     const size_t count = pending_.size();
     const double ms = prewarm_some(boot_ms);
@@ -745,6 +1017,192 @@ void main() {
   }
   static void destroy(Texture& t) { if (t.id) glDeleteTextures(1, &t.id); if (t.fbo) glDeleteFramebuffers(1, &t.fbo); }
 #ifdef __APPLE__
+  struct CompilerJob {
+    ProgramKey key;
+    std::shared_ptr<shader_translation::Result> vertex, pixel;
+  };
+  struct CompilerResult {
+    ProgramKey key;
+    GLuint program = 0;
+    GLsync fence = nullptr;
+    std::array<GLint, 15> locations{};
+    double ms = 0;
+    std::string error;
+  };
+  std::shared_ptr<shader_translation::Result> request_source(GLenum stage, const std::string& hlsl, bool urgent) {
+    const uint64_t hash = gx::hash_bytes(hlsl.data(), hlsl.size());
+    std::ostringstream name; name << (stage == GL_VERTEX_SHADER ? "vs-" : "ps-") << std::hex << hash;
+    const auto tools = mac_host::resources() / "bin";
+    // Queued work owns every input: a Retina resize may change EFB dimensions before it runs.
+    return translations_.request(cache_ / (name.str() + ".glsl"), [cache = cache_, height = height_, stage, hlsl, name = name.str(), tools] {
+      return shader_translation::translate(cache, name, stage == GL_VERTEX_SHADER, height, hlsl, tools);
+    }, urgent);
+  }
+  void start_compiler() {
+    if (sync_shaders_) {
+      // MELEE_SYNC_SHADERS=1 is the diagnostic mode pixel checks rely on: every draw has its program, so keep it.
+      shader_log("opengl: background compiler off: synchronous shaders requested (diagnostic)");
+      return;
+    }
+    if (const char* v = std::getenv("MELEE_SHADER_WORKER"); v && std::strcmp(v, "0") == 0) {
+      // The A/B and kill switch: today's frame-budget path, in case Apple's GL serializes the share group.
+      shader_log("opengl: background compiler off: MELEE_SHADER_WORKER=0");
+      return;
+    }
+    const CGLContextObj render = CGLGetCurrentContext();
+    CGLError error = render ? CGLCreateContext(CGLGetPixelFormat(render), render, &compiler_context_) : kCGLBadContext;
+    if (error == kCGLNoError && !compiler_context_) error = kCGLBadContext;
+    if (error == kCGLNoError) {
+      try {
+        compiler_thread_ = std::thread([this] { compiler_work(); });
+        std::unique_lock<std::mutex> lock(compiler_mutex_);
+        compiler_wake_.wait(lock, [this] { return compiler_started_; });
+        error = compiler_error_;
+        compiler_on_ = error == kCGLNoError;
+      } catch (const std::exception& e) {
+        { std::lock_guard<std::mutex> lock(compiler_mutex_); compiler_stopping_ = true; }
+        compiler_wake_.notify_one();
+        if (compiler_thread_.joinable()) compiler_thread_.join();
+        shader_log("opengl: background compiler off: %s", e.what());
+        CGLDestroyContext(compiler_context_); compiler_context_ = nullptr;
+        return;
+      }
+    }
+    if (compiler_on_) {
+      shader_log("opengl: background compiler on (shared context)");
+    }
+    else {
+      if (compiler_thread_.joinable()) compiler_thread_.join();
+      if (compiler_context_) CGLDestroyContext(compiler_context_);
+      compiler_context_ = nullptr;
+      shader_log("opengl: background compiler off: %s", CGLErrorString(error));
+    }
+  }
+  void stop_compiler() {
+    { std::lock_guard<std::mutex> lock(compiler_mutex_); compiler_stopping_ = true; }
+    compiler_wake_.notify_one();
+    if (compiler_thread_.joinable()) compiler_thread_.join();
+    // The worker has released its context. Shared objects can now be reclaimed on this context.
+    for (const auto& result : compiler_results_) {
+      if (result.fence) glDeleteSync(result.fence);
+      if (result.program) glDeleteProgram(result.program);
+    }
+    compiler_results_.clear();
+    if (compiler_context_) CGLDestroyContext(compiler_context_);
+    compiler_context_ = nullptr;
+    shader_log("opengl: compiler: %llu programs on the worker in %.1f ms, %llu on the frame thread in %.1f ms",
+               (unsigned long long)worker_compiles_, worker_compile_ms_,
+               (unsigned long long)frame_compiles_, frame_compile_ms_);
+  }
+  static void setup_program(GLuint p) {
+    for (int i = 0; i < 2; ++i) {
+      const GLuint block = glGetUniformBlockIndex(p, i ? "PSBlock" : "VSBlock");
+      if (block != GL_INVALID_INDEX) glUniformBlockBinding(p, block, i);
+    }
+    glUseProgram(p);
+    GLint count = 0; glGetProgramiv(p, GL_ACTIVE_UNIFORMS, &count);
+    for (GLint i = 0; i < count; ++i) {
+      char name[512]; GLint size = 0; GLenum type = 0;
+      glGetActiveUniform(p, i, sizeof name, nullptr, &size, &type, name);
+      if (type == GL_SAMPLER_2D) {
+        if (size > 8) throw std::runtime_error("GX combined sampler array exceeded eight textures");
+        const char* texture_name = std::strstr(name, "Tex");
+        if (!texture_name || texture_name[3] < '0' || texture_name[3] > '7') throw std::runtime_error("Cannot identify translated GX sampler " + std::string(name));
+        glUniform1i(glGetUniformLocation(p, name), texture_name[3] - '0');
+      }
+    }
+  }
+  void compiler_work() {
+    const CGLError error = CGLSetCurrentContext(compiler_context_);
+    { std::lock_guard<std::mutex> lock(compiler_mutex_);
+      compiler_error_ = error; compiler_started_ = true; }
+    compiler_wake_.notify_one();
+    if (error != kCGLNoError) return;
+    // These shader objects belong exclusively to the compiler thread; render-thread maps are never touched.
+    std::unordered_map<uint64_t, GLuint> shaders;
+    auto stage = [&](GLenum kind, const std::string& source) {
+      const uint64_t key = gx::hash_bytes(source.data(), source.size()) ^ kind;
+      if (auto found = shaders.find(key); found != shaders.end()) return found->second;
+      std::string glsl = source;
+      replace_all(glsl, "#extension GL_ARB_shader_image_load_store : require\n", "");
+      replace_all(glsl, "layout(early_fragment_tests) in;\n", "");
+      GLuint shader = compile_gl(kind, glsl); shaders.emplace(key, shader); return shader;
+    };
+    for (;;) {
+      CompilerJob job;
+      {
+        std::unique_lock<std::mutex> lock(compiler_mutex_);
+        compiler_wake_.wait(lock, [this] { return compiler_stopping_ || !compiler_jobs_.empty(); });
+        if (compiler_stopping_) break;
+        // Rotate over pending translations so a cold recipe never blocks a warm one.
+        auto ready = std::find_if(compiler_jobs_.begin(), compiler_jobs_.end(), [](const CompilerJob& j) {
+          return j.vertex->state.load(std::memory_order_acquire) != shader_translation::Result::Pending &&
+                 j.pixel->state.load(std::memory_order_acquire) != shader_translation::Result::Pending;
+        });
+        if (ready == compiler_jobs_.end()) {
+          compiler_wake_.wait_for(lock, std::chrono::milliseconds(2));
+          continue;
+        }
+        job = std::move(*ready); compiler_jobs_.erase(ready);
+      }
+      CompilerResult result{}; result.key = job.key;
+      const auto start = Clock::now();
+      try {
+        if (job.vertex->state.load(std::memory_order_acquire) == shader_translation::Result::Failed ||
+            job.pixel->state.load(std::memory_order_acquire) == shader_translation::Result::Failed)
+          throw std::runtime_error("shader translation failed");
+        const GLuint vertex = stage(GL_VERTEX_SHADER, job.vertex->glsl);
+        const GLuint pixel = stage(GL_FRAGMENT_SHADER, job.pixel->glsl);
+        result.program = link_gl(vertex, pixel);
+        setup_program(result.program);
+        result.locations = query_attributes(result.program); // Reflection can force driver link completion.
+        glUseProgram(0);
+        glFlush();
+        result.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (!result.fence) throw std::runtime_error("compiler publication fence failed");
+        glFlush(); // Submit the fence as well as the program's initialization commands.
+        result.ms = milliseconds(start);
+        ++worker_compiles_; worker_compile_ms_ += result.ms;
+      } catch (const std::exception& e) {
+        if (result.program) glDeleteProgram(result.program);
+        result.program = 0; result.error = e.what();
+      }
+      { std::lock_guard<std::mutex> lock(compiler_mutex_); compiler_results_.push_back(std::move(result)); }
+    }
+    glUseProgram(0);
+    for (const auto& shader : shaders) glDeleteShader(shader.second);
+    CGLSetCurrentContext(nullptr);
+  }
+  void adopt_programs() {
+    std::deque<CompilerResult> completed;
+    { std::lock_guard<std::mutex> lock(compiler_mutex_); completed.swap(compiler_results_); }
+    for (auto& result : completed) {
+      if (result.program) {
+        const GLenum status = glClientWaitSync(result.fence, 0, 0); // Never wait on the frame thread.
+        if (status == GL_TIMEOUT_EXPIRED) {
+          std::lock_guard<std::mutex> lock(compiler_mutex_);
+          compiler_results_.push_back(std::move(result));
+          continue;
+        }
+        glDeleteSync(result.fence);
+        if (status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED) {
+          glDeleteProgram(result.program); result.program = 0;
+          result.error = "compiler publication fence wait failed";
+        }
+      }
+      if (!result.program) {
+        worker_failed_.insert(result.key); // A bad recipe must not be resubmitted on every draw.
+        shader_log("opengl: background program failed: %s", result.error.c_str());
+      }
+      else {
+        programs_.emplace(result.key, result.program);
+        // VAOs are context-local. Only construct the VAO here; reflection was completed on the worker.
+        install_attributes(result.program, result.locations);
+        if (!worker_requested_.at(result.key)) log_new_program(result.key, result.ms, true);
+      }
+      worker_requested_.erase(result.key);
+    }
+  }
   GLuint shader(GLenum stage, const std::string& hlsl) {
     const uint64_t hash = gx::hash_bytes(hlsl.data(), hlsl.size());
     const uint64_t key = hash ^ stage;
@@ -753,8 +1211,8 @@ void main() {
     const auto output = cache_ / (name.str() + ".glsl");
     const auto tools =
         mac_host::resources() / "bin";
-    auto translate = [this, stage, hlsl, name = name.str(), tools] {
-      return shader_translation::translate(cache_, name, stage == GL_VERTEX_SHADER, height_, hlsl, tools);
+    auto translate = [cache = cache_, height = height_, stage, hlsl, name = name.str(), tools] {
+      return shader_translation::translate(cache, name, stage == GL_VERTEX_SHADER, height, hlsl, tools);
     };
     std::string glsl;
     if (sync_shaders_) {
@@ -802,6 +1260,38 @@ void main() {
     const auto vs = gx::make_vs_uid(dc); const auto ps = gx::make_ps_uid(dc);
     ProgramKey key{vs.hash(), ps.hash()};
     if (auto i = programs_.find(key); i != programs_.end()) return i->second;
+    if (compiler_on_) {
+      if (worker_failed_.count(key)) return 0;
+      auto found = worker_requested_.find(key);
+      if (found == worker_requested_.end()) {
+        ProgramRecipe r{}; r.components = dc.components; r.bp = dc.bp;
+        std::memcpy(r.xf, dc.xf_regs, sizeof r.xf); remember_recipe(r);
+        auto vertex = request_source(GL_VERTEX_SHADER, gx::generate_vertex_shader(vs), !prewarming_);
+        auto pixel = request_source(GL_FRAGMENT_SHADER, gx::generate_pixel_shader(ps), !prewarming_);
+        worker_requested_.emplace(key, prewarming_);
+        { std::lock_guard<std::mutex> lock(compiler_mutex_);
+          CompilerJob job{key, std::move(vertex), std::move(pixel)};
+          if (prewarming_) compiler_jobs_.push_back(std::move(job));
+          else compiler_jobs_.push_front(std::move(job)); }
+        compiler_wake_.notify_one();
+      } else if (!prewarming_ && found->second) {
+        found->second = false;
+        // A currently visible effect takes priority over recipes for scenes the player has not visited: both its
+        // translations (still queued behind boot work on a cold cache) and its compile job move to the front.
+        request_source(GL_VERTEX_SHADER, gx::generate_vertex_shader(vs), true);
+        request_source(GL_FRAGMENT_SHADER, gx::generate_pixel_shader(ps), true);
+        std::lock_guard<std::mutex> lock(compiler_mutex_);
+        auto queued = std::find_if(compiler_jobs_.begin(), compiler_jobs_.end(),
+                                   [&](const CompilerJob& job) { return job.key == key; });
+        if (queued != compiler_jobs_.end()) {
+          CompilerJob job = std::move(*queued); compiler_jobs_.erase(queued);
+          compiler_jobs_.push_front(std::move(job));
+          compiler_wake_.notify_one();
+        }
+      }
+      // Players may see a missing effect for a frame or two instead of a compile stall.
+      return 0;
+    }
     auto found = builds_.find(key);
     if (found == builds_.end()) {
       ProgramBuild build{}; build.background_only = prewarming_;
@@ -861,10 +1351,12 @@ void main() {
     cache_attributes(p);   // inside the compile budget: it may wait for the driver to finish the link
     compile_spent_ms_ += milliseconds(binding_start);
     programs_.emplace(key, p);
+    ++frame_compiles_; frame_compile_ms_ += build.work_ms + milliseconds(work.start);
     if (!build.background_only) log_new_program(key, build.work_ms + milliseconds(work.start));
     return p;
   }
   void drain_programs() {
+    if (compiler_on_) { adopt_programs(); return; }
     // Rotate past shaders still translating; a slow/failing shader cannot starve ready programs.
     const size_t count = std::min<size_t>(compile_pending_.size(), 64);
     for (size_t i = 0; i < count && compile_allowed(); ++i) {
@@ -985,12 +1477,22 @@ void main() {
     return p;
   }
 #endif
-  void log_new_program(const ProgramKey& key, double ms) {
+  void log_new_program(const ProgramKey& key, double ms
+#ifdef __APPLE__
+                       , bool worker = false
+#endif
+                       ) {
     static unsigned logged = 0; // cap across renderer instances for this process
     if (logged < 400) {
       ++logged;
+#ifdef __APPLE__
+      shader_log("opengl: new program at frame %u (sim %u) in %.1f ms (vs %016llx ps %016llx) (%s)",
+                 presented_, source_retrace_, ms, (unsigned long long)key.vertex, (unsigned long long)key.pixel,
+                 worker ? "worker" : "frame thread");
+#else
       shader_log("opengl: new program at frame %u (sim %u) in %.1f ms (vs %016llx ps %016llx)",
                  presented_, source_retrace_, ms, (unsigned long long)key.vertex, (unsigned long long)key.pixel);
+#endif
     } else if (logged == 400) {
       ++logged;
       shader_log("further new programs not logged");
@@ -1004,7 +1506,29 @@ void main() {
   }
   // Querying a just-linked program makes Apple's GL finish the link on the spot. Built outside the compile budget it
   // stalled scene entries by 50-80 ms; built only at first draw it moved 5-8 ms hitches into matches (Mac A/B, 10-26).
-  // So the async path builds it as a program finishes, charged to the compile budget; the first draw is the fallback.
+  // The Mac worker reflects attributes before publication. The fallback path charges reflection to its compile budget.
+#ifdef __APPLE__
+  static std::array<GLint, 15> query_attributes(GLuint p) {
+    // Reflection is immutable for a linked (or binary-loaded) program.
+    static const char* names[] = {"rawpos", "rawnorm0", "color0", "color1",
+      "rawtex0", "rawtex1", "rawtex2", "rawtex3", "rawtex4", "rawtex5", "rawtex6", "rawtex7",
+      "blend_indices", "blend_indices2", "blend_index7"};
+    std::array<GLint, 15> locations;
+    for (size_t i = 0; i < locations.size(); ++i) locations[i] = glGetAttribLocation(p, names[i]);
+    return locations;
+  }
+  const ProgramAttributes& cache_attributes(GLuint p) {
+    return install_attributes(p, query_attributes(p));
+  }
+  const ProgramAttributes& install_attributes(GLuint p, const std::array<GLint, 15>& locations) {
+    auto& entry = attribute_locations_.emplace(p, ProgramAttributes{locations, 0}).first->second;
+    glGenVertexArrays(1, &entry.vao); glBindVertexArray(entry.vao);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indices_);
+    configure_attributes(p);
+    invalidate_state();
+    return entry;
+  }
+#else
   const ProgramAttributes& cache_attributes(GLuint p) {
     // Reflection is immutable for a linked (or binary-loaded) program.
     static const char* names[] = {"rawpos", "rawnorm0", "color0", "color1",
@@ -1019,6 +1543,7 @@ void main() {
     invalidate_state();
     return entry;
   }
+#endif
   void attributes(GLuint p) {
     GlProbeScope cost(probe_.slot(probe_.attrib));
     const auto found = attribute_locations_.find(p);
@@ -1057,6 +1582,10 @@ void main() {
     const uint64_t desc[] = {t.data->hash, t.width, t.height, t.format, t.tlut_format, t.mip_levels};
     const uint64_t key = gx::look_key(gx::hash_bytes(desc, sizeof desc), look_surface_);
     if (auto i = textures_.find(key); i != textures_.end()) { i->second.used = sequence_; return i->second.id; }
+#ifdef __APPLE__
+    GlProbeScope upload_cost(&upload_ms_);
+    ++upload_count_;
+#endif
     if (probe_.on) ++probe_.uploads;
     invalidate_state(); // Allocation binds on the currently active texture unit.
     if (auto small = gx::look_replacement(t, look_surface_)) {   // the look's treated copy, one level (gx_retro.h)
@@ -1109,6 +1638,9 @@ void main() {
       w = std::max(1u, w / 2); h = std::max(1u, h / 2);
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, entry.levels - 1);
+#ifdef __APPLE__
+    upload_bytes_ += entry.bytes;
+#endif
     const GLuint id = entry.id; textures_.emplace(key, entry); return id;
   }
   GLuint sampler(uint32_t mode0, uint32_t mode1) {
@@ -1316,6 +1848,9 @@ void main() {
   void present(const gx::EfbCopy& c, const gx::Frame& frame) {
     const int test_fill = frame.test_fill;
     resolve_msaa();
+#ifdef __APPLE__
+    screenshot_poll(); // map only a previously submitted, signalled PBO
+#endif
     invalidate_state();
     int w = 0, h = 0;
 #ifdef MELEE_LINUX_X11_EMBED
@@ -1324,13 +1859,18 @@ void main() {
     } else
 #endif
     SDL_GL_GetDrawableSize(window_, &w, &h);
+#if defined(__APPLE__) && defined(GX_PC_SETTINGS)
+    mac_embed::gl_retina_size(window_, &w, &h);
+#endif
+#ifdef __APPLE__
+    if (w <= 0 || h <= 0) mac_embed::screenshot_failed(mac_embed::screenshot_take());
+#endif
     if (w <= 0 || h <= 0) return;
 #ifdef __APPLE__
     // A new window size (full screen, a drag): update the GL surface to it (port/mac/mac_gl.mm).
     if (w != drawable_w_ || h != drawable_h_) {
       if (drawable_w_ && !host::test_env::getenv("MELEE_TEST_NO_GL_UPDATE")) mac_gl_update_context();
-      // The surface must be the window's size in pixels as SDL counts them; a bigger one (a Retina surface SDL does not
-      // know about) draws the picture small in its lower left (embed_mac.mm, 10-26).
+      // Embedded Retina uses the actual GL surface above; OFF/standalone retain SDL's dimensions.
       int sw = 0, sh = 0;
       if (mac_gl_surface_size(&sw, &sh) && (sw != w || sh != h))
         host::log("Mac video: window %dx%d, GL surface %dx%d DOES NOT MATCH", w, h, sw, sh);
@@ -1375,6 +1915,12 @@ void main() {
       const double aspect = hooks_.options ? gx::presented_aspect(*hooks_.options, w, h, widenable_scene_) : 73.0 / 60.0;
       int pw = w, ph = std::lround(w / aspect);
       if (ph > h) { ph = h; pw = std::lround(h * aspect); }
+#if defined(__APPLE__) && defined(GX_PC_SETTINGS)
+      int rw = 0, rh = 0;
+      if (mac_embed::retina_size(window_, &rw, &rh)) {
+        const auto box = mac_embed::letterbox(w, h, aspect); pw = box.w; ph = box.h;
+      }
+#endif
       picture(c, w, h, pw, ph);
     }
     if (hooks_.before_swap) {
@@ -1385,6 +1931,9 @@ void main() {
     }
     if (test_fill < 0) { ++presented_; captures(capture_sequence_); --presented_; }   // the finished window, menus included
     test_shot(w, h);
+#ifdef __APPLE__
+    screenshot_start(w, h);
+#endif
 #ifdef YOUGAME_AGENT_TEST_HOOK
     auto& evidence = yougame::agent_present::recorder();
     yougame::agent_present::Image strip;
@@ -1417,7 +1966,21 @@ void main() {
     };
 #endif
 #ifdef __APPLE__
+    const auto swap_start = Clock::now();
     { GlProbeScope cost(probe_.slot(probe_.swap)); SDL_GL_SwapWindow(window_); } ++presented_;
+    const double swap_ms = milliseconds(swap_start);
+    if (swap_ms > 100) {
+      const double elapsed_ms = milliseconds(swap_log_start_);
+      if (elapsed_ms - slow_swap_logged_ms_ >= 1000) {
+        if (slow_swap_suppressed_)
+          host::log("gl: slow swap %.3f ms at frame %u (t=%.3f) (suppressed %llu)",
+                    swap_ms, presented_, elapsed_ms, (unsigned long long)slow_swap_suppressed_);
+        else
+          host::log("gl: slow swap %.3f ms at frame %u (t=%.3f)", swap_ms, presented_, elapsed_ms);
+        slow_swap_logged_ms_ = elapsed_ms;
+        slow_swap_suppressed_ = 0;
+      } else ++slow_swap_suppressed_;
+    }
 #ifdef YOUGAME_AGENT_TEST_HOOK
     record_present();
 #endif
@@ -1426,7 +1989,13 @@ void main() {
     if (!pending_.empty()) {
       static const double frame_ms = env_ms("MELEE_PREWARM_FRAME_MS", 4);
       GlProbeScope cost(probe_.slot(probe_.prewarm));
-      prewarm_some(frame_ms);
+      if (compiler_on_) {
+        if (worker_requested_.empty()) {
+          shader_log("opengl: prewarm done at frame %u (sim %u): %zu programs ready, %zu queued",
+                     presented_, source_retrace_, programs_.size(), worker_requested_.size());
+          pending_.clear(); pending_next_ = 0;
+        }
+      } else prewarm_some(frame_ms);
     }
     glBindFramebuffer(GL_FRAMEBUFFER, draw_fbo());
 #else
@@ -1740,12 +2309,23 @@ void main() {
   std::unordered_map<GLuint, ProgramAttributes> attribute_locations_;
   GLint copy_source_ = -1, copy_kind_ = -1, copy_rect_ = -1;
   int scale_, width_, height_; bool skip_ = false; uint64_t sequence_ = 0; uint32_t presented_ = 0, source_retrace_ = 0;
+#if defined(__APPLE__) && defined(GX_PC_SETTINGS)
+  mac_embed::EmbedScaleState embed_scale_;
+#endif
   GLuint vao_ = 0, vertices_ = 0, indices_ = 0, uniform_[2]{}, efb_ = 0, color_ = 0, depth_ = 0, copy_program_ = 0;
   GLuint msaa_fbo_ = 0, msaa_rb_[2]{};
   int msaa_samples_ = 1;
   GLuint last_frame_ = 0, last_color_ = 0; bool have_last_ = false;
 #ifdef __APPLE__
+  std::shared_ptr<ShotMapping> shot_mapping_;
+  GLuint shot_pbo_ = 0;
+  GLsync shot_fence_ = nullptr;
+  uint64_t shot_id_ = 0;
+  int shot_w_ = 0, shot_h_ = 0;
   int drawable_w_ = 0, drawable_h_ = 0, surface_probe_ = 0;
+  Clock::time_point swap_log_start_ = Clock::now();
+  double slow_swap_logged_ms_ = -1000;
+  uint64_t slow_swap_suppressed_ = 0;
 #endif
   GLuint picture_program_ = 0;              // the present pass (picture())
   uint32_t capture_frame_ = 0;
@@ -1760,6 +2340,21 @@ void main() {
   bool clockwise_front_ = true;
 #ifdef __APPLE__
   shader_translation::Queue translations_;
+  CGLContextObj compiler_context_ = nullptr;
+  std::thread compiler_thread_;
+  std::mutex compiler_mutex_;
+  std::condition_variable compiler_wake_;
+  std::deque<CompilerJob> compiler_jobs_;
+  std::deque<CompilerResult> compiler_results_;
+  std::unordered_map<ProgramKey, bool, KeyHash> worker_requested_; // frame thread only: prewarm-only flag
+  std::unordered_set<ProgramKey, KeyHash> worker_failed_; // frame thread only
+  bool compiler_on_ = false, compiler_started_ = false, compiler_stopping_ = false;
+  CGLError compiler_error_ = kCGLNoError;
+  uint64_t worker_compiles_ = 0, frame_compiles_ = 0;
+  double worker_compile_ms_ = 0, frame_compile_ms_ = 0;
+  double upload_ms_ = 0;
+  unsigned upload_count_ = 0, texture_logs_ = 0;
+  uint64_t upload_bytes_ = 0;
   size_t sync_cache_hits_ = 0, sync_cache_misses_ = 0;
   bool sync_shaders_ = [] { const char* v = std::getenv("MELEE_SYNC_SHADERS"); return v && std::strcmp(v, "1") == 0; }();
   bool boot_prewarm_ = false;

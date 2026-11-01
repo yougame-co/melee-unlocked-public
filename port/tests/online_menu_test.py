@@ -48,7 +48,7 @@ static AnimLoopSettings mn_803EB57C[] = {{0},{1},{2}}, mn_803EB5A0[] = {{3},{4},
 struct { int selection_count; AnimLoopSettings* anim_loop; int start_frame; u16* description_indices; void(*think)(HSD_GObj*); } mn_803EB6B0[9];
 static u16 mn_803EB66C[3];
 void mu_slippi_online_menu_think(HSD_GObj*);
-static int ranked_supported, ranked_offered, friends_offered, slippi_submenu, boot_oneshot, p2p_auto_direct, friends_confirm_hold, slippi_link_notice;
+static int ranked_supported, ranked_offered, friends_offered, slippi_submenu, boot_oneshot, p2p_auto_direct, friends_confirm_hold, slippi_link_notice, friends_return;
 static int pending_buttons, entered, last_mode = -1, published, installs, switched_menu, switched_row;
 static int p2p, cpu, granted = 1, grant_queries, notices, grant_error, grant_short;
 static int link_requests, link_leaves;
@@ -211,6 +211,11 @@ int main() {
     // A new Online entry starts on Ranked, including boot.
     mu_slippi_switch_to_online_menu(); CHECK(switched_menu == 8 && switched_row == 0);
     boot_oneshot = 1; u8 menu, hovered; CHECK(mu_slippi_menu_enter(GM_BOOT, &menu, &hovered)); CHECK(hovered == 0);
+    // A failed Friends start returns through boot: entry opens Online on Friends, never from the menu's OnEnter.
+    friends_return = slippi_submenu = boot_oneshot = 1;
+    CHECK(mu_slippi_menu_enter(GM_BOOT, &menu, &hovered));
+    CHECK(menu == MENU_KIND_8 && hovered == mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_FRIENDS));
+    CHECK(!friends_return && !slippi_submenu && !boot_oneshot);
     // A listing without a ladder keeps Ranked greyed and starts on Unranked.
     ranked_offered = 0;
     CHECK(!mu_slippi_option_unlocked(0) && mu_slippi_first_unlocked() == 1);
@@ -308,8 +313,10 @@ ROUTE_STUBS = r'''#include <cstdio>
 #include "yougame_blend.h"
 #include "yougame_slippi_link.h"
 static unsigned long long time_ms() { return 123; }
-static bool active, granted, login, vanilla, compatible = true, cancelled;
+static bool active, granted, login, compatible = true, cancelled;
 static std::function<void()> on_account_read;
+// slippi_account.h reaches the real policy through test_env.h; drive its flag.
+static bool& vanilla = host::gameplay::vanilla_only_session;
 static yougame::search_policy::Generation generations;
 static bool ranked_room;
 static int reads, checks, compatibility, prepared, selected_slippi, yg_search, yg_calls, blend, tickets, local_tickets;
@@ -327,7 +334,7 @@ namespace account {
 int why_unusable_grant() { return 0; }
 const char* unusable_text(int) { return "synthetic"; }
 }
-namespace host { void log(const char*, ...) {} namespace gameplay { bool vanilla_only() { return vanilla; } } }
+namespace host { void log(const char*, ...) {} }
 namespace display { enum class Provider { Unknown, YouGame, Slippi }; }
 namespace yougame {
 bool active() { return ::active; }
@@ -835,7 +842,7 @@ Profile resolve(const fs::path& local) {
   ++discoveries; return slippi::account::resolve(local, {launcher});
 }
 }
-namespace host { void log(const char*, ...) {} namespace gameplay { bool vanilla_only() { return true; } } }
+namespace host { void log(const char*, ...) {} namespace gameplay { [[maybe_unused]] static const bool vanilla_forced = (vanilla_only_session = true); } }
 namespace yougame {
 bool active() { return app_active; }
 struct Identity { std::string player_id = "app-player", name = "App", code = "APP#2"; bool ok = true; };
@@ -1054,6 +1061,7 @@ void SetNextWindowPos(ImVec2, int, ImVec2) { ++positions; }
 void SetNextWindowBgAlpha(float) {}
 void Begin(const char* id, void*, int) { CHECK(std::string(id)=="##yougame_friend_waiting"); ++begins; }
 void PushTextWrapPos(float) {} void PopTextWrapPos() {} float GetCursorPosX() { return 0; }
+ImVec2 GetWindowPos() { return {0,0}; } ImVec2 GetWindowSize() { return {0,0}; }
 void TextUnformatted(const char* text) { lines.emplace_back(text); }
 void TextDisabled(const char* text, ...) { lines.emplace_back(text); }
 void End() { ++ends; }

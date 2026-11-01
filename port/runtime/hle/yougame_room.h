@@ -176,6 +176,25 @@ template<class Room> bool agent_drop_room_due(Room& r, const RoomIO& io, int sec
   io.log(("agent-test: dropped the room socket (dropRoomAfter " + std::to_string(seconds) + " s)").c_str());
   return true;
 }
+// dropRoomOnce (Friends console rooms): once per process, after 300 simulation frames on VS character
+// select, only when every seat in the server's roster is an agent. Claims the attempt, refusals included.
+inline std::atomic<bool> agent_drop_room_once_attempted{false};
+inline bool agent_drop_room_once_enabled(const char* value) { return value && value[0] == '1' && !value[1]; }
+template<class Json, class Log>
+bool agent_drop_room_once_due(bool enabled, uint32_t css_frames, const Json& roster, Log log) {
+  if (!enabled || css_frames < 300 || agent_drop_room_once_attempted) return false;
+  if (agent_drop_room_once_attempted.exchange(true)) return false;
+  const auto me = roster.is_object() && roster.count("me") && roster["me"].is_string() ?
+      roster["me"].template get<std::string>() : std::string();
+  const auto state = agent_test::room_input_state(0, 1, false,
+      roster.is_object() && roster.count("participants") ? roster["participants"] : Json(), me);
+  if (state.players < 2 || !state.all_agents) {
+    log("agent-test: dropRoomOnce refused: not an agent-only room");
+    return false;
+  }
+  log("agent-test: dropped the room socket (dropRoomOnce at character select)");
+  return true;
+}
 #endif
 
 // A link ending does not end the room: ranked still owes reports and must hear its result.

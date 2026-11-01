@@ -11,10 +11,13 @@ def source(path):
 class FriendsMenuWiringTest(unittest.TestCase):
     def test_game_poll_uses_unclaimed_buttons_and_honors_ui_capture(self):
         window = source("port/runtime/host/window.cpp")
-        poll = window.index("yougame::friends::events.poll_pad(i, pads[i].err == 0 && invite_focused, menu_buttons)")
+        poll = window.index("yougame::friends::events.poll_pad(i, pads[i].err == 0, menu_buttons);")
         overlay = window.index("g_overlay_pad.poll(yougame::stdio_bridge(), i,")
         strip = window.index("if (!(menu_buttons & 0x1000)) pads[i].button")
         self.assertLess(overlay, poll)
+        # Regression report, 11-01 ("I just pressed A on friends and nothing happened"): the Friends A press does not
+        # wait for window focus, since app-relayed pads move the game's menu while the page has focus.
+        self.assertNotIn("invite_focused, menu_buttons);", window)
         self.assertLess(poll, strip)
         self.assertIn("if (!console && yougame::active() && !opened_here && !g_ui_capture.load())", window[overlay:poll])
         self.assertIn("const uint16_t raw_buttons = pads[i].button;", window[:poll])

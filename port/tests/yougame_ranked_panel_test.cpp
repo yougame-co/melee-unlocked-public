@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <mu_ranked.h>
 #include <mu_rank_badge.h>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdarg>
@@ -195,7 +196,13 @@ static void layout_states() {
           const GXColor expected=label || i==SET_SCORE ? white : gray;
           CHECK(std::memcmp(&row.color,&expected,sizeof expected)==0);
         }
-        CHECK(std::fabs(panel.badges[0]->x-4.0f)<.001f);
+        // The art sits four units after the wider of title and label, never past x 40 / 230 (build 37).
+        auto badge_x=[&](unsigned title,unsigned label,float left,float cap) {
+          const float end=std::max(left+panel.text->rows[title].size()*20.5f*.4f,
+                                   left+panel.text->rows[label].size()*20.5f*panel.text->layout[label].sx)+4;
+          return std::min(end,cap)*.1f;
+        };
+        CHECK(std::fabs(panel.badges[0]->x-badge_x(LOCAL_TITLE,LOCAL_LABEL,-112,40))<.001f);
         CHECK(panel.badges[0]->scale==.105f);
         CHECK(std::fabs(panel.badges[0]->y+12*panel.badges[0]->scale-8.9f)<.001f);
         const bool matched=conn==MU_SLP_MM_OPPONENT_CONNECTING || conn==MU_SLP_MM_CONNECTION_SUCCESS;
@@ -203,7 +210,7 @@ static void layout_states() {
         CHECK(panel.text->rows[OPP_TITLE].empty()==!matched);
         CHECK(panel.text->rows[SET_SCORE].empty()==!(game>1 && (conn==MU_SLP_MM_IDLE || matched)));
         if (matched) {
-          CHECK(std::fabs(panel.badges[1]->x-23.0f)<.001f);
+          CHECK(std::fabs(panel.badges[1]->x-badge_x(OPP_TITLE,OPP_LABEL,70,230))<.001f);
           CHECK(std::fabs(panel.badges[1]->y+12*panel.badges[1]->scale-20.2f)<.001f);
         }
         std::vector<Box> css;
@@ -268,6 +275,13 @@ int main() {
   e3_status = 1; ranks.opponent = rank("Diamond I", 5, 1);
   match.connection_state = MU_SLP_MM_OPPONENT_CONNECTING; mu_ranked_rank_frame();
   CHECK(badge_count == 2 && std::string(panel.badges[1]->rank.label) == "Diamond I");
+  { // Build 37: a short label keeps the art beside its text, not floating at x 40.
+    const auto saved = ranks.self; ranks.self = rank("Gold IV", 3, 4); tick();
+    CHECK(panel.text->rows[LOCAL_LABEL] == "Gold IV" && panel.text->rows[LOCAL_TITLE] == "Your rank");
+    CHECK(std::fabs(panel.badges[0]->x - (-112 + 9*20.5f*.4f + 4)*.1f) < .001f); // after "Your rank"
+    CHECK(badge_count == 2);
+    ranks.self = saved; tick(); CHECK(badge_count == 2);
+  }
   match.connection_state = MU_SLP_MM_CONNECTION_SUCCESS;
   ranks.opponent = {}; tick();
   CHECK(!panel.badges[1]->rank.known && panel.text->rows[OPP_DETAIL] == "Unknown");

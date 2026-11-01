@@ -7,6 +7,7 @@
 #include <dolphin/os.h>
 
 #include "mu_shim.h"
+#include <mu_native.h>
 
 /* ---- interrupts ----
  * The game brackets its own data with these, and while they are off the host must not run any
@@ -42,6 +43,13 @@ BOOL OSEnableInterrupts(void) { return OSRestoreInterrupts(1); }
 static struct { MuEventFn fn; void* a; intptr_t b; } mu_events[MU_EVENT_MAX];
 static int mu_event_head, mu_event_count;
 static int mu_delivering;
+
+/* DVD, CARD and ARQ completions all use mu_post. Include the active dispatcher too: an empty
+ * queue inside a callback is not a load boundary. Called only on the game's main thread. */
+MU_EXPORT unsigned int mu_handoff_callbacks_pending_v1(void)
+{
+    return (unsigned int) mu_event_count + (mu_delivering != 0);
+}
 
 void mu_post(MuEventFn fn, void* a, intptr_t b)
 {

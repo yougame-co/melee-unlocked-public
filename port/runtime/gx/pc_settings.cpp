@@ -5,6 +5,8 @@
 #include "settings_page_navigation.h"
 #ifdef __APPLE__
 #include "../../mac/platform_paths.h"
+#include "../../mac/embed_mac.h"
+#include "../../mac/imgui_retina.h"
 #endif
 #include <mutex>
 #include <thread>
@@ -50,6 +52,8 @@
 #include "lcancel.h"
 #include "../abi/mu_lcancel_flash.h"
 #include "user_gecko.h"
+
+namespace gecko { int option_screen_shake_percent = 100; }
 #include "lag_test_codes.h"
 #include "gecko_data.h"
 #include "yougame_link.h"
@@ -418,15 +422,7 @@ static void draw_player_nicknames() {
 // Under the YouGame app, between matches: how to get back to YouGame. The game keeps running after an
 // online result (Melee Unlocked's own rematch menu), and the app's page is right behind it.
 static void draw_back_to_yougame_hint() {
-  const OverlayBounds bounds = overlay_bounds();
-  const float font_size = std::clamp((bounds.bottom - bounds.top) / 38.0f, 12.0f, 18.0f);
-  const char* label = yougame::parity::kMenuHint;
-  const ImVec2 size = ImGui::GetFont()->CalcTextSizeA(font_size, FLT_MAX, 0.0f, label);
-  const ImVec2 at(bounds.right - size.x - 14.0f, bounds.top + 10.0f);
-  ImDrawList* draw = ImGui::GetForegroundDrawList();
-  draw->AddRectFilled(ImVec2(at.x - 7, at.y - 3), ImVec2(at.x + size.x + 7, at.y + font_size + 4),
-                      IM_COL32(9, 11, 22, 190), 5.0f);
-  draw->AddText(ImGui::GetFont(), font_size, at, IM_COL32(236, 238, 246, 235), label);
+  screen_label::draw_corner_hint(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y, g_overlay_game_aspect);
 }
 
 // Names used both when drawing the Controls list and when saving/loading bindings
@@ -2072,6 +2068,9 @@ static struct {
 
 static void apply_practice_tools(RenderOptions& options);   // below, with the Practice page
 void load_pc_settings(RenderOptions& options, int& volume) {
+#ifdef __APPLE__
+  mac_embed::set_retina(false); // missing key defaults OFF on every load; standalone ignores it
+#endif
   host::ds4_bindings_defaults();    // before the defaults are captured and the saved buttons read
   capture_default_bindings();   // the built-in buttons, before the saved ones replace them
   g_edit_follow_active = true;
@@ -2083,6 +2082,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   options.settings_open = false;
   options.cpu_20xx = false;   // a file without the key: off
   options.freeze_fd = false;
+  options.hide_ko_explosions = false;
   options.unlock_all = true;   // a file without the key: on
   options.results_screen = true;
   options.offline_delay = false;
@@ -2127,6 +2127,9 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       bool matched = true;
       if (key == "fps") { double rate = std::stod(value); if (rate == -1 || rate == 0 || rate >= 30) options.fps_cap = std::min(rate, 2000.0); }
       else if (key == "scale") { int scale = std::stoi(value); if (scale >= 0 && scale <= 8) options.efb_scale = scale; }
+#ifdef __APPLE__
+      else if (key == "retina") mac_embed::set_retina(value == "1");
+#endif
       else if (key == "fullscreen") options.fullscreen = value == "1";
       else if (key == "exclusivefullscreen") options.exclusive_fullscreen = value == "1";
       else if (key == "vsync") { options.vsync = value == "1"; vsync_seen = true; }
@@ -2213,6 +2216,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       // presented frame and nobody should switch it on by browsing.
       else if (key == "flickerscan") options.flicker_scan = value == "1";
       else if (key == "settingsreminder") options.settings_hint = value != "0";
+      else if (key == "skin_online_notice") options.skin_online_notice = value != "0";
       else if (key == "advancedvideo") g_advanced_open[0] = value == "1";
       else if (key == "advancedoverlays") g_advanced_open[1] = value == "1";
       else if (key == "legacymenu") options.legacy_menu_enabled = value == "1";
@@ -2275,6 +2279,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "lowspec_look") lowspec_look = value == "1";
       else if (key == "lightweight") { int n = std::atoi(value.c_str()); if (n >= 0 && n < kLightweightLevels) options.lightweight = n; }
       else if (key == "inputoverlay") options.input_overlay = value == "1";
+      else if (key == "clean_replays") options.clean_replays = value == "1";
       else if (key == "labview") options.lab_view = value == "1";
       else if (key == "labskipscene") options.lab_skip_scene = value != "0";
       // Settings saved before the overlay could show several ports name a single port number.
@@ -2292,6 +2297,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "autolcancel") lcancel::set_automatic(value == "1");
       else if (key == "palstockicons") gecko::option_pal_stock_icons = value == "1";
       else if (key == "noscreenshake") gecko::option_no_screen_shake = value == "1";
+      else if (key == "screenshake") gecko::option_screen_shake_percent = std::clamp(std::stoi(value), 0, 200);
       else if (key == "geckocode") gecko_on.push_back(value);
       else if (key == "geckochosen") gecko_chosen = value == "1";
       else if (key == "swpro_gc_picture") g_swpro_gc_picture = value == "1";
@@ -2300,6 +2306,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "gamelanguage") host::g_game_language.store(value == "1" ? 1 : value == "2" ? 2 : 0);
       else if (key == "cpu_20xx") options.cpu_20xx = value == "1";
       else if (key == "freeze_fd") options.freeze_fd = value == "1";
+      else if (key == "hide_ko_explosions") options.hide_ko_explosions = value == "1";
       else if (key == "unlock_all") options.unlock_all = value != "0";
       else if (key == "results_screen") options.results_screen = value != "0";
 #ifndef MELEE_NO_SLIPPI
@@ -2543,9 +2550,11 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   }
   RenderOptions::live_cpu_20xx() = options.cpu_20xx;
   RenderOptions::live_online_frame_protection().store(options.online_frame_protection, std::memory_order_relaxed);
+  RenderOptions::live_clean_replays().store(options.clean_replays, std::memory_order_relaxed);
   RenderOptions::live_stadium_frozen() = options.stadium_frozen;
   RenderOptions::live_freeze_fd() = options.freeze_fd;
   host::g_freeze_fd.store(options.freeze_fd, std::memory_order_relaxed);
+  host::g_hide_ko_explosions.store(options.hide_ko_explosions, std::memory_order_relaxed);
   RenderOptions::live_unlock_all() = options.unlock_all;
   RenderOptions::live_results_screen() = options.results_screen;
   RenderOptions::live_offline_delay() = options.offline_delay;
@@ -2637,6 +2646,15 @@ static float game_ui_scale(float client_height) {
   if (forced > 0.0f) return forced;
   return client_height > 1080.0f ? std::min(client_height / 1080.0f, 3.0f) : 1.0f;
 }
+#ifdef __APPLE__
+static SDL_Window* g_settings_sdl_window = nullptr;
+static float retina_ui_scale() {
+  int w = 0, h = 0;
+  mac_embed::drawable_size(g_settings_sdl_window, &w, &h);
+  return g_fill_window.load(std::memory_order_relaxed) ?
+      g_window_scale.load(std::memory_order_relaxed) : game_ui_scale(float(h));
+}
+#endif
 // MELEE_TEST_MENU_STYLE=<0..5> (tests): the panel uses that menu style, and the standalone settings
 // window draws it the way the game does instead of its own old screen, so a hidden
 // MELEE_TEST_SETTINGS_SHOT run can capture any style. -1 when the variable is not set.
@@ -2808,9 +2826,9 @@ static void settings_gd_home(SettingsState& state) {
     const float dx = selected ? -5.0f : 0.0f, dy = selected ? -5.0f : 0.0f;
     quad(x+dx, y+dy, 444, 30, selected ? settings_accent(2) : IM_COL32(46, 54, 64, 255));
     if (nav_frame) {
-      // Lifted face and its shadow together, in the rows' own slant.
-      const ImVec2 frame[] = {point(x+dx, y+dy), point(x+444, y+dy),
-                              point(x+444, y+30), point(x+dx, y+30)};
+      // Follow all four corners of the lifted face.
+      const ImVec2 frame[] = {point(x+dx, y+dy), point(x+444+dx, y+dy),
+                              point(x+444+dx, y+30+dy), point(x+dx, y+30+dy)};
       settings_nav_frame(draw, frame);
     }
     gd_kit_text(draw, "row", origin, scale, x+16+dx, y+20.28f+dy,
@@ -3252,7 +3270,9 @@ static bool settings_nav_tile(int index, bool selected, int overlay_style, ImVec
                                     ImVec4(0.40f, 0.27f, 0.62f, 1));
   ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.68f, 0.47f, 0.90f, 1));
   ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, dashboard ? 14.0f : 3.0f);
+  if (gd_kit) ImGui::PushStyleColor(ImGuiCol_NavCursor, IM_COL32(0, 0, 0, 0));
   bool clicked = settings_widgets::Button("##category", size);
+  if (gd_kit) ImGui::PopStyleColor();
   if (selected) ImGui::SetItemDefaultFocus();
   const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
   ImDrawList* draw = ImGui::GetWindowDrawList();
@@ -3271,6 +3291,7 @@ static bool settings_nav_tile(int index, bool selected, int overlay_style, ImVec
     draw->AddConvexPolyFilled(face, 4,
         selected ? settings_accent(2) :
         (hovered ? IM_COL32(47, 85, 184, 255) : IM_COL32(30, 58, 140, 255)));
+    if (settings_nav_frame_on_item()) settings_nav_frame(draw, face);
   } else if (selected) {
     draw->AddRect(a, b, IM_COL32(244, 223, 255, 255), dashboard ? 14.0f : 5.0f, 0, 2.0f);
   }
@@ -3357,6 +3378,9 @@ void settings_context_create(void* window, bool open_at_startup) {
 #ifndef _WIN32
   if (SDL_GetWindowFlags(static_cast<SDL_Window*>(window)) & SDL_WINDOW_VULKAN) ImGui_ImplSDL2_InitForVulkan(static_cast<SDL_Window*>(window));
   else ImGui_ImplSDL2_InitForOpenGL(static_cast<SDL_Window*>(window), SDL_GL_GetCurrentContext());
+#ifdef __APPLE__
+  g_settings_sdl_window = static_cast<SDL_Window*>(window);
+#endif
   ImGui_ImplSDL2_SetGamepadMode(ImGui_ImplSDL2_GamepadMode_Manual, nullptr, 0);
   // The window code decides when the pointer shows (window_sdl.inl show_cursor). Without this the
   // SDL backend turned it back on every frame, so it never hid on Linux.
@@ -3364,7 +3388,9 @@ void settings_context_create(void* window, bool open_at_startup) {
   host::window_set_message_callback([](void* w, uint32_t m, uintptr_t, intptr_t) {
     if (m != host::kSdlEventMessage) return false;
     SDL_Event e = *static_cast<SDL_Event*>(w);
-    // The pointer arrives in pixels and a scaled frame is laid out in smaller units.
+#ifdef __APPLE__
+    if (mac_embed::imgui_retina_process_event(g_settings_sdl_window, e, retina_ui_scale())) return false;
+#endif
     if (const float scale = g_frame_ui_scale.load(std::memory_order_relaxed); scale != 1.0f) {
       if (e.type == SDL_MOUSEMOTION) { e.motion.x = (int)std::lround(e.motion.x / scale); e.motion.y = (int)std::lround(e.motion.y / scale); }
       if (e.type == SDL_MOUSEBUTTONDOWN || e.type == SDL_MOUSEBUTTONUP) { e.button.x = (int)std::lround(e.button.x / scale); e.button.y = (int)std::lround(e.button.y / scale); }
@@ -4189,9 +4215,30 @@ static std::string lab_colour_text(uint32_t c) {
   return buf;
 }
 
+// Why the last settings write failed, shown in the panel: a folder Windows will not let the game write
+// to (Program Files, Controlled folder access, a read-only or synced folder) used to lose every change
+// silently, and the player only saw the old values come back at the next start.
+std::string g_settings_save_error;
+
+static bool write_settings_file_impl(const SettingsState& state, const RenderOptions& options);
 static bool write_settings_file(const SettingsState& state, const RenderOptions& options) {
+  if (write_settings_file_impl(state, options)) { g_settings_save_error.clear(); return true; }
+  const unsigned long code = GetLastError();
+  const std::string reason = code == ERROR_ACCESS_DENIED ? "Windows denied access" : "error " + std::to_string(code);
+  if (g_settings_save_error.empty())
+    host::log("settings: could not save %s (%s)", options.settings_path.c_str(), reason.c_str());
+  g_settings_save_error = "Settings could not be saved to " + options.settings_path + " (" + reason +
+                          "). Move the game folder somewhere you can write to (not Program Files), or allow "
+                          "the game in Windows Security > Controlled folder access.";
+  return false;
+}
+static bool write_settings_file_impl(const SettingsState& state, const RenderOptions& options) {
   std::filesystem::path path(options.settings_path), temporary = path; temporary += ".tmp";
   std::ofstream file(temporary);
+#ifdef __APPLE__
+  // Preserve the opt-in across ordinary settings saves without changing OFF files.
+  if (mac_embed::retina_setting()) file << "retina 1\n";
+#endif
   file << "fps " << options.fps_cap << "\nscale " << options.efb_scale << "\nfullscreen " << options.fullscreen
        << "\nexclusivefullscreen " << options.exclusive_fullscreen
        << "\nvsync " << (g_display_keys.own_vsync ? g_display_keys.vsync : options.vsync)
@@ -4255,6 +4302,7 @@ static bool write_settings_file(const SettingsState& state, const RenderOptions&
        << "\nautoopenoverlay " << (options.settings_open ? 1 : 0)
        // Read since it was added and never written, so hiding the reminder lasted one session.
        << "\nsettingsreminder " << (options.settings_hint ? 1 : 0)
+       << "\nskin_online_notice " << (options.skin_online_notice ? 1 : 0)
        << "\nadvancedvideo " << (g_advanced_open[0] ? 1 : 0)
        << "\nadvancedoverlays " << (g_advanced_open[1] ? 1 : 0)
        << "\nlegacymenu " << (options.legacy_menu_enabled ? 1 : 0)
@@ -4277,6 +4325,7 @@ static bool write_settings_file(const SettingsState& state, const RenderOptions&
        << "\nplayernicknames " << (options.show_player_nicknames ? 1 : 0)
        << "\nmatchmakinghint " << (options.matchmaking_hint ? 1 : 0) << "\npracticestyle " << options.practice_style << "\npracticeopens " << options.practice_opens
        << "\ninputoverlay " << options.input_overlay << "\ninputoverlayports " << options.input_overlay_ports
+       << "\nclean_replays " << (options.clean_replays ? 1 : 0)
        << "\nlabview " << options.lab_view << "\nlabskipscene " << options.lab_skip_scene
        << "\ninputoverlayhideborder " << options.input_overlay_hide_border
        << "\ninputoverlayvalues " << options.input_overlay_values
@@ -4322,6 +4371,7 @@ static bool write_settings_file(const SettingsState& state, const RenderOptions&
        << "\nautolcancel " << (lcancel::automatic_enabled() ? 1 : 0)
        << "\npalstockicons " << (gecko::option_pal_stock_icons ? 1 : 0)
        << "\nnoscreenshake " << (gecko::option_no_screen_shake ? 1 : 0)
+       << "\nscreenshake " << gecko::option_screen_shake_percent
        << "\nswpro_gc_picture " << (g_swpro_gc_picture ? 1 : 0)
        << family_options_text()
        << "\nrumble " << (host::g_rumble_enabled.load(std::memory_order_relaxed) ? 1 : 0)
@@ -4329,6 +4379,7 @@ static bool write_settings_file(const SettingsState& state, const RenderOptions&
        << "\ngamelanguage " << host::g_game_language.load()
        << "\ncpu_20xx " << (options.cpu_20xx ? 1 : 0)
        << "\nfreeze_fd " << (options.freeze_fd ? 1 : 0)
+       << "\nhide_ko_explosions " << (options.hide_ko_explosions ? 1 : 0)
        << "\nunlock_all " << (options.unlock_all ? 1 : 0)
        << "\nresults_screen " << (options.results_screen ? 1 : 0)
 #ifndef MELEE_NO_SLIPPI
@@ -4769,7 +4820,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
 #ifdef _WIN32
   ImGui_ImplWin32_NewFrame();
 #else
+#ifdef __APPLE__
+  mac_embed::imgui_retina_new_frame(g_settings_sdl_window, retina_ui_scale());
+#else
   ImGui_ImplSDL2_NewFrame();
+#endif
 #endif
   // The backend has just set the display size in pixels. On a scaled frame (the standalone settings
   // window on a scaled display, the game window above 1080 pixels high) lay it out in smaller units
@@ -4781,11 +4836,15 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     g_frame_pixel_size = io.DisplaySize;
     const float ui_scale = g_fill_window.load(std::memory_order_relaxed) ?
         g_window_scale.load(std::memory_order_relaxed) : game_ui_scale(io.DisplaySize.y);
+#ifdef __APPLE__
+    mac_embed::imgui_retina_display_size(g_settings_sdl_window, ui_scale);
+#else
     // The small allowance keeps float rounding from turning an exact 1080 into 1081.
     if (ui_scale != 1.0f)
       io.DisplaySize = ImVec2(std::ceil(io.DisplaySize.x / ui_scale - 0.001f),
                               std::ceil(io.DisplaySize.y / ui_scale - 0.001f));
     io.DisplayFramebufferScale = ImVec2(ui_scale, ui_scale);
+#endif
     g_frame_ui_scale.store(ui_scale, std::memory_order_relaxed);
   }
   // UI navigation is armed only after the selected pad has returned to neutral. A held A that
@@ -4856,10 +4915,12 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     phob_native_request(socket - 1);
   }
 #endif
-  // Test runs (MELEE_TEST_PHOB): the PhobGCC menu opens on adapter socket 1 with the panel.
+  // Test runs (MELEE_TEST_PHOB): the PhobGCC menu opens on adapter socket 1 with the panel
+  // ("panel": only the Controls tab on that socket, with its Controller test and PhobGCC entries).
   {
     static bool phob_test_opened = false;
-    if (!phob_test_opened && state.open && host::test_env::getenv("MELEE_TEST_PHOB")) { phob_test_opened = true; phob_native_request(0); }  }
+    const char* phob_test = host::test_env::getenv("MELEE_TEST_PHOB");
+    if (!phob_test_opened && state.open && phob_test && std::strcmp(phob_test, "panel") != 0) { phob_test_opened = true; phob_native_request(0); }  }
   if (!state.open && phob_native_open()) phob_native_close();
   // The PhobGCC menu reads the controller itself: the panel gets none of it.
   if (have_pad && nav_active && state.practice_pad_armed && phob_native_open()) {
@@ -4883,12 +4944,24 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     const auto screen = ImGui::GetIO().DisplaySize;
     const auto passive_flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing;
+    float notice_bottom = 16.0f;
     if (!toast.empty()) {
       ImGui::SetNextWindowPos(ImVec2(screen.x - 16, 16), ImGuiCond_Always, ImVec2(1, 0));
       ImGui::SetNextWindowBgAlpha(0.85f);
       ImGui::Begin("##yougame_invite_notice", nullptr, passive_flags);
       ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + std::min(380.0f, screen.x - 64));
       ImGui::TextUnformatted(toast.c_str());
+      ImGui::PopTextWrapPos();
+      notice_bottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y + 8.0f;
+      ImGui::End();
+    }
+    if (const auto message = yougame::friends::events.message(now); !message.empty()) {
+      // Under the invite toast when both show, so a chat line never hides an invite.
+      ImGui::SetNextWindowPos(ImVec2(screen.x - 16, notice_bottom), ImGuiCond_Always, ImVec2(1, 0));
+      ImGui::SetNextWindowBgAlpha(0.85f);
+      ImGui::Begin("##yougame_message_notice", nullptr, passive_flags);
+      ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + std::min(380.0f, screen.x - 64));
+      ImGui::TextUnformatted(message.c_str());
       ImGui::PopTextWrapPos();
       ImGui::End();
     }
@@ -5078,7 +5151,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       options.cpu_tech = field(0, 7, 5);
       options.cpu_getup = field(3, 7, 5);
       options.cpu_di = field(6, 3, 3);
-      options.cpu_sdi = field(8, 7, 6);
+      options.cpu_sdi = RenderOptions::cpu_sdi_game_mode(field(8, 7, 6));   // the game's mode back to the row
       options.cpu_no_taunt = (word & 0x800u) != 0;
       options.cpu_lcancel = (word & 0x1000u) != 0;
       options.cpu_no_rapid_jab = (word & 0x2000u) != 0;
@@ -5149,13 +5222,14 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   // 20XX TE's Input display is the same switch as the Controller overlay (te_pairs_linked), and the
   // overlay already shows the controllers: with it on, TE's own display is not drawn as well.
   const bool te_input_row = training_overlay::input_display() && !options.input_overlay;
-  training_overlay::draw(options.native_source &&
+  const bool clean_replay = gx::clean_replay_active();   // "Clean replays": nothing of ours over a replay
+  training_overlay::draw(!clean_replay && options.native_source &&
                              ((RenderOptions::live_te_options() & 0x48000u) == 0x48000u || te_input_row) &&
                              !state.fill_window,
                          ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y);
-  net_overlay::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y);
+  if (!clean_replay) net_overlay::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y);
   replay_bar::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y, state.open || state.menu_open || state.practice_open || state.fill_window);
-  screen_label::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y, g_overlay_game_aspect);
+  if (!clean_replay) screen_label::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y, g_overlay_game_aspect);
   // Start on the controller closes the panel from any page (the open chord is Start + Down + Z,
   // which the input layer swallows whole, so this never fires on the press that opened it).
   if (state.open && !phob_native_open() && ImGui::IsKeyPressed(ImGuiKey_GamepadStart, false) &&
@@ -6073,34 +6147,52 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     }
     // ---- Get mod looks ----
     // One click each: the authors' own download, checked against its published file and built from the
-    // player's own disc (host::cosmetics::install_official_look). Open until both are installed; once
-    // Animelee is built the Mods folder is scanned again and it is switched on.
+    // player's own disc (host::cosmetics::install_official_look). Open until all three are installed; once
+    // an Animelee is built the Mods folder is scanned again and it is switched on.
     {
       namespace mods = source_port::mods;
       const std::string mods_dir = mods::mods_folder().u8string();
-      const auto diet = host::cosmetics::official_look_state(0, mods_dir);
-      const auto anim = host::cosmetics::official_look_state(1, mods_dir);
-      static bool was_busy[2] = {false, false};
-      static bool enable_animelee = false, animelee_new = false;   // installed in this session: not running yet
-      if (was_busy[1] && !anim.busy && anim.installed) { mods::rescan_async(); enable_animelee = animelee_new = true; }
-      was_busy[0] = diet.busy; was_busy[1] = anim.busy;
+      {
+        // Screenshot tooling (MELEE_SETTINGS_SCROLL_TO=modlooks): bring the cards into view once.
+        static int scroll_frames = 0;
+        if (scroll_frames < 30) {
+          const char* target = std::getenv("MELEE_SETTINGS_SCROLL_TO");
+          if (target && std::strcmp(target, "modlooks") == 0) ImGui::SetScrollHereY(0.1f);
+          ++scroll_frames;
+        }
+      }
+      const host::cosmetics::OfficialLookState looks[3] = {host::cosmetics::official_look_state(0, mods_dir),
+                                                           host::cosmetics::official_look_state(1, mods_dir),
+                                                           host::cosmetics::official_look_state(2, mods_dir)};
+      static bool was_busy[3] = {false, false, false};
+      static int enable_animelee = 0;                             // 1 or 2: just built, switched on after the rescan
+      static bool animelee_new[3] = {false, false, false};       // installed in this session: not running yet
+      for (int which = 1; which < 3; ++which)
+        if (was_busy[which] && !looks[which].busy && looks[which].installed) { mods::rescan_async(); enable_animelee = which; animelee_new[which] = true; }
+      for (int which = 0; which < 3; ++which) was_busy[which] = looks[which].busy;
       if (enable_animelee) {
         const auto view = mods::panel_view();
         if (!view.scanning) {
-          for (const auto& d : view.result.items)
-            if (d.can_enable && !d.enabled && d.path.filename() == std::filesystem::u8path(anim.disc).filename()) mods::choose(d.key, true);
-          enable_animelee = false;
+          // The two Animelees replace the same files: the one just installed goes on, the other off.
+          const auto on = std::filesystem::u8path(looks[enable_animelee].disc).filename();
+          const auto off = std::filesystem::u8path(looks[3 - enable_animelee].disc).filename();
+          for (const auto& d : view.result.items) {
+            if (d.can_enable && !d.enabled && d.path.filename() == on) mods::choose(d.key, true);
+            if (d.enabled && d.path.filename() == off) mods::choose(d.key, false);
+          }
+          enable_animelee = 0;
         }
       }
-      if (settings_widgets::CollapsingHeader("Get mod looks##official", diet.installed && anim.installed ? 0 : ImGuiTreeNodeFlags_DefaultOpen)) {
+      if (settings_widgets::CollapsingHeader("Get mod looks##official", looks[0].installed && looks[1].installed && looks[2].installed ? 0 : ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Indent(8.0f);
         struct Card { const char* name; const char* credit; const char* page; const char* size; };
-        static const Card cards[2] = {
+        static const Card cards[3] = {
             {"Diet Melee (Classic, 64 and Crystal)", "By the Diet Melee team", "https://diet.melee.tv", "about 200 MB"},
             {"Animelee (Complete Edition)", "By the Animelee team", "https://www.animelee.xyz", "about 30 MB"},
+            {"Animelee x DBZ (Dragon Ball Z edition)", "By the Animelee team", "https://www.animelee.xyz", "about 30 MB"},
         };
-        for (int which = 0; which < 2; ++which) {
-          const auto& s = which == 0 ? diet : anim;
+        for (int which = 0; which < 3; ++which) {
+          const auto& s = looks[which];
           const Card& card = cards[which];
           ImGui::PushID(which);
           ImGui::TextUnformatted(card.name);
@@ -6113,9 +6205,10 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             ImGui::TextColored(ImVec4(.37f, .84f, .53f, 1), "Installed");
             // The Static Recomp plays a disc mod from the launcher's Mods page, not from the MODS tab.
             settings_hint("%s", which == 0 ? "Pick Look > Diet Classic, Diet 64 or Crystal under Low-Detail Modes, then restart."
-                                : options.native_source ? "On in Game mods (MODS tab). Restart to play with it."
+                                : options.native_source ? "On in Game mods (MODS tab), one Animelee at a time. Restart to play with it."
                                                         : "Play it from the launcher's Mods page.");
-            if (which == 1 && animelee_new && options.native_source) restart_now_button("official_animelee");
+            if (which >= 1 && animelee_new[which] && options.native_source)
+              restart_now_button(which == 1 ? "official_animelee" : "official_animelee_dbz");
           } else {
             ImGui::BeginDisabled(s.any_busy);
             if (settings_widgets::Button("Install")) {
@@ -6140,7 +6233,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           if (settings_widgets::SmallButton("Authors' page")) ShellExecuteA(nullptr, "open", card.page, nullptr, nullptr, SW_SHOWNORMAL);
 #endif
           ImGui::PopID();
-          if (which == 0) ImGui::Separator();
+          if (which < 2) ImGui::Separator();
         }
         ImGui::Unindent(8.0f);
       }
@@ -7361,8 +7454,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Less buffering reduces delay; too little can cause gaps. This controls the software buffer. Windows and the audio device add their own delay.");
     }
     if (kShowFasterSoundEffects) {
-      // Faster sound effects: Source Port only (the Static Recomp's sound code is the console's).
-      ImGui::BeginDisabled(host::game_image == nullptr);
+      // Faster sound effects: Source Port only (the Static Recomp's sound code is the console's). The
+      // launcher's settings window has no game behind it, so it stays settable there.
+      ImGui::BeginDisabled(!g_settings_standalone && host::game_image == nullptr);
       if (settings_toggle("Faster sound effects", &gx::RenderOptions::live_audio_early_keyon())) changed = true;
       ImGui::EndDisabled();
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -8926,6 +9020,15 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         ImGui::SetTooltip("The P1, P2, P3 and P4 markers over the fighters stay up for the whole match.\n"
                           "Display only, so it is yours alone online. Takes effect immediately.");
     }
+    {
+      // Screenshot tooling (MELEE_SETTINGS_SCROLL_TO=screenshake): bring the shake settings into view once.
+      static int scroll_frames = 0;
+      if (scroll_frames < 30) {
+        const char* target = std::getenv("MELEE_SETTINGS_SCROLL_TO");
+        if (target && std::strcmp(target, "screenshake") == 0) ImGui::SetScrollHereY(0.3f);
+        ++scroll_frames;
+      }
+    }
     // Also a port code: zeroes the camera's shake offset before the game applies it. With 20XX TE on
     // it is the same setting as TE's "Disable screen rumble" (te_pairs_linked).
     if (settings_toggle("Disable screen shake", &gecko::option_no_screen_shake)) {
@@ -8936,6 +9039,29 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SetTooltip("The camera no longer shakes on hard hits, explosions and stage effects.\n"
                         "Camera only: fighters and hits are unchanged. Takes effect immediately.%s",
                         te_pair_hover(kTeNoScreenRumble));
+    // Strength in between: the native camera scales its quake offset (camera.c, host API 27). Greyed
+    // only over a running Static Recomp: the launcher's settings window has no game behind it, and a
+    // Source Port player sets it there too (it was greyed for everyone in that window).
+    if (!gecko::option_no_screen_shake) {
+      ImGui::BeginDisabled(!g_settings_standalone && host::game_image == nullptr);
+      if (ImGui::SliderInt("Screen shake strength", &gecko::option_screen_shake_percent, 0, 200, "%d%%",
+                           ImGuiSliderFlags_AlwaysClamp))
+        changed = true;
+      ImGui::EndDisabled();
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("How strongly the camera shakes on hard hits, explosions and stage effects.\n"
+                          "100%% is the game's own. Offline only; network sessions use 100%%. Source Port only.");
+    }
+    // The explosion still runs, out of sight (ft_0D31.c, host.cpp apply_ko_explosions): its particles
+    // draw random numbers, so leaving it out would change the match.
+    if (settings_toggle("Hide KO explosions", &options.hide_ko_explosions)) {
+      host::g_hide_ko_explosions.store(options.hide_ko_explosions, std::memory_order_relaxed);
+      changed = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("No burst of colour when a fighter is KO'd off the side, top or bottom.\n"
+                        "The match is exactly the same, so it also works online and in replays.\n"
+                        "Picture only, yours alone. Both engines. Takes effect from the next KO.");
 
 
     ImGui::TextUnformatted("Input delay");
@@ -9610,6 +9736,13 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             changed |= binding_level_slider(tab_kind, tab_index, i);
           }
         }
+        // Every controller on the adapter, PhobGCC or not: the PhobScope screens on their own.
+        if (tab_kind == host::CaptureDevice::GCAdapter) {
+          ImGui::Spacing();
+          ImGui::PushID("controller_test");
+          draw_controller_test(tab_index);
+          ImGui::PopID();
+        }
         if (tab_kind == host::CaptureDevice::GCAdapter && settings_widgets::CollapsingHeader("PhobGCC")) {
           ImGui::PushID("phob");
           draw_phob_menu(tab_index);
@@ -9662,10 +9795,22 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     }
       }
       if (state.active_tab == 4) {
+    if (settings_toggle("Clean replays", &options.clean_replays)) {
+      RenderOptions::live_clean_replays().store(options.clean_replays, std::memory_order_relaxed);
+      changed = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("While a replay plays, nothing is drawn over the game: no controller or input display,\n"
+                        "frame rate, graphs, notices, hitboxes or combo counter, and the replay bar starts hidden\n"
+                        "(H shows it; every key still works). For tournament VODs and clips.");
     changed |= settings_toggle("Show player nicknames above fighters", &options.show_player_nicknames);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shows each online player's name at Melee's player-tag anchor. Local display only.");
     changed |= settings_toggle("Show the \"Settings: F1\" reminder", &options.settings_hint);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", yougame::stdio_bridge() ? yougame::parity::kSettingsHint : "F1, or Start + D-pad Down + Z on a GameCube controller, opens settings.");
+    changed |= settings_toggle("Show the note when skins are off online", &options.skin_online_notice);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("In an online mode, skins and stage mods that could change more than looks show as the\n"
+                        "standard ones, and a note says so for 15 seconds. Off: no note (Settings > Mods still lists them).");
 #ifndef MELEE_NO_SLIPPI   // no matchmaking panel in the build without that layer
     changed |= settings_toggle("Show the Practice menu hint in Training", &options.matchmaking_hint);
     if (ImGui::IsItemHovered())
@@ -9807,7 +9952,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             ImGui::SetTooltip("Runs natively: while it is on, attack hitboxes show as with VIDEO > Arcade look.\n"
                               "Offline matches and replays only.");
         } else if (built_in)
-          engine_only_reason("Built in: \"%s\" above is the switch that applies here.", built_in);
+          engine_only_reason("Built in: \"%s\" is the switch that applies here.", built_in);
         else if (!runs_here)
           engine_only_reason("Cannot run in this build: this code %s.", c.reason.c_str());
         else if (ImGui::IsItemHovered())
@@ -9842,7 +9987,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             ImGui::SetTooltip("Runs natively: while it is on, attack hitboxes show as with VIDEO > Arcade look.\n"
                               "Offline matches and replays only.");
         } else if (built_in)
-          engine_only_reason("Built into the Source Port: \"%s\" above is the switch that applies here.\n"
+          engine_only_reason("Built into the Source Port: \"%s\" is the switch that applies here.\n"
                              "This one is your setting for the Static Recomp.", built_in);
         else if (!runs_here)
           engine_only_reason("Cannot run on the Source Port: this code %s.\n"
@@ -9961,6 +10106,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       if (settings_widgets::Button("Close")) { state.open = false; g_close_requested.store(true, std::memory_order_relaxed); }
     }
     if (state.saved && ImGui::IsItemHovered()) ImGui::SetTooltip("Settings saved");
+    if (!g_settings_save_error.empty()) {
+      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.42f, 0.36f, 1.0f));
+      ImGui::TextWrapped("%s", g_settings_save_error.c_str());
+      ImGui::PopStyleColor();
+    }
 
     if (state.confirm != SettingsState::Confirm::None) {
       const bool restart = state.confirm == SettingsState::Confirm::Restart;
@@ -10049,7 +10199,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     auto action = [&](const char* id, const char* label, int index) {
       const float x = 20.0f + index * (button_w + gap), y = 66.0f;
       ImGui::SetCursorPos(ImVec2(x, y));
+      ImGui::PushStyleColor(ImGuiCol_NavCursor, IM_COL32(0, 0, 0, 0));
       const bool pressed = ImGui::InvisibleButton(id, ImVec2(button_w, 58.0f), ImGuiButtonFlags_EnableNav);
+      ImGui::PopStyleColor();
       if (state.menu_quit && index == 0 && state.menu_quit_focus_pending) {
         // The window stays open across views, so SetItemDefaultFocus cannot replace the old ID.
         // Focus the submitted confirm item immediately, without activating it on the opening A.
@@ -10085,6 +10237,8 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                              ImVec2(q.x + button_w - 9, q.y + 54), ImVec2(q.x, q.y + 54)};
       draw->AddConvexPolyFilled(shadow, 4, hot ? accent_dark : IM_COL32(24, 13, 34, 245));
       draw->AddConvexPolyFilled(face, 4, hot ? accent : IM_COL32(31, 20, 42, 245));
+      if (settings_nav_frame_on_item())
+        draw->AddPolyline(face, 4, settings_mix_color(accent, IM_COL32_WHITE, .75f), ImDrawFlags_Closed, 2.0f);
       const ImVec2 text_size = ImGui::CalcTextSize(label);
       draw->AddText(ImVec2(q.x + (button_w - text_size.x) * .5f, q.y + (54.0f - text_size.y) * .5f),
                     IM_COL32(255, 250, 253, 255), label);
@@ -10127,7 +10281,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
 #endif
   if (!state.fill_window && !state.open && !state.menu_open)
     draw_native_practice(state, options, practice, pad, have_pad);
-  if (!state.fill_window && !state.open && !state.menu_open && replay_control::active())
+  if (!state.fill_window && !state.open && !state.menu_open && replay_control::active() && !gx::clean_replay_active())
     draw_replay_practice(options, pad, have_pad);
   if (practice_was_open && !state.practice_open) state.practice_release_capture = true;
   // Practice menu changes (the CPU, your setups, skipped codes, the hint count) are saved as they happen.
@@ -10158,7 +10312,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // Hidden on request; F1 still opens the panel. This must not return early: ImGui::Render() is
     // at the end of this function, and skipping it left draw() handing the renderer draw data that
     // was never built for this frame, which crashed on the next F1.
-    if (options.settings_hint) {
+    if (options.settings_hint && !gx::clean_replay_active()) {
       const OverlayBounds bounds = overlay_bounds();
       ImGui::SetNextWindowPos(ImVec2(bounds.right - 12, bounds.top + 12), ImGuiCond_Always, ImVec2(1, 0));
       ImGui::SetNextWindowBgAlpha(ImGui::GetTime() < 20.0 ? 0.8f : 0.35f);
@@ -10171,7 +10325,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   // Test hook for screenshots: MELEE_TEST_OVERLAY=1 shows the controller overlay with its values.
   static const bool test_overlay = host::test_env::getenv("MELEE_TEST_OVERLAY") != nullptr;
   if (test_overlay) { options.input_overlay = true; options.input_overlay_values = true; if (const char* k = host::test_env::getenv("MELEE_TEST_KNOB")) options.input_overlay_stick = std::atoi(k); }
-  if (options.input_overlay) {
+  if (options.input_overlay && !gx::clean_replay_active()) {
     const int mask = options.input_overlay_ports ? options.input_overlay_ports : 1;
     const bool lone = (mask & (mask - 1)) == 0;   // exactly one port selected
     int row = 0;
@@ -10195,9 +10349,12 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   // violation on the next present. 0.3.2 shipped exactly that as an early return here and crashed
   // the launcher's settings window. The warning was already in this file, twenty lines up.
   if (!state.fill_window) {
-    draw_lcancel_overlays();
-    draw_discord_invite_overlay();
-    draw_skin_online_notice();
+    const bool clean_replay = gx::clean_replay_active();
+    if (!clean_replay) {
+      draw_lcancel_overlays();
+      draw_discord_invite_overlay();
+      if (options.skin_online_notice) draw_skin_online_notice();
+    }
     // The plain readouts: frame rate and, while online, the ping. Small, top left, no window
     // chrome, the way a Dolphin OSD line looks, and separate from the performance graph.
     // Reflex flash indicator: a white square on the frame A goes down on port 1, and the matching
@@ -10232,7 +10389,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     const bool latency_line = options.reflex_stats && streamline::reflex_latency_ms() > 0.0f;
     float vram_used = 0, vram_total = 0;
     const bool vram_line = options.show_vram && vram_usage(&vram_used, &vram_total);
-    if (options.show_fps || ping_line || latency_line || vram_line) {
+    if ((options.show_fps || ping_line || latency_line || vram_line) && !clean_replay) {
       char lines[4][40];
       int n = 0;
       if (options.show_fps) std::snprintf(lines[n++], sizeof lines[0], "FPS: %.0f", ImGui::GetIO().Framerate);
@@ -10254,7 +10411,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         fg->AddText(p, IM_COL32(0, 255, 255, 255), lines[i]);
       }
     }
-    if (options.performance_overlay) {
+    if (options.performance_overlay && !clean_replay) {
       // Draggable, and resizable by its bottom-right corner (drag it smaller if it is in the way);
       // NoTitleBar keeps it out of the way otherwise. Opens under the FPS and ping lines.
       const OverlayBounds bounds = overlay_bounds();

@@ -62,14 +62,16 @@ uintptr_t import(const char* name) {
     IMPORT(printf), IMPORT(sprintf), IMPORT(strtoul),
     {"strchr",reinterpret_cast<uintptr_t>(static_cast<char*(*)(char*,int)>(&::strchr))},
     IMPORT(strlen), IMPORT(memcmp), IMPORT(vsprintf), IMPORT(strncmp), IMPORT(strncpy),
-    IMPORT(memset), IMPORT(vsnprintf), IMPORT(memcpy), IMPORT(strcpy), IMPORT(fclose),
+    IMPORT(memset), IMPORT(vsnprintf), IMPORT(memcpy), IMPORT(strcpy), IMPORT(strcat), IMPORT(fclose),
     {"strrchr",reinterpret_cast<uintptr_t>(static_cast<char*(*)(char*,int)>(&::strrchr))},
     {"memchr",reinterpret_cast<uintptr_t>(static_cast<void*(*)(void*,int,size_t)>(&::memchr))},
     IMPORT(fflush), IMPORT(fopen), IMPORT(getenv), IMPORT(fabsf), IMPORT(strcmp),
     IMPORT(fprintf), IMPORT(atoi),
     {"fabs",reinterpret_cast<uintptr_t>(static_cast<double(*)(double)>(&::fabs))},
     IMPORT(snprintf), IMPORT(memmove),
-    IMPORT(sqrtf), IMPORT(fwrite)
+    IMPORT(sqrtf), IMPORT(fwrite),
+    // mu_css_state.c's line buffer: allocated and freed inside the game, never across the host boundary.
+    IMPORT(malloc), IMPORT(free)
   };
   // fabs[f] is exact sign-bit clearing; sqrtf is IEEE single precision on x86.
   // Simulation's other math stays bound to its own ELF definitions (DT_SYMBOLIC).

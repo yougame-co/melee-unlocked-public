@@ -165,6 +165,29 @@ _Static_assert(MU_DISPLAY_HITBOXES_BEHIND == MU_DISPLAY_OPTION_HITBOXES_BEHIND, 
 _Static_assert(MU_DISPLAY_GRID == MU_DISPLAY_OPTION_GRID, "display option bits");
 _Static_assert(MU_DISPLAY_ARCADE_CAMERA == MU_DISPLAY_OPTION_ARCADE_CAMERA, "display option bits");
 
+int mu_ko_explosions_hidden(void)
+{
+    static int logged = -1;
+    const int on = (mu_display_options() & MU_DISPLAY_NO_KO_EXPLOSIONS) != 0;
+    if (on != logged) {
+        logged = on;
+        OSReport("[ko] blast-zone explosions %s\n", on ? "out of sight" : "shown");
+    }
+    return on;
+}
+_Static_assert(MU_DISPLAY_NO_KO_EXPLOSIONS == MU_DISPLAY_OPTION_NO_KO_EXPLOSIONS, "display option bits");
+
+int mu_console_active(void);
+
+/* Camera state participates in rollback snapshots: local strength must not change it online. */
+float mu_screen_shake_scale(void)
+{
+    if (!mu_host || mu_host->version < 27 || !mu_host->screen_shake_scale) return 1.0f;
+    if (mu_console_active() || mu_online_active() || mu_online_pending()) return 1.0f;
+    const float scale = mu_host->screen_shake_scale();
+    return scale >= 0.0f && scale <= 4.0f ? scale : 1.0f;
+}
+
 /* The Arcade look grid's colour (0 from a host before version 21: the default). */
 unsigned int mu_grid_color(void)
 {

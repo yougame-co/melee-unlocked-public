@@ -197,7 +197,11 @@ void script_keys_require_hook(Fixture& f) {
   const auto s = f.load_json({{"script", "ab_vs_source.txt"}, {"rng_seed", 305419896}, {"time_base", 0},
       {"frames", 7200}, {"frame_times", "ft.csv"}, {"sim_times", "sim.csv"}, {"replay_dir", "replays"},
       {"record_native", true}, {"slippi_menus", false}, {"no_gc_adapter", true}, {"early_rng_seed", "1@60"},
-      {"stopAt", 600}});
+      {"stopAt", 600}
+#ifdef __APPLE__
+      , {"panelKeyAfter", 10}, {"activateAfter", 10}, {"macPanel", "neverKey"}
+#endif
+      });
   CHECK(s.arguments.empty() && s.environment.empty());
   CHECK(s.log == "agent-test.json; invalid/unknown or inapplicable keys ignored");
 }

@@ -30,4 +30,7 @@ class MenuHintAnimation {
   double first_ = -1;
 };
 bool console_menu_visible(); // atomic publication from the simulation thread
+#ifdef YOUGAME_AGENT_TEST_HOOK
+uint32_t console_css_frames(); // consecutive session frames on VS character select (dropRoomOnce)
+#endif
 } // namespace yougame::console

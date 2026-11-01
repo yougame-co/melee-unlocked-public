@@ -152,6 +152,21 @@ def agent_test_hook_enabled(executable):
     return b'agent-test.json' in executable.read_bytes()
 
 
+def package_snapexcl(source: Path, library: Path, original: Path):
+    """Only non-loaded debug sections change in packaging; offsets stay fixed.
+
+    Bind the build's offsets to the final shipped file size, after objcopy/strip.
+    Windows retains its existing build-time size contract.
+    """
+    lines = source.read_text().splitlines()
+    sizes = [line for line in lines if line.startswith('# dll_size ')]
+    if len(sizes) != 1 or sizes[0] != f'# dll_size {original.stat().st_size}':
+        raise SystemExit(f'{source}: dll_size does not match the build library')
+    library.with_suffix('.snapexcl').write_text('\n'.join(
+        f'# dll_size {library.stat().st_size}' if line.startswith('# dll_size ') else line
+        for line in lines) + '\n')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--build-dir', type=Path, default=ROOT / 'build-linux/port/linux/full')
@@ -173,7 +188,8 @@ def main():
     snapexcl = args.game_build_dir / 'melee_game.snapexcl'
     compat_exe = args.compat_build_dir / (EXE + '_compat')
     compat_game = args.compat_build_dir / 'melee_game_compat.so'
-    for need in (exe, launcher, game, snapexcl, compat_exe, compat_game):
+    compat_snapexcl = args.compat_game_build_dir / 'melee_game.snapexcl'
+    for need in (exe, launcher, game, snapexcl, compat_exe, compat_game, compat_snapexcl):
         if not need.is_file():
             raise SystemExit(f'missing {need} (run tools/build_linux.py first)')
     agent_hook = agent_test_hook_enabled(exe)
@@ -214,7 +230,6 @@ def main():
         raise SystemExit(f'missing {dbg} (built with melee_game)')
     shutil.copy2(game, folder / 'melee_game.so')
     shutil.copy2(dbg, folder / 'melee_game.dbg')
-    shutil.copy2(snapexcl, folder / 'melee_game.snapexcl')
     run('objcopy', '--compress-debug-sections=zlib', folder / 'melee_game.dbg')
     subprocess.run(['objcopy', '--remove-section=.gnu_debuglink', '--add-gnu-debuglink=melee_game.dbg',
                     'melee_game.so'], cwd=folder, check=True)
@@ -283,6 +298,9 @@ def main():
         run('patchelf', '--set-rpath', '$ORIGIN', path)
     run('patchelf', '--set-rpath', '$ORIGIN/lib', folder / 'melee_game.so')
     run('patchelf', '--set-rpath', '$ORIGIN/lib', folder / 'melee_game_compat.so')
+    # Last step that changes either game library: bind the snapshot ranges to the shipped size now.
+    package_snapexcl(snapexcl, folder / 'melee_game.so', game)
+    package_snapexcl(compat_snapexcl, folder / 'melee_game_compat.so', compat_game)
     for tool in shader_tools:
         run('patchelf', '--set-rpath', '$ORIGIN/../lib', tool)
     # Prove it: with no help from the environment, every dependency the package bundles resolves to lib/.

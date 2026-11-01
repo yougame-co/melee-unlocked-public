@@ -16,13 +16,26 @@
 // no_gc_adapter, early_rng_seed; netDelayMs:0..250, netJitterMs:0..100 (positive delay, Direct only).
 // padTrace:"<relative file>" appends changed game-poll pad states (both engines).
 // Output paths stay inside the data directory.
+// Source hook gate 1: handoffSave:"<file>" or handoffLoad:"<file>", handoffAt:300..30000
+// engine bodies after first local VS CSS (2/0); identical test-only CSS boot request in both.
+// handoffHashLog:"<file>" (per-span + total every 60 bodies for 600 after handoff),
+// handoffDiffDump:"<file>" (raw spans on either save or load),
+// handoffKeep:[["0xADDR",positive_length],...] preserves B's bytes, bounds checked at handoff.
+// Known host API words and handoffKeep are omitted from comparison hashes, never raw dumps.
 // keys:"overlay@20,escape@30" emits stdio protocol taps after the first presented frame.
 // Hook-only, both online engines: dropRoomAfter:330..900 seconds (agent-only rooms, never ranked).
+// Hook-only, Source Friends: dropRoomOnce:true closes the room socket client-side once, 5 s into VS
+// character select (agent-only rooms), so the held-seat rejoin runs without root or network tools.
 // openMenu:"phob:<1-4>" opens Controls -> PhobGCC on the chosen socket at boot.
 // Source renderer hook: present_log:"<name>", present_frames:"<directory-name>:<1..600>".
+// Mac player-box hook keys (Apple only; other platforms keep their ordinary unknown-key handling):
+// panelKeyAfter:1..600 seconds (the panel takes the keyboard focus once, as a click on it does),
+// activateAfter:1..600 seconds (the game asks to become the active app once), and
+// macPanel:"neverKey"|"fsAux"|"refreshActivity" (full-screen slowdown test switches, one per run).
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <nlohmann/json.hpp>
+#include "friends_handoff_join.h"
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include "yougame_agent_paths.h"
 #include "yougame_agent_pad_trace.h"
@@ -31,6 +44,7 @@
 #include "yougame_agent_present.h"
 #include "yougame_box_present.h"
 #include "yougame_net_test.h"
+#include "handoff_state.h"
 #endif
 #include <algorithm>
 #include <array>
@@ -47,6 +61,13 @@ namespace yougame::agent_test {
 enum class Engine { Source, Static };
 #ifdef YOUGAME_AGENT_TEST_HOOK
 inline std::atomic<int> phob_menu_socket{0};
+struct Handoff {
+  std::string save, load, hash_log, diff_dump, error;
+  uint32_t at = 0;
+  std::vector<handoff_state::Range> keep;
+  bool enabled() const { return !save.empty() || !load.empty() || !error.empty(); }
+};
+inline Handoff handoff;
 #endif
 
 struct Settings {
@@ -70,6 +91,8 @@ struct Settings {
   int stop_at_frame = 0;
   int phob_socket = 0;
   nlohmann::json console_request;
+  Handoff handoff;
+  bool friends_handoff_join = false; // Source-only opt-in; independent of gate-1 save/load.
 #endif
 
   std::vector<std::string> prepend(int argc, char* const* argv) const {
@@ -214,6 +237,42 @@ inline Settings map_keys(const nlohmann::json& object, Engine engine = Engine::S
     const auto& key = it.key();
     const auto& value = it.value();
 #ifdef YOUGAME_AGENT_TEST_HOOK
+    if (key == "friendsHandoffJoin") {
+      if (engine == Engine::Source && value.is_boolean()) {
+        out.friends_handoff_join = value.get<bool>(); applied(key.c_str());
+      } else ignored = true;
+      continue;
+    }
+    if (key.compare(0, 7, "handoff") == 0) {
+      auto invalid = [&](const char* why) { out.handoff.error = std::string("invalid ") + key + ": " + why; };
+      if (engine != Engine::Source) { ignored = true; continue; }
+      if (key == "handoffAt") {
+        if (!integer_in(value, 300, 30000)) invalid("expected 300..30000");
+        else { out.handoff.at = value.get<uint32_t>(); applied(key.c_str()); }
+      } else if (key == "handoffKeep") {
+        if (!value.is_array() || value.size() > 256) invalid("expected at most 256 ranges");
+        else for (const auto& item : value) {
+          handoff_state::Range range;
+          if (!item.is_array() || item.size() != 2 || !item[0].is_string() ||
+              !unsigned_in(item[1], UINT32_MAX) ||
+              !handoff_state::parse_range(item[0].get<std::string>(), item[1].get<uint64_t>(), range)) {
+            invalid("invalid range"); break;
+          }
+          out.handoff.keep.push_back(range);
+        }
+        if (out.handoff.error.empty()) applied(key.c_str());
+      } else if (key == "handoffSave" || key == "handoffLoad" || key == "handoffHashLog" || key == "handoffDiffDump") {
+        std::filesystem::path path;
+        if (!value.is_string() || !source_output_path(value.get<std::string>(), data_dir, false, path, *capability))
+          invalid("invalid data-directory path");
+        else {
+          auto& target = key == "handoffSave" ? out.handoff.save : key == "handoffLoad" ? out.handoff.load :
+              key == "handoffHashLog" ? out.handoff.hash_log : out.handoff.diff_dump;
+          target = agent_paths::slashes(value.get<std::string>()); applied(key.c_str());
+        }
+      } else invalid("unknown key");
+      continue;
+    }
     if (key == "console") {
       if (engine == Engine::Source && !object.count("online") && !object.count("match") && console_key(value, out.console_request)) applied("console");
       else ignored = true;
@@ -321,6 +380,14 @@ inline Settings map_keys(const nlohmann::json& object, Engine engine = Engine::S
       else applied("keys");
       continue;
     }
+    if (key == "dropRoomOnce") {
+      if (engine != Engine::Source || value != true) ignored = true;
+      else {
+        out.environment.emplace_back("MELEE_ONLINE_TEST_DROP_ROOM_ONCE", "1");
+        applied("dropRoomOnce");
+      }
+      continue;
+    }
     if (key == "dropRoomAfter") {
       if (!integer_in(value, 330, 900)) ignored = true;
       else {
@@ -381,6 +448,21 @@ inline Settings map_keys(const nlohmann::json& object, Engine engine = Engine::S
       else { out.stop_at_frame = value.get<int>(); applied("stopAt"); }
       continue;
     }
+#ifdef __APPLE__
+    if (key == "panelKeyAfter" || key == "activateAfter" || key == "macPanel") {
+      const bool mode = key == "macPanel";
+      if (mode ? !(value.is_string() && (value == "neverKey" || value == "fsAux" || value == "refreshActivity"))
+               : !integer_in(value, 1, 600))
+        diagnostic(key + " invalid value");
+      else {
+        out.environment.emplace_back(key == "panelKeyAfter" ? "MELEE_TEST_PANEL_KEY_AFTER" :
+                                     key == "activateAfter" ? "MELEE_TEST_ACTIVATE_AFTER" : "MELEE_TEST_MAC_PANEL",
+                                     mode ? value.get<std::string>() : std::to_string(value.get<int>()));
+        applied(key.c_str());
+      }
+      continue;
+    }
+#endif
     if (key == "captureEvery" || key == "frames") {
       const bool capture = key == "captureEvery";
 #if defined(MELEE_LINUX) && !defined(__APPLE__)
@@ -466,6 +548,15 @@ inline Settings map_keys(const nlohmann::json& object, Engine engine = Engine::S
     out.log += "; invalid/unknown or inapplicable keys ignored";
   }
 #ifdef YOUGAME_AGENT_TEST_HOOK
+  if (out.handoff.enabled()) {
+    if (!out.handoff.at || (!out.handoff.save.empty() && !out.handoff.load.empty()))
+      out.handoff.error = "handoff requires handoffAt and exactly one save/load";
+    if (object.count("online") || object.count("match") || object.count("console"))
+      out.handoff.error = "handoff requires offline local CSS";
+    const std::array<std::string, 4> names{{out.handoff.save, out.handoff.load, out.handoff.hash_log, out.handoff.diff_dump}};
+    for (size_t i = 0; i < names.size(); ++i) for (size_t j = i+1; j < names.size(); ++j)
+      if (!names[i].empty() && names[i] == names[j]) out.handoff.error = "handoff paths must be distinct";
+  }
   if (!diagnostics.empty()) out.log += diagnostics.substr(out.log.empty() ? 1 : 0);
 #endif
   return out;
@@ -478,6 +569,8 @@ inline Settings load(bool active, const char* data_dir, Engine engine = Engine::
   agent_present::recorder().stop();
   agent_paths::policy = {};
   agent_paths::session.reset();
+  handoff = {};
+  console::friends_handoff_join_test.store(false, std::memory_order_release);
   // All early returns and exceptions release the root unless mapping activated a session.
   struct LoadScope {
     bool active = false;
@@ -530,7 +623,7 @@ inline Settings load(bool active, const char* data_dir, Engine engine = Engine::
 #ifdef YOUGAME_AGENT_TEST_HOOK
   if (!out.console_request.is_null()) console::requests.push(out.console_request);
   const bool active_session = !out.console_request.is_null() || !out.arguments.empty() || !out.environment.empty() || !out.key_script.empty() ||
-      out.phob_socket > 0 || !out.pad_trace.empty() || out.rumble_test || out.box_present_compositor || out.static_online_test || out.pad_back_seconds > 0 || out.fight || out.net.delay_ms > 0 || out.present.enabled();
+      out.phob_socket > 0 || !out.pad_trace.empty() || out.rumble_test || out.box_present_compositor || out.static_online_test || out.pad_back_seconds > 0 || out.fight || out.net.delay_ms > 0 || out.present.enabled() || out.handoff.enabled() || out.friends_handoff_join;
   if (!active_session) return out;
   // Consumers must reopen through the capability, not through a checked pathname.
   agent_paths::policy = {};
@@ -555,6 +648,8 @@ inline Settings load(bool active, const char* data_dir, Engine engine = Engine::
     out.log += "agent-test: padTrace output capability refused; ignored";
   }
   phob_menu_socket.store(out.phob_socket);
+  handoff = out.handoff;
+  console::friends_handoff_join_test.store(out.friends_handoff_join, std::memory_order_release);
   scope.active = true;
 #endif
   return out;

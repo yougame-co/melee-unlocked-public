@@ -267,6 +267,10 @@ void handle_event(const SDL_Event& e) {
 #endif
           int w = 0, h = 0;
           SDL_GL_GetDrawableSize(sdl_window(), &w, &h);
+#ifdef __APPLE__
+          mac_embed::drawable_size(sdl_window(), &w, &h);
+          if (mac_embed::active() && w == g_client_w && h == g_client_h) return;
+#endif
           if (w > 0 && h > 0) {
             g_client_w = w; g_client_h = h;
             if (g_on_resize) g_on_resize(w, h);
@@ -393,6 +397,7 @@ void* window_create(int w, int h, const wchar_t* title, bool visible) {
   SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_GAMECUBE, "0");
 #ifdef __APPLE__
   const bool mac_boxed = mac_embed::configure(yougame::embedded());
+  mac_disable_window_restoration();
   if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) die("cannot start SDL video: %s", SDL_GetError());
 #endif
   if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0)
@@ -425,6 +430,12 @@ void* window_create(int w, int h, const wchar_t* title, bool visible) {
   SDL_Window* window = SDL_CreateWindow(utf8_title(title).c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, w, h, flags);
 #endif
   if (!window) die("cannot create the game window: %s", SDL_GetError());
+#ifdef __APPLE__
+  SDL_SysWMinfo info{};
+  SDL_VERSION(&info.version);
+  if (SDL_GetWindowWMInfo(window, &info) && info.subsystem == SDL_SYSWM_COCOA)
+    mac_window_disable_restoration(info.info.cocoa.window);
+#endif
   g_hwnd = window;
   linux_compat::set_game_window(g_hwnd);
 #ifdef MELEE_LINUX_X11_EMBED
@@ -452,6 +463,9 @@ void* window_create(int w, int h, const wchar_t* title, bool visible) {
   g_closed = false;
   int dw = w, dh = h;
   SDL_GL_GetDrawableSize(window, &dw, &dh);
+#ifdef __APPLE__
+  mac_embed::retina_size(window, &dw, &dh);
+#endif
   g_client_w = dw > 0 ? dw : w; g_client_h = dh > 0 ? dh : h;
 #ifdef __APPLE__
   if (visible
@@ -568,6 +582,9 @@ void window_presented(uint64_t frame) {
 #endif
   if (at && frame >= at && frame <= at + 300 && (frame - at) % 30 == 0) {
     int w = 0, h = 0; SDL_GL_GetDrawableSize(sdl_window(), &w, &h);
+#ifdef __APPLE__
+    mac_embed::retina_size(sdl_window(), &w, &h);
+#endif
     host::log("%s: frame %llu fullscreen=%d drawable=%dx%d", tag, (unsigned long long)frame, window_is_fullscreen(), w, h);
   }
 }
@@ -671,6 +688,13 @@ void window_pump() {
 #endif
 #ifdef __APPLE__
   if (mac_embed::pump()) { g_closed = true; request_user_exit(); return; }
+  // Backing-scale changes can arrive without SDL_WINDOWEVENT_SIZE_CHANGED (foreign SDL window).
+  int retina_w = 0, retina_h = 0;
+  if (mac_embed::drawable_size(sdl_window(), &retina_w, &retina_h) && retina_w > 0 && retina_h > 0 &&
+      (retina_w != g_client_w || retina_h != g_client_h)) {
+    g_client_w = retina_w; g_client_h = retina_h;
+    if (g_on_resize) g_on_resize(retina_w, retina_h);
+  }
 #endif
 #ifdef YOUGAME_AGENT_TEST_HOOK
   // Protocol taps also run in the embedded Linux window, before its cursor-only early return.

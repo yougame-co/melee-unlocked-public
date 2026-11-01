@@ -16,6 +16,9 @@ namespace {
 Engine global_engine;
 std::atomic<bool> global_active{false};
 std::atomic<bool> global_menu_visible{false};
+#ifdef YOUGAME_AGENT_TEST_HOOK
+std::atomic<uint32_t> global_css_frames{0};
+#endif
 uint64_t monotonic_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -31,6 +34,9 @@ std::string hex(uint64_t v) {
 }
 Engine& console_engine() { return global_engine; }
 bool console_menu_visible() { return global_menu_visible.load(std::memory_order_acquire); }
+#ifdef YOUGAME_AGENT_TEST_HOOK
+uint32_t console_css_frames() { return global_css_frames.load(std::memory_order_acquire); }
+#endif
 bool console_active() { return global_active.load(std::memory_order_acquire); }
 bool prepare_card(const std::filesystem::path& data, const SessionConfig& config,
                   std::filesystem::path& card) {
@@ -93,17 +99,33 @@ void Engine::end(const std::string& reason, bool desync) {
   active_ = false; ended_ = true;
   if (this == &global_engine) global_menu_visible.store(false,std::memory_order_release);
   if (this == &global_engine) global_active.store(false, std::memory_order_release);
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  if (this == &global_engine) global_css_frames.store(0, std::memory_order_release);
+#endif
   match_ = body_clock_ = false;
   clocks_.clear(); candidates_.clear();
   pads_.fill(disconnected()); local_.clear(); checks_.clear();
   for (auto& history : remote_) history.clear();
   log("console: session ended: " + reason);
   const auto message = session_notice(reason);
-  if (hooks_.notice) hooks_.notice(message ? message : desync ? "Your game and your friend's game went out of sync." :
+  if (hooks_.notice && reason != kSelfLeft) hooks_.notice(message ? message : desync ? "Your game and your friend's game went out of sync." :
                                          "Lost connection to your friend.");
   link_.reset();
 }
+uint64_t Engine::liveness_clock() const {
+  return link_->liveness_clock(hooks_.now_ms());
+}
+void Engine::relink_notice() {
+  const bool waiting = link_->reconnecting();
+  const auto now = hooks_.now_ms();
+  if (waiting && (!relink_shown_ || now >= relink_notice_at_)) {
+    if (hooks_.notice) hooks_.notice(kReconnecting);
+    relink_notice_at_ = now+1000;
+  } else if (!waiting && relink_shown_ && hooks_.notice) hooks_.notice("");
+  relink_shown_ = waiting;
+}
 bool Engine::compare_digests() {
+  relink_notice();
   for (auto it = checks_.begin(); it != checks_.end();) {
     for (int p : config_.ports) {
       const unsigned bit = 1u << (p - 1);
@@ -119,7 +141,7 @@ bool Engine::compare_digests() {
       it->second.pending &= ~bit;
     }
     if (!it->second.pending) it = checks_.erase(it);
-    else if (hooks_.now_ms() - it->second.since >= 8000) {
+    else if (liveness_clock() - it->second.since >= 8000) {
       end("state digest timed out"); return false;
     } else ++it;
   }
@@ -130,6 +152,10 @@ bool Engine::advance(const Pads& hardware, const MuStatePod& state) {
   if (this == &global_engine) global_menu_visible.store(
       honest_menu(menus_lockstep(),rollback_enabled_,config_.ports.size(),state.scene_major,state.scene),
       std::memory_order_release);
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  if (this == &global_engine) global_css_frames.store(state.scene_major == 2 && state.scene == 0 ?
+      global_css_frames.load(std::memory_order_relaxed) + 1 : 0, std::memory_order_release);
+#endif
   const bool menu = menus_lockstep();
   if (menu && !menu_window_active_) {
     menu_window_active_ = true; menu_window_ = hooks_.now_ms();
@@ -147,24 +173,26 @@ bool Engine::advance(const Pads& hardware, const MuStatePod& state) {
     if (!publish(frame_)) return false;
   }
   if (!frame_ && link_->frame_zero_barrier) {
-    const auto barrier_at = hooks_.now_ms();
+    const auto barrier_at = liveness_clock();
     log("console: waiting for every peer at frame 0 (60 s)");
     for (;;) {
       link_->pump(0);
       if (auto lost = link_->lost()) { end(*lost); return false; }
+      relink_notice();
       bool ready = true;
       for (int p : config_.ports) if (p != config_.my_port && !link_->digest(p,0)) ready = false;
       if (ready) break;
-      const auto elapsed = hooks_.now_ms() - barrier_at;
+      const auto elapsed = liveness_clock() - barrier_at;
       if (elapsed >= 60000) { end(kBootTimeout); return false; }
       if (hooks_.responsive) hooks_.responsive();
       if (!active_) return false;
       link_->pump(static_cast<int>(std::min<uint64_t>(5,60000-elapsed)));
     }
-    if (auto check = checks_.find(0); check != checks_.end()) check->second.since = hooks_.now_ms();
+    if (auto check = checks_.find(0); check != checks_.end()) check->second.since = liveness_clock();
     log("console: frame 0 barrier passed");
   }
   const uint64_t began = hooks_.now_ms();
+  const uint64_t live_began = liveness_clock();
   if (!window_began_) window_began_ = began;
   int missing = 0;
   for (;;) {
@@ -208,10 +236,10 @@ bool Engine::advance(const Pads& hardware, const MuStatePod& state) {
       }
       return true;
     }
-    if (waited >= 8000) { end("pad wait timed out at frame " + std::to_string(frame_)); return false; }
+    if (liveness_clock() - live_began >= 8000) { end("pad wait timed out at frame " + std::to_string(frame_)); return false; }
     if (hooks_.responsive) hooks_.responsive();
     if (!active_) return false;
-    const auto elapsed = hooks_.now_ms() - began;
+    const auto elapsed = liveness_clock() - live_began;
     if (elapsed >= 8000) { end("pad wait timed out at frame " + std::to_string(frame_)); return false; }
     link_->pump(static_cast<int>(std::min<uint64_t>(5, 8000 - elapsed)));
   }
@@ -296,7 +324,7 @@ bool Engine::publish(uint32_t corrected_boundary) {
     for (int p : config_.ports) if (p != config_.my_port) pending |= 1u << (p - 1);
     // Testers compare these lines across seats for a short desync check without a full match.
     log("console: hash " + std::to_string(it->first) + " " + hex(it->second));
-    checks_[it->first] = {it->second, pending, hooks_.now_ms()};
+    checks_[it->first] = {it->second, pending, liveness_clock()};
     link_->send_digest(it->first, it->second);
     published_through_ = it->first;
     it = candidates_.erase(it);
@@ -346,17 +374,17 @@ bool Engine::restore_clock(uint32_t body) {
 }
 bool Engine::confirm(uint32_t body) {
   if (!match_active() || frame_ != match_origin_ + body || body_clock_) return false;
-  const auto began = hooks_.now_ms();
+  const auto began = liveness_clock();
   for (;;) {
     link_->pump(0);
     if (auto lost = link_->lost()) { end(*lost); return false; }
     if (!compare_digests()) return false;
     receive(frame_);
     if (confirmed_through() >= frame_) return true;
-    if (hooks_.now_ms() - began >= 8000) { end("terminal input wait timed out"); return false; }
+    if (liveness_clock() - began >= 8000) { end("terminal input wait timed out"); return false; }
     if (hooks_.responsive) hooks_.responsive();
     if (!active_) return false;
-    const auto elapsed = hooks_.now_ms() - began;
+    const auto elapsed = liveness_clock() - began;
     if (elapsed >= 8000) { end("terminal input wait timed out"); return false; }
     link_->pump(static_cast<int>(std::min<uint64_t>(5, 8000 - elapsed)));
   }
@@ -430,6 +458,7 @@ void Engine::poll() {
   if (!active_) return;
   link_->pump(0); // Loading/OS waits service links without advancing a body.
   if (auto lost = link_->lost()) { end(*lost); return; }
+  relink_notice();
   if (!rollback_enabled_) ticks_ += poll_ticks;
   else {
     if (!servicing() && (!match_ || body_clock_)) ticks_ += poll_ticks;

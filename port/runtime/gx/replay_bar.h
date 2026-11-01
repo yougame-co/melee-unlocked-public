@@ -21,6 +21,7 @@ bool active();
 // A short label near the bottom of the picture for a moment (the stage skin just picked on the
 // stage select screen). Any thread may set it; the UI thread draws it.
 namespace screen_label {
+void draw_corner_hint(float width, float height, float game_aspect);
 void show(const char* text, double seconds);
 void draw(float width, float height, float game_aspect = 73.0f / 60.0f);
 }  // namespace screen_label

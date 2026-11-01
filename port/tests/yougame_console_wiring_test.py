@@ -48,11 +48,45 @@ class ConsoleWiring(unittest.TestCase):
     def test_app_route_caps_and_rejoin_metadata_reach_console(self):
         link = read('port/runtime/hle/yougame_link.cpp')
         self.assertIn('console::direct_notice(push)', link)
-        self.assertIn('g_relaunch = console::relaunch_cap(j)', link)
-        self.assertIn('g_relaunch = console::relaunch_cap(hello)', link)
+        self.assertIn('console::read_caps(j, g_relaunch)', link)
+        self.assertIn('console::read_caps(hello, g_relaunch)', link)
+        bar = (ROOT / 'port/runtime/gx/replay_bar.cpp').read_text()
+        self.assertIn('page_lobby_lines.load(std::memory_order_acquire) ? std::string()', bar)
+        practice = (ROOT / 'port/runtime/hle/native_practice.cpp').read_text()
+        self.assertIn('!leave_line.empty() && !yougame::friends::page_lobby_lines.load', practice)
         self.assertIn('broker_->open(ticket, room, timeout, session)', link)
         stream = read('port/runtime/hle/yougame_transport.h')
         self.assertIn('if (!session.empty()) q["session"] = session;', stream)
+
+    def test_relaunch_drop_is_an_atomic_matching_session_signal(self):
+        production = read('port/runtime/hle/yougame_link.cpp')
+        entry = body(production, 'friends_entry')
+        policy = read('port/runtime/hle/yougame_console_entry.h')
+        self.assertIn('std::atomic_load(&g_relaunch_wait)', production)
+        self.assertIn('wait->push(push)', production)
+        self.assertLess(entry.index('std::atomic_store(&g_relaunch_wait,relaunch_wait)'), entry.index('prepared = handoff('))
+        self.assertIn('json m; b->next(m,50);', entry)
+        self.assertLess(entry.index('relaunch_wait->reason()'), entry.index('relaunch_wait->timed_out(epoch_now())'))
+        dropped = entry[entry.index('if (relaunch_wait && relaunch_wait->reason())'):]
+        self.assertIn('entry.status(kRelaunchDropped); break;', dropped)
+        self.assertIn('console: relaunch dropped by the app: %s', dropped)
+        self.assertIn('sessionId",64) != session', policy)
+        self.assertIn('now - handed_at >= 45000', policy)
+        self.assertIn("Couldn't start playing together. Press Play again.", policy)
+
+    def test_live_relink_owns_membership_and_room_rejoin_publication(self):
+        production = read('port/runtime/hle/yougame_link.cpp')
+        backend = production[production.index('struct ConsoleBackend'):production.index('SessionIO console_io(')]
+        self.assertIn('if (session_live && !handoff_pending && (type == "back" || type == "join" || type == "welcome"))', backend)
+        self.assertIn('control.erase("players"); control.erase("participants");', backend)
+        self.assertLess(backend.index('incoming.push_back(std::move(m))'), backend.index('if (type == "welcome") rejoining = false;'))
+        self.assertIn('io.room_rejoining = [b] { return b->rejoining.load(); };', production)
+        transport = read('port/runtime/hle/yougame_console_link.cpp')
+        self.assertIn('link->open_peer(peer,budget())', transport)
+        self.assertIn('reply = open_link(attempt->request,conn,peer,1000)', transport)
+        engine = read('port/runtime/hle/yougame_console_engine.cpp')
+        self.assertIn('hooks_.notice(kReconnecting)', engine)
+        self.assertIn('liveness_clock() - it->second.since >= 8000', engine)
 
     def test_links_are_serviced_during_boot_and_loading_and_relaunch_has_no_leave(self):
         link = read('port/runtime/hle/yougame_console_link.cpp')
@@ -67,10 +101,17 @@ class ConsoleWiring(unittest.TestCase):
         self.assertIn('link_->pump(0)', body(engine, 'poll'))
         backend = production[production.index('struct ConsoleBackend'):production.index('SessionIO console_io(')]
         self.assertIn('room->close(1000)', backend)
-        self.assertNotIn('"leave"', backend)
+        self.assertNotIn('"leave"', body(backend, 'close'))
+        self.assertIn('if (!handoff_pending) room->send({{"t","leave"}});', backend)
         self.assertIn('broker_->close(1000, code)', production)
         entry = body(production, 'friends_entry')
-        self.assertNotIn('"leave"', entry)
+        # Explicit cancellation leaves; a retire owns cleanup after a page Leave.
+        condition = 'if (!b->retiring && (!prepared || friends::lobby.cancelled() || entry.cancelled()))'
+        self.assertIn(condition, entry)
+        cleanup = entry[entry.index(condition):]
+        self.assertIn('{"t","leave"}', cleanup)
+        self.assertLess(cleanup.index('{"t","leave"}'), cleanup.index('b->close()'))
+        self.assertIn('if (!b->retiring) b->close();', cleanup)
         self.assertNotIn('close_room(', entry)
         self.assertIn('str(m,"sessionId") == prepared_session', entry)
         self.assertIn('io.close = [] {};', entry)
@@ -80,6 +121,18 @@ class ConsoleWiring(unittest.TestCase):
                         shutdown.index('backend_at_exit->reset()'))
         self.assertIn('b->session = friends::text(request,"sessionId",64);', production)
         self.assertIn('open_session("",ticket,code,&error,ms,session)', backend)
+
+    def test_handoff_leaves_savestate_exclusions_and_pad_padding_to_each_process(self):
+        # Gate 1 (, 11-02): the only bytes that differed after an equal-frame load were host
+        # state (sound synth, command queues) and PADStatus padding copied into gmMain_8046B108.
+        host = read('port/app/source_host.cpp')
+        start = body(host, 'handoff_start')
+        self.assertIn('append_sound_driver_exclusions(exclusions);', start)
+        self.assertIn('run.spans = native_savestate::subtract(std::vector<MuStateRegion>(regions, regions+count), exclusions);', start)
+        self.assertIn('validate_keep(run.keep, whole, why)', start)
+        self.assertIn('handoff_start(game_regions, region_count, exclusions, &api);', host)
+        self.assertIn('append_sound_driver_exclusions(exclusions);', body(host, 'begin_native_savestates'))
+        self.assertIn('memset(&status[i], 0, sizeof status[i]);', body(read('sourceport/game/shim/mu_pad.c'), 'PADRead'))
 
     def test_main_build_friends_default_keeps_console_handoff(self):
         self.assertIn('#define YOUGAME_FRIENDS_ROW 1', read('port/runtime/hle/yougame_mode_policy.h'))
@@ -186,7 +239,7 @@ class ConsoleWiring(unittest.TestCase):
         self.assertNotIn('MELEE_SOURCE_PORT', body(link, 'console_io'))
         self.assertIn('host_save_reader.store(&source_port::console_host_save', self.host)
         # 30.x seats (console1: no shared save, intro boot) must never share a session with these.
-        self.assertEqual(body(link, 'console_io').count('+ "-console2";'), 2)
+        self.assertEqual(body(link, 'console_io').count('+ "-console4";'), 2)
         self.assertNotIn('-console1"', link)
         self.assertIn('atomic_load(&g_console_host_snapshot)', body(self.host, 'console_host_save'))
         self.assertIn('card_find("SuperSmashBros0110290334")', body(self.host, 'card_refresh_snapshot'))
@@ -343,7 +396,7 @@ RANKED_ROUTINES = ('mu_online_start_melee', 'report_game')
 def baseline(path, base=BASE):
     if not (ROOT / '.git').exists():
         raise unittest.SkipTest('history checks require a git checkout')
-    available = subprocess.run([GIT, 'cat-file', '-e', base + '^{commit}'], cwd=ROOT,
+    available = subprocess.run([GIT, 'show', '--format=', '--no-patch', base + '^{commit}'], cwd=ROOT,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if available.returncode:
         raise unittest.SkipTest('history checks require revision ' + base)
@@ -422,7 +475,38 @@ class ConsoleOffEquivalence(unittest.TestCase):
 
     def test_entry_only_changes_pod_size_assertion_and_preserves_field_offsets(self):
         path = 'sourceport/game/shim/mu_entry.c'
-        self.assertEqual(read(path).replace('103 * sizeof(uint32_t)', '80 * sizeof(uint32_t)'), baseline(path))
+        # v0.9.87 adds only this guarded presentation reader; reverse its exact bytes.
+        shake = """int mu_console_active(void);
+
+/* Camera state participates in rollback snapshots: local strength must not change it online. */
+float mu_screen_shake_scale(void)
+{
+    if (!mu_host || mu_host->version < 27 || !mu_host->screen_shake_scale) return 1.0f;
+    if (mu_console_active() || mu_online_active() || mu_online_pending()) return 1.0f;
+    const float scale = mu_host->screen_shake_scale();
+    return scale >= 0.0f && scale <= 4.0f ? scale : 1.0f;
+}
+
+"""
+        # v0.9.89 adds this display-option reader (KO explosions out of sight); reverse its exact bytes too.
+        ko = """int mu_ko_explosions_hidden(void)
+{
+    static int logged = -1;
+    const int on = (mu_display_options() & MU_DISPLAY_NO_KO_EXPLOSIONS) != 0;
+    if (on != logged) {
+        logged = on;
+        OSReport("[ko] blast-zone explosions %s\\n", on ? "out of sight" : "shown");
+    }
+    return on;
+}
+_Static_assert(MU_DISPLAY_NO_KO_EXPLOSIONS == MU_DISPLAY_OPTION_NO_KO_EXPLOSIONS, "display option bits");
+
+"""
+        entry = read(path)
+        self.assertEqual(entry.count(shake), 1)
+        self.assertEqual(entry.count(ko), 1)
+        self.assertEqual(entry.replace(shake, '').replace(ko, '').replace('103 * sizeof(uint32_t)',
+                         '80 * sizeof(uint32_t)'), baseline(path))
         path = 'port/runtime/abi/mu_host.h'
         old = re.search(r'typedef struct MuStatePod \{(.*?)\} MuStatePod;', baseline(path), re.S)[1]
         new = re.search(r'typedef struct MuStatePod \{(.*?)\} MuStatePod;', read(path), re.S)[1]
@@ -496,7 +580,7 @@ class ConsoleOffEquivalence(unittest.TestCase):
     def test_patch_hunk_counts(self):
         patch = read('sourceport/patches/melee-native.patch')
         hunks = list(re.finditer(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[^\n]*\n', patch, re.M))
-        # Build 28 plus upstream v0.9.86 has 10067 hunks.
+        # Build 28 plus upstream v0.9.87 has 10067 hunks.
         self.assertEqual(len(hunks), 10067)
         for i, h in enumerate(hunks):
             after = patch[h.end():hunks[i + 1].start() if i + 1 < len(hunks) else len(patch)]
@@ -506,6 +590,22 @@ class ConsoleOffEquivalence(unittest.TestCase):
             new = sum(line.startswith((' ', '+')) for line in lines)
             self.assertEqual((old, new), (int(h[2] or 1), int(h[4] or 1)), h[0])
 
+    def test_drop_room_once_runs_in_the_console_worker_outside_its_lock(self):
+        link = read('port/runtime/hle/yougame_link.cpp')
+        worker = link[link.index('worker = std::thread([this,code] {'):link.index('trying held-seat rejoin')]
+        hook = worker[worker.index('const bool drop_once'):worker.index('if (host::exit_requested())')]
+        self.assertIn('std::getenv("MELEE_ONLINE_TEST_DROP_ROOM_ONCE")', hook)
+        self.assertIn('console::console_css_frames() >= 300', hook)
+        due = hook.index('agent_drop_room_once_due(')
+        lock_end = hook.index('); }', due)
+        self.assertLess(hook.index('std::lock_guard<std::mutex> lock(mutex)'), due)
+        self.assertGreater(hook.index('room->agent_test_drop_room()'), lock_end)
+        self.assertLess(link.rindex('#ifdef YOUGAME_AGENT_TEST_HOOK', 0, link.index('const bool drop_once')),
+                        link.index('const bool drop_once'))
+        engine = read('port/runtime/hle/yougame_console_engine.cpp')
+        self.assertIn('state.scene_major == 2 && state.scene == 0', engine)
+        end = body(engine, 'Engine::end')
+        self.assertIn('global_css_frames.store(0', end)
 
 if __name__ == '__main__':
     unittest.main()

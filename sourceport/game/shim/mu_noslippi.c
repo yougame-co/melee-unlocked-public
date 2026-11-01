@@ -15,6 +15,8 @@
 #include <melee/gm/gmvs.h>
 #include "mu_yougame_pause.h"
 #include <melee/gm/types.h>
+#include <melee/gm/gmmain_lib.h>
+#include <melee/mn/types.h>
 #include <melee/gr/stage.h>
 #include <sysdolphin/baselib/gobj.h>
 #include <sysdolphin/baselib/jobj.h>
@@ -195,6 +197,20 @@ int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned c
     return 0;   /* the retail menu picks its own page */
 }
 void mu_slippi_main_menu_loaded(void) {}
+void mu_friends_css_enter(CSSData* css)
+{
+    static int applied;
+    unsigned char query = 10, response[4];
+    unsigned int got = 0;
+    int mu_online_abi_command(unsigned int, const unsigned char*, unsigned int, unsigned char*, unsigned int, unsigned int*);
+    if (applied || mu_online_abi_command(0xE6, &query, 1, response, 4, &got) != 0 || got != 4) return;
+    applied = 1;
+    gmMainLib_804D3EE0->vs.unk_530.x2 = response[0];
+    gmMainLib_804D3EE0->vs.unk_530.x3 = response[1];
+    gmMainLib_804D3EE0->vs.unk_530.x6 = response[2];
+    css->vs.start.players[response[3] - 1].ckind = response[0];
+    css->vs.start.players[response[3] - 1].color = response[1];
+}
 void mu_slippi_switch_to_online_menu(void) {}
 int mu_slippi_menu_clear_check(int menus_differ) { return menus_differ; }
 void mu_slippi_online_menu_think(HSD_GObj* gp) { (void) gp; }

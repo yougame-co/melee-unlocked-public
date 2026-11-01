@@ -463,12 +463,24 @@ void mu_slippi_menu_prep(void)
     mu_mnmain_install_online_menu();
 }
 
+static int friends_return;
 /* The jump-table entries OnMenuPrep and boot.asm replace: previous mode 8 (OnReturnFromOnline)
- * and, once after boot, previous mode GM_BOOT (OnFirstMenuLoad). Returns 1 when it set the menu. */
+ * and, once after boot, previous mode GM_BOOT (OnFirstMenuLoad). Returns 1 when it set the menu.
+ * A pending Friends return opens the online menu on Friends here, before the menu is built:
+ * mn_80229894 frees the running menu proc, so it can't run from the scene's OnEnter. */
 int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned char* hovered)
 {
     if (!mu_slippi_menus_enabled()) {
         return 0;
+    }
+    if (friends_return) {
+        friends_return = 0;
+        if (previous_mode == GM_BOOT) boot_oneshot = 0;
+        slippi_submenu = 0;
+        mu_mnmain_install_online_menu();
+        *menu_kind = MENU_KIND_8;
+        *hovered = (u8) mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_FRIENDS);
+        return 1;
     }
     if (previous_mode == GM_HANYU_CSS) {
         mu_content_mode(-1);   /* back from online: the offline view again */
@@ -509,6 +521,17 @@ int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned c
     return 0;
 }
 
+void mu_slippi_return_to_friends(void)
+{
+    friends_return = 1;
+    if (gm_GetCurrentGameMode() == GM_MENU) {
+        slippi_submenu = 0;
+        mu_mnmain_install_online_menu();
+        mn_80229894(MENU_KIND_8, (u16) mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_FRIENDS), 1);
+        slp.force_clear = 1;
+        friends_return = 0;
+    }
+}
 /* OnMenuLoad, end of mnMain_Scene_OnEnter: the "Melee" voice on the first boot, then BA on every
  * entry. The title-screen user text is intentionally off in this build. */
 void mu_slippi_main_menu_loaded(void)
@@ -518,6 +541,7 @@ void mu_slippi_main_menu_loaded(void)
     slippi_link_notice = 0;
     mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &friends_menu, 1, NULL, 0, NULL);
     if (!mu_slippi_menus_enabled()) {
+        friends_return = 0; /* a pending Friends return never outlives a load without the online menu */
         return;
     }
     if (first_boot) {

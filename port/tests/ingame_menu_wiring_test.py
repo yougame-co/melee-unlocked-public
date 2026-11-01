@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from online_menu_test import compiler_command
+from yougame_console_wiring_test import body
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -20,6 +21,9 @@ class IngameMenuTest(unittest.TestCase):
         escape = between('  if (phob_native_open() && host::window_take_escape()) {', '\n#ifdef YOUGAME_AGENT_TEST_HOOK\n  agent_menu_state();')
         draw = between('  // ---- the Esc menu ----', '  const bool practice_was_open = state.practice_open;')
         focus = between('  agent_menu_state();\n  {\n    static ImGuiID last_focus', '\n#endif\n  if (!state.fill_window')
+        visuals = (ROOT / 'port/runtime/gx/pc_settings_visuals.inl').read_text()
+        helpers = ('static bool settings_nav_frame_on_item() {' + body(visuals, 'settings_nav_frame_on_item') + '}\n' +
+                   'static ImU32 settings_mix_color(ImU32 a, ImU32 b, float amount) {' + body(visuals, 'settings_mix_color') + '}\n')
         harness = r'''
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -60,6 +64,7 @@ static bool g_settings_custom_color_enabled, g_hud_match;
 static int g_settings_palette;
 static ImVec4 g_settings_custom_color;
 static ImU32 settings_accent(int) { return IM_COL32(120,60,180,255); }
+''' + helpers + r'''
 static void reset_settings_home(const char*) {}
 struct Close { void store(bool, std::memory_order) {} } g_close_requested;
 static void frame(State& state=::state, Options& options=::options) {
@@ -91,6 +96,11 @@ static void open_confirm() {
   CHECK(state.menu_open && state.menu_quit && !state.menu_quit_focus_pending);
   focused("##confirm_quit"); CHECK(exits==0);
 }
+static int vertices(ImU32 color) {
+  int count=0; auto* w=ImGui::FindWindowByName("##esc_menu"); CHECK(w);
+  for (const auto& v:w->DrawList->VtxBuffer) if (v.col==color) ++count;
+  return count;
+}
 int main() {
   ImGui::CreateContext(); auto& io=ImGui::GetIO();
   io.IniFilename=nullptr; io.LogFilename=nullptr;
@@ -99,6 +109,23 @@ int main() {
   io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
   io.ConfigInputTrickleEventQueue=false;
   unsigned char* pixels; int w,h; io.Fonts->GetTexDataAsRGBA32(&pixels,&w,&h);
+  const auto nav_color=IM_COL32(20,200,40,255);
+  ImGui::GetStyle().Colors[ImGuiCol_NavCursor]=ImGui::ColorConvertU32ToFloat4(nav_color);
+  app=true; open_main();
+  const auto outline=settings_mix_color(settings_accent(0),IM_COL32_WHITE,.75f);
+  CHECK(ImGui::GetCurrentContext()->NavCursorVisible);
+  CHECK(vertices(nav_color)==0); CHECK(vertices(outline)>0);
+  // Hover still lifts/fills, with no outline when keyboard/pad cursor visibility is off.
+  auto* menu=ImGui::FindWindowByName("##esc_menu");
+  ImGui::SetNavCursorVisible(false);
+  io.AddMousePosEvent(menu->Pos.x+65,menu->Pos.y+90); frame();
+  CHECK(!ImGui::GetCurrentContext()->NavCursorVisible);
+  CHECK(vertices(nav_color)==0 && vertices(outline)==0);
+  io.AddMousePosEvent(-100,-100); frame();
+  // Confirm and cancel use the same slanted focus rendering.
+  open_confirm(); CHECK(vertices(nav_color)==0 && vertices(outline)>0);
+  tap(ImGuiKey_RightArrow); settle(); focused("##cancel_quit");
+  CHECK(vertices(nav_color)==0 && vertices(outline)>0);
   // Each app/standalone case starts in-game and reaches confirmation through the real main rows.
   for (bool under_app : {true,false}) {
     app=under_app;

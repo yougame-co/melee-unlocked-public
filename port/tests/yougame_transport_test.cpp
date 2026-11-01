@@ -300,7 +300,18 @@ static void lobby_match_links() {
   CHECK(requests.size()==2 && requests[0]["type"]=="netOpen" && requests[1]["type"]=="directOpen");
   close_links(links,request); CHECK(requests.size()==3 && requests.back()["type"]=="directClose");
 }
+static void mixed_version_reasons() {
+  using yougame::transport::lobby_protocol_mismatch;
+  CHECK(lobby_protocol_mismatch({{"reason","the rooms server answered 403: This room uses a different lobby protocol or configuration"}}));
+  CHECK(lobby_protocol_mismatch({{"reason","HTTP 403: INCOMPATIBLE LOBBY PROTOCOL; please update"}}));
+  CHECK(lobby_protocol_mismatch({{"errorCode","console_mixed_builds"}}));
+  CHECK(lobby_protocol_mismatch({{"refused","lobby_mismatch"}}));
+  CHECK(!lobby_protocol_mismatch({{"reason","the rooms server answered 403: ticket expired"}}));
+  CHECK(!lobby_protocol_mismatch({{"reason","connection lost"}}));
+  CHECK(!lobby_protocol_mismatch({{"reason",12}}));
+}
 int main() {
+  mixed_version_reasons();
   closed_during_event_wait(); closed_state_transitions();
   mode_and_candidates(); broker_ordering(); unranked_recovery(); link_budget(); recovery_and_ranked(); leave_reasons(); lobby_match_links();
   std::puts("yougame_transport: mode, candidates, broker ordering, link timeout/retry, leave reasons, lobby/match links, seat recovery and ranked resume passed");

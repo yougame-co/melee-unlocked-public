@@ -108,6 +108,18 @@ class Events {
   std::set<int> retired_;
 };
 using Request = std::function<json(const json&, int)>; // returns bridge.result, throws on refusal
+// Structured broker codes take precedence; older app bridges forward only human text.
+inline bool lobby_protocol_mismatch(const json& p) {
+  for (const auto* field : {"errorCode", "refused"})
+    if (str(p,field) == "console_mixed_builds" || str(p,field) == "lobby_mismatch") return true;
+  std::string reason = str(p,"reason");
+  for (auto& ch : reason) if (ch >= 'A' && ch <= 'Z') ch = char(ch + ('a'-'A'));
+  for (const auto* phrase : {"different lobby protocol", "incompatible lobby protocol", "lobby protocol mismatch",
+                             "different lobby configuration", "console_mixed_builds"})
+    if (reason.find(phrase) != std::string::npos) return true;
+  return false;
+}
+
 class Stream {
  public:
   Stream(Events& events, Request request, std::function<uint64_t()> clock = now_ms)
@@ -121,7 +133,7 @@ class Stream {
     // replacing it could deliberately evict a seat which connected after the timeout.
     if (conn_ && !closed_) return ready_ || wait_open(until, cancelled);
     if (conn_) events_.retire(conn_);
-    conn_ = 0; pending_.clear(); ready_ = false; code_ = 1006;
+    conn_ = 0; pending_.clear(); ready_ = false; code_ = 1006; lobby_mismatch_ = false;
     json q = {{"type", "netOpen"}, {"ticket", ticket}};
     if (!room.empty()) q["room"] = room;
     if (!session.empty()) q["session"] = session;
@@ -152,7 +164,7 @@ class Stream {
       else if (!conn_ || closed_ || !events_.next(conn_, p, (int)std::max<int64_t>(0, (int64_t)until - clock_()))) return false;
       const auto event = str(p, "event");
       if (event == "open") ready_ = true;
-      if (event == "close") { closed_ = true; ready_ = false; code_ = p.value("code", 1006); return false; }
+      if (event == "close") { closed_ = true; ready_ = false; record_close(p); return false; }
       if (event == "message" && !ready_) { pending_.push_back(std::move(p)); continue; }
       if (event == "message" && p.count("data") && p["data"].is_string()) {
         m = json::parse(p["data"].get<std::string>(), nullptr, false);
@@ -175,6 +187,7 @@ class Stream {
   bool closed() const { return closed_.load(); }
   bool ready() const { std::lock_guard<std::mutex> lock(mutex_); return ready_; }
   int close_code() const { std::lock_guard<std::mutex> lock(mutex_); return code_; }
+  bool lobby_mismatch() const { std::lock_guard<std::mutex> lock(mutex_); return lobby_mismatch_; }
   int conn() const { std::lock_guard<std::mutex> lock(mutex_); return conn_; }
 #ifdef YOUGAME_AGENT_TEST_HOOK
   uint64_t agent_test_first_open_at() const {
@@ -191,6 +204,11 @@ class Stream {
   }
 #endif
  private:
+  void record_close(const json& p) {
+    code_ = p.value("code", 1006);
+    // Embedded ws-client forwards the HTTP refusal as a fixed close reason (not the JSON code).
+    lobby_mismatch_ = code_ == 1006 && lobby_protocol_mismatch(p);
+  }
   bool wait_open(uint64_t until, const std::function<bool()>& cancelled) {
     while (clock_() < until) {
       if (cancelled && cancelled()) return false;
@@ -201,7 +219,7 @@ class Stream {
       const auto event = str(p, "event");
       if (event == "open") { ready_ = true; return true; }
       if (event == "message") pending_.push_back(std::move(p));
-      if (event == "close") { code_ = p.value("code", 1006); closed_ = true; return false; }
+      if (event == "close") { record_close(p); closed_ = true; return false; }
     }
     return false;
   }
@@ -211,7 +229,7 @@ class Stream {
   mutable std::mutex mutex_;
   int conn_ = 0, code_ = 1006;
   std::atomic<bool> closed_{true};
-  bool ready_ = false;
+  bool ready_ = false, lobby_mismatch_ = false;
   std::deque<json> pending_;
 #ifdef YOUGAME_AGENT_TEST_HOOK
   bool first_open_recorded_ = false;

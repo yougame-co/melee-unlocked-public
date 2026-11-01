@@ -1,5 +1,9 @@
 [
   {
+    "before": "  const OverlayBounds bounds = overlay_bounds();\n  const float font_size = std::clamp((bounds.bottom - bounds.top) / 38.0f, 12.0f, 18.0f);\n  const char* label = yougame::parity::kMenuHint;\n  const ImVec2 size = ImGui::GetFont()->CalcTextSizeA(font_size, FLT_MAX, 0.0f, label);\n  const ImVec2 at(bounds.right - size.x - 14.0f, bounds.top + 10.0f);\n  ImDrawList* draw = ImGui::GetForegroundDrawList();\n  draw->AddRectFilled(ImVec2(at.x - 7, at.y - 3), ImVec2(at.x + size.x + 7, at.y + font_size + 4),\n                      IM_COL32(9, 11, 22, 190), 5.0f);\n  draw->AddText(ImGui::GetFont(), font_size, at, IM_COL32(236, 238, 246, 235), label);",
+    "after": "  screen_label::draw_corner_hint(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y, g_overlay_game_aspect);"
+  },
+  {
     "before": "      ImGui::Begin(\"##yougame_friend_waiting\", nullptr, passive_flags);\n      ImGui::TextUnformatted(status.c_str());",
     "after": "      ImGui::Begin(\"##yougame_friend_waiting\", nullptr, passive_flags);\n      ImGui::TextUnformatted(yougame::slippi_link_status(status).c_str());"
   },
@@ -58,5 +62,53 @@
   {
     "before": "    const auto console_status = yougame::console::entry.status();",
     "after": "    const auto console_status = yougame::console::waiting_status();"
+  },
+  {
+    "before": "#include \"lcancel.h\"\n#include \"../abi/mu_lcancel_flash.h\"\n#include \"user_gecko.h\"\n#include \"lag_test_codes.h\"\n#include \"gecko_data.h\"\n#include \"yougame_link.h\"\n",
+    "after": "#include \"lcancel.h\"\n#include \"../abi/mu_lcancel_flash.h\"\n#include \"user_gecko.h\"\n\nnamespace gecko { int option_screen_shake_percent = 100; }\n#include \"lag_test_codes.h\"\n#include \"gecko_data.h\"\n#include \"yougame_link.h\"\n"
+  },
+  {
+    "before": "      else if (key == \"autolcancel\") lcancel::set_automatic(value == \"1\");\n      else if (key == \"palstockicons\") gecko::option_pal_stock_icons = value == \"1\";\n      else if (key == \"noscreenshake\") gecko::option_no_screen_shake = value == \"1\";\n      else if (key == \"geckocode\") gecko_on.push_back(value);\n      else if (key == \"geckochosen\") gecko_chosen = value == \"1\";\n      else if (key == \"swpro_gc_picture\") g_swpro_gc_picture = value == \"1\";\n",
+    "after": "      else if (key == \"autolcancel\") lcancel::set_automatic(value == \"1\");\n      else if (key == \"palstockicons\") gecko::option_pal_stock_icons = value == \"1\";\n      else if (key == \"noscreenshake\") gecko::option_no_screen_shake = value == \"1\";\n      else if (key == \"screenshake\") gecko::option_screen_shake_percent = std::clamp(std::stoi(value), 0, 200);\n      else if (key == \"geckocode\") gecko_on.push_back(value);\n      else if (key == \"geckochosen\") gecko_chosen = value == \"1\";\n      else if (key == \"swpro_gc_picture\") g_swpro_gc_picture = value == \"1\";\n"
+  },
+  {
+    "before": "  return buf;\n}\n\nstatic bool write_settings_file(const SettingsState& state, const RenderOptions& options) {\n  std::filesystem::path path(options.settings_path), temporary = path; temporary += \".tmp\";\n  std::ofstream file(temporary);\n  file << \"fps \" << options.fps_cap << \"\\nscale \" << options.efb_scale << \"\\nfullscreen \" << options.fullscreen\n",
+    "after": "  return buf;\n}\n\n// Why the last settings write failed, shown in the panel: a folder Windows will not let the game write\n// to (Program Files, Controlled folder access, a read-only or synced folder) used to lose every change\n// silently, and the player only saw the old values come back at the next start.\nstd::string g_settings_save_error;\n\nstatic bool write_settings_file_impl(const SettingsState& state, const RenderOptions& options);\nstatic bool write_settings_file(const SettingsState& state, const RenderOptions& options) {\n  if (write_settings_file_impl(state, options)) { g_settings_save_error.clear(); return true; }\n  const unsigned long code = GetLastError();\n  const std::string reason = code == ERROR_ACCESS_DENIED ? \"Windows denied access\" : \"error \" + std::to_string(code);\n  if (g_settings_save_error.empty())\n    host::log(\"settings: could not save %s (%s)\", options.settings_path.c_str(), reason.c_str());\n  g_settings_save_error = \"Settings could not be saved to \" + options.settings_path + \" (\" + reason +\n                          \"). Move the game folder somewhere you can write to (not Program Files), or allow \"\n                          \"the game in Windows Security > Controlled folder access.\";\n  return false;\n}\nstatic bool write_settings_file_impl(const SettingsState& state, const RenderOptions& options) {\n  std::filesystem::path path(options.settings_path), temporary = path; temporary += \".tmp\";\n  std::ofstream file(temporary);\n  file << \"fps \" << options.fps_cap << \"\\nscale \" << options.efb_scale << \"\\nfullscreen \" << options.fullscreen\n"
+  },
+  {
+    "before": "       << \"\\nautolcancel \" << (lcancel::automatic_enabled() ? 1 : 0)\n       << \"\\npalstockicons \" << (gecko::option_pal_stock_icons ? 1 : 0)\n       << \"\\nnoscreenshake \" << (gecko::option_no_screen_shake ? 1 : 0)\n       << \"\\nswpro_gc_picture \" << (g_swpro_gc_picture ? 1 : 0)\n       << family_options_text()\n       << \"\\nrumble \" << (host::g_rumble_enabled.load(std::memory_order_relaxed) ? 1 : 0)\n",
+    "after": "       << \"\\nautolcancel \" << (lcancel::automatic_enabled() ? 1 : 0)\n       << \"\\npalstockicons \" << (gecko::option_pal_stock_icons ? 1 : 0)\n       << \"\\nnoscreenshake \" << (gecko::option_no_screen_shake ? 1 : 0)\n       << \"\\nscreenshake \" << gecko::option_screen_shake_percent\n       << \"\\nswpro_gc_picture \" << (g_swpro_gc_picture ? 1 : 0)\n       << family_options_text()\n       << \"\\nrumble \" << (host::g_rumble_enabled.load(std::memory_order_relaxed) ? 1 : 0)\n"
+  },
+  {
+    "before": "      ImGui::SetTooltip(\"The camera no longer shakes on hard hits, explosions and stage effects.\\n\"\n                        \"Camera only: fighters and hits are unchanged. Takes effect immediately.%s\",\n                        te_pair_hover(kTeNoScreenRumble));\n\n\n    ImGui::TextUnformatted(\"Input delay\");\n",
+    "after": "      ImGui::SetTooltip(\"The camera no longer shakes on hard hits, explosions and stage effects.\\n\"\n                        \"Camera only: fighters and hits are unchanged. Takes effect immediately.%s\",\n                        te_pair_hover(kTeNoScreenRumble));\n    // Strength in between: the native camera scales its quake offset (camera.c, host API 27).\n    if (!gecko::option_no_screen_shake) {\n      ImGui::BeginDisabled(host::game_image == nullptr);\n      if (ImGui::SliderInt(\"Screen shake strength\", &gecko::option_screen_shake_percent, 0, 200, \"%d%%\",\n                           ImGuiSliderFlags_AlwaysClamp))\n        changed = true;\n      ImGui::EndDisabled();\n      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))\n        ImGui::SetTooltip(\"How strongly the camera shakes on hard hits, explosions and stage effects.\\n\"\n                          \"100%% is the game's own. Offline only; network sessions use 100%%. Source Port only.\");\n    }\n\n\n    ImGui::TextUnformatted(\"Input delay\");\n"
+  },
+  {
+    "before": "      if (settings_widgets::Button(\"Close\")) { state.open = false; g_close_requested.store(true, std::memory_order_relaxed); }\n    }\n    if (state.saved && ImGui::IsItemHovered()) ImGui::SetTooltip(\"Settings saved\");\n\n    if (state.confirm != SettingsState::Confirm::None) {\n      const bool restart = state.confirm == SettingsState::Confirm::Restart;\n",
+    "after": "      if (settings_widgets::Button(\"Close\")) { state.open = false; g_close_requested.store(true, std::memory_order_relaxed); }\n    }\n    if (state.saved && ImGui::IsItemHovered()) ImGui::SetTooltip(\"Settings saved\");\n    if (!g_settings_save_error.empty()) {\n      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.42f, 0.36f, 1.0f));\n      ImGui::TextWrapped(\"%s\", g_settings_save_error.c_str());\n      ImGui::PopStyleColor();\n    }\n\n    if (state.confirm != SettingsState::Confirm::None) {\n      const bool restart = state.confirm == SettingsState::Confirm::Restart;\n"
+  },
+  {
+    "before": "    if (nav_frame) {\n      // Lifted face and its shadow together, in the rows' own slant.\n      const ImVec2 frame[] = {point(x+dx, y+dy), point(x+444, y+dy),\n                              point(x+444, y+30), point(x+dx, y+30)};\n      settings_nav_frame(draw, frame);\n",
+    "after": "    if (nav_frame) {\n      // Follow all four corners of the lifted face.\n      const ImVec2 frame[] = {point(x+dx, y+dy), point(x+444+dx, y+dy),\n                              point(x+444+dx, y+30+dy), point(x+dx, y+30+dy)};\n      settings_nav_frame(draw, frame);\n"
+  },
+  {
+    "before": "  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, dashboard ? 14.0f : 3.0f);\n  bool clicked = settings_widgets::Button(\"##category\", size);\n  if (selected) ImGui::SetItemDefaultFocus();\n",
+    "after": "  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, dashboard ? 14.0f : 3.0f);\n  if (gd_kit) ImGui::PushStyleColor(ImGuiCol_NavCursor, IM_COL32(0, 0, 0, 0));\n  bool clicked = settings_widgets::Button(\"##category\", size);\n  if (gd_kit) ImGui::PopStyleColor();\n  if (selected) ImGui::SetItemDefaultFocus();\n"
+  },
+  {
+    "before": "        (hovered ? IM_COL32(47, 85, 184, 255) : IM_COL32(30, 58, 140, 255)));\n  } else if (selected) {\n",
+    "after": "        (hovered ? IM_COL32(47, 85, 184, 255) : IM_COL32(30, 58, 140, 255)));\n    if (settings_nav_frame_on_item()) settings_nav_frame(draw, face);\n  } else if (selected) {\n"
+  },
+  {
+    "before": "      const bool pressed = ImGui::InvisibleButton(id, ImVec2(button_w, 58.0f), ImGuiButtonFlags_EnableNav);\n",
+    "after": "      ImGui::PushStyleColor(ImGuiCol_NavCursor, IM_COL32(0, 0, 0, 0));\n      const bool pressed = ImGui::InvisibleButton(id, ImVec2(button_w, 58.0f), ImGuiButtonFlags_EnableNav);\n"
+  },
+  {
+    "before": "      if (state.menu_quit && index == 0 && state.menu_quit_focus_pending) {\n",
+    "after": "      ImGui::PopStyleColor();\n      if (state.menu_quit && index == 0 && state.menu_quit_focus_pending) {\n"
+  },
+  {
+    "before": "      const ImVec2 text_size = ImGui::CalcTextSize(label);\n",
+    "after": "      if (settings_nav_frame_on_item())\n        draw->AddPolyline(face, 4, settings_mix_color(accent, IM_COL32_WHITE, .75f), ImDrawFlags_Closed, 2.0f);\n      const ImVec2 text_size = ImGui::CalcTextSize(label);\n"
   }
 ]

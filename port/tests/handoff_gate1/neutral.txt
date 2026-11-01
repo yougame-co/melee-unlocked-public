@@ -1,0 +1,8 @@
+# P1 plugged, all other ports unplugged; neutral forever, including boot.
+0
+@scene 2:0
+0
+100
+130
+140
+150

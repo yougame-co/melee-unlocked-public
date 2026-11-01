@@ -3,6 +3,7 @@
 #include <dolphin/pad.h>
 
 #include "mu_shim.h"
+#include <string.h>
 
 BOOL PADInit(void) { return 1; }
 int mu_console_active(void)
@@ -50,6 +51,8 @@ u32 PADRead(PADStatus* status)
     int i;
     mu_host->pad_read(pads);
     for (i = 0; i < 4; i++) {
+        /* The padding byte after err too: copied into the pad queues, it would hold stack bytes. */
+        memset(&status[i], 0, sizeof status[i]);
         status[i].button = pads[i].button;
         status[i].stickX = pads[i].stick_x;
         status[i].stickY = pads[i].stick_y;

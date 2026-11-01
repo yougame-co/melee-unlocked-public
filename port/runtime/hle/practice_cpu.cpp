@@ -44,6 +44,9 @@ void apply_test_env_locked() {
   if (const char* v = host::test_env::getenv("MELEE_TEST_PRACTICE_GHOST")) {
     if (practice_cpu::ghost(std::atoi(v), g_config)) g_config.enabled = 1;
   }
+  // MELEE_TEST_PRACTICE_TOOLS=<MU_PC_TOOL_* bits, hex> (tests only): the Training tools, as the
+  // Practice page's Tools rows set them.
+  if (const char* v = host::test_env::getenv("MELEE_TEST_PRACTICE_TOOLS")) g_config.tools = (uint8_t)std::strtoul(v, nullptr, 16);
 }
 std::atomic<uint32_t> g_generation{1};
 std::atomic<bool> g_driving{false};

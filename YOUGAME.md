@@ -1,7 +1,7 @@
 # Melee Unlocked: YouGame's version
 
-Source candidate for YouGame build 37.3, Melee Unlocked 0.9.86,
-row `0.9.86-linux-experimental.37.3`. Original project:
+Source candidate for YouGame build 42.79, Melee Unlocked 0.9.89,
+row `0.9.89-mac-online-experimental.79`. This is build 42 plus the macOS host line: the Mac build on the main listing. Original project:
 https://github.com/Hero88go/melee-unlocked (GPL-3.0-or-later).
 Retain LICENSE, NOTICE and third-party notices.
 

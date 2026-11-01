@@ -1,5 +1,7 @@
 # These window-free diagnostics must run on Linux as well as macOS and Windows.
 enable_testing()
+include("${CMAKE_CURRENT_LIST_DIR}/friends_retire.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/handoff_state.cmake")
 foreach(case IN ITEMS friends_input session_logs net_diagnostics)
   add_executable(port_${case}_test "${CMAKE_CURRENT_LIST_DIR}/${case}_test.cpp")
   target_include_directories(port_${case}_test PRIVATE
@@ -58,3 +60,13 @@ add_test(NAME port_friends_label COMMAND port_friends_label_test)
 
 add_test(NAME port_online_menu COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_LIST_DIR}/online_menu_test.py")
 add_test(NAME port_slippi_title COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_LIST_DIR}/slippi_title_test.py")
+
+add_test(NAME port_css_state_wiring COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_LIST_DIR}/css_state_wiring_test.py")
+enable_language(C)
+add_executable(port_css_state_test "${CMAKE_CURRENT_LIST_DIR}/css_state_test.c"
+  "${FRIENDS_LABEL_ROOT}/sourceport/game/shim/mu_css_state.c")
+target_include_directories(port_css_state_test PRIVATE "${FRIENDS_LABEL_ROOT}/sourceport/game/include"
+  "${FRIENDS_LABEL_ROOT}/port/runtime/abi")
+target_compile_definitions(port_css_state_test PRIVATE MU_NATIVE)
+target_compile_features(port_css_state_test PRIVATE c_std_11)
+add_test(NAME port_css_state COMMAND port_css_state_test)

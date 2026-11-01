@@ -84,6 +84,10 @@ public:
   static uint64_t state_digest(const MuStatePod&);
   static bool valid(const SessionConfig&);
 private:
+  uint64_t liveness_clock() const;
+  void relink_notice();
+  bool relink_shown_ = false;
+  uint64_t relink_notice_at_ = 0;
   bool compare_digests();
   void candidate(uint32_t boundary, const MuStatePod&);
   bool publish(uint32_t corrected_boundary);

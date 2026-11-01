@@ -2,6 +2,7 @@
 #include "native_savestate.h"
 #include "yougame_console_menu.h"
 #include "yougame_console_card.h"
+#include "yougame_console_notice.h"
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -106,6 +107,12 @@ void boot_barrier() {
     engine.end(reason);
     CHECK(notices.size() == 1);
     CHECK(notices[0] == (std::string(reason) == "host_ended" ? "The host ended the session." : "Your friend left."));
+  }
+  { // The seat that pressed Leave ends quietly; only its friend is told.
+    Bus bus; Engine engine; std::vector<std::string> logs, notices;
+    CHECK(engine.begin(std::make_unique<Loopback>(bus,1),config(1),hooks(bus,logs,notices), false));
+    engine.end(kSelfLeft);
+    CHECK(notices.empty()); CHECK(logs.back() == "console: session ended: you left");
   }
 }
 void same_stream() {

@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #define NOMINMAX
 #include "test_env.h"
+#if defined(YOUGAME_AGENT_TEST_HOOK) && defined(__APPLE__)
+#include "yougame_agent_present.h"
+#endif
 #include <functional>
 #include <windows.h>
 #include <dbghelp.h>
@@ -1078,8 +1081,10 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS* info) {
     CloseHandle(dump);
   }
   if (g_crash_dialog) {
-    std::string text = std::string(head) + "\n\nMelee Unlocked crashed. The launcher can send this report: it asks once you close this "
-                       "message. If you started the game without the launcher, please send melee_port.log, melee_port_crash.txt and "
+    // A crash on a helper thread leaves the match running behind this message, so it says when the
+    // game closes: a player in an online match pressed OK mid-game expecting to play on.
+    std::string text = std::string(head) + "\n\nMelee Unlocked crashed and closes when you press OK. The launcher can then send this "
+                       "report. If you started the game without the launcher, please send melee_port.log, melee_port_crash.txt and "
                        "melee_port_crash.dmp from the game folder with your bug report (https://github.com/hero88go/melee-unlocked/issues).";
     MessageBoxA(nullptr, text.c_str(), "Melee Unlocked", MB_ICONERROR | MB_OK);
   }
@@ -1185,8 +1190,8 @@ static void die_report(const char* message) {
     CloseHandle(dump);
   }
   if (g_crash_dialog) {
-    std::string text = std::string(head) + "\n\nMelee Unlocked stopped with an error. The launcher can send this report: it asks once you "
-                       "close this message. If you started the game without the launcher, please send melee_port.log, "
+    std::string text = std::string(head) + "\n\nMelee Unlocked stopped with an error and closes when you press OK. The launcher can then "
+                       "send this report. If you started the game without the launcher, please send melee_port.log, "
                        "melee_port_crash.txt and melee_port_crash.dmp from the game folder with your bug report "
                        "(https://github.com/hero88go/melee-unlocked/issues).";
     MessageBoxA(nullptr, text.c_str(), "Melee Unlocked", MB_ICONERROR | MB_OK);
@@ -1457,7 +1462,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 #endif
 #ifdef __APPLE__
 #include "../mac/full_launch.h"
+#include "../mac/window_state.h"
+#include "../mac/thread_qos.h"
 int main(int argc, char** argv) {
+  mac_disable_window_restoration();
   auto args = mac_host::full_launch_arguments(argc, argv);
   std::vector<char*> pointers;
   for (auto& arg : args) pointers.push_back(arg.data());
@@ -1504,10 +1512,14 @@ static int melee_main(int argc, char** argv) {
 #endif
   const auto agent_test = yougame::agent_test::load(yougame::active(), std::getenv("YOUGAME_DATA"), agent_engine);
   yougame::display_defaults::agent_test_run = agent_test.agent_file;   // the FPS counter's default (read with the settings)
+  host::test_env::agent_run = agent_test.agent_file;   // Slippi Launcher search and refresh off
   yougame::ranked_cpu::practice_allowed = agent_test.agent_file;
   yougame::net_test::install(agent_test.net);
   yougame::ranked_cpu::enabled = agent_test.ranked_cpu;
   for (const auto& [name, value] : agent_test.environment) _putenv_s(name.c_str(), value.c_str());
+#endif
+#if defined(YOUGAME_AGENT_TEST_HOOK) && defined(__APPLE__)
+  yougame::agent_present::start_standalone(yougame::active());
 #endif
   user_gecko::set_sources_allowed(yougame::mode_policy::mod_sources(yougame::active()).folders);
 #ifndef MELEE_SOURCE_PORT
@@ -1608,6 +1620,11 @@ static int melee_main(int argc, char** argv) {
   // melee_port.log let it rotate the game's log away at its start, so a player's log held only the
   // panel's three lines and every desync line of the match was lost.
   if (settings_window_only && host::options.log_file.empty()) host::options.log_file = "melee_settings.log";
+#ifdef __APPLE__
+  // This main thread runs simulation in both embedded and standalone launches.
+  // The early parse above must select --log-file before the QoS result is logged.
+  mac_host::interactive_thread_qos_once("simulation");
+#endif
 #ifdef _WIN32
   // Log only after the early --log-file parse, so the report uses the game's chosen run log.
   host::log("timing: timeBeginPeriod(1) %s", timer_resolution.raised ? "ok" : "failed");
@@ -1754,6 +1771,11 @@ static int melee_main(int argc, char** argv) {
     else if (a == "--headless") headless = true;
     else if (a == "--hidden") hidden = true;
     else if (a == "--threaded-renderer") threaded = true;
+#ifdef __APPLE__
+    else if (a == "--mac-retina") setenv("MELEE_MAC_EMBED_RETINA", "1", 1);  // embedded Retina for one launch
+    else if (a == "--mac-metal") setenv("MELEE_MAC_RENDERER", "metal", 1);  // the Metal renderer for one launch (a test build's spec)
+    else if (a == "--mac-pause-probe") setenv("MELEE_PAUSE_PROBE", "1", 1);  // pause_probe.h diagnostics for one launch (a test build's spec)
+#endif
     else if (a == "--fps") {   // display rate: N or "unlocked"; enables the render thread
       std::string v = next(); gfx.fps_cap = v == "unlocked" ? 0 : v == "monitor" ? -1 : std::atoi(v.c_str());
       if (v != "unlocked" && v != "monitor" && (gfx.fps_cap < 1 || v.find_first_not_of("0123456789") != std::string::npos)) { usage(); return 2; }
@@ -2172,7 +2194,15 @@ static int melee_main(int argc, char** argv) {
   if (settings_window_only) {
     gfx.pc_settings = true;
     gx::load_pc_settings(gfx, o.volume);
-    const int rc = app::run_settings_window(gfx, settings_standby, [&] { gx::load_pc_settings(gfx, o.volume); gfx.pc_settings = true; });
+    // Shown again from standby: the settings file and the skin profile as the game or an earlier panel
+    // left them. The profile was read once at the launcher's start, so a skin set back to standard in the
+    // game showed as still on here, and any skin change in this panel saved those old picks back.
+    const int rc = app::run_settings_window(gfx, settings_standby, [&] {
+      gx::load_pc_settings(gfx, o.volume); gfx.pc_settings = true;
+      host::cosmetics::configure(gfx.settings_path);
+      host::log("settings: reloaded for show, cosmetic profile %s",
+                host::cosmetics::profile_enabled() ? "enabled" : "disabled");
+    });
     // The panel polls every controller so its live readouts work, which starts the adapter and
     // Switch Pro threads, and it can start an update check. Returning straight from here left those
     // threads running into static destruction, where a joinable std::thread ends the process: every
@@ -2390,6 +2420,7 @@ static int melee_main(int argc, char** argv) {
     host::set_process_ending();
     // Join the console link service before tearing down the host/bridge.
     yougame::console::console_engine().end("window closed");
+    yougame::console::wait_friends_retired(2000);   // a Leave just before quitting still leaves the room
     host::report_sim_work();
     g_profiler.report();   // no-op without --profile
     backend_at_exit->reset();

@@ -187,6 +187,7 @@ std::map<unsigned, int> g_link_events;
 std::map<unsigned, std::string> g_link_routes;
 std::map<unsigned, std::vector<uint64_t>> g_link_rtts;
 std::atomic<bool> g_relaunch{false};
+std::shared_ptr<console::RelaunchWait> g_relaunch_wait; // atomic shared_ptr publication, like handoff channels
 int direct_state(unsigned id) {
   const int state = yg_enet_link_state(id);
   if (state == 2 || state == 3) return state;
@@ -284,7 +285,7 @@ void handle_app_line(const std::string& line) {
   if (line.rfind("yg ", 0) == 0) {
     json j = json::parse(line.substr(3), nullptr, false);
     if (j.is_discarded() || !j.is_object()) return;
-    if (j.count("caps")) g_relaunch = console::relaunch_cap(j);
+    if (j.count("caps")) console::read_caps(j, g_relaunch);
     if (j.count("re") && j["re"].is_number_integer()) {
       // The id first: json's operator= takes its argument by value, so moving j into it would empty
       // j before an index read from j on the left is evaluated (C++17 sequences the right side first).
@@ -296,8 +297,10 @@ void handle_app_line(const std::string& line) {
     // Pushes from the app: the pad mirror's handle ({"push":{"type":"pads","handle":N}}).
     if (j.count("push") && j["push"].is_object()) {
       const json& push = j["push"];
+      if (auto wait = std::atomic_load(&g_relaunch_wait)) wait->push(push);
       if (console::launch_request(push)) parity::signals.console_boot_ready();
       if (g_stdio) ux::page_pause.push(push);
+      if (push.value("cmd",json()) == "leave") { friends::lobby.leave(); console::entry.stop(); } // no-op outside a held room
       if (friends::events.push(push, now_ms()) && friends::version_reason(push)) log_friend_version();
       if (push.value("type", "") == "net") g_net_events.push(push);
       if (push.value("type", "") == "direct") {
@@ -596,6 +599,11 @@ class Socket {
   }
   int connection() const { return broker_ ? broker_->conn() : 0; }
   bool recoverable() const { return broker_ && broker_->close_code() == 1006; }
+  // Friends rooms also hold the seat after Rooms' silent-socket close (4002, rooms/src/room-rules.ts
+  // SILENT_CLOSE): it is not final, so the console backend rejoins as it does after a 1006 drop.
+  bool rejoinable() const { return recoverable() || (broker_ && broker_->close_code() == 4002); }
+  bool lobby_mismatch() const { return broker_ && broker_->lobby_mismatch(); }
+  int close_code() const { return broker_ ? broker_->close_code() : 1006; }
   bool brokered() const { return broker_ != nullptr; }
 #ifdef YOUGAME_AGENT_TEST_HOOK
   uint64_t agent_test_first_open_at() const { return broker_ ? broker_->agent_test_first_open_at() : 0; }
@@ -930,11 +938,13 @@ std::string g_rank_opponent, g_rank_score;
 int g_rank_local = 0;
 constexpr uint64_t kDrainMs = 30000;   // a ranked room stays open this long at most for its result
 
+std::string g_blend_reason; // guarded by g_mutex; reset for each search
 void set_status(const std::string& s) {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (search_stopped()) return;
-  if (g_status != s) host::log("yougame: %s", s.c_str());
-  g_status = s;
+  const std::string shown = !g_blend_reason.empty() && s == blend::kSearchBoth ? blend::kSearchYouGameOnly : s;
+  if (g_status != shown) host::log("yougame: %s", shown.c_str());
+  g_status = shown;
   g_status_since = now_ms();
 }
 
@@ -1114,7 +1124,7 @@ Identity fetch_identity(const std::function<bool()>& cancelled = nullptr) {
       friends::events.hello(hello);
       console::launch_hello(hello);
       if (console::requests.pending()) parity::signals.console_boot_ready();
-      if (hello.count("caps")) g_relaunch = console::relaunch_cap(hello);
+      if (hello.count("caps")) console::read_caps(hello, g_relaunch);
     }
 #ifdef _WIN32
     const auto mode = transport::Mode::hello(hello);
@@ -1171,48 +1181,201 @@ Identity fetch_identity(const std::function<bool()>& cancelled = nullptr) {
 // The room worker owns Socket after open. SessionLink only queues sends and polls messages;
 // it never waits for a bridge answer from pump(wait_ms).
 namespace {
+console::FriendsRetire g_console_retired;
+void wait_console_retired(const std::function<bool()>& stop = {}) {
+  if (!g_console_retired.wait(5000,stop) && !(stop && stop())) host::log("console: previous Friends room still closing");
+}
 struct ConsoleBackend {
   std::unique_ptr<Socket> room;
   std::thread worker;
   std::atomic<bool> stop{false}, closed{false};
-  std::mutex mutex;
+  std::atomic<bool> rejoining{false};
+  std::atomic<bool> retiring{false};
+  std::shared_future<void> preparation_finished;
+  std::vector<json> retired_links; // mutex; SessionLink's destructor queues directClose here
+  std::mutex mutex, close_mutex;
   std::condition_variable cv;
   std::deque<json> incoming, outgoing;
   size_t sending = 0; // guarded by mutex; outgoing may be empty while the worker is sending
   ENetSocket datagrams = ENET_SOCKET_NULL;
-  int conn = 0;
+  std::atomic<int> conn{0};
+  int players = 2;
+  bool private_queue = true; // the relaunched shared session's ticket carries no queue
+  std::atomic<bool> peers_present{true}, handoff_pending{false}, end_previous_on_welcome{false};
   std::string session;
+  std::atomic<bool> session_live{false}, interrupted{false}, waiting_previous{false};
+  json last_roster;
+  std::function<std::string(int)> renew_ticket;
   ~ConsoleBackend() { close(); }
   bool open(const std::string& ticket, const std::string& code, int ms) {
     room = std::make_unique<Socket>(); std::string error;
-    if (!room->open_session("",ticket,code,&error,ms,session)) return false;
+    if (!room->open_session("",ticket,code,&error,ms,session)) {
+      host::log("console: room open refused (close %d, %s)", room->close_code(),
+                room->lobby_mismatch() ? "lobby_mismatch" : "unclassified");
+      return false;
+    }
     conn = room->connection();
-    worker = std::thread([this] {
+    worker = std::thread([this,code] {
       uint64_t ping = now_ms(), next_card = 0;
+#ifdef YOUGAME_AGENT_TEST_HOOK
+      const bool drop_once = transport::agent_drop_room_once_enabled(std::getenv("MELEE_ONLINE_TEST_DROP_ROOM_ONCE"));
+#endif
       for (;;) {
+#ifdef YOUGAME_AGENT_TEST_HOOK
+        if (drop_once && !transport::agent_drop_room_once_attempted && console::console_css_frames() >= 300 &&
+            room->brokered() && !room->closed()) {
+          bool due = false;
+          { std::lock_guard<std::mutex> lock(mutex);
+            due = transport::agent_drop_room_once_due(true,console::console_css_frames(),last_roster,
+                [](const char* s) { host::log("%s",s); }); }
+          if (due) room->agent_test_drop_room(); // 1006 locally: the held-seat rejoin below takes it
+        }
+#endif
+        if (host::exit_requested()) {
+          if (!handoff_pending) room->send({{"t","leave"}});
+          break; // an intentional shared-session relaunch retains its seat
+        }
         json m;
         if (!stop && room->next(m,10)) {
+          const auto type = ranked::str(m,"t");
+          if (session_live && !handoff_pending && (type == "back" || type == "join" || type == "welcome")) {
+            // The live Link validates frozen slots/accounts and new connection ids.
+            // Lobby's old host id must not turn a held host's new id into a Leave;
+            // leave/lobby rosters still pass, so a released host closes the guest.
+            auto control = m; control.erase("players"); control.erase("participants");
+            friends::lobby.observe(control); // final room closure still applies immediately
+          } else friends::lobby.observe(m);
+          if (friends::lobby.cancelled()) console::entry.stop();
+          bool ended_session = false;
+          if (type == "sessionEnded") {
+            std::lock_guard<std::mutex> lock(mutex);
+            ended_session = ranked::str(m,"sessionId") == session;
+            if (ended_session) { session_live = waiting_previous = false; interrupted = true; }
+          }
+          else if (m.count("console") && m["console"].is_object()) session_live = true;
+          else if (m.count("room") && m["room"].is_object() && m["room"].count("console") && m["room"]["console"].is_object()) session_live = true;
+          else if (type == "welcome" || type == "lobby") {
+            if (session_live.exchange(false)) interrupted = true;
+            waiting_previous = false; // reconnect after expiry can miss sessionEnded
+          }
           std::lock_guard<std::mutex> lock(mutex);
+          if (type == "welcome") last_roster = m;
+          else if (!last_roster.is_null()) {
+            for (const auto* key : {"players","participants","host","revision"})
+              if (m.count(key)) last_roster[key] = m[key];
+            if (type == "leave" && m.count("player") && last_roster.count("participants")) {
+              auto& seats = last_roster["participants"];
+              const auto id = ranked::str(m["player"],"id");
+              seats.erase(std::remove_if(seats.begin(),seats.end(),[&](const json& p) {
+                return ranked::str(p,"connectionId") == id || ranked::str(p,"id") == id;
+              }),seats.end());
+            }
+          }
+          // Preserve a new Start that beats the simulation's return tick, including its save chunks.
+          const json* frozen = m.count("console") && m["console"].is_object() ? &m["console"] :
+            m.count("room") && m["room"].is_object() && m["room"].count("console") && m["room"]["console"].is_object() ? &m["room"]["console"] : nullptr;
+          if (!last_roster.is_null()) {
+            if (frozen) {
+              last_roster["console"] = *frozen;
+              last_roster["matchId"] = m.value("matchId",frozen->value("sessionId",json()));
+            } else if (ended_session || type == "welcome" || type == "lobby") {
+              last_roster.erase("console"); last_roster.erase("matchId");
+              if (last_roster.count("room") && last_roster["room"].is_object()) last_roster["room"].erase("console");
+            }
+          }
+          if (type == "welcome" && end_previous_on_welcome.exchange(false) && frozen &&
+              ranked::str(*frozen,"sessionId") == session) {
+            waiting_previous = true;
+            outgoing.push_back({{"t","end-session"},{"sessionId",session}});
+          }
+          if (m.count("players") && m["players"].is_array()) {
+            const auto me = ranked::str(last_roster,"me");
+            peers_present = m["players"].size() == size_t(players) &&
+              std::none_of(m["players"].begin(),m["players"].end(),[&](const json& p) {
+                return ranked::str(p,"id") != me && p.value("away",json()) == true;
+              });
+          }
           if (incoming.size() >= 1024) { closed = true; break; }
           incoming.push_back(std::move(m)); cv.notify_all();
+          if (type == "welcome") rejoining = false; // publish the fresh roster before allowing opens
         }
-        if (room->closed()) { closed = true; cv.notify_all(); break; }
+        const auto quit = [this] { return stop.load() || friends::lobby.cancelled() || host::exit_requested(); };
+        if (room->closed() && room->rejoinable() && !quit()) {
+          rejoining = true;
+          // Rooms holds a dropped seat for 90 s (AWAY_MS); 60 s rides out a Rooms deploy's ~30 s reset.
+          const auto until = now_ms()+60000;
+          bool recovered = false;
+          uint64_t backoff = 250; // a refused ticket must not become a request storm
+          host::log("console: room transport dropped (%d); trying held-seat rejoin",room->close_code());
+          while (!quit() && now_ms() < until && room->rejoinable()) {
+            const auto budget = int(std::min<uint64_t>(2000,until-now_ms()));
+            try {
+              const auto ticket = renew_ticket ? renew_ticket(budget) : std::string();
+              std::string current_session;
+              { std::lock_guard<std::mutex> lock(mutex); current_session = session; }
+              std::string error;
+              if (!ticket.empty() && now_ms() < until && room->open_session("",ticket,code,&error,
+                  int(std::min<uint64_t>(2000,until-now_ms())),quit,current_session)) {
+                conn = room->connection(); recovered = true; break;
+              }
+            } catch (...) { /* bounded retry, never log a ticket or bridge exception */ }
+            const auto left = until > now_ms() ? until-now_ms() : 0;
+            { // close() wakes this, so a Leave never waits out a backoff
+              std::unique_lock<std::mutex> lock(mutex);
+              cv.wait_for(lock,std::chrono::milliseconds(std::min(backoff,left)),[this] { return stop.load(); });
+            }
+            backoff = std::min<uint64_t>(backoff*2,4000);
+          }
+          if (recovered) { host::log("console: held-seat rejoin connected"); continue; }
+        }
+        if (room->closed()) {
+          if (room->close_code() == 4012) friends::lobby.closed(4012); // 1006 keeps the held seat
+          if (friends::lobby.cancelled()) console::entry.stop();
+          closed = true; cv.notify_all(); break;
+        }
         std::deque<json> send;
         { std::lock_guard<std::mutex> lock(mutex); send.swap(outgoing); sending = send.size(); }
         if (now_ms()-ping >= 5000) { send.push_back({{"t","ping"},{"at",now_ms()}}); ping = now_ms(); }
-        for (const auto& value : send) {
+        for (size_t k = 0; k < send.size(); ++k) {
+          const auto& value = send[k];
           // Pace actual Room sends too: a delayed worker must not burst a queued save over 120/s.
           if (value.count("d") && value["d"].is_object() && ranked::str(value["d"],"kind") == "mu-card") {
             const auto now = now_ms();
             if (now < next_card) std::this_thread::sleep_for(std::chrono::milliseconds(next_card-now));
             next_card = now_ms()+12;
           }
-          if (!room->send(value)) { closed = true; cv.notify_all(); break; }
+          if (!room->send(value)) {
+            if (!room->closed()) continue; // a timeout loses one message, not the stream
+            // Dropped socket: keep the rest for after the held-seat rejoin (or the final close).
+            std::lock_guard<std::mutex> lock(mutex); outgoing.insert(outgoing.begin(),send.begin()+k,send.end()); break;
+          }
         }
         { std::lock_guard<std::mutex> lock(mutex); sending = 0; cv.notify_all(); }
         if (closed || stop) break; // flush queued session-end notices before closing the stream
       }
     });
+    return true;
+  }
+  bool resume_room(bool host) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (closed || !last_roster.is_object()) return false;
+    auto strip_previous = [this](json& m) {
+      const json* frozen = m.count("console") && m["console"].is_object() ? &m["console"] :
+        m.count("room") && m["room"].is_object() && m["room"].count("console") && m["room"]["console"].is_object() ? &m["room"]["console"] : nullptr;
+      if (frozen && ranked::str(*frozen,"sessionId") == session) {
+        m.erase("console"); m.erase("matchId");
+        if (m.count("room") && m["room"].is_object()) m["room"].erase("console");
+      }
+    };
+    auto roster = last_roster;
+    waiting_previous = session_live && (!roster.count("console") || ranked::str(roster["console"],"sessionId") == session);
+    strip_previous(roster);
+    for (auto& m : incoming) strip_previous(m);
+    incoming.push_front(std::move(roster));
+    interrupted = false;
+    // A failed peer link cannot resume the old simulation at its last frame.
+    // End only that session; the host keeps the room for the next shared boot.
+    if (host && waiting_previous) outgoing.push_back({{"t","end-session"},{"sessionId",session}});
     return true;
   }
   bool next(json& m, int ms) {
@@ -1233,7 +1396,10 @@ struct ConsoleBackend {
     }) && !closed;
   }
   bool attach(int ms) {
+    if (retiring) return false; // a cancelled preparing entry must not wait on its own retire
+    wait_console_retired([this] { return retiring.load(); }); // every console-session attach shares the process-global channel
     if (ms <= 0) return false;
+    if (retiring) return false;
     if (!yg_enet_channel_ready()) {
       // Like directOpen: a refused attach answers {ok:false, code} (no_direct when the links helper is
       // missing or won't start). Log the code (letters and _ only) instead of throwing it away.
@@ -1258,8 +1424,11 @@ struct ConsoleBackend {
     return datagrams != ENET_SOCKET_NULL;
   }
   void close() {
-    stop = true;
+    std::lock_guard<std::mutex> closing(close_mutex);
+    { std::lock_guard<std::mutex> lock(mutex); stop = true; }
+    cv.notify_all();
     if (worker.joinable()) worker.join();
+    closed = true; cv.notify_all();
     // A clean close preserves Rooms' relaunch hold. Never send an explicit leave.
     if (room) { room->close(1000); room.reset(); }
     if (datagrams != ENET_SOCKET_NULL) { yg_enet_destroy(datagrams); datagrams = ENET_SOCKET_NULL; yg_enet_enable(0); }
@@ -1269,6 +1438,18 @@ struct ConsoleBackend {
 
 namespace console {
 namespace {
+std::mutex friends_backend_mutex;
+std::mutex friends_report_mutex;
+std::shared_ptr<ConsoleBackend> friends_backend;
+void track_friends_backend(const std::shared_ptr<ConsoleBackend>& b) {
+  std::shared_ptr<ConsoleBackend> old;
+  {
+    std::lock_guard<std::mutex> lock(friends_backend_mutex);
+    if (b && b->retiring) return; // a Leave already took it; never reinstall a retiring backend
+    old = std::exchange(friends_backend,b);
+  }
+  // old's destructor joins its worker here, outside the lock the simulation thread also takes
+}
 std::string current_build() {
   static const auto build = [] {
     wchar_t exe[32768]{};
@@ -1284,12 +1465,12 @@ SessionIO console_io(const std::shared_ptr<ConsoleBackend>& b) {
   SessionIO io;
   // Console boots before the ordinary mod/card scan. Use native Direct's canonical
   // content key in both the waiting game and the fresh boot (no ranked rules).
-  // The suffix is the console session protocol: console2 = the host's save on every seat and a
-  // straight-to-VS boot (build 37.1). Seats on another protocol must never share a session.
+  // The suffix is the console session protocol: console4 adds game-local save choices and rejoin agreement
+  // to the shared host save and straight-to-VS boot. Other protocols must never share a session.
 #ifdef MELEE_PORT_VERSION
-  io.compatibility = compatibility_key(MELEE_PORT_VERSION,false,"",false) + "-console2";
+  io.compatibility = compatibility_key(MELEE_PORT_VERSION,false,"",false) + "-console4";
 #else
-  io.compatibility = compatibility_key("dev",false,"",false) + "-console2";
+  io.compatibility = compatibility_key("dev",false,"",false) + "-console4";
 #endif
   io.host_save = [] {
     const auto read = yougame::console::host_save_reader.load(std::memory_order_acquire);
@@ -1299,14 +1480,23 @@ SessionIO console_io(const std::shared_ptr<ConsoleBackend>& b) {
     const char* data = std::getenv("YOUGAME_DATA");
     return data && stage_card(std::filesystem::u8path(data),c);
   };
+  io.discard_card = [](const SessionConfig& c) {
+    const char* data = std::getenv("YOUGAME_DATA");
+    if (data && !discard_staged_card(std::filesystem::u8path(data),c))
+      host::log("console: couldn't remove staged save; default launch ignores it");
+  };
   io.restore_card = [](SessionConfig& c) {
     const char* data = std::getenv("YOUGAME_DATA");
-    return data && load_card(std::filesystem::u8path(data),c);
+    return data && take_card_choice(std::filesystem::u8path(data),c) && load_card(std::filesystem::u8path(data),c);
   };
   io.exclusive = true;
   io.background_service = true;
   io.random = random64;
-  io.request = [](const json& q,int ms) {
+  io.request = [b](const json& q,int ms) {
+    if (ranked::str(q,"type") == "directClose" && b->retiring) {
+      std::lock_guard<std::mutex> lock(b->mutex); b->retired_links.push_back(q);
+      return json::object();
+    }
     // A refused directOpen answers {ok:false, code} (no_direct, not_room, not_peer, exists, rate_links, ended).
     // bridge() would throw that away; hand the code (letters and _ only) to the link log instead.
     if (ranked::str(q,"type") == "directOpen") {
@@ -1331,12 +1521,25 @@ SessionIO console_io(const std::shared_ptr<ConsoleBackend>& b) {
     }
     return bridge(q,ms);
   };
-  io.open_room = [b](const std::string& ticket,const std::string& room,int ms) { return b->open(ticket,room,ms); };
+  io.open_room = [b,compatibility = io.compatibility](const std::string& ticket,const std::string& room,int ms) {
+    b->renew_ticket = [room,compatibility,players = b->players,private_queue = b->private_queue](int budget) {
+      // Same shape as the session's first ticket (yougame_console_link.cpp), so Rooms sees the same lobby.
+      json q = {{"type","mpTicket"},{"room",room},{"players",players},{"mode","console"},{"ranked",false},
+        {"lobby",{{"version",1},{"minPlayers",players},{"maxLocalPlayers",1},{"compatibility",compatibility}}}};
+      if (private_queue) q["queue"] = "private";
+      const auto reply = bridge(q,budget);
+      return ranked::str(reply,"ticket");
+    };
+    return b->open(ticket,room,ms);
+  };
+  io.room_mismatch = [b] { return b->room && b->room->lobby_mismatch(); };
   io.next_room = [b](json& m,int ms) { return b->next(m,ms); };
   io.send_room = [b](const json& m) { return b->send(m); };
   io.flush_room = [b](int ms) { return b->flush(ms); };
   io.room_closed = [b] { return b->closed.load(); };
-  io.connection = [b] { return b->conn; };
+  io.room_rejoining = [b] { return b->rejoining.load(); };
+  io.rebound = [](const std::string& old_id,const std::string& new_id) { friends::lobby.rebound(old_id,new_id); };
+  io.connection = [b] { return b->conn.load(); };
   io.attach = [b](int ms) { return b->attach(ms); };
   io.state = direct_state;
   io.route = [](unsigned id) { std::lock_guard<std::mutex> lock(g_link_mutex); return g_link_routes[id]; };
@@ -1357,22 +1560,39 @@ SessionIO console_io(const std::shared_ptr<ConsoleBackend>& b) {
     id = ENET_NET_TO_HOST_32(address.host) & 65535; bytes.resize(size_t(n)); return true;
   };
   io.wait = [b](int ms) { enet_uint32 condition = ENET_SOCKET_WAIT_RECEIVE; if (yg_enet_wait(b->datagrams,&condition,ms) < 0) b->closed = true; };
-  io.close = [b] { b->close(); };
+  io.close = [b] {
+    if (b->retiring) return; // Leave's retire owns flush/close after Engine::end joins its worker
+    if (friends::lobby.cancelled() || host::exit_requested()) { b->send({{"t","leave"}}); b->flush(1000); }
+    // Keep receiving authoritative room departure after a peer link ends the game.
+    if (!friends::lobby.held() || host::exit_requested()) { b->close(); friends::events.current_room({}); }
+  };
   io.log = [](const std::string& line) { host::log("%s",line.c_str()); };
   return io;
 }
 } // namespace
 std::unique_ptr<SessionLink> start_session(const json& request, SessionConfig& config, std::string& error) {
+  const char* data = std::getenv("YOUGAME_DATA");
+  if (friends::lobby.cancelled() || (data && session_left(std::filesystem::u8path(data),session_id(request)))) {
+    error = "left"; return nullptr; // a page Leave during the load must never rejoin
+  }
   bool busy;
   { std::lock_guard<std::mutex> lock(g_mutex); busy = bool(g_room) || g_slippi_match; }
+  friends::events.current_room(friends::room(request));
   if (!active() || !wait_identity(10000).ok || !g_broker || !g_direct || busy) {
     error = "console sessions need the YouGame link helper";
-    host::log("console: start failed: %s",error.c_str()); return nullptr;
+    host::log("console: start failed: %s",error.c_str()); friends::events.current_room({}); return nullptr;
+  }
+  if (request.value("players",2) == 2) {
+    friends::lobby.begin(false); // welcome supplies the host identity, including migrated ports
+    friends::lobby.opened(friends::room(request));
   }
   auto b = std::make_shared<ConsoleBackend>();
   b->session = friends::text(request,"sessionId",64);
+  b->players = request.value("players",2);
+  b->private_queue = false;
   auto io = console_io(b);
-  io.cancelled = [] { return host::exit_requested(); };
+  track_friends_backend(b);
+  io.cancelled = [] { return friends::lobby.cancelled() || host::exit_requested(); };
   return start_session(request,config,error,std::move(io));
 }
 void take_pending_launch() {
@@ -1382,14 +1602,130 @@ void take_pending_launch() {
       [](const json& q,const auto& consume) { return requests.push(q,true,consume); },
       [](const char* text) { host::log("%s",text); });
 }
-void friends_entry(const std::string& room) {
+std::function<void()> leave_friends_room() {
+  entry.stop();
+  std::shared_ptr<ConsoleBackend> b;
+  std::shared_future<void> preparation;
+  { std::lock_guard<std::mutex> lock(friends_backend_mutex); b = std::exchange(friends_backend,{}); }
+  if (b) {
+    b->retiring = true;
+    std::lock_guard<std::mutex> lock(b->mutex); preparation = b->preparation_finished;
+  }
+  requests.clear();
+  const char* data = std::getenv("YOUGAME_DATA");
+  if (data) { std::error_code ec; std::filesystem::remove(std::filesystem::u8path(data) / "console" / "pending.json",ec); }
+  friends::events.current_room({});
+  return g_console_retired.begin([b,preparation] {
+    const auto began = std::chrono::steady_clock::now();
+    host::log("console: Friends leave closing in background");
+    // An entry may still be opening this exact room. Let it finish using the backend
+    // before closing it; never consult the mutable Entry or replacement backend.
+    if (preparation.valid() && preparation.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+      host::log("console: Friends leave waiting for the room to finish opening");
+      preparation.wait();
+    }
+    if (b) {
+      // Read the session only now: an opening entry may have committed one meanwhile.
+      // FIFO: end the frozen session (if any), then leave lobby membership, then close.
+      std::string session;
+      { std::lock_guard<std::mutex> lock(b->mutex); session = b->session; }
+      const char* data = std::getenv("YOUGAME_DATA");
+      if (data && !session.empty() && !mark_session_left(std::filesystem::u8path(data),session))
+        host::log("console: couldn't record cancelled launch");
+      if (!session.empty()) b->send({{"t","end-session"},{"sessionId",session}});
+      b->send({{"t","leave"}});
+      b->flush(1000);
+    }
+    {
+      std::lock_guard<std::mutex> report_lock(friends_report_mutex);
+      try { bridge({{"type","mpRoom"},{"code",nullptr},{"players",json::array()}},1000); } catch (...) {}
+    }
+    if (b) {
+      for (const auto& q : b->retired_links) { try { bridge(q,1000); } catch (...) {} }
+      b->close();
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-began).count();
+    host::log("console: Friends leave closed in %lld ms",static_cast<long long>(ms));
+  });
+}
+void close_friends_room(std::function<void()> release) {
+  // Engine::end has joined its datagram worker; only the detached retire may close now.
+  release();
+}
+bool wait_friends_retired(int ms) { return g_console_retired.wait(ms); }
+void friends_entry(const std::string& room, bool host_reenter, bool held_reenter) {
   if (!entry.begin()) return;
-  friends::events.current_room(room);
-  host::log("console: Friends waiting in room %s",room.c_str());
-  std::thread([room] {
-    auto b = std::make_shared<ConsoleBackend>();
+  if (held_reenter) {
+    if (!friends::lobby.resume()) { entry.finished(); return; }
+  } else friends::lobby.begin(room == "new" || host_reenter);
+  if (host_reenter) friends::lobby.opened(room);
+  friends::events.current_room(room == "new" ? std::string() : room);
+  host::log("console: Friends opening room");
+  std::thread([room,host_reenter,held_reenter] {
+    wait_console_retired(); // also order the new room/page reports after the old empty report
+    if (entry.cancelled() || friends::lobby.cancelled()) { entry.finished(); return; }
+    auto done = std::make_shared<std::promise<void>>();
+    struct Finished {
+      std::shared_ptr<std::promise<void>> done;
+      ~Finished() { done->set_value(); }
+    } finished{done};
+    std::shared_ptr<ConsoleBackend> b;
+    const auto preparing = done->get_future().share();
+    if (host_reenter || held_reenter) {
+      // Publish this entry on the reused backend in the same step that reads it, so a Leave that
+      // takes it next waits for this entry before its retire closes it.
+      std::lock_guard<std::mutex> lock(friends_backend_mutex); b = friends_backend;
+      if (b) { std::lock_guard<std::mutex> backend_lock(b->mutex); b->preparation_finished = preparing; }
+    }
+    if (held_reenter && !host_reenter && b && b->closed) {
+      friends::lobby.session_stopped(false); entry.finished(); return;
+    }
+    const bool reuse = b && !b->closed;
+    if (!reuse) {
+      std::string previous;
+      if (b) { std::lock_guard<std::mutex> lock(b->mutex); previous = b->session; }
+      b = std::make_shared<ConsoleBackend>(); b->session = std::move(previous);
+      b->end_previous_on_welcome = host_reenter && !b->session.empty();
+    }
+    { std::lock_guard<std::mutex> lock(b->mutex); b->preparation_finished = preparing; }
+    track_friends_backend(b);
     auto io = console_io(b);
-    io.cancelled = [] { return entry.cancelled() || host::exit_requested(); };
+    if (reuse) {
+      io.open_room = [b,host_reenter](const std::string&,const std::string&,int) {
+        return b->resume_room(host_reenter);
+      };
+    }
+    io.previous_session_active = [b] { return b->waiting_previous.load(); };
+    io.friends_lobby = true;
+    io.handoff_join = friends_handoff_join_enabled();
+    if (io.handoff_join) {
+      const auto info = std::atomic_load_explicit(&handoff_join::published_info, std::memory_order_acquire);
+      if (info) io.handoff_info = *info;
+    }
+    io.handoff_css = [] { return handoff_join::host_css.load(std::memory_order_acquire); };
+    io.handoff_begin = [] {
+      auto channel = std::make_shared<handoff_join::Channel>();
+      std::atomic_store_explicit(&handoff_join::pending_channel,channel,std::memory_order_release);
+      return channel;
+    };
+    io.held_reenter = host_reenter || held_reenter;
+    io.committed = [b](const SessionConfig& c) {
+      std::lock_guard<std::mutex> lock(b->mutex); b->session = c.session_id; b->interrupted = false;
+    };
+    io.opened = [](const std::string& code) { friends::events.current_room(code); friends::lobby.opened(code); };
+    io.roster = [](const std::string& code,const json& participants,const std::string& me,int revision) {
+      std::lock_guard<std::mutex> report_lock(friends_report_mutex);
+      if (friends::lobby.cancelled() || entry.cancelled()) return;
+      std::string player;
+      for (const auto& p : participants) if (ranked::str(p,"connectionId") == me) player = ranked::str(p,"id");
+      // This report completes the page's held-room contract before mpFriend.room is sent.
+      bridge({{"type","mpRoom"},{"code",code},{"queue","private"},{"size",2},{"me",player},
+          {"players",participants},{"participants",participants},{"revision",revision}},1000);
+      friends::lobby.report_ready();
+    };
+    io.css_ready = [b] { return friends::lobby.ready() && b->peers_present.load(); };
+    io.freeze_pick = [](const std::string& name) { return friends::lobby.freeze(name); };
+    io.cancelled = [] { return friends::lobby.cancelled() || entry.cancelled() || host::exit_requested(); };
     io.confirm_start = [] { return entry.start(); };
     std::string last;
     io.waiting = [&last](const std::string& text,bool ready) {
@@ -1397,14 +1733,25 @@ void friends_entry(const std::string& room) {
       if (last != text) { host::log("console: %s",text.c_str()); last = text; }
     };
     bool prepared = false; std::string prepared_session; int64_t handed_at = 0;
+    std::shared_ptr<RelaunchWait> relaunch_wait;
     const bool relaunching = g_stdio && g_relaunch;
-    io.prepared = [&](const SessionConfig& c) {
-      prepared_session = c.session_id; handed_at = epoch_now();
+    HandoffIO handoff_io; handoff_io.clock = io.clock; handoff_io.cancelled = io.cancelled;
+    io.prepared = [&,handoff_io](const SessionConfig& c) {
+      if (friends::lobby.cancelled() || entry.cancelled()) return;
+      prepared_session = c.session_id;
+      { std::lock_guard<std::mutex> lock(b->mutex); b->session = c.session_id; }
+      handed_at = epoch_now();
+      if (relaunching) {
+        relaunch_wait = std::make_shared<RelaunchWait>(prepared_session,handed_at);
+        std::atomic_store(&g_relaunch_wait,relaunch_wait);
+      }
       const char* data = std::getenv("YOUGAME_DATA");
+      b->handoff_pending = true;
       prepared = handoff(c,relaunching,data ? std::filesystem::u8path(data) : std::filesystem::path(),
           epoch_now(),current_build(), [](const json& q) { write_line("yg " + q.dump()); },
           [](const std::string& line) { host::log("%s",line.c_str()); },
-          [](const char* text) { entry.status(text); });
+          [](const char* text) { entry.status(text); },handoff_io);
+      if (!prepared) b->handoff_pending = false;
     };
     // Keep the frozen room alive while the user closes/relaunches the game. Rooms owns the gap.
     io.close = [] {};
@@ -1417,10 +1764,14 @@ void friends_entry(const std::string& room) {
       if (!prepared && !error.empty() && !entry.cancelled())
         entry.status(error == update::kMessage ? std::string(update::kMessage) :
                      session_notice(error) ? session_notice(error) : "Couldn't start playing together: " + error);
-      while (prepared && !entry.cancelled() && !host::exit_requested() && !b->closed) {
+      while (prepared && !friends::lobby.cancelled() && !entry.cancelled() && !host::exit_requested() && !b->closed) {
         json m; b->next(m,50);
+        if (relaunch_wait && relaunch_wait->reason()) {
+          host::log("console: relaunch dropped by the app: %s",relaunch_wait->reason());
+          entry.status(kRelaunchDropped); break;
+        }
         // The app closes this game and starts the session; still here long after means it didn't.
-        if (relaunching && epoch_now() - handed_at >= 45000) {
+        if (relaunch_wait && relaunch_wait->timed_out(epoch_now())) {
           host::log("console: no relaunch 45 s after the request; the app didn't start the session");
           entry.status("Couldn't start playing together. Close the game and try again."); break;
         }
@@ -1434,7 +1785,22 @@ void friends_entry(const std::string& room) {
       host::log("console: start failed: couldn't start playing together");
       entry.status("Couldn't start playing together");
     }
-    b->close();
+    std::atomic_store(&g_relaunch_wait,std::shared_ptr<RelaunchWait>{});
+    if ((b->interrupted || (b->closed && !friends::lobby.host())) && !friends::lobby.cancelled() && !entry.cancelled()) {
+      friends::lobby.session_stopped(!b->closed);
+      entry.finished();
+      return; // same room/socket; host's simulation tick reenters local CSS
+    }
+    if (!b->retiring && (!prepared || friends::lobby.cancelled() || entry.cancelled())) {
+      std::string session;
+      { std::lock_guard<std::mutex> lock(b->mutex); session = b->session; }
+      const char* data = std::getenv("YOUGAME_DATA");
+      if (data && !session.empty()) mark_session_left(std::filesystem::u8path(data),session);
+      if (!session.empty()) b->send({{"t","end-session"},{"sessionId",session}});
+      b->send({{"t","leave"}}); b->flush(1000);
+      if (!friends::lobby.cancelled()) friends::lobby.leave(entry.status());
+    }
+    if (!b->retiring) b->close();
     friends::events.current_room({});
     entry.finished();
   }).detach();
@@ -1452,7 +1818,7 @@ void logging_ready() {
     if (g_embed_toplevel && g_toplevel_dpi_failed)
       host::log("embed: toplevel DPI awareness failed err=%lu", (unsigned long)g_toplevel_dpi_error);
 #endif
-    std::atexit([] { g_relay_pads.flush(); host::log_flush(); });
+    std::atexit([] { g_console_retired.wait(2000); g_relay_pads.flush(); host::log_flush(); });
   });
 }
 bool active() { return g_relay_pads.active(); }
@@ -1660,6 +2026,16 @@ void update_notice_presented() {
   host::request_user_exit();
 }
 
+void blend_slippi_stopped(uint64_t epoch, const std::string& reason) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_search_generation.current(epoch)) return;
+  g_blend_reason = blend::slippi_stop_reason(reason);
+  if (g_status == blend::kSearchBoth || g_status == blend::kSearchYouGameOnly) {
+    g_status = blend::kSearchYouGameOnly;
+    g_status_since = now_ms();
+  }
+}
+
 std::string status_line() {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_status = friends::expire_joined(g_status, g_status_since, now_ms());
@@ -1667,6 +2043,8 @@ std::string status_line() {
 }
 
 std::string slippi_link_status(const std::string& status) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (status == blend::kSearchYouGameOnly && !g_blend_reason.empty()) return status + "\n" + g_blend_reason;
   return status == slippi_linking::kSearching
       ? slippi_linking::presentation.line(slippi_linking::Screen::Search) : status;
 }
@@ -1675,11 +2053,13 @@ nlohmann::json request_slippi_link(const nlohmann::json& request, int timeout, c
   return bridge(request, timeout, cancelled);
 }
 
-std::string pick_friend_room(const std::function<bool()>& cancelled) {
+std::string pick_friend_room(const std::function<bool()>& cancelled, const std::string& held) {
   host::log("friends: picker requested");
   try {
-    auto code = friends::resolve_room({},
-        [&](const json& q, int ms) { return bridge(q, ms, cancelled); }, cancelled);
+    auto code = held.empty() ? friends::resolve_room({},
+        [&](const json& q, int ms) { return bridge(q, ms, cancelled); }, cancelled)
+        : friends::picker_room(bridge(friends::picker(held),friends::kPickerTimeout,cancelled));
+    if (cancelled() || (!held.empty() && code != held)) throw std::runtime_error("Cancelled");
     host::log("friends: invite sent");
     return code;
   } catch (const std::exception& e) {
@@ -1716,7 +2096,12 @@ void slippi_link(bool linked, const std::string& tag) {
   if (g_stdio) write_line(line);
 }
 
-uint64_t begin_search() { return close_room(Leave::Quit); }
+uint64_t begin_search() {
+  const auto epoch = close_room(Leave::Quit);
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (g_search_generation.current(epoch)) g_blend_reason.clear();
+  return epoch;
+}
 
 bool guard_search(uint64_t epoch, const std::function<void()>& commit) {
   std::lock_guard<std::mutex> lock(g_mutex);

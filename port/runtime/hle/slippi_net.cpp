@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "test_env.h"
 #include "slippi_net.h"
+#include "slippi_address.h"
 #include "slippi_netplay_receive.h"
 #include "slippi_online.h"
 #include "slippi_report.h"
@@ -192,7 +193,8 @@ Packet& Packet::operator>>(std::string& s) {
 
 // ---------------------------------------------------------------- user
 User::User(std::string user_dir, bool slippi_only) : dir_(std::move(user_dir)), slippi_only_(slippi_only) {
-  if (AttemptLogin()) RefreshFromServer();
+  if (host::test_env::agent_copy()) host::log("agent: skipping Slippi Launcher search and server refresh");
+  if (AttemptLogin() && !host::test_env::agent_copy()) RefreshFromServer();
 }
 std::unique_ptr<User> User::GrantedSlippiUser(const std::string& user_dir) {
   if (account::app_sign_in().empty()) return nullptr;
@@ -200,6 +202,7 @@ std::unique_ptr<User> User::GrantedSlippiUser(const std::string& user_dir) {
   return user->IsLoggedIn() ? std::move(user) : nullptr;
 }
 void User::RefreshFromServer() {
+  if (host::test_env::agent_copy()) return;
   if (refresh_.valid() && refresh_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
   UserInfo me = GetUserInfo();
   if (me.uid.empty()) return;
@@ -262,30 +265,35 @@ int User::PollOnlineCompatibility(std::string* error, VersionFetch fetch) {
 }
 bool User::CheckOnlineCompatibility(std::string* error, VersionFetch fetch) {
   *error = "Could not check Slippi version. Try again.";
+  const auto failed = [](const char* step, unsigned long code) {
+    host::log("slippi: version check failed: %s %lu", step, code);
+    return false;
+  };
   const UserInfo me = GetUserInfo();
-  if (me.uid.empty()) { *error = "Sign in to Slippi before playing online."; return false; }
+  if (me.uid.empty()) { *error = "Sign in to Slippi before playing online."; return failed("signed-out", 0); }
   try {
     std::string response; int status = 0;
-    if (!(fetch ? fetch : report::http_get)("https://users-rest-dot-slippi.uc.r.appspot.com/user/" + me.uid, &response, &status) || status != 200)
-      return false;
+    if (!(fetch ? fetch : report::http_get)("https://users-rest-dot-slippi.uc.r.appspot.com/user/" + me.uid, &response, &status)) {
+      const auto why = fetch ? report::HttpFailure{"http-get", (unsigned long)status} : report::last_http_failure();
+      return failed(why.step, why.code);
+    }
+    if (status != 200) return failed("http-status", status);
     const json reply = json::parse(response, nullptr, false);
-    if (!reply.is_object()) return false;
+    if (!reply.is_object()) return failed("json", 0);
     const std::string latest = str_or(reply, "latestVersion", "");
-    if (!release_version_valid(latest)) return false;
+    if (!release_version_valid(latest)) return failed("latest-version", 0);
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (info_.uid != me.uid) return false;  // the player signed out or changed accounts
+      if (info_.uid != me.uid) return failed("account-changed", 0);
       info_.latest_version = latest;
     }
     if (version_newer(latest, SLIPPI_SEMVER)) {
       *error = "Slippi " + latest + " is out. Update Melee Unlocked";
-      return false;
+      return failed("update-required", 0);
     }
     error->clear();
     return true;
-  } catch (...) {
-    return false;
-  }
+  } catch (...) { return failed("exception", 0); }
 }
 
 bool User::AttemptLogin(bool rediscover) {
@@ -306,6 +314,7 @@ bool User::AttemptLogin(bool rediscover) {
     if (id.ok && !had) host::log("slippi: YouGame player %s (%s)", info_.display_name.c_str(), info_.connect_code.c_str());
     return true;
   }
+  if (host::test_env::agent_copy()) return false;
   account::Profile profile;
   if (yougame::active()) {
     // Even slippi_only callers must never discover an ambient account in an app launch.
@@ -381,7 +390,8 @@ void DirectCodes::AddOrUpdateCode(const std::string& code) {
 
 // ---------------------------------------------------------------- netplay client
 NetplayClient::NetplayClient(std::vector<std::string> addrs, std::vector<uint16_t> ports, uint8_t remote_player_count, uint16_t local_port,
-                             bool is_decider, uint8_t player_idx, bool own_udp) {
+                             bool is_decider, uint8_t player_idx, bool own_udp, std::vector<std::string> public_fallbacks) {
+  public_fallbacks_ = std::move(public_fallbacks);
   host::log("slippi: netplay client: decider %d, player index %u, %u remote players", is_decider, player_idx, remote_player_count);
   is_decider_ = is_decider;
   // Every per-remote array here has REMOTE_PLAYER_MAX entries and every per-player one
@@ -416,6 +426,13 @@ NetplayClient::NetplayClient(std::vector<std::string> addrs, std::vector<uint16_
         status_.store(ConnectStatus::FAILED); return;
       }
       own_udp_ingress_->senders.allow({addr.host, ports[i]});
+    }
+    // The same-router public fallback (the app's internetClient grant reaches no LAN address)
+    // must also pass the sender filter; a malformed one is dropped, never resolved.
+    for (int i = 0; i < remote_player_count && size_t(i) < public_fallbacks_.size(); ++i) {
+      ENetAddress addr{};
+      if (!slippi::public_endpoint(public_fallbacks_[i], addr)) { public_fallbacks_[i].clear(); continue; }
+      own_udp_ingress_->senders.allow({addr.host, addr.port});
     }
   }
   if (!requested.valid) {
@@ -827,7 +844,9 @@ void NetplayClient::ThreadFunc() {
   const uint64_t timeout = 8000;
   std::vector<bool> connections(remote_player_count_, false);
   std::vector<ENetAddress> remote_addrs;
-  for (int i = 0; i < remote_player_count_; ++i) remote_addrs.push_back(server_[i]->address);
+  for (int i = 0; i < remote_player_count_; ++i) remote_addrs.push_back(server_[i] ? server_[i]->address : ENetAddress{});
+  std::vector<bool> fallback_started(remote_player_count_,false);
+  bool fallback_logged = false;
 
   while (status_.load(std::memory_order_acquire) == ConnectStatus::INITIATED) {
     ENetEvent ev;
@@ -847,16 +866,13 @@ void NetplayClient::ThreadFunc() {
           break;
         case ENET_EVENT_TYPE_CONNECT: {
           if (!ev.peer) break;
-          int early_idx = 0;
-          for (int i = 0; i < (int)remote_addrs.size(); ++i)
-            if (remote_addrs[i].host == ev.peer->address.host && remote_addrs[i].port == ev.peer->address.port) { early_idx = i; break; }
-          ActiveConnectionInfo info;
-          info.player_idx = match_info_.remote[early_idx].player_idx;
-          active_connections_[peer_key(ev.peer)][ev.peer] = info;
-          player_active_[info.player_idx].store(true, std::memory_order_release);
           bool already = false;
           for (size_t i = 0; i < server_.size(); ++i)
-            if (connections[i] && ev.peer->address.host == server_[i]->address.host && ev.peer->address.port == server_[i]->address.port) { server_[i] = ev.peer; already = true; break; }
+            if (connections[i] && ev.peer->address.host == server_[i]->address.host && ev.peer->address.port == server_[i]->address.port) {
+              ActiveConnectionInfo info; info.player_idx = match_info_.remote[i].player_idx;
+              active_connections_[peer_key(ev.peer)][ev.peer] = info;
+              server_[i] = ev.peer; already = true; break;
+            }
           if (already) break;
           // Exact address first: several players can share one host (local multi-instance
           // tests, or a LAN behind one address), and matching the host alone would hand this
@@ -866,15 +882,47 @@ void NetplayClient::ThreadFunc() {
             if (!connections[i] && remote_addrs[i].host == ev.peer->address.host && remote_addrs[i].port == ev.peer->address.port) slot = (int)i;
           for (size_t i = 0; i < server_.size() && slot < 0; ++i)
             if (!connections[i] && remote_addrs[i].host == ev.peer->address.host) slot = (int)i;
+          // The peer's 2 s switch to our public endpoint can beat ours: accept its public address too.
+          for (size_t i = 0; i < server_.size() && i < public_fallbacks_.size() && slot < 0; ++i) {
+            ENetAddress pub{};
+            if (!connections[i] && slippi::public_endpoint(public_fallbacks_[i], pub) && pub.host == ev.peer->address.host) slot = (int)i;
+          }
           if (slot >= 0) {
+            ActiveConnectionInfo info;
+            info.player_idx = match_info_.remote[slot].player_idx;
+            active_connections_[peer_key(ev.peer)][ev.peer] = info;
+            player_active_[info.player_idx].store(true, std::memory_order_release);
             host::log("slippi: connected to peer");
             server_[slot] = ev.peer;
             connections[slot] = true;
-          }
+          } else enet_peer_reset(ev.peer); // stale LAN connect after switching, or an unknown peer
           break;
         }
         default: break;
       }
+    }
+    // Internet-only sandboxes cannot reach LAN candidates. Keep the same eight-second
+    // total budget and switch only unconnected seats, two seconds after the LAN attempt.
+    for (int i = 0; i < remote_player_count_; ++i) {
+      if (!public_fallback_due(time_ms()-start_time,connections[i],fallback_started[i],
+          size_t(i) < public_fallbacks_.size() && !public_fallbacks_[i].empty())) continue;
+      fallback_started[i] = true;
+      ENetAddress address{};
+      if (!slippi::public_endpoint(public_fallbacks_[i], address)) continue;
+      if (!fallback_logged) { host::log("slippi: LAN connection pending; trying public address fallback"); fallback_logged = true; }
+      if (server_[i]) {
+        auto found = active_connections_.find(peer_key(server_[i]));
+        if (found != active_connections_.end()) {
+          found->second.erase(server_[i]);
+          if (found->second.empty()) active_connections_.erase(found);
+        }
+        enet_peer_reset(server_[i]);
+      }
+      remote_addrs[i] = address;
+      server_[i] = enet_host_connect(client_,&address,3,0);
+      if (!server_[i]) { status_.store(ConnectStatus::FAILED,std::memory_order_release); return; }
+      ActiveConnectionInfo info; info.player_idx = match_info_.remote[i].player_idx;
+      active_connections_[peer_key(server_[i])][server_[i]] = info;
     }
     bool all = true;
     for (int i = 0; i < remote_player_count_; ++i) if (!connections[i]) all = false;
@@ -1767,8 +1815,9 @@ static Matchmaking::ParsedTicket parse_ticket(const json& resp) {
     if (int_or(el, "port", 0) - 1 == t.local_player_index) continue;
     std::string ext = str_or(el, "ipAddress", "1.1.1.1:123");
     std::string lan = str_or(el, "ipAddressLan", "1.1.1.1:123");
-    if (ext.substr(0, ext.find(':')) != local_external_ip || lan.empty()) t.remote_ips.push_back(ext);
-    else t.remote_ips.push_back(lan);
+    const auto address = remote_address(local_external_ip,ext,lan);
+    t.remote_ips.push_back(address.first);
+    t.public_fallbacks.push_back(address.fallback);
   }
   t.is_host = bool_or(resp, "isHost", false);
   if (const json* stages = json_member(resp, "stages"))
@@ -1799,6 +1848,7 @@ bool Matchmaking::ingest_ticket(const Ticket& ticket) {
   ParsedTicket t = parse_ticket(ticket.resp);
   host::log("slippi: match id %s", t.match_id.c_str());
   remote_ips_.clear();
+  public_fallbacks_.clear();
   MatchmakeResult result;
   if (t.ok) { result.id = t.match_id; result.players = t.players; result.stages = t.stages; result.items = t.items; }
   // The result is swapped in complete. A netplay client left from an earlier attempt is destroyed
@@ -1823,6 +1873,7 @@ bool Matchmaking::ingest_ticket(const Ticket& ticket) {
     return false;
   }
   remote_ips_.swap(t.remote_ips);
+  public_fallbacks_.swap(t.public_fallbacks);
   is_host_ = t.is_host;
   return true;
 }
@@ -1916,12 +1967,17 @@ void Matchmaking::blendMatchmaking() {
   const auto slippi_failed = [&](const std::string& error) {
     dropSlippi();
     slippi = Slippi::Off;
-    std::lock_guard<std::mutex> lk(mutex);
-    if (!coord.live(Side::Slippi)) return;
-    host::log("yougame: unranked blend: Slippi search stopped: %s", error.c_str());
-    last_error = error;
-    coord.failed(Side::Slippi, time_ms());
-    print();
+    bool alone = false;
+    {
+      std::lock_guard<std::mutex> lk(mutex);
+      if (!coord.live(Side::Slippi)) return;
+      host::log("yougame: unranked blend: Slippi search stopped: %s", error.c_str());
+      last_error = error;
+      coord.failed(Side::Slippi, time_ms());
+      alone = coord.yougame_only();
+      print();
+    }
+    if (alone) yougame::blend_slippi_stopped(search.epoch, error);
   };
   for (;;) {
     if (!searching()) {                                    // the player left, or the search was shut down
@@ -2079,7 +2135,7 @@ void Matchmaking::handleConnecting() {
   }
   const uint8_t remote_count = (uint8_t)std::min<size_t>(remote_ips_.size(), (size_t)REMOTE_PLAYER_MAX);
   auto client = std::make_unique<NetplayClient>(addrs, ports, remote_count, (uint16_t)host_port_, is_host_, (uint8_t)local_player_index_,
-      display_provider_ == display::Provider::YouGame && !yg_enet_selected());
+      display_provider_ == display::Provider::YouGame && !yg_enet_selected(), public_fallbacks_);
   bool handed_over = false;
   while (!handed_over) {
     auto st = client->GetSlippiConnectStatus();

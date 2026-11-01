@@ -146,9 +146,12 @@ MuRankBadge* mu_rank_badge_create(struct HSD_GObj* parent, float x, float y, flo
     /* The division numeral sits centered under the art (only the setup screen draws it; CSS and
      * reveal are art only). At 80 units to the right it fell off the 640-wide setup screen for
      * the right-hand badge and floated under the left player's name (build 31, 11-01).
-     * y: SIS draws this glyph about 12.4*scale below its row, measured on build 31's frames. */
+     * Build 37: at .35*scale it crossed the setup header's bottom border (glyph about y 180-207
+     * px, border about 195), so it is a size smaller and sits between the art and that border.
+     * SIS draws a glyph about 35*(its scale) below its row (measured on build 31's frames). */
     b->text->default_alignment = 1;
-    b->subtext = HSD_SisLib_803A6B98(b->text, 12*scale, 11.6f*scale + 1, "%s", "");
+    b->subtext = HSD_SisLib_803A6B98(b->text, 12*scale, 11.4f*scale, "%s", "");
+    HSD_SisLib_803A7548(b->text, b->subtext, .25f*scale, .25f*scale);
     b->text_destroy = b->text->entity->user_data_remove_func;
     b->text->entity->user_data_remove_func = badge_destroy;
     b->text->render_callback = badge_draw;

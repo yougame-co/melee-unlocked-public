@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <nlohmann/json.hpp>
+#include "../host/test_env.h"
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -59,6 +60,7 @@ inline Profile search(const std::filesystem::path& root, int depth, size_t& rema
 
 inline std::vector<std::filesystem::path> launcher_roots() {
   std::vector<std::filesystem::path> roots;
+  if (host::test_env::agent_copy()) return roots;
   for (const char* name : {"APPDATA", "LOCALAPPDATA"}) {
 #ifdef _WIN32
     char* value = nullptr;
@@ -146,6 +148,7 @@ inline std::filesystem::path app_sign_in() {
 
 inline Profile resolve(const std::filesystem::path& local_user_dir,
                        const std::vector<std::filesystem::path>& roots = launcher_roots()) {
+  if (host::test_env::agent_copy()) return {};
   if (const auto app = app_sign_in(); !app.empty()) return read(app);
   if (auto profile = read(local_user_dir / "user.json")) return profile;
   for (const auto& root : roots) {

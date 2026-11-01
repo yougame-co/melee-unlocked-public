@@ -85,6 +85,9 @@ struct RenderOptions {
   // The "Settings: F1" reminder in the corner. On for a new player, off for anyone who knows the
   // key and does not want it in a recording.
   bool settings_hint = false;   // the corner reminder is off by default; Overlays can turn it on
+  // The note at the top in an online mode when skins or stage mods there show as the standard ones
+  // (ini key skin_online_notice). On by default; a player who knows asked to turn it off.
+  bool skin_online_notice = true;
   bool legacy_menu_enabled = false; // F11 and launcher Settings use the selected legacy presentation
   int legacy_menu_style = 7; // 7: Legacy Old (v0.6.6), 6: Legacy New
   bool settings_menu_sounds = false;
@@ -104,6 +107,10 @@ struct RenderOptions {
   // Times the Practice menu has been opened: the "Start + D-pad Up + Z" hint stops after the third.
   int practice_opens = 0;
   bool input_overlay = false;     // on-screen controller display, for streaming
+  // Clean replays: while a replay plays, none of ours is drawn over the game (controller and input
+  // displays, readouts, graphs, notices, hitboxes, the combo counter) and the replay bar starts
+  // hidden (H shows it). For tournament VODs and clips. The game's own HUD and the chosen look stay.
+  bool clean_replays = false;
   // Lab view: draw matches as Slippi Lab draws replays (flat silhouettes on a plain stage) over
   // the game image. Display only, so it is safe online. F3 toggles it. See lab_view.h.
   bool lab_view = false;
@@ -227,6 +234,10 @@ struct RenderOptions {
   // its first form, with no transformations or white flash. The player's own, online too.
   bool freeze_fd = false;
   static bool& live_freeze_fd() { static bool value = false; return value; }
+  // "Hide KO explosions" (Video tab, ini key hide_ko_explosions, both engines): the blast-zone
+  // explosion runs out of sight, so the match is unchanged (host::g_hide_ko_explosions). The player's
+  // own, online and in replays too.
+  bool hide_ko_explosions = false;
   // "Unlock everything" (Game tab, ini key unlock_all, on unless the file says 0): Slippi's "Unlock
   // All Characters and Stages". Off, the save file decides what is unlocked, offline only: a network
   // session always has everything. Static Recomp: gecko::option_unlock_all (host.cpp); Source Port:
@@ -274,6 +285,10 @@ struct RenderOptions {
   int cpu_getup = 0;    // 0 off, 1 stand, 2 roll forward, 3 roll back, 4 getup attack, 5 random
   int cpu_di = 0;       // 0 off, 1 none, 2 random, 3 survival
   int cpu_sdi = 0;      // 0 off, 1 none, 2 random, 3 with the hit, 4 against it, 5 up, 6 down
+  // The game's (20XX Hack Pack's) SDI modes 3 and 4 are the other way round: its 3 holds the stick
+  // toward the attacker, into the hit (shim/mu_20xx_cpu.c, the stick at dmg.facing_dir_1). The rows
+  // keep their names and the word gets the mode that does what the row says; both directions.
+  static int cpu_sdi_game_mode(int row) { return row == 3 ? 4 : row == 4 ? 3 : row; }
   bool cpu_no_taunt = false;
   bool cpu_lcancel = false;
   bool cpu_no_rapid_jab = false;
@@ -284,7 +299,7 @@ struct RenderOptions {
     const auto field = [](int value, int max, int shift) {
       return value >= 1 && value <= max ? (uint32_t)value << shift : 0u;
     };
-    return field(cpu_tech, 5, 0) | field(cpu_getup, 5, 3) | field(cpu_di, 3, 6) | field(cpu_sdi, 6, 8) |
+    return field(cpu_tech, 5, 0) | field(cpu_getup, 5, 3) | field(cpu_di, 3, 6) | field(cpu_sdi_game_mode(cpu_sdi), 6, 8) |
            (cpu_no_taunt ? 0x800u : 0u) | (cpu_lcancel ? 0x1000u : 0u) | (cpu_no_rapid_jab ? 0x2000u : 0u) |
            (cpu_no_transform ? 0x4000u : 0u);
   }
@@ -318,6 +333,7 @@ struct RenderOptions {
   // Online: protect match speed (slippi_online.cpp budget_watch). On by default.
   bool online_frame_protection = true;
   static std::atomic<bool>& live_online_frame_protection() { static std::atomic<bool> value{true}; return value; }
+  static std::atomic<bool>& live_clean_replays() { static std::atomic<bool> value{false}; return value; }
   int efb_scale = 0;          // internal resolution multiplier; 0 = auto (integer scale covering the window, like Dolphin "Auto (Window Size)")
   int window_w = 1280, window_h = 960;  // initial client size
   // The player picked a fixed window size ("window WxH" in the ini, or --window): the panel keeps

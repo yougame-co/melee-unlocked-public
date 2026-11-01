@@ -107,8 +107,9 @@ void pause_event(bool pausable, bool paused, const char* reason);
 
 // The host picker runs off the simulation thread while code entry remains visible.
 // Throws on cancellation, a page error, or an invalid answer; opens no room.
-std::string pick_friend_room(const std::function<bool()>& cancelled);
+std::string pick_friend_room(const std::function<bool()>& cancelled, const std::string& held = {});
 std::string slippi_link_status(const std::string& status);
+void blend_slippi_stopped(uint64_t epoch, const std::string& reason);
 
 // Retire any previous YouGame room before selecting plain UDP for a Slippi search.
 bool prepare_slippi_match(const std::function<bool()>& cancelled, uint64_t epoch = 0);

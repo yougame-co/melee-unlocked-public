@@ -70,6 +70,7 @@
 #endif
 #ifdef __APPLE__
 #include <SDL_syswm.h>
+#include "../../mac/window_state.h"
 extern "C" bool mac_window_is_fullscreen(void*);
 extern "C" void mac_toggle_fullscreen(void*);
 #endif
@@ -1319,6 +1320,9 @@ void apply_family_options(PadFamily family, PadState& pad) {
 static void g_pad_frame_reset();   // defined with g_pad_frame below (outside the anonymous namespace)
 void input_mark_match_start() { g_match_start_retrace.store(retrace_count()); g_pad_frame_reset(); }
 
+#ifdef YOUGAME_AGENT_TEST_HOOK
+static bool g_console_script_profile = false;
+#endif
 bool input_load_script(const char* path) {
 #ifdef YOUGAME_AGENT_TEST_HOOK
   const bool secured = yougame::agent_paths::same(path, yougame::agent_paths::policy.script);
@@ -1330,6 +1334,9 @@ bool input_load_script(const char* path) {
 #else
   FILE* f = fopen(path, "r");
   if (!f) return false;
+#endif
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  g_console_script_profile = secured;
 #endif
   g_script.clear();
   g_script_ports = 1;
@@ -1847,7 +1854,7 @@ struct UiSnapshot {
           pads[i] = {}; pads[i].err = err;
           g_ui_navigation_pads[i] = pads[i];
           menu_buttons = 0;
-        } else yougame::friends::events.poll_pad(i, pads[i].err == 0 && invite_focused, menu_buttons);
+        } else yougame::friends::events.poll_pad(i, pads[i].err == 0, menu_buttons);  // the game's menu takes this A unfocused too
       }
       if (!(menu_buttons & 0x1000)) pads[i].button &= static_cast<uint16_t>(~0x1000);
       g_ui_navigation_pads[i].button &= pads[i].button; // preserve consumed chords/shortcuts
@@ -1993,6 +2000,21 @@ void input_read_console_devices(PadState out[4]) {
     ui.keyboard_ports[i] = out[i].err == 0 && debug.feeding[i].kind == DeviceKind::Keyboard;
   { std::lock_guard<std::mutex> lock(g_last_pads_mutex); for (int i = 0; i < 4; ++i) g_last_pads[i] = out[i]; }
 }
+
+#ifdef YOUGAME_AGENT_TEST_HOOK
+// Console hardware slots are local devices, not session seats. The engine samples the first
+// connected slot and sends it as config.my_port through its ordinary delay/rollback queue.
+void input_console_script(PadState out[4], int local_port) {
+  if (!g_console_script_profile || local_port < 1 || local_port > 4 || !input_script_active()) return;
+  PadState scripted[4]{};
+  for (auto& p : scripted) p.err = -1;
+  script_pads(retrace_count(),true,scripted);
+  if (scripted[0].err != 0) return;
+  out[0] = scripted[0]; // Route p=1 means this seat's own pad, whatever its assigned session port.
+  static bool logged = false;
+  if (!logged) { log("agent-test: pad script drives console port %d",local_port); logged = true; }
+}
+#endif
 
 bool input_script_active() {
 #ifdef YOUGAME_AGENT_TEST_HOOK

@@ -24,9 +24,10 @@ struct SessionConfig {
   uint64_t seed = 0;            // Game RNG seed at frame 0.
   int64_t epoch_ms = 0;         // The boot clock every machine starts from (rooms' start time).
   int input_delay = 3;          // Frames between sampling a pad and the frame that uses it.
-  std::string card_digest;      // Frozen SHA-256 of the host Melee GCI.
+  bool default_card = false;   // Agreed fresh save; survives relaunch against a frozen host digest.
+  std::string card_digest;      // Frozen SHA-256 of the host Melee GCI, unless default was agreed.
   std::vector<uint8_t> card_bytes; // Verified host copy, carried only inside this process.
-  std::string settings_digest;  // Host settings hash (sha256 hex); empty until settings sync exists.
+  std::string settings_digest;  // Frozen settings key; friends1 carries the host CSS fighter/costume/pad.
 };
 
 // The link side, as the engine sees it. Frames are the engine's lockstep frame numbers, from 0.
@@ -45,6 +46,9 @@ public:
   virtual void pump(int wait_ms) = 0;
   // Set once a peer has left or timed out: a short reason for the log and the notice.
   virtual std::optional<std::string> lost() const = 0;
+  // Transport recovery pauses only wall-clock liveness deadlines, never frame/input rules.
+  virtual bool reconnecting() const { return false; }
+  virtual uint64_t liveness_clock(uint64_t ordinary) const { return ordinary; }
 };
 
 // Joins the session's room, waits for its start, and connects to every peer over the app's link helper.

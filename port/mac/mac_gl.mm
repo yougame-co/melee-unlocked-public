@@ -3,6 +3,23 @@
 // surface until the context is told to update; the last picture then sits small in the middle of
 // the bigger window. SDL's context marks itself for an update here and applies it at the next swap.
 #import <AppKit/AppKit.h>
+#include "window_state.h"
+
+extern "C" void mac_disable_window_restoration() {
+  @autoreleasepool {
+    // Registration domain only: never persist changes to the player's preferences.
+    [NSUserDefaults.standardUserDefaults registerDefaults:@{
+      @"ApplePersistenceIgnoreState": @YES,
+      @"NSQuitAlwaysKeepsWindows": @NO
+    }];
+  }
+}
+
+extern "C" void mac_window_disable_restoration(void* nswindow) {
+  NSWindow* window = (__bridge NSWindow*)nswindow;
+  window.restorable = NO;
+  window.restorationClass = Nil;
+}
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"

@@ -66,6 +66,14 @@ static void files(const std::filesystem::path& data) {
   const auto c = config();
   CHECK(relaunch_cap({{"caps",{"ready","relaunch"}}}));
   CHECK(!relaunch_cap({{"caps",{"ready"}}})); CHECK(!relaunch_cap({{"caps","relaunch"}}));
+  { // lobby-lines: the page draws the Friends lobby lines; an older app's hello turns MU's back on.
+    std::atomic<bool> relaunch{false};
+    read_caps({{"caps",{"relaunch","lobby-lines"}}}, relaunch);
+    CHECK(relaunch.load()); CHECK(yougame::friends::page_lobby_lines.load());
+    read_caps({{"caps",{"ready"}}}, relaunch);
+    CHECK(!relaunch.load()); CHECK(!yougame::friends::page_lobby_lines.load());
+    CHECK(yougame::friends::host_left_line("") == "Your friend left: lobby closed");
+  }
   CHECK(handoff(c,true,data,1000,"build-a",send,log,show));
   CHECK(sent.size() == 1 && sent[0] == relaunch_message(c)); CHECK(!std::filesystem::exists(path));
   CHECK(sent[0]["request"]["seed"] == "ffffffffffffffff");
@@ -96,6 +104,25 @@ static void files(const std::filesystem::path& data) {
   { std::ofstream f(exe); f << "build two"; }
   CHECK(first != build_fingerprint(exe)); CHECK(build_fingerprint(data / "absent").empty());
 }
+static void relaunch_dropped() {
+  ++cases;
+  RelaunchWait wait("prepared",1000);
+  CHECK(!wait.reason() && !wait.timed_out(45999) && wait.timed_out(46000));
+  wait.push({{"type","relaunchDropped"},{"sessionId","another"},{"reason","ticket"}});
+  CHECK(!wait.reason());
+  std::thread reader([&] { wait.push({{"type","relaunchDropped"},{"sessionId","prepared"},{"reason","ticket"}}); });
+  reader.join(); CHECK(std::string(wait.reason()) == "ticket");
+  Entry e; CHECK(e.begin()); e.status(kRelaunchDropped);
+  CHECK(e.status() == "Couldn't start playing together. Press Play again.");
+  for (const auto& reason : {json("renewal_failed"),json("unexpected secret text"),json(nullptr),json(7)}) {
+    RelaunchWait other("prepared",1000);
+    other.push({{"type","relaunchDropped"},{"sessionId","prepared"},{"reason",reason}});
+    CHECK(std::string(other.reason()) == (reason == "renewal_failed" ? "renewal_failed" : "internal"));
+  }
+  RelaunchWait missing("prepared",1000);
+  missing.push({{"type","relaunchDropped"},{"sessionId","prepared"}});
+  CHECK(std::string(missing.reason()) == "internal");
+}
 static void waiting() {
   ++cases; Entry e; CHECK(e.begin()); CHECK(!e.begin());
   e.status(kHostStart,true); CHECK(e.poll(0,true,0x1000)); CHECK(!e.start());
@@ -112,7 +139,7 @@ int main(int argc,char** argv) {
   CHECK(argc == 2);
   auto data = std::filesystem::path(argv[1]) / ("console-integration-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
   CHECK(std::filesystem::create_directory(data));
-  boot_paths(); boot_notices(); files(data); waiting();
+  boot_paths(); boot_notices(); files(data); waiting(); relaunch_dropped();
   std::filesystem::remove_all(data); // only this test's unique fixture
   std::printf("yougame_console_integration: %d cases, %d checks passed\n",cases,checks);
 }

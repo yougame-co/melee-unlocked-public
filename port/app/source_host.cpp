@@ -11,10 +11,15 @@
 #include "layer_fingerprint.h"
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include "yougame_agent_paths.h"
+#include "yougame_agent_test.h"
+#include "handoff_state.h"
 #endif
 #include "source_host.h"
 #include "yougame_update.h"
 #include "yougame_console_card.h"
+#include "friends_handoff_join.h"
+#include "friends_handoff_transfer.h"
+#include "handoff_state.h"
 #include <windows.h>
 #ifndef _WIN32
 #include <dlfcn.h>
@@ -77,6 +82,8 @@
 #include "yougame_mode_policy.h"
 #include "yougame_memcard.h"
 #include "yougame_console_engine.h"
+#include "yougame_console_entry.h"
+#include "yougame_friends_lobby.h"
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include "yougame_agent_fight.h"
 #endif
@@ -121,15 +128,30 @@
 
 // The settings panel's port-code options (pc_settings.cpp); the native game reads them through
 // MuHostApi.game_options.
-namespace gecko { extern bool option_no_screen_shake; extern bool option_pal_stock_icons; extern bool option_widescreen; }
+namespace gecko { extern int option_screen_shake_percent; extern bool option_no_screen_shake; extern bool option_pal_stock_icons; extern bool option_widescreen; }
 
 namespace source_port {
 namespace {
 bool g_console_boot = false; // retain pad/card isolation after a session ends
 std::filesystem::path g_console_card;
+int g_console_host_pad = -1; // physical host pad carried from the solo Friends CSS
 yougame::console::Pads console_hardware() {
   host::PadState raw[4]{};
   host::input_read_console_devices(raw); // publishes UI from this one read, before local capture
+  // The relaunched process still uses console device routing after returning to local CSS.
+  // Its UI snapshot skips ordinary Friends input; restore Z/B only after lockstep ends.
+  if (!yougame::console::console_active()) for (int port = 0; port < 4; ++port) {
+    if (yougame::console::entry.poll(port,raw[port].err == 0 && !host::window_input_captured(),raw[port].button)) {
+      const auto err = raw[port].err; raw[port] = {}; raw[port].err = err;
+    }
+  }
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  host::input_console_script(raw,yougame::console::console_engine().config().my_port);
+#endif
+  if (g_console_host_pad >= 0) {
+    // Engine::first maps this physical controller onto the host's frozen virtual port.
+    for (int port = 0; port < 4; ++port) if (port != g_console_host_pad) raw[port].err = -1;
+  }
   static host::console_input::Capture capture;
   capture.apply(raw, host::window_input_captured());
   yougame::console::Pads pads{};
@@ -176,6 +198,7 @@ struct GameImageReservation {
 GameImageReservation g_game_image_reservation;
 
 MuGameApi g_game{};
+std::filesystem::path g_loaded_game_path;
 #ifdef __APPLE__
 mac_elf::Image g_mac_image;
 std::jmp_buf g_mac_run_boundary;
@@ -183,7 +206,11 @@ bool g_mac_running = false;
 std::string g_dll = (mac_host::resources() / "melee_game.so").string();
 #else
 #ifdef _WIN32
-std::string g_dll = "melee_game.dll";
+// The compatibility build (melee_source_compat.exe) loads its own SSE2 game library, as on Linux.
+#ifndef MELEE_CPU_BASELINE_NAME
+#define MELEE_CPU_BASELINE_NAME "AVX2" // standalone syntax/probe builds; CMake supplies the release value
+#endif
+std::string g_dll = std::strcmp(MELEE_CPU_BASELINE_NAME, "AVX2") == 0 ? "melee_game.dll" : "melee_game_compat.dll";
 #elif defined(MELEE_GAME_LIBRARY_NAME)
 std::string g_dll = MELEE_GAME_LIBRARY_NAME;   // the compatibility build loads its own game library
 #else
@@ -195,6 +222,30 @@ audio_core::State g_audio;
 // Native online play (host API 13). While the game re-simulates after a rollback load, the
 // machine stands still: no time, alarms, audio, retraces or presentation.
 native_savestate::Engine g_savestates;
+unsigned g_handoff_disc_depth = 0;
+unsigned (*g_handoff_callbacks_pending)() = nullptr;
+void friends_handoff_tick();
+struct FriendsHandoffRuntime {
+  handoff_state::Identity identity;
+  std::vector<native_savestate::Span> spans;
+  std::shared_ptr<yougame::console::handoff_join::Channel> channel;
+  uint64_t frame = 0, request_at = 0, css_bodies = 0, waited_bodies = 0;
+  unsigned serial = 0;
+  bool ready = false, css_requested = false;
+} g_friends_handoff;
+#ifdef YOUGAME_AGENT_TEST_HOOK
+// Gate 1 owns a full MEM1 + image data/bss capture, independent of rollback's exclusions.
+// The raw dump must include process-local words so identical-input runs can discover them.
+struct HandoffRuntime {
+  bool ready = false, failed = false, boot_requested = false, css_seen = false, acted = false;
+  uint64_t frame = 0, css_start = 0, action_frame = 0;
+  handoff_state::Identity identity;
+  std::vector<native_savestate::Span> spans;
+  std::vector<handoff_state::Range> keep;
+  std::vector<native_savestate::Span> compared;
+} g_handoff;
+void handoff_tick();
+#endif
 bool g_resim = false;
 bool gl_costs_enabled() {
   // First use follows session-policy setup; global initialization precedes it.
@@ -1095,6 +1146,16 @@ int32_t h_console_seed(uint32_t* seed) {
   return 1;
 }
 int32_t h_console_frame_begin() {
+  if (yougame::console::friends_handoff_join_enabled()) {
+    int32_t scene[2]{};
+    const bool css = g_game.practice && g_game.practice(MU_PRACTICE_SCENE,scene,2) == 0 &&
+        scene[0] == 2 && scene[1] == 0;
+    yougame::console::handoff_join::host_css.store(css,std::memory_order_release);
+    friends_handoff_tick();
+  }
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  handoff_tick(); // unconditional engine-body hook; never count PADRead or VI callbacks as bodies
+#endif
   if (!g_console_boot) return 0;
   auto& engine = yougame::console::console_engine();
   if (engine.active()) {
@@ -1225,6 +1286,7 @@ uint32_t h_display_options() {
          (gx::fod_reflections_active() ? MU_DISPLAY_OPTION_FOD_REFLECTIONS : 0u) |
          (gx::css_background_free_active() ? MU_DISPLAY_OPTION_CSS_BACKGROUND_FREE : 0u) |
          (gx::RenderOptions::live_freeze_fd() ? MU_DISPLAY_OPTION_FREEZE_FD : 0u) |
+         (host::g_hide_ko_explosions.load(std::memory_order_relaxed) ? MU_DISPLAY_OPTION_NO_KO_EXPLOSIONS : 0u) |
          // The Arcade look's hitboxes: never in a network match (the game also checks). Its grid is a
          // picture like the rest of the background, so it stays.
          (slippi::online::session_mode() >= 0 || source_p2p::requested() ? 0u : gx::arcade_display() & gx::kArcadeGameBits) |
@@ -1235,6 +1297,7 @@ uint32_t h_display_options() {
          (gx::arcade_display() & gx::kArcadeGrid);
 }
 uint32_t h_shield_color(int32_t slot) { return gx::shield_color(slot); }
+float h_screen_shake_scale() { return gecko::option_screen_shake_percent / 100.0f; }
 uint32_t h_grid_color() { return gx::look_live().arcade_grid_rgb.load(std::memory_order_relaxed) & 0xFFFFFFu; }
 void h_hud_combo(int32_t slot, int32_t link_slot, float percent, int32_t stunned) {
   gx::set_native_hud_combo(slot, link_slot, percent, stunned != 0);
@@ -1263,6 +1326,9 @@ constexpr uint32_t kHpTeOptions2 = MU_GAME_OPTION2_TE_NO_SCREEN_RUMBLE | MU_GAME
                                    MU_GAME_OPTION2_TE_COLOR_OVERLAYS;
 bool hp_te_words() { return !mods::status().te_owned && hackpack::loaded(); }
 uint32_t te_words_mask1() { return mods::status().te_owned ? 0x00007FF0u : hp_te_words() ? kHpTeOptions : 0u; }
+// What pc_settings.cpp apply_practice_tools sets in the options word for the Training tools.
+constexpr uint32_t kPracticeLabBits = MU_GAME_OPTION_LAB | MU_GAME_OPTION_LAB_BUBBLES | MU_GAME_OPTION_LAB_BUBBLES_ONLY |
+                                      MU_GAME_OPTION_LAB_OVERLAY | MU_GAME_OPTION_LAB_LOOP;
 uint32_t te_words_mask2() { return mods::status().te_owned ? 0xFFFFFFFFu : hp_te_words() ? kHpTeOptions2 : 0u; }
 uint32_t h_game_options2() {
   if (yougame::console::console_active()) return 0;
@@ -1313,9 +1379,17 @@ uint32_t h_game_options() {
          (g_slippi_menus ? MU_GAME_OPT_SLIPPI_MENUS : 0u) |
          (!host::gameplay::vanilla_only() && mods::status().tmce && !g_replaying ? MU_GAME_OPTION_TMCE : 0u) |
          (host::gameplay::vanilla_only() ? 0u : g_replaying ? g_replay_feature_options
-                   : gx::RenderOptions::live_te_options() & te_words_mask1());
+                   : gx::RenderOptions::live_te_options() & te_words_mask1()) |
+         // The Practice panel's Training tools (D-pad save states and recording, hitboxes, the loop)
+         // are the native lab's bits (shim/mu_lab.c), set from the practice settings by
+         // apply_practice_tools. The mask above passes only 20XX TE's own bits, so since the panel
+         // came in these switches never reached the game. The lab itself acts only in an offline
+         // Training match outside a replay; never sent in a network session or during playback.
+         (host::gameplay::vanilla_only() || g_replaying || slippi::online::session_mode() >= 0 || source_p2p::requested()
+              ? 0u : gx::RenderOptions::live_te_options() & kPracticeLabBits);
   // (Only 20XX TE's own bits, and only with its save, or the Hack Pack's share of them with the pack.
-  // The Training Lab bits above 0x7FF0 are not offered any more: Training Mode CE replaces it.)
+  // The old Training Lab's own rows (dummy DI, reactions, tech) are not offered any more: Training
+  // Mode CE and the practice CPU replace them.)
 }
 // Match conveniences implemented by the host follow the same gates as mu_te2 in the game.
 bool te_host_feature(uint32_t feature) {
@@ -1345,6 +1419,224 @@ void log_savestate_stats(const char* when) {
 
 void mem1_watch_begin(const std::vector<MuStateRegion>& ranges);
 
+// The sound driver's whole state (every variable of the AX files, synth and axdriver), from the
+// ranges the build wrote beside the game library: a console savestate leaves all of it out, and
+// restoring its voice tables while the voices play on cuts and restarts sounds on every rollback.
+void append_sound_driver_exclusions(std::vector<MuStateRegion>& exclusions) {
+  if (!g_loaded_game_path.empty() && host::game_image) {
+    auto path = g_loaded_game_path; path.replace_extension(".snapexcl");
+    std::ifstream in(path);
+    std::error_code size_error;
+    const auto dll_size = std::filesystem::file_size(g_loaded_game_path,size_error);
+    std::vector<MuStateRegion> sound;
+    std::string line;
+    size_t bytes = 0;
+    bool other_build = bool(size_error), size_seen = false;
+    while (std::getline(in, line)) {
+      unsigned long long value = 0;
+      if (std::sscanf(line.c_str(), "# dll_size %llu", &value) == 1) { size_seen = true; other_build = other_build || value != dll_size; continue; }
+      unsigned long long offset = 0, size = 0;
+      if (std::sscanf(line.c_str(), "%llx %llx", &offset, &size) == 2 && size) {
+        sound.push_back(MuStateRegion{(void*)((uintptr_t)host::game_image + offset), (uint32_t)size});
+        bytes += size;
+      }
+    }
+    if (!in.is_open() || sound.empty())
+      host::log("online: no snapexcl applied: file missing or empty (%s)",path.string().c_str());
+    else if (other_build || !size_seen)
+      host::log("online: no snapexcl applied: size mismatch (%s)",path.string().c_str());
+    else {
+      exclusions.insert(exclusions.end(), sound.begin(), sound.end());
+      host::log("online: sound driver state left out of snapshots: %zu ranges, %zu bytes", sound.size(), bytes);
+    }
+  } else host::log("online: no snapexcl applied: library not found");
+}
+
+// Immutable identity only; never capture or read span contents on the room worker.
+void publish_handoff_join_info(const MuStateRegion* regions, uint32_t count,
+                               std::vector<MuStateRegion> exclusions, const MuHostApi* api) {
+  using namespace yougame::console;
+  if (!friends_handoff_join_enabled()) return;
+  try {
+    handoff_state::Identity identity;
+    std::string why;
+    if (!handoff_state::library_identity(g_loaded_game_path,identity,why)) return;
+    append_sound_driver_exclusions(exclusions);
+    // Keep the process's host ABI binding OUT of the transmitted span table, rather than
+    // importing A's pointer and excluding it only from the final comparison.
+    const uintptr_t binding = reinterpret_cast<uintptr_t>(api);
+    size_t bindings = 0;
+    for (uint32_t j = 0; j < count; ++j) {
+      auto* p = static_cast<uint8_t*>(regions[j].address);
+      for (size_t k = 0; k+sizeof binding <= regions[j].size; ++k) {
+        if (std::memcmp(p+k,&binding,sizeof binding)) continue;
+        exclusions.push_back({p+k,sizeof binding}); ++bindings;
+      }
+    }
+    if (!bindings || !g_handoff_callbacks_pending) return;
+    const auto spans = native_savestate::subtract(
+        std::vector<MuStateRegion>(regions,regions+count),exclusions);
+    if (spans.empty()) return;
+    g_friends_handoff.identity = identity; g_friends_handoff.spans = spans;
+    g_friends_handoff.ready = true;
+    // Same little-endian (u64 address,u32 size) table as MUHS; no native padding or pointers on wire.
+    std::vector<uint8_t> table;
+    for (const auto& span : spans) {
+      const uint64_t address = reinterpret_cast<uintptr_t>(span.address);
+      for (unsigned i = 0; i < 8; ++i) table.push_back(uint8_t(address >> (8*i)));
+      for (unsigned i = 0; i < 4; ++i) table.push_back(uint8_t(span.size >> (8*i)));
+    }
+    auto info = std::make_shared<handoff_join::Info>();
+    info->library_size = identity.size;
+    constexpr char hex[] = "0123456789abcdef";
+    for (const auto b : identity.sha256) {
+      info->library_sha256 += hex[b >> 4]; info->library_sha256 += hex[b & 15];
+    }
+    info->spans_digest = host::hackpack_ai::rules::sha256_hex(table.data(),table.size());
+#ifdef _WIN32
+    info->os = "windows";
+#elif defined(__APPLE__)
+    info->os = "macos";
+#else
+    info->os = "linux";
+#endif
+    std::shared_ptr<const handoff_join::Info> immutable = std::move(info);
+    std::atomic_store_explicit(&handoff_join::published_info,std::move(immutable),std::memory_order_release);
+  } catch (...) { /* missing metadata refuses live join; ordinary entry remains available */ }
+}
+
+void friends_handoff_tick() {
+  using namespace yougame::console::handoff_join;
+  auto& run = g_friends_handoff;
+  ++run.frame;
+  auto channel = std::atomic_exchange_explicit(&pending_channel,std::shared_ptr<Channel>{},std::memory_order_acq_rel);
+  if (channel) { run.channel = std::move(channel); run.serial = 0; run.css_requested = false; }
+  channel = run.channel;
+  if (!channel) return;
+  channel->working.store(true,std::memory_order_release);
+  struct Working { std::shared_ptr<Channel> c; ~Working() { c->working.store(false,std::memory_order_release); } } working{channel};
+  if (channel->cancelled.load(std::memory_order_acquire)) return;
+  const auto q = std::atomic_load_explicit(&channel->request,std::memory_order_acquire);
+  if (!q) return;
+  const auto now = yougame::transport::now_ms();
+  if (q->serial != run.serial) {
+    run.serial = q->serial; run.request_at = now; run.css_bodies = run.waited_bodies = 0;
+  } else {
+    const auto old = std::atomic_load_explicit(&channel->result,std::memory_order_acquire);
+    if (old && old->serial == q->serial) return;
+  }
+  auto result = std::make_shared<Result>(); result->serial = q->serial;
+  auto publish = [&] {
+    std::shared_ptr<const Result> immutable = result;
+    std::atomic_store_explicit(&channel->result,std::move(immutable),std::memory_order_release);
+  };
+  int32_t scene[2]{};
+  if (!run.ready || !g_game.practice || g_game.practice(MU_PRACTICE_SCENE,scene,2) != 0 ||
+      g_console_boot || yougame::console::console_active() || g_replaying || g_online_test_mode >= 0 ||
+      slippi::online::session_mode() >= 0) { result->reason = "live-state-unavailable"; publish(); return; }
+  if (q->operation == Operation::GuestCSS && !run.css_requested) {
+    run.css_requested = true;
+    if (scene[0] != 2 || scene[1] != 0) {
+      int32_t major = 2;
+      if (g_game.practice(MU_PRACTICE_REQUEST_MAJOR,&major,1) != 0) {
+        result->reason = "css-request-failed"; publish();
+      }
+      return;
+    }
+  }
+  const bool css = scene[0] == 2 && scene[1] == 0;
+  const bool quiet = g_handoff_callbacks_pending && quiescent(g_handoff_disc_depth,g_handoff_callbacks_pending());
+  ++run.waited_bodies;
+  if (q->operation == Operation::GuestCSS) {
+    run.css_bodies = css && quiet ? run.css_bodies+1 : 0;
+    if (run.css_bodies >= 30) publish();
+    else if (now-run.request_at >= 15000) { result->reason = "at-css-timeout"; publish(); }
+    return;
+  }
+  if (!css) { result->reason = "host-not-vs-css"; publish(); return; }
+  if (!quiet) {
+    if (now-run.request_at >= 5000) { result->reason = "not-quiescent"; publish(); }
+    return; // keep ordinary bodies running while any excluded callback remains
+  }
+  host::log("handoff-join: quiescent after %llu bodies",(unsigned long long)run.waited_bodies);
+  handoff_state::State state{run.frame,2,0,{}};
+  handoff_state::Sizes sizes;
+  std::string why;
+  auto bytes = std::make_shared<Buffer>();
+  const auto began = yougame::transport::now_ms();
+  if (q->operation == Operation::Base) {
+    try {
+      if (!handoff_state::encode(run.identity,run.spans,state,*bytes,sizes,why) || bytes->size() > stored_limit) {
+        result->reason = "base-capture-failed";
+      } else { result->bytes = bytes; result->raw = sizes.raw; result->ms = yougame::transport::now_ms()-began; }
+    } catch (...) { result->reason = "base-capture-failed"; }
+    publish(); return;
+  }
+  // No game poll, callback, retrace or scene continuation can run in this scope. All work is
+  // on this thread. The temporary guest load is undone before leaving this exact native frame.
+  channel->paused_at.store(began,std::memory_order_release);
+  channel->paused.store(true,std::memory_order_release);
+  struct Resume {
+    std::shared_ptr<Channel> channel;
+    const std::vector<native_savestate::Span>& spans;
+    Buffer backup;
+    bool restore = false;
+    ~Resume() {
+      size_t at = 0;
+      if (restore) for (const auto& s : spans) { std::memcpy(s.address,backup.data()+at,s.size); at += s.size; }
+      channel->paused.store(false,std::memory_order_release);
+    }
+  } resume{channel,run.spans,{}};
+  try {
+    if (q->operation == Operation::PauseDelta) {
+      Json record{{"v",1},{"frame",run.frame},{"ticks",host::cpu->tb},{"epoch",host::console_epoch_ticks()},
+          {"retraces",host::retrace_count()},{"nextRetrace",host::next_retrace_tb()},
+          {"seed",q->seed},{"seedPolicy","reseed-at-N"}};
+      const auto text = record.dump(); state.host.assign(text.begin(),text.end());
+      host::log("handoff-join: paused at frame %llu",(unsigned long long)run.frame);
+      if (!q->base || !handoff_state::encode_delta(*q->base,run.identity,run.spans,state,*bytes,result->pages,why)) {
+        result->reason = "delta-capture-failed";
+      } else {
+        result->bytes = bytes; result->frame = run.frame;
+        result->hash = frame_hash(native_savestate::hash_spans(run.spans));
+        host::log("handoff-join: delta pages %zu stored %zu bytes ms %llu",result->pages,bytes->size(),
+            (unsigned long long)(yougame::transport::now_ms()-began));
+      }
+    } else {
+      // Retain B's bytes before touching live memory. Restoring is allocation-free and cannot fail.
+      for (const auto& s : run.spans) resume.backup.insert(resume.backup.end(),s.address,s.address+s.size);
+      handoff_state::State decoded; std::vector<uint8_t> raw;
+      bool ok = q->base && q->delta && handoff_state::apply_delta(*q->base,*q->delta,run.identity,run.spans,*bytes,why,&result->pages) &&
+          handoff_state::inspect(*bytes,run.identity,run.spans,decoded,sizes,raw,why);
+      Json record;
+      if (ok) {
+        record = Json::parse(decoded.host.begin(),decoded.host.end(),nullptr,false);
+        ok = record.is_object() && record.value("v",Json()) == 1 && record.value("frame",Json()) == decoded.frame &&
+            record.value("seed",Json()) == q->seed && record.value("seedPolicy",Json()) == "reseed-at-N" &&
+            decoded.scene_major == 2 && decoded.scene_minor == 0;
+        for (const char* field : {"ticks","epoch","retraces","nextRetrace"})
+          ok = ok && record.count(field) && record[field].is_number_unsigned();
+      }
+      if (ok) { resume.restore = true; ok = handoff_state::load(*bytes,run.identity,run.spans,state,sizes,why); }
+      if (!ok) result->reason = "load-validation-failed";
+      else { result->frame = state.frame; result->hash = frame_hash(native_savestate::hash_spans(run.spans)); }
+      host::log("handoff-join: load %s",ok ? "ok" : "refused load-validation-failed");
+    }
+    if (result->reason.empty()) host::log("handoff-join: hash %s at frame %llu",result->hash.c_str(),(unsigned long long)result->frame);
+    host::log("handoff-join: audio not reset"); // no imported body is run in this milestone
+    result->ms = yougame::transport::now_ms()-began; publish();
+    while (result->reason.empty() && !channel->cancelled.load(std::memory_order_acquire) &&
+           !host::exit_requested() && yougame::transport::now_ms()-began < 20000) {
+      host::window_pump(); std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (q->operation == Operation::PauseDelta) host::log("handoff-join: paused %llu ms",
+        (unsigned long long)(yougame::transport::now_ms()-began));
+  } catch (...) {
+    result = std::make_shared<Result>(); result->serial = q->serial;
+    result->reason = "capture-failed"; publish();
+  }
+}
+
 // The snapshot of an online match: the game's capture ranges (all of main memory and the image's
 // writable sections) minus its exclusions. They are fixed within a match, so the spans are computed
 // once, at online frame 1.
@@ -1353,45 +1645,7 @@ void begin_native_savestates(int slots = slippi::ROLLBACK_MAX_FRAMES) {   // a r
   g_game.snapshot_ranges(ranges.data(), (uint32_t)ranges.size());
   std::vector<MuStateRegion> exclusions(g_game.state_exclusions(nullptr, 0));
   g_game.state_exclusions(exclusions.data(), (uint32_t)exclusions.size());
-  // The sound driver's whole state (every variable of the AX files, synth and axdriver), from the
-  // ranges the build wrote beside the game library: a console savestate leaves all of it out, and
-  // restoring its voice tables while the voices play on cuts and restarts sounds on every rollback.
-  {
-    char dll_path[MAX_PATH] = {};
-    HMODULE module = GetModuleHandleA("melee_game.dll");
-    if (module && GetModuleFileNameA(module, dll_path, MAX_PATH)) {
-      std::string path(dll_path);
-      path = path.substr(0, path.size() - 4) + ".snapexcl";
-      std::ifstream in(path);
-      // The offsets are right only for the library they were read from: a file from another build
-      // (a library copied without it) left the wrong memory out and restored the sound driver's on
-      // every rollback, which crashed within seconds. Its "# dll_size" line must match this file.
-      WIN32_FILE_ATTRIBUTE_DATA dll_info{};
-      const unsigned long long dll_size = GetFileAttributesExA(dll_path, GetFileExInfoStandard, &dll_info)
-          ? ((unsigned long long)dll_info.nFileSizeHigh << 32 | dll_info.nFileSizeLow) : 0;
-      std::vector<MuStateRegion> sound;
-      std::string line;
-      size_t bytes = 0;
-      bool other_build = false;
-      while (std::getline(in, line)) {
-        unsigned long long value = 0;
-        if (std::sscanf(line.c_str(), "# dll_size %llu", &value) == 1) { other_build = value != dll_size; continue; }
-        unsigned long long offset = 0, size = 0;
-        if (std::sscanf(line.c_str(), "%llx %llx", &offset, &size) == 2 && size) {
-          sound.push_back(MuStateRegion{(void*)((uintptr_t)module + offset), (uint32_t)size});
-          bytes += size;
-        }
-      }
-      if (other_build)
-        host::log("online: WARNING: %s belongs to another build of melee_game.dll; sound driver state is inside snapshots", path.c_str());
-      else if (sound.empty())
-        host::log("online: WARNING: %s missing; sound driver state is inside snapshots", path.c_str());
-      else {
-        exclusions.insert(exclusions.end(), sound.begin(), sound.end());
-        host::log("online: sound driver state left out of snapshots: %zu ranges, %zu bytes", sound.size(), bytes);
-      }
-    }
-  }
+  append_sound_driver_exclusions(exclusions);
   // Diagnostic (MELEE_SNAPSHOT_EXCLUDE=lo-hi[,lo-hi...], hex): leave extra ranges out, to find
   // which memory a rollback must not restore.
   if (const char* extra = host::test_env::getenv("MELEE_SNAPSHOT_EXCLUDE")) {
@@ -1646,6 +1900,151 @@ void lab_load() {
   gx::mark_discontinuity();
   host::log("lab: state loaded");
 }
+#ifdef YOUGAME_AGENT_TEST_HOOK
+void handoff_refused(const std::string& reason) {
+  host::log("handoff: refused: %s", reason.c_str());
+  g_handoff.failed = true;
+}
+using HandoffFile = std::unique_ptr<FILE, decltype(&std::fclose)>;
+HandoffFile handoff_open(const std::string& name, yougame::agent_paths::Mode mode) {
+  return HandoffFile(yougame::agent_paths::open(yougame::agent_paths::session.path, name, mode), &std::fclose);
+}
+void handoff_start(const MuStateRegion* regions, uint32_t count, std::vector<MuStateRegion> exclusions,
+                   const MuHostApi* api) {
+  const auto& config = yougame::agent_test::handoff;
+  if (!config.enabled()) return;
+  if (!config.error.empty()) { handoff_refused(config.error); return; }
+  auto& run = g_handoff;
+  std::string why;
+  if (!handoff_state::library_identity(g_loaded_game_path, run.identity, why)) { handoff_refused(why); return; }
+  // What a console savestate skips (audio driver and mixer, renderer bridge, host plumbing, the
+  // sound driver ranges beside the library) stays B's own: it is host state, not game state.
+  append_sound_driver_exclusions(exclusions);
+  const auto whole = native_savestate::subtract(std::vector<MuStateRegion>(regions, regions+count), {});
+  run.spans = native_savestate::subtract(std::vector<MuStateRegion>(regions, regions+count), exclusions);
+  size_t excluded = 0;
+  for (const auto& e : exclusions) excluded += e.size;
+  host::log("handoff: %zu exclusions (%zu bytes) stay this process's own", exclusions.size(), excluded);
+  run.keep = config.keep;
+  // mu_game_entry stores exactly one host-owned binding: mu_host = api. It is private in
+  // ELF builds, so locate ALL copies of the bound value in validated writable spans rather
+  // than relying on exports or a build-specific address. No other startup API/table is passed.
+  size_t bindings = 0;
+  const uintptr_t value = reinterpret_cast<uintptr_t>(api);
+  for (const auto& s : whole) for (size_t i = 0; i+sizeof value <= s.size; ++i) {
+    if (std::memcmp(s.address+i, &value, sizeof value)) continue;
+    const auto address = reinterpret_cast<uintptr_t>(s.address+i);
+    ++bindings;
+    bool captured = false;
+    for (const auto& c : run.spans)
+      captured = captured || (s.address+i >= c.address && s.address+i+sizeof value <= c.address+c.size);
+    if (!captured) { host::log("handoff: host API word 0x%llX +%zu already excluded", (unsigned long long)address, sizeof value); continue; }
+    run.keep.push_back({address, sizeof value});
+    host::log("handoff: keep host API word 0x%llX +%zu", (unsigned long long)address, sizeof value);
+  }
+  if (!bindings) { handoff_refused("mu_host binding not found in snapshot spans"); return; }
+  // Bounds: the game's own regions. A keep inside an exclusion is redundant, not wrong.
+  if (!handoff_state::validate_keep(run.keep, whole, why)) { handoff_refused(why); return; }
+  {
+    std::vector<handoff_state::Range> clipped;   // only the captured parts need preserving
+    for (const auto& r : run.keep) for (const auto& c : run.spans) {
+      const auto lo = std::max<uintptr_t>(r.address, reinterpret_cast<uintptr_t>(c.address));
+      const auto hi = std::min<uintptr_t>(r.address+r.size, reinterpret_cast<uintptr_t>(c.address)+c.size);
+      if (lo < hi) clipped.push_back({lo, static_cast<uint32_t>(hi-lo)});
+    }
+    run.keep = std::move(clipped);
+  }
+  std::vector<MuStateRegion> kept;
+  for (const auto& r : run.keep) kept.push_back({reinterpret_cast<void*>(r.address), r.size});
+  std::vector<MuStateRegion> captured;
+  for (const auto& s : run.spans) captured.push_back({s.address, s.size});
+  run.compared = native_savestate::subtract(captured, kept);
+  host::log("handoff: guest event queue unavailable (mu_events/mu_event_count/mu_delivering are static; no host ABI accessor)");
+  run.ready = true;
+}
+void handoff_tick() {
+  auto& run = g_handoff;
+  const auto& config = yougame::agent_test::handoff;
+  if (!run.ready || run.failed) return;
+  ++run.frame;
+  int32_t scene[2]{};
+  if (g_game.practice(MU_PRACTICE_SCENE, scene, 2) != 0) { handoff_refused("scene query failed"); return; }
+  if (g_console_boot || yougame::console::console_active() || g_replaying || g_online_test_mode >= 0 ||
+      slippi::online::session_mode() >= 0) { handoff_refused("requires offline local CSS"); return; }
+  // Identical automatic CSS entry in A and B; neither needs boot/menu controller input.
+  if (!run.boot_requested) {
+    run.boot_requested = true;
+    if (scene[0] != 2 || scene[1] != 0) {
+      int32_t major = 2;
+      if (g_game.practice(MU_PRACTICE_REQUEST_MAJOR, &major, 1) != 0) handoff_refused("CSS boot request failed");
+      return;
+    }
+  }
+  if (!run.css_seen && scene[0] == 2 && scene[1] == 0) {
+    run.css_seen = true; run.css_start = run.frame;
+    host::log("handoff: CSS first frame %llu, script frame %u", (unsigned long long)run.frame, host::retrace_count());
+  }
+  if (!run.css_seen) return;
+  const auto relative = run.frame-run.css_start;
+  if (!run.acted && relative == config.at) {
+    run.acted = true;
+    if (scene[0] != 2 || scene[1] != 0) { handoff_refused("not in local VS CSS at handoffAt"); return; }
+    if (g_handoff_disc_depth) { handoff_refused("disc read/callback pending"); return; }
+    handoff_state::State state{run.frame, uint32_t(scene[0]), uint32_t(scene[1]), {}};
+    handoff_state::Sizes sizes;
+    std::vector<uint8_t> file;
+    std::string why;
+    const bool saving = !config.save.empty();
+    if (saving) {
+      if (!handoff_state::encode(run.identity, run.spans, state, file, sizes, why)) { handoff_refused(why); return; }
+      auto out = handoff_open(config.save, yougame::agent_paths::Mode::Truncate);
+      if (!handoff_state::write_file(out.get(), file, why)) { handoff_refused(why); return; }
+    } else {
+      auto in = handoff_open(config.load, yougame::agent_paths::Mode::Read);
+      const handoff_state::Gate gate{run.frame, uint32_t(scene[0]), uint32_t(scene[1]), g_handoff_disc_depth != 0, false};
+      if (!handoff_state::read_file(in.get(), run.spans, file, why) ||
+          !handoff_state::load(file, run.identity, run.spans, state, sizes, why, &gate, run.keep)) {
+        handoff_refused(why); return;
+      }
+      gx::mark_discontinuity();
+    }
+    run.action_frame = run.frame;
+    host::log("handoff: %s %llu bytes, %zu spans, hash %016llX, frame %llu, scene %u/%u, tb %llu, retraces %u, next_retrace_tb %llu, script frame %u, body frame %llu, css frame %llu, epoch %llu",
+        saving ? "saved" : "loaded", (unsigned long long)sizes.file, run.spans.size(),
+        (unsigned long long)native_savestate::hash_spans(run.compared), (unsigned long long)state.frame,
+        state.scene_major, state.scene_minor, (unsigned long long)host::cpu->tb, host::retrace_count(),
+        (unsigned long long)host::next_retrace_tb(), host::retrace_count(), (unsigned long long)run.frame,
+        (unsigned long long)relative, (unsigned long long)host::console_epoch_ticks());
+    if (!config.diff_dump.empty()) {
+      auto out = handoff_open(config.diff_dump, yougame::agent_paths::Mode::Truncate);
+      if (!handoff_state::dump(out.get(), run.spans, why)) { handoff_refused(why); return; }
+    }
+    if (!config.hash_log.empty()) {
+      auto out = handoff_open(config.hash_log, yougame::agent_paths::Mode::Truncate);
+      if (!out) { handoff_refused("cannot open hash log"); return; }
+    }
+  }
+  if (!run.action_frame || run.frame <= run.action_frame) return;
+  const auto after = run.frame-run.action_frame;
+  if (after > 600 || after % 60 || config.hash_log.empty()) return;
+  auto out = handoff_open(config.hash_log, yougame::agent_paths::Mode::Append);
+  if (!out) { handoff_refused("cannot append hash log"); return; }
+  for (size_t i = 0; i < run.spans.size(); ++i) {
+    const auto& s = run.spans[i];
+    const auto lo = reinterpret_cast<uintptr_t>(s.address);
+    std::vector<native_savestate::Span> parts;
+    for (const auto& p : run.compared)
+      if (reinterpret_cast<uintptr_t>(p.address) >= lo && reinterpret_cast<uintptr_t>(p.address)-lo < s.size) parts.push_back(p);
+    std::fprintf(out.get(), "after %llu frame %llu span %zu address 0x%llX bytes %u hash %016llX\n",
+        (unsigned long long)after, (unsigned long long)run.frame, i, (unsigned long long)lo, s.size,
+        (unsigned long long)native_savestate::hash_spans(parts));
+  }
+  std::fprintf(out.get(), "after %llu frame %llu total %016llX\n", (unsigned long long)after,
+      (unsigned long long)run.frame, (unsigned long long)native_savestate::hash_spans(run.compared));
+  if (std::ferror(out.get()) || std::fflush(out.get())) { handoff_refused("hash log write failed"); return; }
+  if (after == 600) host::log("handoff: hashlog done");
+}
+#endif
 uint64_t g_selftest_checks = 0, g_selftest_failures = 0;
 
 void report_selftest(int32_t frame, std::vector<uint8_t>& reply) {
@@ -1841,6 +2240,15 @@ int32_t h_slippi_command(uint8_t command, const uint8_t* payload, uint32_t paylo
   // Console capture/load bypass Slippi dispatch altogether. A failed load never resumes as if
   // it succeeded; the shim exits this session with an explicit epoch/body diagnostic.
   auto& console = yougame::console::console_engine();
+  if (command == 0xE6 && payload_size == 1 && payload[0] == 10) {
+    if (response_size) *response_size = 0;
+    const auto pick = yougame::friends::css_pick(console.config().settings_digest);
+    if (!console.active() || !pick || response_capacity < 4) return 0;
+    response[0] = uint8_t(pick->character); response[1] = uint8_t(pick->costume);
+    response[2] = uint8_t(pick->pad); response[3] = 1; // native Friends host is frozen port 1
+    if (response_size) *response_size = 4;
+    return 0;
+  }
   if (console.match_active() && (command == 0xB1 || command == 0xB2)) {
     if (response_size) *response_size = 0;
     if (payload_size != 32 || !g_savestates.active()) return -1;
@@ -2423,7 +2831,7 @@ void h_pad_read(MuPadStatus out[4]) {
   if (slippi::online::session_mode() < 0 && !g_replaying) user_gecko::apply();
   // A pasted always-display hitbox code turns on the Arcade look switches its lines stand for.
   gx::set_arcade_display(gx::ArcadeSource::Codes, user_gecko::arcade_bits_of_codes());
-  // Hidden test hook: MELEE_TEST_INSTALL_LOOK=<0 Diet, 1 Animelee> starts that one-click install once.
+  // Hidden test hook: MELEE_TEST_INSTALL_LOOK=<0 Diet, 1 Animelee, 2 Animelee x DBZ> starts that one-click install once.
   {
     static const int test_install = [] { const char* v = host::test_env::getenv("MELEE_TEST_INSTALL_LOOK"); return v && *v ? std::atoi(v) : -1; }();
     static int frames = 0;
@@ -2588,6 +2996,7 @@ bool jukebox_disc_read(uint32_t offset, void* dst, uint32_t size) {
   return ok;
 }
 void h_disc_read(uint32_t offset, void* dst, uint32_t size, MuDiscDone done, void* user) {
+  struct DiscScope { DiscScope() { ++g_handoff_disc_depth; } ~DiscScope() { --g_handoff_disc_depth; } } disc_scope;
   bool ok = false;
   const auto began = std::chrono::steady_clock::now();
   if (!read_cosmetic(offset, dst, size, &ok) && !read_system_file(offset, dst, size, &ok) &&
@@ -3560,6 +3969,7 @@ MuHostApi make_host() {
   h.hud_combo = h_hud_combo;
   h.shield_color = h_shield_color;
   h.grid_color = h_grid_color;
+  h.screen_shake_scale = h_screen_shake_scale;
   return h;
 }
 
@@ -3622,10 +4032,12 @@ LONG CALLBACK on_game_exception(EXCEPTION_POINTERS* info) {
     if (code == EXCEPTION_ACCESS_VIOLATION &&
         info->ExceptionRecord->NumberParameters >= 2 &&
         info->ExceptionRecord->ExceptionInformation[0] == 8) {
-      __try {
-        const uint64_t caller = *(const uint64_t*)info->ContextRecord->Rsp;
+      uint64_t caller = 0;
+      SIZE_T read = 0;
+      if (ReadProcessMemory(GetCurrentProcess(), (const void*)info->ContextRecord->Rsp,
+                            &caller, sizeof caller, &read) && read == sizeof caller) {
         called_by_game = caller >= base && caller < end;
-      } __except (EXCEPTION_EXECUTE_HANDLER) { }
+      }
     }
     if (!called_by_game) return EXCEPTION_CONTINUE_SEARCH;
   }
@@ -3647,6 +4059,7 @@ LONG CALLBACK on_game_exception(EXCEPTION_POINTERS* info) {
   for (int depth = 0; depth < 24; ++depth) {
     DWORD64 image = 0;
     PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image, nullptr);
+#ifdef _MSC_VER
     __try {
       if (fn) {
         void* handler_data = nullptr; DWORD64 frame = 0;
@@ -3656,6 +4069,15 @@ LONG CALLBACK on_game_exception(EXCEPTION_POINTERS* info) {
         ctx.Rsp += 8;
       }
     } __except (EXCEPTION_EXECUTE_HANDLER) { break; }
+#else
+    // MinGW cannot protect RtlVirtualUnwind with MSVC SEH. Read a leaf's return address
+    // through the checked self-process API; stop at a non-leaf rather than risking a second fault.
+    if (fn) break;
+    SIZE_T read = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), (const void*)ctx.Rsp, &ctx.Rip, sizeof ctx.Rip, &read) ||
+        read != sizeof ctx.Rip) break;
+    ctx.Rsp += 8;
+#endif
     if (ctx.Rip == 0) break;
     if (ctx.Rip >= base && ctx.Rip < end) host::log("  stack: melee_game.dll+0x%llX", (unsigned long long)(ctx.Rip - 1 - base));
     else { host::log("  (leaves the game at %016llX)", (unsigned long long)ctx.Rip); break; }
@@ -3719,6 +4141,8 @@ bool begin_console(std::unique_ptr<yougame::console::SessionLink> link,
     host::log("console: %s", yougame::console::kDefaultCard);
     screen_label::show(yougame::console::kDefaultCard, 12.0);
   }
+  const auto pick = yougame::friends::css_pick(config.settings_digest);
+  g_console_host_pad = config.my_port == 1 && pick ? pick->pad : -1;
   g_console_card = std::move(card);
   g_console_boot = true;
   return true;
@@ -3726,7 +4150,7 @@ bool begin_console(std::unique_ptr<yougame::console::SessionLink> link,
 
 int32_t console_practice_bridge(int32_t op, int32_t* args, int32_t count) {
   if (yougame::console::console_active() && op != MU_PRACTICE_SCENE &&
-      op != MU_PRACTICE_GET_PLAYER && op != MU_PRACTICE_GET_STAGE &&
+      op != MU_PRACTICE_FRIENDS_RETURN && op != MU_PRACTICE_GET_PLAYER && op != MU_PRACTICE_GET_STAGE &&
       op != MU_PRACTICE_GET_ONLINE_MODE && op != MU_PRACTICE_UNLOCKED &&
       !(op == MU_PRACTICE_PAGE_PAUSE && count >= 3 && args[0] == -1)) return -1;
   return g_game.practice ? g_game.practice(op, args, count) : -1;
@@ -4277,6 +4701,20 @@ int run(void (*shutdown)(int)) {
 #endif
 #endif
   auto entry = (MuGameEntry)game_proc("mu_game_entry");
+  g_handoff_callbacks_pending = (unsigned (*)())game_proc("mu_handoff_callbacks_pending_v1");
+#ifdef __APPLE__
+  g_loaded_game_path = g_dll; // The custom ELF mapper owns this exact resources path.
+#else
+#ifdef _WIN32
+  char loaded_path[MAX_PATH]{};
+  if (GetModuleFileNameA(module,loaded_path,MAX_PATH)) g_loaded_game_path = loaded_path;
+  else g_loaded_game_path = g_dll; // The sandbox's custom mapper is not in the loader list.
+#else
+  Dl_info game_info{};
+  if (entry && dladdr(reinterpret_cast<void*>(entry), &game_info) && game_info.dli_fname)
+    g_loaded_game_path = game_info.dli_fname;
+#endif
+#endif
   g_update_ranked_busy = (int (*)())game_proc("mu_update_ranked_busy_v1");
   g_look_snapshot = (void (*)(MuLookSnapshot*))game_proc("mu_look_snapshot_v1");
   g_look_items = (void (*)(MuLookItems*))game_proc("mu_look_items_v1");
@@ -4315,6 +4753,10 @@ int run(void (*shutdown)(int)) {
   host::log("source port: native state exclusions %u (%llu bytes)", exclusion_count,
             (unsigned long long)excluded_bytes);
   host::native_retrace = native_retrace;
+  publish_handoff_join_info(game_regions,region_count,exclusions,&api);
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  handoff_start(game_regions, region_count, exclusions, &api);
+#endif
   host::native_state_snapshot = g_game.state_snapshot;
 #ifdef _WIN32
   AddVectoredExceptionHandler(1, on_game_exception);

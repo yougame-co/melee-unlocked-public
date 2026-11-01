@@ -73,6 +73,7 @@ def main():
 
     if args.test:
         targets += ['linux_gc_adapter_test', 'linux_input_script_test', 'port_yougame_sysgen_test',
+                    'port_handoff_state_test', 'port_handoff_agent_hook_test', 'port_handoff_agent_off_test',
                     'port_sdl_video_thread_test',
                     'port_settings_mouse_test', 'port_keyboard_navigation_test', 'port_controller_profiles_test',
                     'port_settings_profile_bindings_test', 'port_dolphin_profile_test',
@@ -99,12 +100,12 @@ def main():
                     'port_practice_ghost_placeholders_test', 'port_yougame_pad_trace_hook_test',
                     'port_yougame_pad_trace_off_test',
                     'port_yougame_console_integration_test', 'port_yougame_console_engine_test',
-                    'port_yougame_console_pad_test', 'port_yougame_console_link_test', 'port_yougame_unranked_test', 'port_yougame_release_test',
+                    'port_yougame_console_pad_test', 'port_yougame_console_link_test', 'port_friends_retire_test', 'port_yougame_unranked_test', 'port_yougame_release_test',
                     'port_phob_mirror_test', 'port_phob_mirror_hook_test',
                     'port_net_diagnostics_test', 'port_yg_enet_socket_test', 'port_yg_enet_posix_ring_test',
                     'port_yougame_udp_test', 'port_yougame_udp_enet_test',
                     'port_yougame_relay_output_hook_test', 'port_yougame_relay_output_off_test',
-                    'port_controller_relay_test', 'port_yougame_controller_relay_test', 'port_slippi_link_test']
+                    'port_controller_relay_test', 'port_yougame_controller_relay_test', 'port_slippi_link_test', 'port_slippi_address_test', 'port_css_state_test']
         if full:
             targets += ['linux_ws_frame_test']  # YouGame's WebSocket framing (port/linux/compat/tests)
             # The app-owned ring (fake ring, POSIX attach) and the transport routing tests.

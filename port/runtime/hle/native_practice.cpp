@@ -94,6 +94,9 @@ Phase g_logged_phase = Phase::Idle;
 bool g_lobby_started = false;
 uint32_t g_lobby_boot_ticks = 0;
 bool g_friend_handoff = false;
+bool g_friend_css_requested = false;
+bool g_shared_css_seen = false;
+bool g_shared_was_active = false;
 uint32_t g_friend_menu_ticks = 0;
 std::future<std::string> g_friend_picker;
 std::shared_ptr<std::atomic<bool>> g_friend_picker_stop;
@@ -115,7 +118,7 @@ NativeBridge g_bridge = nullptr;
 ContentBridge g_content_bridge = nullptr;
 enum { OP_SCENE, OP_GET_PLAYER, OP_SET_PLAYER, OP_GET_STAGE, OP_SET_STAGE, OP_SET_EVENT_BACKUP,
        OP_REQUEST_MAJOR, OP_SET_ONLINE_MODE, OP_GET_ONLINE_MODE, OP_DIRECT_FIRST_MATCH, OP_FRAME_PAUSE, OP_CPU_MOVE,
-       OP_TRAINING_PICK, OP_TRAINING_STAGE, OP_UNLOCKED, OP_PAGE_PAUSE };
+       OP_TRAINING_PICK, OP_TRAINING_STAGE, OP_UNLOCKED, OP_PAGE_PAUSE, OP_CSS_PICK, OP_FRIENDS_RETURN };
 std::atomic<uint32_t> g_unlocked{0xFFFFFFFFu};   // tick(): the card's unlocked characters, read in Training
 
 uint8_t current_major() {
@@ -655,7 +658,67 @@ void submit_acknowledge_failure() {
 }
 
 void tick() {
+  // Room and picker workers publish state; only this simulation thread touches scenes/CSS.
+  auto& friends_lobby = yougame::friends::lobby;
+  const bool shared_active = yougame::console::console_active();
+  if (g_shared_was_active && !shared_active && friends_lobby.held()) {
+    friends_lobby.session_stopped();
+    g_shared_css_seen = false;
+  }
+  g_shared_was_active = shared_active;
+  if (!shared_active && yougame::console::entry.available()) {
+    const auto held_room = friends_lobby.take_reenter();
+    if (!held_room.empty()) {
+      g_friend_css_requested = g_shared_css_seen = false;
+      yougame::console::friends_entry(held_room,friends_lobby.host(),true);
+    }
+  }
+  if (shared_active && current_major() == 2) g_shared_css_seen = true;
+  if (g_shared_css_seen && current_major() != 2 && current_major() == 1) {
+    friends_lobby.leave(); g_shared_css_seen = false;
+  }
+  if (friends_lobby.host() && !friends_lobby.room().empty() && !g_friend_css_requested) {
+    g_friend_css_requested = true;
+    request_major(2); // room FIRST, ordinary local VS CSS SECOND
+  }
+  if (friends_lobby.loading() && g_friend_picker_stop) *g_friend_picker_stop = true;
+  if (friends_lobby.host() && current_major() == 2 && current_minor() == 0 && g_bridge) {
+    int32_t a[3] = {};
+    if (g_bridge(OP_CSS_PICK,a,3) == 0) friends_lobby.shown({a[0],a[1],a[2]});
+    if (friends_lobby.reported() && !g_friend_picker.valid() && friends_lobby.take_invite()) {
+      g_friend_picker_stop = std::make_shared<std::atomic<bool>>(false);
+      const auto room = friends_lobby.room();
+      std::packaged_task<std::string()> task([stop = g_friend_picker_stop,room] {
+        return yougame::pick_friend_room([stop] { return stop->load() || yougame::friends::lobby.cancelled(); },room);
+      });
+      g_friend_picker = task.get_future(); std::thread(std::move(task)).detach();
+    }
+    if (g_friend_picker.valid() && g_friend_picker.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+      try { g_friend_picker.get(); }
+      catch (const std::exception& e) {
+        // Cancel only closes the picker: the room and local CSS stay open. Z invites again.
+        if (std::string(e.what()) != "Cancelled") yougame::friends::events.notice("Couldn't open your friends list. Press Z to try again.",
+          uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
+      }
+    }
+    yougame::friends::events.picker_open(g_friend_picker.valid());
+  }
+  if (friends_lobby.host() && friends_lobby.shown() && current_major() != 2) friends_lobby.leave();
+  std::string leave_line;
+  if (friends_lobby.take_return(leave_line)) {
+    if (g_friend_picker_stop) *g_friend_picker_stop = true;
+    g_friend_picker = {}; yougame::friends::events.picker_open(false);
+    auto retire = yougame::console::leave_friends_room(); // queue end-session + leave before teardown
+    yougame::console::console_engine().end(yougame::console::kSelfLeft);
+    yougame::console::close_friends_room(std::move(retire));
+    g_friend_css_requested = g_shared_css_seen = false;
+    if (g_bridge) { int32_t a[1] = {}; g_bridge(OP_FRIENDS_RETURN,a,1); }
+    else request_major(1);
+    if (!leave_line.empty() && !yougame::friends::page_lobby_lines.load(std::memory_order_acquire)) yougame::friends::events.notice(leave_line,
+      uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
+  }
   if (yougame::console::console_active()) return;
+  if (friends_lobby.held()) return; // local CSS remains interactive; the room worker owns preparation
   // This tick runs at retrace even while the scene is frozen. No game state is
   // accessed by the stdin reader; online sessions never touch these pause flags.
   if (yougame::stdio_bridge()) {
@@ -722,10 +785,28 @@ void tick() {
       *g_friend_picker_stop = true;
       g_friend_picker = {};
     }
-    if (safe && yougame::identity().ok) {
+    yougame::friends::events.picker_open(g_friend_picker.valid());
+    const uint64_t friends_now = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (safe && picker_scene && yougame::friends::events.friend_entry()) {
+      // A Friends press the host can't act on yet says why on screen; it used to do nothing.
+      const auto id = yougame::identity();
+      if (!id.ok && yougame::friends::events.take_host()) {
+        host::log("friends: entry refused (%s)", id.error.empty() ? "not signed in" : id.error.c_str());
+        yougame::friends::events.notice(id.error.empty() ? "Signing in to YouGame..." : id.error, friends_now);
+      }
+    }
+    if (safe && yougame::identity().ok && yougame::console::entry.available()) {
       auto room = yougame::friends::events.take_join(true);
       const bool host_friend = yougame::friends::events.take_host();
-      // Keep Friends in place until the page has chosen a room.
+      if (g_bridge && host_friend && picker_scene && !yougame::console::entry.active()) {
+        slippi::online::native_cleanup_match();
+        g_friend_css_requested = false;
+        yougame::friends::events.online_menu(false);
+        yougame::console::friends_entry("new");
+        return;
+      }
+      // Static recomp retains its existing online entry.
       if (picker_scene && host_friend && !g_friend_picker.valid() && room.empty() && !yougame::console::entry.active()) {
         host::log("friends: entry opened (%s)", yougame::friends::events.trigger().c_str());
         g_friend_picker_stop = std::make_shared<std::atomic<bool>>(false);
@@ -741,9 +822,15 @@ void tick() {
           g_friend_picker = {};
         } else if (g_friend_picker.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
           try { room = g_friend_picker.get(); }
-          catch (const std::exception& e) { yougame::friends::events.picker_error(e.what()); }
+          catch (const std::exception& e) {
+            yougame::friends::events.picker_error(e.what());
+            const std::string why = e.what();
+            if (why != "Cancelled" && why != yougame::friends::kVersion)  // a version refusal has its own toast
+              yougame::friends::events.notice("Couldn't open your friends list. Press A to try again.", friends_now);
+          }
         }
       }
+      yougame::friends::events.picker_open(g_friend_picker.valid());
       if (!room.empty()) {
         yougame::friends::events.online_menu(false);
         slippi::online::native_cleanup_match();

@@ -41,10 +41,10 @@ int main() {
   CHECK(compat_tag_with_test_timer("", "60") == "t60" && compat_tag_with_test_timer("mixed", "60") == "mixed-t60");
   CHECK(compat_tag_with_test_timer("", "abc") == "t0");   // atoi, as the setup block plays it
   for (const char* tag : {"", "mixed"}) {
-    const auto plain = compatibility_key("0.9.86", false, "", false, rules, tag);
-    const auto t60 = compatibility_key("0.9.86", false, "", false, rules, compat_tag_with_test_timer(tag, "60"));
-    CHECK(plain != t60 && t60 == compatibility_key("0.9.86", false, "", false, rules, compat_tag_with_test_timer(tag, "60")));
-    CHECK(t60 != compatibility_key("0.9.86", false, "", false, rules, compat_tag_with_test_timer(tag, "90")));
+    const auto plain = compatibility_key("0.9.87", false, "", false, rules, tag);
+    const auto t60 = compatibility_key("0.9.87", false, "", false, rules, compat_tag_with_test_timer(tag, "60"));
+    CHECK(plain != t60 && t60 == compatibility_key("0.9.87", false, "", false, rules, compat_tag_with_test_timer(tag, "60")));
+    CHECK(t60 != compatibility_key("0.9.87", false, "", false, rules, compat_tag_with_test_timer(tag, "90")));
     CHECK(t60.size() <= 64 && t60.find("-rbbbbbbbb") != std::string::npos);
   }
   CHECK(compatibility_key("0.9.80", false, "", false, "bad").empty());

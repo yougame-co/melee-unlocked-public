@@ -5,6 +5,8 @@
 #include "yougame_console_request.h"
 #include "yougame_room.h"
 #include "yougame_console_notice.h"
+#include "friends_handoff_join.h"
+#include "friends_handoff_transfer.h"
 
 namespace yougame::console {
 using Bytes = std::vector<uint8_t>;
@@ -35,10 +37,13 @@ struct SessionIO {
   std::function<uint64_t()> clock = transport::now_ms;
   std::function<uint64_t()> random;
   std::function<bool(const std::string&, const std::string&, int)> open_room;
+  std::function<bool()> room_mismatch; // exact broker HTTP upgrade refusal, not every 403/1006
   std::function<bool(json&, int)> next_room;
   std::function<bool(const json&)> send_room;
   std::function<bool(int)> flush_room; // finish queued card sends before the app can relaunch
   std::function<bool()> room_closed;
+  std::function<bool()> room_rejoining = [] { return false; }; // own held-seat recovery; not a final close
+  std::function<void(const std::string&,const std::string&)> rebound; // validated held-seat identity replacement
   std::function<int()> connection;
   std::function<bool(int)> attach;
   std::function<int(unsigned)> state;
@@ -46,13 +51,26 @@ struct SessionIO {
   std::function<std::vector<uint64_t>(unsigned)> rtt; // consume app path RTT samples
   std::function<bool()> cancelled = [] { return false; };
   std::function<bool()> confirm_start = [] { return true; };
+  bool held_reenter = false;
+  std::function<bool()> previous_session_active = [] { return false; };
+  bool friends_lobby = false; // Human Friends waits in local CSS without a seat deadline/START gate.
+  bool handoff_join = false; // Only Friends entry opts in; defaults preserve all other callers.
+  handoff_join::Info handoff_info;
+  std::function<bool()> handoff_css = [] { return false; };
+  handoff_join::Begin handoff_begin;
+  std::function<void(const std::string&)> opened;
+  std::function<void(const std::string&,const json&,const std::string&,int)> roster;
+  std::function<bool()> css_ready = [] { return true; };
+  std::function<std::string(const std::string&)> freeze_pick;
   std::function<void(const std::string&,bool)> waiting;
   // Human entry freezes Rooms config, then relaunches; it never boots this running engine.
   std::function<void(const SessionConfig&)> prepared;
+  std::function<void(const SessionConfig&)> committed;
   // Present for Friends; four-seat callers retain their existing startup contract.
   std::function<Bytes()> host_save;
   std::function<bool(const SessionConfig&)> persist_card;
   std::function<bool(SessionConfig&)> restore_card;
+  std::function<void(const SessionConfig&)> discard_card; // default final removes any staged copy
   std::function<void(unsigned, const Bytes&)> send;
   std::function<bool(unsigned&, Bytes&)> receive;
   std::function<void(int)> wait;

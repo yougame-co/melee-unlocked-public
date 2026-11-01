@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.15)
 project(MeleeUnlocked LANGUAGES CXX)
+option(YOUGAME_FRIENDS_HANDOFF_DEFAULT "Experimental Friends live handoff agreement" OFF)
+if(YOUGAME_FRIENDS_HANDOFF_DEFAULT)
+  add_compile_definitions(YOUGAME_FRIENDS_HANDOFF_DEFAULT=1)
+endif()
 option(YOUGAME_RANKED_BRANCH "Ranked: visible Ranked and local CPU practice" ON)   # ON in the main staging build (Friends + Ranked on the main build)
 
 set(YOUGAME_COMPAT_TAG "" CACHE STRING "Isolate YouGame lobby compatibility to this branch tag")
@@ -48,11 +52,23 @@ target_compile_features(port_yougame_console_link_test PRIVATE cxx_std_17)
 target_compile_definitions(port_yougame_console_link_test PRIVATE YOUGAME_AGENT_TEST_HOOK)
 target_link_libraries(port_yougame_console_link_test PRIVATE Threads::Threads)
 add_test(NAME port_yougame_console_link COMMAND port_yougame_console_link_test)
+add_test(NAME port_console_card_agreement COMMAND port_yougame_console_link_test --card-agreement)
+add_test(NAME port_console_room_refusals COMMAND port_yougame_console_link_test --room-refusals)
 add_test(NAME port_yougame_console_latency COMMAND port_yougame_console_link_test --latency)
 add_test(NAME port_console_watchdog COMMAND port_yougame_console_link_test --watchdog)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME port_sdl_video_thread_wiring COMMAND "${Python3_EXECUTABLE}" -B
   "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/sdl_video_thread_wiring_test.py")
+add_test(NAME port_friends_order COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/friends_order_test.py")
+add_test(NAME port_friends_disconnect COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/friends_disconnect_test.py")
+add_test(NAME port_round38_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/round38_wiring_test.py")
+add_test(NAME port_round38c COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/round38c_test.py")
+add_test(NAME port_round38b COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/round38b_test.py")
 add_test(NAME port_yougame_console_wiring COMMAND "${Python3_EXECUTABLE}" -B
   "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_console_wiring_test.py")
 add_test(NAME port_console_input_wiring COMMAND "${Python3_EXECUTABLE}" -B
@@ -85,6 +101,12 @@ target_include_directories(port_slippi_link_test PRIVATE port/runtime/hle port/t
 target_compile_features(port_slippi_link_test PRIVATE cxx_std_17)
 target_link_libraries(port_slippi_link_test PRIVATE Threads::Threads)
 add_test(NAME port_slippi_link COMMAND port_slippi_link_test)
+add_executable(port_slippi_address_test port/tests/slippi_address_test.cpp)
+target_include_directories(port_slippi_address_test PRIVATE port/runtime/hle)
+target_compile_features(port_slippi_address_test PRIVATE cxx_std_17)
+add_test(NAME port_slippi_address COMMAND port_slippi_address_test)
+add_test(NAME port_slippi_fallback COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/slippi_fallback_test.py")
 add_test(NAME port_slippi_link_wiring COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/slippi_link_wiring_test.py")
 
 # Blended Unranked's coordinator (yougame_blend.h) and its wiring; window-free, before Linux's return().
@@ -422,6 +444,14 @@ if(NOT WIN32)
   target_compile_definitions(port_yougame_agent_present_test PRIVATE YOUGAME_AGENT_TEST_HOOK)
   target_link_libraries(port_yougame_agent_present_test PRIVATE Threads::Threads)
   add_test(NAME port_yougame_agent_present COMMAND port_yougame_agent_present_test "${CMAKE_CURRENT_BINARY_DIR}/yougame-agent-present-test")
+  if(APPLE)
+    add_executable(port_standalone_present_hook_test port/tests/standalone_present_test.cpp)
+    target_include_directories(port_standalone_present_hook_test PRIVATE port/runtime/hle port/third_party)
+    target_compile_features(port_standalone_present_hook_test PRIVATE cxx_std_17)
+    target_compile_definitions(port_standalone_present_hook_test PRIVATE YOUGAME_AGENT_TEST_HOOK)
+    target_link_libraries(port_standalone_present_hook_test PRIVATE Threads::Threads)
+    add_test(NAME port_standalone_present_hook COMMAND port_standalone_present_hook_test "${CMAKE_CURRENT_BINARY_DIR}")
+  endif()
   add_executable(port_yougame_agent_present_off_test port/tests/yougame_agent_present_test.cpp)
   target_include_directories(port_yougame_agent_present_off_test PRIVATE port/runtime/hle)
   target_compile_features(port_yougame_agent_present_off_test PRIVATE cxx_std_17)

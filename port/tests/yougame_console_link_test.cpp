@@ -37,6 +37,7 @@ struct Fixture {
   std::function<void(unsigned,const Bytes&)> deliver;
   std::function<void()> on_wait;
   std::function<void(json&)> alter_start;
+  std::function<json(const json&)> direct_open;
   yougame::transport::Events events{[this](int ms) { wait(ms); }};
   yougame::transport::Stream stream{events,[this](const json& q,int ms) { return request(q,ms); },[this] { return now; }};
   Fixture(int n = 2,int s = 0) : players(n),seat(s) {}
@@ -79,7 +80,7 @@ struct Fixture {
       if (str(m,"t") == "msg" && m.count("d") && str(m["d"],"kind") == "mu-cand" && reply_candidates)
         push({{"t","msg"},{"from",m["to"]},{"d",m["d"]}});
     }
-    if (type == "directOpen") return {{"link",unsigned(q["peer"].get<std::string>()[1]-'0'+1)}};
+    if (type == "directOpen") return direct_open ? direct_open(q) : json{{"link",unsigned(q["peer"].get<std::string>()[1]-'0'+1)}};
     return json::object();
   }
   SessionIO io() {
@@ -141,6 +142,42 @@ static void intake() {
   auto newer = app; newer["sessionId"] = "newer"; CHECK(launch_request(newer)); launch_hello({{"launch",app}}); CHECK(take_request() == newer);
   launch_hello({{"launch",app}}); CHECK(take_request() == app);
   CHECK(requests.claim()); CHECK(!launch_request(app)); CHECK(!requests.claim()); requests.release();
+}
+static void failed_session_new_invite() {
+  ++cases;
+  yougame::friends::Events invites;
+  invites.current_room("OldRoom");
+  Fixture failed(2,1); failed.attach_ok = false;
+  auto old = failed.input(); old["room"] = "OldRoom";
+  SessionConfig config; std::string error;
+  CHECK(!start_session(old,config,error,failed.io()) && !error.empty());
+  invites.current_room({}); // the production console IO close releases/retire this room
+  invites.menu_scene(yougame::friends::menu_safe(2,0));
+  CHECK(invites.push({{"type","join"},{"room","NewRoom"}},1));
+  CHECK(!invites.push({{"type","join"},{"room","OldRoom"}},2));
+  CHECK(invites.join_pending());
+  Fixture retry(2,1); auto next = retry.input(); next["room"] = invites.take_join(true);
+  CHECK(next["room"] == "NewRoom");
+  auto link = start_session(next,config,error,retry.io()); CHECK(link && error.empty());
+  CHECK(config.room == "NewRoom");
+  CHECK(retry.requests.front()["room"] == "NewRoom");
+  CHECK(!invites.push({{"type","join"},{"room","OldRoom"}},3));
+
+  // A fresh invite lets the guest retry the SAME live room after a failed join.
+  ++cases; yougame::friends::Events same;
+  same.current_room("OldRoom");
+  CHECK(!start_session(old,config,error,failed.io()) && !error.empty());
+  same.current_room({});
+  CHECK(!same.push({{"type","join"},{"room","OldRoom"}},4)); // stale page push, no invite
+  CHECK(same.push({{"type","notice"},{"kind","invite"},{"from","Host"},{"text","Play with me"}},5));
+  CHECK(same.push({{"type","join"},{"room","OldRoom"}},6));
+  Fixture same_retry(2,1); auto same_request = same_retry.input(); same_request["room"] = same.take_join(true);
+  same.current_room(same_request["room"]);
+  CHECK(same_request["room"] == "OldRoom");
+  auto same_link = start_session(same_request,config,error,same_retry.io());
+  CHECK(same_link && error.empty() && config.room == "OldRoom");
+  same.current_room({});
+  CHECK(!same.push({{"type","join"},{"room","OldRoom"}},7)); // the new generation also retires
 }
 static void starts() {
   for (int count : {2,3,4}) {
@@ -419,7 +456,9 @@ static void departures_and_waits() {
     else if (std::string(event) == "link") f.state = 3;
     else if (std::string(event) == "closed") f.closed = true;
     else f.push({{"t",event},{"player",{{"id","c1"}}},{"reason","left"}});
-    l->pump(0); CHECK(l->lost());
+    l->pump(0);
+    if (std::string(event) != "closed") { CHECK(!l->lost() && l->reconnecting()); f.closed = true; l->pump(0); }
+    CHECK(l->lost());
     const auto expected = "your friend disconnected";
     CHECK(*l->lost() == expected);
     CHECK(str(f.messages.back()["d"],"kind") == "mu-console-end"); CHECK(f.messages.back()["d"]["reason"] == expected);
@@ -438,8 +477,9 @@ static void departures_and_waits() {
   for (const char* event : {"leave","left","away","kicked"}) {
     f.push({{"t",event},{"player",{{"id","c1"}}}}); l->pump(0); CHECK(!l->lost());
   }
-  // Lobby arrivals/reservations do not mutate or interrupt the frozen session.
-  auto r = f.roster(); r[1]["connectionId"] = "replacement"; f.push({{"t","join"},{"participants",r}}); l->pump(0); CHECK(!l->lost());
+  // An unverified replacement cannot inherit the frozen peer's port.
+  auto r = f.roster(); r[1]["connectionId"] = "replacement"; f.push({{"t","join"},{"participants",r}}); l->pump(0);
+  CHECK(l->lost() == "your friend disconnected");
 }
 static void common_end_reason() {
   ++cases;
@@ -476,6 +516,7 @@ static void app_launch_contract() {
     SessionConfig c; c.room = "ABCDEF"; c.session_id = "b1c99ca4-63b7-4502-969e-c74c8b547c7a"; c.my_port = 2;
     c.ports.clear(); for (size_t p = 1; p <= players; ++p) c.ports.push_back(int(p));
     c.seed = 0x0123456789abcdefull; c.epoch_ms = 1793443200123LL; c.input_delay = 2;
+    c.default_card = !shared;
     if (shared) c.card_digest = std::string(64,'a');
     const auto launch = session_launch(c);
     CHECK(app_console_session_error(launch).empty());
@@ -564,15 +605,215 @@ static void watchdog_receive_clock() {
   // A nearly-five-second foreground gap does not end a peer that just sent again.
   f.now += 4999; f.inbox.emplace_back(2,heartbeat); link->pump(0); CHECK(!link->lost());
   f.now += 4999; link->pump(0); CHECK(!link->lost());
-  ++f.now; link->pump(0); CHECK(link->lost() == "your friend disconnected");
-  const auto diagnostic = "console: port 2 silent 5000 ms (last heard frame 0): no receive for 5 s";
+  ++f.now; link->pump(0); CHECK(!link->lost() && link->reconnecting());
+  const auto diagnostic = "console: link to port 2 lost; waiting for the room to come back";
   CHECK(std::count(f.logs.begin(),f.logs.end(),diagnostic) == 1);
-  CHECK(f.logs[f.logs.size()-2] == diagnostic);
+  auto held = f.roster(); held[1]["away"] = true;
+  f.push({{"t","away"},{"participants",held}}); link->pump(0);
+  f.now += 74999; link->pump(0); CHECK(!link->lost());
+  ++f.now; link->pump(0); CHECK(link->lost() == "your friend disconnected");
+  CHECK(f.logs[f.logs.size()-2] == "console: relink gave up after 75000 ms (room did not return)");
   CHECK(f.logs.back() == "console: session ended: your friend disconnected");
-  // Explicit close names a different cause and does not wait for the silence threshold.
+  // A closed helper link now enters recovery immediately, before the silence threshold.
   Fixture closed; auto other = closed.start(c); closed.state = 3; other->pump(0);
-  CHECK(other->lost() == "your friend disconnected");
-  CHECK(closed.logs[closed.logs.size()-2].find("transport closed") != std::string::npos);
+  CHECK(!other->lost() && other->reconnecting());
+  CHECK(closed.logs.back() == diagnostic);
+}
+static void relink_failures() {
+  auto ends_sent = [](const Fixture& f) {
+    return std::count_if(f.messages.begin(),f.messages.end(),[](const json& m) {
+      return str(m,"t") == "msg" && m.count("d") && str(m["d"],"kind") == "mu-console-end";
+    });
+  };
+  auto logged = [](const Fixture& f,const std::string& line) { return std::find(f.logs.begin(),f.logs.end(),line) != f.logs.end(); };
+  for (int mode = 0; mode < 10; ++mode) {
+    ++cases; Fixture f; bool cancel = false, rejoining = mode < 7;
+    auto io = f.io(); io.room_rejoining = [&] { return rejoining; }; io.cancelled = [&] { return cancel; };
+    SessionConfig c; std::string error; auto link = start_session(f.input(),c,error,std::move(io)); CHECK(link);
+    // The app refuses every reopen once direct links are off: give up now, not after 75 s.
+    if (mode == 7) f.direct_open = [](const json&) { return json{{"link",0},{"refused","no_direct"}}; };
+    f.state = 3; link->pump(0); const auto lost_at = f.now;
+    CHECK(!link->lost() && link->reconnecting());
+    if (mode == 0 || mode == 6) {
+      if (mode == 6) rejoining = false; // room returned, helper never comes up
+      f.now += 74999; link->pump(0); CHECK(!link->lost());
+      ++f.now; link->pump(0);
+      CHECK(link->lost() == "your friend disconnected");
+      CHECK(f.logs[f.logs.size()-2] == std::string("console: relink gave up after 75000 ms (") +
+          (mode == 0 ? "room did not return)" : "link did not come up)"));
+    } else if (mode == 1) {
+      auto released = f.roster(); released.erase(released.begin()+1);
+      f.push({{"t","leave"},{"participants",released}}); link->pump(0); CHECK(link->lost());
+      CHECK(f.now == lost_at);
+    } else if (mode == 2) {
+      cancel = true; link->pump(0); CHECK(link->lost() == kSelfLeft && f.now == lost_at);
+      CHECK(ends_sent(f) == 0); // the room's leave/sessionEnded carries Leave; the friend keeps a notice
+    } else if (mode == 3) {
+      f.push({{"t","sessionEnded"},{"sessionId","other"},{"reason","left"}}); link->pump(0); CHECK(!link->lost());
+      f.push({{"t","sessionEnded"},{"sessionId",c.session_id},{"reason","left"}}); link->pump(0); CHECK(link->lost() == "left");
+    } else if (mode == 4) {
+      for (uint32_t frame = 0; frame < kHistory; ++frame) link->send_pad(frame,sample(frame,1));
+      CHECK(!link->lost()); link->send_pad(kHistory,{}); CHECK(link->lost() == "your friend disconnected");
+      CHECK(ends_sent(f) == 1);
+    } else if (mode == 7) {
+      f.now += 100; link->pump(0);
+      CHECK(link->lost() == "your friend disconnected");
+      CHECK(logged(f,"console: relink gave up after 100 ms (direct links unavailable)"));
+    } else if (mode == 8) {
+      // No away roster, rejoin or re-seat: the friend's seat is not being held.
+      while (!link->lost() && f.now-lost_at < 30000) { f.now += 100; link->pump(0); }
+      CHECK(link->lost() == "your friend disconnected" && f.now-lost_at == 20000);
+      CHECK(logged(f,"console: relink gave up after 20000 ms (seat not held)"));
+    } else if (mode == 9) {
+      f.push({{"t","msg"},{"from","c1"},{"d",{{"kind","mu-console-end"},{"v",1},{"sessionId",c.session_id},{"reason",kSelfLeft}}}});
+      link->pump(0); CHECK(link->lost() == "left");
+    } else {
+      for (uint32_t frame = 0; frame < kHistory; ++frame) link->send_digest(frame,frame);
+      CHECK(!link->lost()); link->send_digest(kHistory,0); CHECK(link->lost() == "your friend disconnected");
+    }
+  }
+  // A returned room can have lost the session while the socket was away.
+  for (bool replaced : {false,true}) {
+    ++cases; Fixture f; SessionConfig c; auto link = f.start(c);
+    f.state = 3; link->pump(0); CHECK(link->reconnecting());
+    json welcome = {{"t","welcome"},{"participants",f.roster()}};
+    if (replaced) { welcome["console"] = f.console_start(); welcome["console"]["sessionId"] = "another-session"; }
+    f.push(welcome); link->pump(0); CHECK(link->lost() == "your friend disconnected");
+  }
+}
+// Two real transports and Engines, deterministic room/helper fakes. The only room
+// that drops is B's; A learns away/back through its still-connected room. Each
+// helper allocates a fresh local id and becomes up only after BOTH games open.
+static void relink_async_leave() {
+  ++cases; Fixture f; SessionConfig c; std::string error;
+  auto io = f.io(); const auto request = io.request;
+  std::atomic<bool> live{false}, closed{false}, cancel{false};
+  std::promise<void> entered, release, cleaned;
+  auto released = release.get_future().share();
+  io.request = [&](const json& q,int ms) {
+    if (!live) return request(q,ms);
+    CHECK(ms > 0 && ms <= 1000);
+    if (str(q,"type") == "directOpen") { entered.set_value(); released.wait(); return json{{"link",20}}; }
+    if (str(q,"type") == "directClose" && q["link"] == 20) cleaned.set_value();
+    return json::object();
+  };
+  io.background_service = true;
+  io.state = [&](unsigned) { return closed ? 3 : 2; };
+  io.cancelled = [&] { return cancel.load(); };
+  auto link = start_session(f.input(),c,error,std::move(io)); CHECK(link && error.empty());
+  live = closed = true;
+  CHECK(entered.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+  auto sender = std::async(std::launch::async,[&] { link->send_pad(0,{}); link->pump(0); });
+  const bool responsive = sender.wait_for(std::chrono::milliseconds(50)) == std::future_status::ready;
+  cancel = true; link->pump(0); CHECK(link->lost() == kSelfLeft);
+  sender.get(); link.reset(); // must not wait for the bridge request; Leave takes effect now
+  release.set_value();
+  CHECK(cleaned.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
+  CHECK(responsive); // late successful open is closed by the abandoned attempt
+}
+static void relink_engines(int dropped_seat, bool match = false) {
+  ++cases;
+  Fixture a,b(2,1); std::array<Fixture*,2> f{&a,&b};
+  std::array<SessionConfig,2> c;
+  std::array<SessionLink*,2> links{};
+  std::array<unsigned,2> ids{2,1};
+  std::array<bool,2> opened{false,false};
+  bool dropped = false, back = false;
+  std::array<int,2> rooms{10,11}; int stalls = 0;
+  std::array<Engine,2> engines;
+  std::array<yougame::friends::Lobby,2> lobbies;
+  std::array<std::vector<std::string>,2> notices, hashes;
+  for (int s = 0; s < 2; ++s) {
+    lobbies[s].begin(s == 0);
+    lobbies[s].observe({{"t","welcome"},{"me","c"+std::to_string(s)},{"host","c0"},{"participants",f[s]->roster()}});
+    auto io = f[s]->io();
+    io.rebound = [&,s](const std::string& old_id,const std::string& new_id) { lobbies[s].rebound(old_id,new_id); };
+    io.connection = [&,s] { return rooms[s]; };
+    io.room_rejoining = [&,s] { return s == dropped_seat && dropped && !back; };
+    io.state = [&,s](unsigned id) {
+      if (!dropped) return 2;
+      if (id <= 2) return 3;
+      return opened[0] && opened[1] ? 2 : 1;
+    };
+    const auto send = io.send;
+    io.send = [&,s,send](unsigned id,const Bytes& bytes) {
+      if (!links[s]) { send(id,bytes); return; } // startup's fake delay agreement
+      if (dropped && (!back || !opened[0] || !opened[1])) return;
+      f[1-s]->inbox.emplace_back(ids[1-s],bytes);
+    };
+    f[s]->direct_open = [&,s](const json& q) {
+      if (!dropped) return json{{"link",ids[s]}};
+      CHECK(back && str(q,"peer") == (1-s == dropped_seat ? "c9" : "c"+std::to_string(1-s)));
+      CHECK(q["conn"] == rooms[s]);
+      opened[s] = true; ids[s] = unsigned(20+s); return json{{"link",ids[s]}};
+    };
+    std::string error; auto link = start_session(f[s]->input(),c[s],error,std::move(io)); CHECK(link && error.empty());
+    links[s] = link.get();
+    EngineHooks h; h.now_ms = [&,s] { return f[s]->now; };
+    h.notice = [&,s](const char* text) { notices[s].emplace_back(text); };
+    h.log = [&,s](const std::string& line) { CHECK(line.find("desync") == std::string::npos); if (line.find("console: hash ") == 0) hashes[s].push_back(line); };
+    h.responsive = [&] {
+      CHECK(dropped);
+      for (auto* seat : f) seat->now += 1000;
+      if (++stalls == 15) {
+        back = true; rooms[dropped_seat] = 99;
+        auto roster = a.console_start()["participants"]; roster[dropped_seat]["connectionId"] = "c9"; roster[dropped_seat]["id"] = "new-id";
+        f[1-dropped_seat]->push({{"t","back"},{"participants",roster}});
+        auto welcome = b.console_start(); welcome["participants"] = roster;
+        f[dropped_seat]->push({{"t","welcome"},{"me","c9"},{"room",{{"console",welcome}}}});
+      }
+      for (auto& engine : engines) engine.poll();
+    };
+    CHECK(engines[s].begin(std::move(link),c[s],std::move(h),false));
+  }
+  // Seed only the initial digest rendezvous so sequential Engines can meet at 0.
+  for (auto* link : links) link->send_digest(0,Engine::state_digest({}));
+  for (int n = 0; n < 4; ++n) for (auto* link : links) link->pump(0);
+  for (uint32_t frame = 0; frame < 660; ++frame) {
+    if (match && frame == 30) for (auto& engine : engines) {
+      engine.enable_rollback(true); CHECK(engine.begin_match());
+    }
+    if (frame == 60) {
+      dropped = true;
+      auto roster = a.roster(); roster[dropped_seat]["away"] = true;
+      f[1-dropped_seat]->push({{"t","away"},{"participants",roster}});
+    }
+    for (int s = 0; s < 2; ++s) {
+      Pads hw{}; for (auto& pad : hw) pad.err = -1; hw[0] = sample(frame,s+1); hw[0].err = 0;
+      const bool advanced = engines[s].advance(hw,{});
+      if (!advanced) std::fprintf(stderr,"relink engine %d frame %u: %s; transport %s\n",s,frame,
+          notices[s].empty() ? "no notice" : notices[s].back().c_str(),f[s]->logs.back().c_str());
+      if (!advanced) for (const auto& line : f[s]->logs) std::fprintf(stderr,"%s\n",line.c_str());
+      CHECK(advanced); CHECK(engines[s].frame() == frame);
+      if (match && frame >= 30) {
+        const auto body = frame-30;
+        CHECK(engines[s].confirm(body)); // terminal causal wait uses the same paused deadline
+        CHECK(engines[s].replay(body)); // read corrected, confirmed pads after any prediction
+        CHECK(engines[s].validated(body));
+        CHECK(engines[s].boundary(body,{})); CHECK(engines[s].finish_body(body));
+      }
+      Pads out; engines[s].read({},out);
+      for (int p = 0; p < 2; ++p) {
+        auto expected = frame < unsigned(c[s].input_delay) ? MuPadStatus{} : sample(frame-c[s].input_delay,p+1); expected.err = 0;
+        same_pad(out[p],expected);
+      }
+      for (auto* link : links) link->pump(0);
+    }
+    for (auto* seat : f) seat->now += 17;
+  }
+  CHECK(stalls >= 15 && back && opened[0] && opened[1]);
+  CHECK(hashes[0] == hashes[1] && hashes[0].size() == (match ? 12u : 11u));
+  for (int s = 0; s < 2; ++s) {
+    auto roster = a.roster(); roster[dropped_seat]["connectionId"] = "c9";
+    lobbies[s].observe({{"t","back"},{"participants",roster}});
+    CHECK(!lobbies[s].cancelled() && lobbies[s].held());
+    CHECK(engines[s].active() && !links[s]->lost() && !links[s]->reconnecting());
+    CHECK(std::find(notices[s].begin(),notices[s].end(),kReconnecting) != notices[s].end());
+    CHECK(notices[s].back().empty());
+    CHECK(std::count_if(f[s]->logs.begin(),f[s]->logs.end(),[](const std::string& line) { return line.find(" lost; waiting for the room") != std::string::npos; }) == 1);
+    CHECK(std::count_if(f[s]->logs.begin(),f[s]->logs.end(),[](const std::string& line) { return line.find(" reopened via ") != std::string::npos; }) == 1);
+  }
+  for (auto& engine : engines) engine.end("test complete");
 }
 static void background_boot_service() {
   ++cases; Fixture f; SessionConfig c; std::string error;
@@ -962,6 +1203,12 @@ static void card_transfers() {
   io.flush_room = [&](int ms) { CHECK(ms > 0); flushed = true; return true; };
   io.wait = [](int) { CHECK(false); }; // no datagram helper exists in the waiting process
   io.prepared = [&](const SessionConfig& c) { CHECK(flushed); prepared(c); handed = true; };
+  const auto host_send = io.send_room;
+  io.send_room = [&](const json& m) {
+    if (m.count("d") && str(m["d"],"kind") == "mu-card" && m["d"]["i"] == 0)
+      host.push({{"t","msg"},{"from","c1"},{"d",{{"kind","mu-card-verdict"},{"v",1},{"match","session-fixed"},{"ok",true}}}});
+    return host_send(m);
+  };
   host.start_delay = 2;
   host.alter_start = [&](json& s) { s["console"]["cardDigest"] = digest; };
   auto request = host.input(); request["inputDelay"] = 2;
@@ -1026,10 +1273,85 @@ static void card_transfers() {
     return str(m,"t") == "begin" || (m.count("d") && str(m["d"],"kind") == "mu-card");
   }));
 
-  // Good out-of-order delivery and duplicate; then missing, corrupt, excessive count/total,
-  // malformed index/base64, absent digest, room closure, cancellation and write failure.
-  for (int mode = 0; mode < 13; ++mode) {
-    ++cases; Fixture guest(2,1); auto g = guest.io(); bool ready = false, persisted = false;
+  // Game-local choice survives both handoff forms; missing/unreadable/stale files fail open.
+  for (int seat : {0,1}) for (int mode = 0; mode < 9; ++mode) {
+    ++cases; Fixture r(2,seat); r.start_delay = 2; r.session = "session-fixed";
+    auto rio = r.io(); bool restored_card = false;
+    auto marked = launch; marked.erase("cardDigest"); marked["port"] = seat+1;
+    const auto data = root / ("choice-"+std::to_string(seat)+"-"+std::to_string(mode)); std::filesystem::create_directory(data);
+    SessionConfig choice = restored; choice.default_card = mode == 0; choice.card_digest = digest;
+    CHECK(write_card_choice(data,choice));
+    const auto marker = data / "console" / choice.session_id / "save-choice.json";
+    if (mode == 1 || mode == 7) std::filesystem::remove(marker);
+    if (mode == 2) std::ofstream(marker) << "broken";
+    if (mode == 3) std::ofstream(marker) << json({{"sessionId","other"},{"digest",digest}});
+    const auto next = rio.next_room;
+    rio.next_room = [&](json& m,int ms) {
+      const bool got = next(m,ms);
+      if (got && m.count("room") && m["room"].count("console")) m["room"]["console"]["cardDigest"] = digest;
+      // A peer with a missing marker vetoes our valid staged host save as well.
+      if (got && m.count("d") && str(m["d"],"kind") == "mu-cand") {
+        if (mode == 6 || mode == 8) m["d"]["cardDigest"] = "";
+        // The marker arrives only AFTER this launch read its missing choice and sent
+        // its original empty digest. It must never revise that default vote.
+        if (mode == 7) CHECK(write_card_choice(data,choice));
+        if (mode == 1 || mode == 7) m["d"]["cardDigest"] = digest; // Our missing choice vetoes a host-ready peer.
+      }
+      return got;
+    };
+    rio.restore_card = [&](SessionConfig& c) {
+      if (!take_card_choice(data,c)) return false;
+      restored_card = true; c.card_bytes = save;
+      if (mode == 4) c.card_bytes.back() ^= 1;
+      return true;
+    };
+    auto link = start_session(marked,config,error,std::move(rio));
+    CHECK(link && error.empty());
+    CHECK(config.default_card == (mode != 5));
+    CHECK((config.card_digest == digest && config.card_bytes == save) == (mode == 5));
+    CHECK(restored_card == (mode == 4 || mode == 5 || mode == 6 || mode == 8));
+    if (mode == 7) CHECK(take_card_choice(data,choice)); // late record was never consulted by this launch
+    CHECK(!take_card_choice(data,choice)); // consumed choices never authorize another host-card boot
+    CHECK(session_launch(config).size() == 8 && !session_launch(config).count("card"));
+    CHECK(pending_write(data,session_launch(config),1000,"test-build"));
+    CHECK(pending_take(data,1001,"test-build",[&](const json& q,auto consume) {
+      CHECK(q.size() == 8 && !q.count("card")); return consume();
+    },[](const std::string&) {}));
+  }
+  auto bad_marker = launch; bad_marker["card"] = "default"; CHECK(!parse_request(bad_marker,parsed));
+
+  // Replay both actual local choices through the relaunch rendezvous. One seat can have
+  // the host final while its peer timed out: both receive the other's ORIGINAL digest.
+  auto check_default_pair = [&](const SessionConfig& host_choice, const SessionConfig& guest_choice) {
+    const SessionConfig choices[] = {host_choice,guest_choice};
+    for (int seat : {0,1}) {
+      ++cases; Fixture f(2,seat); f.session = "session-fixed"; f.start_delay = 2;
+      auto io = f.io();
+      const auto next = io.next_room;
+      io.next_room = [&](json& m,int ms) {
+        const bool got = next(m,ms);
+        if (got && m.count("room") && m["room"].count("console")) m["room"]["console"]["cardDigest"] = digest;
+        if (got && m.count("d") && str(m["d"],"kind") == "mu-cand") m["d"]["cardDigest"] = choices[1-seat].card_digest;
+        return got;
+      };
+      io.restore_card = [&](SessionConfig& c) {
+        if (choices[seat].card_digest.empty()) return false;
+        c.card_bytes = save; return true;
+      };
+      auto marked = launch; marked["port"] = seat+1;
+      SessionConfig actual; std::string e;
+      auto playing = start_session(marked,actual,e,std::move(io));
+      CHECK(playing && e.empty() && actual.default_card && actual.card_digest.empty() && actual.card_bytes.empty());
+      CHECK(std::count(f.logs.begin(),f.logs.end(),std::string("console: ")+kDefaultCard) == 1);
+    }
+  };
+
+  // Run the guest against the real host decision, relaying its actual verdict and the host's final.
+  // Good out-of-order delivery/duplicate; missing, corrupt, excessive count/total, malformed
+  // index/base64, absent digest, closure, cancellation, write failure, no final and host disk error.
+  for (int mode = 0; mode < 20; ++mode) {
+    ++cases; Fixture guest(2,1); auto g = guest.io(); bool ready = false, persisted = false, discarded = false;
+    SessionConfig guest_prepared, host_prepared; bool host_ready = false;
     g.host_save = []() -> Bytes { CHECK(false); return {}; }; // guest never reads its own save
     const auto next = g.next_room; bool injected = false;
     const auto id = "guest-"+std::to_string(mode);
@@ -1037,15 +1359,21 @@ static void card_transfers() {
       const bool got = next(m,ms);
       if (got && m.count("console")) {
         m["console"]["sessionId"] = id; m["matchId"] = id;
-        if (mode != 8) m["console"]["cardDigest"] = mode == 2 ? std::string(64,'0') : digest;
+        if (mode != 8) m["console"]["cardDigest"] = digest;
         if (!injected) {
           injected = true;
+          if (mode == 16) guest.push({{"t","msg"},{"from","c0"},{"d",{
+              {"kind","mu-card-final"},{"v",1},{"match",id},{"use","default"}}}});
           const size_t count = mode == 4 ? (kCardLimit+kCardChunk-1)/kCardChunk : chunks;
           for (size_t n = count; n-- > 0;) {
             if (mode == 1 && n == 0) continue;
             const size_t offset = mode == 4 ? 0 : n*kCardChunk;
             json d = {{"kind","mu-card"},{"v",1},{"match",id},{"i",n},{"n",count},
                 {"data",card_encode(save.data()+offset,std::min(kCardChunk,save.size()-offset))}};
+            if (mode == 2 && n == chunks-1) {
+              auto corrupt = save; corrupt.back() ^= 1;
+              d["data"] = card_encode(corrupt.data()+offset,std::min(kCardChunk,corrupt.size()-offset));
+            }
             if (mode == 3) d["n"] = 99999;
             if (mode == 5) d["i"] = count;
             if (mode == 6) d["data"] = "%%%=";
@@ -1061,26 +1389,150 @@ static void card_transfers() {
     g.persist_card = [&](const SessionConfig& c) {
       persisted = true;
       if (mode == 12) return false;
+      if (mode == 15) throw std::runtime_error("disk error");
       return stage_card(root,c);
     };
-    g.prepared = [&](const SessionConfig& c) {
-      if (mode == 8) CHECK(c.card_digest.empty() && c.card_bytes.empty()); else prepared(c);
-      ready = true;
+    g.discard_card = [&](const SessionConfig& c) { discarded = true; CHECK(discard_staged_card(root,c)); };
+    g.prepared = [&](const SessionConfig& c) { guest_prepared = c; ready = true; };
+    const auto send = g.send_room;
+    g.send_room = [&](const json& m) {
+      const bool sent = send(m);
+      if (!m.count("d") || str(m["d"],"kind") != "mu-card-verdict") return sent;
+      CHECK(m["to"] == "c0" && m["d"]["v"] == 1 && m["d"]["match"] == id);
+      const bool ok = mode == 0 || mode == 13 || mode == 14 || mode == 17 || mode == 18 || mode == 19;
+      CHECK(m["d"]["ok"] == ok);
+      Fixture h; auto hio = h.io(); hio.host_save = [&] { return save; };
+      h.alter_start = [&](json& s) { s["console"]["sessionId"] = id; s["matchId"] = id; s["console"]["cardDigest"] = digest; };
+      const auto host_root = root / ("host-"+id); std::filesystem::create_directory(host_root);
+      hio.persist_card = [&](const SessionConfig& c) { return mode != 14 && stage_card(host_root,c); };
+      hio.discard_card = [&](const SessionConfig& c) { CHECK(discard_staged_card(host_root,c)); };
+      hio.prepared = [&](const SessionConfig& c) { host_prepared = c; host_ready = true; };
+      std::vector<uint64_t> finals;
+      int flushes = 0; hio.flush_room = [&](int ms) { CHECK(ms > 0); ++flushes; return true; };
+      const auto hs = hio.send_room;
+      hio.send_room = [&](const json& msg) {
+        const bool sent_host = hs(msg);
+        if (msg.count("d") && str(msg["d"],"kind") == "mu-card" && msg["d"]["i"] == 0)
+          h.push({{"t","msg"},{"from","c1"},{"d",m["d"]}}); // must survive pacing
+        if (msg.count("d") && str(msg["d"],"kind") == "mu-card-final") {
+          CHECK((flushes >= 1 && flushes <= 3) && !host_ready);
+          if (finals.size() < 2) finals.push_back(h.now);
+          if (mode != 13) guest.push({{"t","msg"},{"from","c0"},{"d",msg["d"]}});
+        }
+        return sent_host;
+      };
+      std::string he; SessionConfig hc;
+      CHECK(!start_session(h.input(),hc,he,std::move(hio)) && he.empty());
+      CHECK(host_ready && flushes == 3);
+      CHECK(finals.size() == 2 && finals[1] == finals[0]+1000);
+      const auto use = ok && mode != 14 ? "host" : "default";
+      CHECK(std::count(h.logs.begin(),h.logs.end(),std::string("console: card verdicts ")+(ok ? "1" : "0")+"/1 ok; using "+use) == 1);
+      CHECK(std::count(h.logs.begin(),h.logs.end(),std::string("console: card final ")+use) == 1);
+      if (mode == 13) {
+        // Spoofed, stale, invalid-version and invalid-use finals cannot authorize handoff.
+        for (int invalid = 0; invalid < 4; ++invalid) {
+          json d = {{"kind","mu-card-final"},{"v",1},{"match",id},{"use","default"}};
+          if (invalid == 1) d["match"] = "stale";
+          if (invalid == 2) d["v"] = 2;
+          if (invalid == 3) d["use"] = "other";
+          guest.push({{"t","msg"},{"from",invalid == 0 ? "intruder" : "c0"},{"d",d}});
+        }
+      }
+      return mode == 17 ? false : sent;
     };
+    if (mode == 18 || mode == 19) {
+      const auto normal_next = g.next_room;
+      g.next_room = [&,normal_next](json& m,int ms) {
+        // A permanently nonempty zero-wait queue must hit the drain cap.
+        if (ms == 0) { if (mode == 19) guest.now += 40000; m = {{"t","ping"}}; return true; }
+        return normal_next(m,ms);
+      };
+    }
     if (mode == 10) g.room_closed = [&] { return injected; };
     if (mode == 11) g.cancelled = [&] { return injected; };
     CHECK(!start_session(guest.input(),config,error,std::move(g)));
-    if (mode == 0) { CHECK(ready && persisted && error.empty()); }
-    else if (mode == 8) { CHECK(ready && !persisted && error.empty()); } // no digest: default card, no transfer
-    else {
-      CHECK(!ready); CHECK(error == (mode == 11 ? "cancelled" : kCardFailure));
-      CHECK(persisted == (mode == 12));
+    if (mode == 8) { CHECK(ready && !persisted && error.empty() && !host_ready); }
+    else if (mode == 11) { CHECK(!ready && error == "cancelled" && !host_ready); }
+    else if (mode == 10 || mode == 13 || mode == 17 || mode == 18 || mode == 19) {
+      CHECK(ready && error.empty() && guest_prepared.default_card);
+      CHECK(guest_prepared.card_digest.empty());
+      if (mode == 13) CHECK(guest.now == 40001 && host_ready && host_prepared.card_digest == digest);
+      if (mode == 13 || mode == 17 || mode == 18 || mode == 19) check_default_pair(host_prepared,guest_prepared);
+    } else {
+      CHECK(ready && host_ready && error.empty());
+      CHECK(guest_prepared.card_digest == host_prepared.card_digest && guest_prepared.card_bytes == host_prepared.card_bytes);
+      if (mode == 0) { CHECK(persisted && !discarded); CHECK(guest_prepared.card_digest == digest && guest_prepared.card_bytes == save); }
+      else {
+        CHECK(discarded && guest_prepared.default_card && host_prepared.default_card);
+        CHECK(guest_prepared.card_digest.empty() && guest_prepared.card_bytes.empty());
+        CHECK(!std::filesystem::exists(root / id / "incoming.gci"));
+        CHECK(session_launch(guest_prepared).size() == 8 && session_launch(host_prepared).size() == 8);
+        CHECK(write_card_choice(root,guest_prepared) && !take_card_choice(root,guest_prepared));
+      }
+      CHECK(std::count(guest.logs.begin(),guest.logs.end(),std::string("console: card verdict ")+(mode == 0 || mode == 14 ? "ok" : "fail")+" sent") == 1);
+      CHECK(std::count(guest.logs.begin(),guest.logs.end(),std::string("console: card final ")+(mode == 0 ? "host" : "default")) == 1);
       if (mode == 1 || mode == 9) {
-        CHECK(guest.now >= 20001 && guest.now <= 20051);
+        CHECK(guest.now == 21501);
         CHECK(std::any_of(guest.logs.begin(),guest.logs.end(),[](const std::string& s) { return s.find("chunks sha ") != std::string::npos && s.find(" timeout") != std::string::npos; }));
       }
       if (mode == 2) CHECK(std::any_of(guest.logs.begin(),guest.logs.end(),[](const std::string& s) { return s.find(" mismatch") != std::string::npos; }));
     }
+  }
+  // Host timeout and local send/flush/disk failures all select default. Invalid verdicts
+  // never count, and duplicate ok verdicts cannot replace a missing seat.
+  for (int mode = 0; mode < 14; ++mode) {
+    ++cases; Fixture h; auto hio = h.io(); bool ready = false; int flushes = 0;
+    hio.host_save = [&] { return save; };
+    h.alter_start = [&](json& s) { s["console"]["cardDigest"] = digest; };
+    hio.persist_card = [&](const SessionConfig&) -> bool {
+      if (mode == 5) throw std::runtime_error("disk error");
+      return mode != 2;
+    };
+    hio.flush_room = [&](int ms) {
+      CHECK(ms > 0); ++flushes;
+      if (flushes == 2 && (mode == 7 || mode == 11)) return false;
+      if ((flushes == 2 && mode == 8) || (flushes == 3 && mode == 13)) h.now += uint64_t(ms);
+      if (flushes == 3 && mode == 12) return false;
+      return flushes != 1 || mode != 3;
+    };
+    hio.prepared = [&](const SessionConfig& c) {
+      CHECK(c.default_card && c.card_digest.empty() && c.card_bytes.empty()); ready = true;
+      if (mode >= 9) { SessionConfig other; other.card_digest = digest; other.card_bytes = save; check_default_pair(c,other); }
+    };
+    const auto hn = hio.next_room; bool late_verdict = false;
+    hio.next_room = [&](json& m,int ms) {
+      const bool got = hn(m,ms);
+      if (!got && mode == 6 && !late_verdict && h.start_at && h.now >= h.start_at+25000) {
+        late_verdict = true;
+        m = {{"t","msg"},{"from","c1"},{"d",{{"kind","mu-card-verdict"},{"v",1},{"match","session-fixed"},{"ok",true}}}};
+        return true;
+      }
+      return got;
+    };
+    const auto hs = hio.send_room; int final_sends = 0;
+    hio.send_room = [&](const json& m) {
+      if (m.count("d") && str(m["d"],"kind") == "mu-card-final") {
+        ++final_sends;
+        if ((mode == 9 && final_sends == 1) || (mode == 10 && final_sends == 2)) return false;
+      }
+      if (m.count("d") && str(m["d"],"kind") == "mu-card" && m["d"]["i"] == 0) {
+        if (mode == 0 || mode == 6) {
+          for (int invalid = 0; invalid < 4; ++invalid) {
+            json d = {{"kind","mu-card-verdict"},{"v",1},{"match","session-fixed"},{"ok",true}};
+            if (invalid == 1) d["match"] = "stale";
+            if (invalid == 2) d["v"] = 2;
+            if (invalid == 3) d["ok"] = "true";
+            h.push({{"t","msg"},{"from",invalid == 0 ? "intruder" : "c1"},{"d",d}});
+          }
+        } else h.push({{"t","msg"},{"from","c1"},{"d",{{"kind","mu-card-verdict"},{"v",1},{"match","session-fixed"},{"ok",mode != 1 && (mode < 7 || mode >= 9)}}}});
+        if (mode == 4) return false;
+      }
+      return hs(m);
+    };
+    CHECK(!start_session(h.input(),config,error,std::move(hio)));
+    CHECK(error.empty() && ready);
+    if (mode == 0 || mode == 6) CHECK(h.now == h.start_at+26000);
+    CHECK(std::count(h.logs.begin(),h.logs.end(),std::string("console: card final default")) == 1);
   }
   ++cases;
   Fixture doubles(4); auto four = doubles.io();
@@ -1088,8 +1540,296 @@ static void card_transfers() {
   auto link = start_session(doubles.input(),config,error,std::move(four)); CHECK(link && error.empty());
   CHECK(config.ports == std::vector<int>({1,2,3,4}));
   for (const auto& m : doubles.messages) if (str(m,"t") == "begin") CHECK(!m.count("cardDigest") && m["inputDelay"] == 3);
+  std::filesystem::remove_all(root);
 }
+// Exercise the actual broker close envelope through Stream and console startup.
+static void room_upgrade_refusals() {
+  const std::string mismatch = "the rooms server answered 403: This room uses a different lobby protocol or configuration";
+  CHECK(std::string(kMixedBuilds) == "Your friend is on a different version of Melee Unlocked. Both of you need the latest update to play together.");
+  CHECK(session_notice(kMixedBuilds) == std::string(kMixedBuilds));
+  for (int mode = 0; mode < 6; ++mode) {
+    ++cases; Fixture f(2,1); auto io = f.io();
+    const std::string reason = mode == 0 || mode == 3 ? mismatch :
+        mode == 1 ? "the rooms server answered 403: ticket expired" : "";
+    yougame::transport::Stream stream(f.events,[&](const json& q,int) -> json {
+      if (str(q,"type") == "netOpen") {
+        if (mode == 4) f.events.push({{"conn",77},{"event","error"},{"code","refused"},{"message",mismatch}});
+        f.events.push({{"conn",77},{"event","close"},{"code",mode == 3 ? 1008 : 1006},{"reason",reason}});
+        return {{"conn",77}};
+      }
+      return {};
+    },[&] { return f.now; });
+    io.open_room = [&](const std::string& t,const std::string& r,int ms) {
+      return mode == 5 ? false : stream.open(t,r,ms);
+    };
+    io.room_mismatch = [&] { return stream.lobby_mismatch(); };
+    SessionConfig c; std::string error;
+    CHECK(!start_session(f.input(),c,error,std::move(io)));
+    CHECK(error == (mode == 0 ? kMixedBuilds : "couldn't open your friend's room"));
+    CHECK(stream.lobby_mismatch() == (mode == 0));
+  }
+  ++cases; Fixture f;
+  CHECK(f.stream.open("fake-ticket","ABCDEF",100));
+  f.events.push({{"conn",f.conn},{"event","close"},{"code",1006},{"reason",mismatch}});
+  json m;
+  while (f.stream.next(m,0)) {}
+  CHECK(f.stream.lobby_mismatch());
+  f.seat = 1; // broker connection IDs are never reused
+  CHECK(f.stream.open("fake-ticket","ABCDEF",100));
+  CHECK(!f.stream.lobby_mismatch()); // new attempts never inherit a previous refusal
+}
+// The worker remains blocked after START's save deadline. Its owned result is discarded;
+// no session stack is referenced by it, and tests release it before leaving the case.
+static void blocked_card_io() {
+  const auto save = save_fixture(); const auto digest = card_sha(save);
+  for (int mode : {0,1,2,3,4}) { // host read/persist, guest persist, host/guest discard
+    ++cases; Fixture f(2,mode == 2 || mode == 4 ? 1 : 0); auto io = f.io();
+    struct Work { std::atomic<bool> entered{false}, release{false}, done{false}; };
+    auto work = std::make_shared<Work>();
+    auto blocked = [work] {
+      work->entered = true;
+      while (!work->release) std::this_thread::yield();
+      work->done = true;
+    };
+    io.clock = [&] { return f.now + (work->entered ? (mode >= 3 ? 1000 : 20000) : 0); };
+    io.host_save = mode == 0 ? std::function<Bytes()>([blocked,save] { blocked(); return save; }) : std::function<Bytes()>([save] { return save; });
+    if (mode != 0) {
+      f.alter_start = [&](json& m) { m["console"]["cardDigest"] = digest; };
+      if (mode < 3) io.persist_card = [blocked](const SessionConfig&) { blocked(); return true; };
+      else {
+        io.persist_card = [](const SessionConfig&) { return false; };
+        io.discard_card = [blocked](const SessionConfig&) { blocked(); };
+      }
+      if (mode == 2 || mode == 4) {
+        const auto next = io.next_room; auto injected = std::make_shared<bool>(false);
+        io.next_room = [&,next,injected](json& m,int ms) {
+          const bool got = next(m,ms);
+          if (got && m.count("console") && !*injected) {
+            *injected = true; m["console"]["cardDigest"] = digest;
+            const size_t n = (save.size()+kCardChunk-1)/kCardChunk;
+            for (size_t chunk = 0; chunk < n; ++chunk) {
+              const size_t offset = chunk*kCardChunk;
+              f.push({{"t","msg"},{"from","c0"},{"d",{{"kind","mu-card"},{"v",1},{"match","session-fixed"},
+                  {"i",chunk},{"n",n},{"data",card_encode(save.data()+offset,std::min(kCardChunk,save.size()-offset))}}}});
+            }
+            f.push({{"t","msg"},{"from","c0"},{"d",{{"kind","mu-card-final"},{"v",1},{"match","session-fixed"},{"use","host"}}}});
+          }
+          return got;
+        };
+      }
+    }
+    bool ready = false;
+    auto marker = std::make_shared<Work>();
+    const auto session_clock = io.clock;
+    io.prepared = [&](const SessionConfig& c) {
+      ready = true; CHECK(work->entered && !work->done && c.card_digest.empty() && c.card_bytes.empty());
+      if (mode < 3) return;
+      CHECK(c.default_card);
+      // Both filesystem workers stay blocked while the app receives its relaunch request.
+      HandoffIO hio;
+      hio.clock = [&] { return session_clock() + (marker->entered ? 1000 : 0); };
+      hio.choice = [marker](const std::filesystem::path&,const SessionConfig& card) {
+        marker->entered = true;
+        while (!marker->release) std::this_thread::yield();
+        CHECK(card.default_card && card.card_digest.empty()); marker->done = true; return true;
+      };
+      hio.pending = [](const std::filesystem::path&,const json& request,int64_t,const std::string&) {
+        CHECK(request["sessionId"] == "session-fixed" && request.size() == 8); return true;
+      };
+      bool sent = false, manual_ready = false; std::vector<std::string> logs;
+      CHECK(handoff(c,mode == 3,{},0,"",[&](const json& q) {
+        CHECK(marker->entered && !marker->done && !work->done && q["type"] == "relaunch"); sent = true;
+      },[&](const std::string& line) { logs.push_back(line); },[&](const char* text) {
+        manual_ready = std::string(text) == kManualStart;
+      },hio));
+      CHECK(sent == (mode == 3) && manual_ready == (mode == 4));
+      CHECK(std::count(logs.begin(),logs.end(),std::string("console: ")+kDefaultCard) == 1);
+      CHECK(std::count(f.logs.begin(),f.logs.end(),std::string("console: ")+kDefaultCard) == 1);
+    };
+    SessionConfig c; std::string error;
+    CHECK(!start_session(f.input(),c,error,std::move(io)) && ready && error.empty());
+    work->release = true; marker->release = true;
+    while (!work->done || (mode >= 3 && !marker->done)) std::this_thread::yield();
+  }
+}
+static void card_final_repeats() {
+  const auto save = save_fixture(); const auto digest = card_sha(save);
+  for (int mode = 0; mode < 6; ++mode) {
+    ++cases; Fixture f(2,1); auto io = f.io();
+    const auto next = io.next_room; bool injected = false, verdict = false, first = false, repeat = false, ready = false;
+    std::atomic<bool> slow_persist{false};
+    auto push_final = [&](const char* use) {
+      f.push({{"t","msg"},{"from","c0"},{"d",{{"kind","mu-card-final"},{"v",1},{"match","session-fixed"},{"use",use}}}});
+    };
+    io.next_room = [&](json& m,int ms) {
+      if (slow_persist.exchange(false)) f.now += 2000;
+      const bool got = next(m,ms);
+      if (got && m.count("console") && !injected) {
+        injected = true; m["console"]["cardDigest"] = digest;
+        if (mode == 5) { first = repeat = true; push_final("host"); }
+        const size_t n = (save.size()+kCardChunk-1)/kCardChunk;
+        for (size_t chunk = 0; chunk < n; ++chunk) {
+          const size_t offset = chunk*kCardChunk;
+          f.push({{"t","msg"},{"from","c0"},{"d",{{"kind","mu-card"},{"v",1},{"match","session-fixed"},
+              {"i",chunk},{"n",n},{"data",card_encode(save.data()+offset,std::min(kCardChunk,save.size()-offset))}}}});
+        }
+        if (mode == 5) push_final("default"); // remains queued behind the last chunk
+      }
+      return got;
+    };
+    io.persist_card = [&](const SessionConfig&) { if (mode == 5) slow_persist = true; return true; };
+    const auto send = io.send_room;
+    io.send_room = [&](const json& m) {
+      if (m.count("d") && str(m["d"],"kind") == "mu-card-verdict") verdict = true;
+      return send(m);
+    };
+    const uint64_t first_at = mode == 2 ? 32001 : 101;
+    f.on_wait = [&] {
+      if (verdict && !first && f.now >= first_at) { first = true; push_final(mode == 4 ? "default" : "host"); }
+      if (first && !repeat && mode != 3 && f.now >= first_at+1000) {
+        repeat = true; push_final(mode == 1 ? "default" : "host");
+      }
+    };
+    io.prepared = [&](const SessionConfig& c) {
+      ready = true;
+      if (mode == 1 || mode == 4 || mode == 5) CHECK(c.default_card && c.card_bytes.empty() && c.card_digest.empty());
+      else CHECK(c.card_bytes == save && !c.default_card);
+    };
+    SessionConfig c; std::string error;
+    CHECK(!start_session(f.input(),c,error,std::move(io)));
+    if (mode == 1 || mode == 4 || mode == 5) CHECK(ready && error.empty() && repeat);
+    else {
+      CHECK(ready && error.empty());
+      CHECK(f.now >= first_at+1500 && f.now < 40001);
+      CHECK(repeat == (mode != 3));
+    }
+  }
+}
+static void friends_order_phase_a() {
+  ++cases;
+  Fixture f; f.fill = false; auto io = f.io();
+  std::vector<std::string> order; bool css = false, prepared = false, roster_reported = false;
+  const auto request = io.request;
+  io.request = [&](const json& q,int ms) {
+    if (str(q,"type") == "mpTicket") { CHECK(q["queue"] == "private"); order.push_back("ticket"); }
+    return request(q,ms);
+  };
+  io.friends_lobby = true;
+  io.opened = [&](const std::string& room) {
+    CHECK(order == std::vector<std::string>{"ticket"});
+    CHECK(room == new_room_code(UINT64_C(0xfedcba9876543210)));
+    order.push_back("room");
+  };
+  io.roster = [&](const std::string&,const json& r,const std::string& me,int rev) {
+    CHECK(me == "c0" && (rev == 7 || rev == 8)); CHECK(!r.empty()); roster_reported = true;
+  };
+  io.css_ready = [&] { return css; };
+  io.confirm_start = [] { CHECK(false); return false; }; // Friends never asks for START
+  io.waiting = [](const std::string&,bool) { CHECK(false); }; // no waiting panel
+  const yougame::friends::CssPick pick{18,3,2};
+  io.freeze_pick = [&](const std::string& name) {
+    CHECK(css && roster_reported && name == "Marth"); order.push_back("arrival"); return pick.settings();
+  };
+  f.alter_start = [&](json& m) { m["console"]["settingsDigest"] = pick.settings(); };
+  io.prepared = [&](const SessionConfig& c) {
+    CHECK(c.settings_digest == pick.settings()); CHECK(yougame::friends::css_pick(c.settings_digest)->pad == 2);
+    prepared = true;
+  };
+  f.on_wait = [&] {
+    // Simulate more than ten minutes of local CSS; no sleeps or real network.
+    if (!css) { CHECK(order.back() == "room"); css = true; order.push_back("css");
+      CHECK(yougame::friends::picker(new_room_code(UINT64_C(0xfedcba9876543210)))["room"] != "new");
+      order.push_back("picker"); f.now = 660001; }
+    else if (!f.fill) {
+      CHECK(std::none_of(f.messages.begin(),f.messages.end(),[](const json& m) { return str(m,"t") == "begin"; }));
+      f.fill = true; auto r = f.roster(); r[1]["name"] = "Marth";
+      f.push({{"t","join"},{"participants",r},{"revision",8},{"host","c0"}});
+    }
+  };
+  SessionConfig c; std::string error;
+  CHECK(!start_session(f.input(),c,error,std::move(io))); CHECK(error.empty() && prepared && f.start_at > 600000);
+  CHECK(order == (std::vector<std::string>{"ticket","room","css","picker","arrival"}));
+  for (const auto& m : f.messages) if (str(m,"t") == "begin") CHECK(m["settingsDigest"] == pick.settings());
+  // A roomClosed message ends the session without accepting another roster/reconnect.
+  Fixture guest(2,1); auto link = guest.start(c);
+  guest.push({{"t","roomClosed"},{"reason","host_left"},{"host","c0"},{"name","Luigi"}});
+  link->pump(0); CHECK(link->lost() == "Luigi left: lobby closed");
+  // Full-roster validation still rejects duplicates even on automatic Friends startup.
+  Fixture bad; auto badio = bad.io(); badio.friends_lobby = true;
+  bad.alter_start = [](json& m) { m["console"]["participants"][1]["port"] = 1; };
+  CHECK(!start_session(bad.input(),c,error,std::move(badio))); CHECK(error == "invalid console session start");
+}
+
+static void friends_reenter_held_room() {
+  ++cases;
+  Fixture f; auto io = f.io(); io.friends_lobby = io.held_reenter = true;
+  bool previous = true, prepared = false;
+  io.previous_session_active = [&] { return previous; };
+  const auto send = io.send_room;
+  io.send_room = [&](const json& m) { if (str(m,"t") == "begin") CHECK(!previous); return send(m); };
+  f.on_wait = [&] {
+    if (f.now >= 200 && previous) {
+      previous = false;
+      f.push({{"t","sessionEnded"},{"sessionId","old-session"},{"reason","away"}});
+    }
+  };
+  io.prepared = [&](const SessionConfig& c) { CHECK(c.room == "room123"); prepared = true; };
+  // Even a stale frozen start must not relaunch the interrupted session.
+  const auto open = io.open_room;
+  io.open_room = [&](const std::string& ticket,const std::string& room,int ms) {
+    CHECK(room == "room123");
+    const bool ok = open(ticket,room,ms);
+    f.push({{"t","lobby"},{"console",f.console_start()},{"participants",f.roster()}});
+    return ok;
+  };
+  SessionConfig c;std::string error;
+  CHECK(!start_session({{"room","room123"},{"players",2}},c,error,std::move(io)));
+  CHECK(prepared && error.empty() && f.now >= 200);
+  CHECK(f.requests.front()["room"] == "room123");
+}
+static void friends_guest_waits_for_next_start() {
+  ++cases;
+  Fixture f(2,1); f.reply_start = false;
+  auto io = f.io(); io.friends_lobby = io.held_reenter = true;
+  bool previous = true, prepared = false;
+  io.previous_session_active = [&] { return previous; };
+  f.on_wait = [&] {
+    if (f.now >= 200 && previous) {
+      previous = false;
+      f.push({{"t","sessionEnded"},{"sessionId","old-session"},{"reason","host_ended"}});
+      f.push({{"t","start"},{"matchId","session-fixed"},{"console",f.console_start()},{"participants",f.roster()}});
+    }
+  };
+  io.prepared = [&](const SessionConfig& c) { CHECK(c.room == "room123" && c.my_port == 2); prepared = true; };
+  SessionConfig c;std::string error;
+  CHECK(!start_session({{"room","room123"},{"players",2}},c,error,std::move(io)));
+  CHECK(prepared && error.empty());
+  CHECK(std::none_of(f.messages.begin(),f.messages.end(),[](const json& m) { return str(m,"t") == "begin"; }));
+}
+#include "friends_handoff_join_test.inc"
 int main(int argc,char** argv) {
+  if (argc > 1 && std::string(argv[1]) == "--handoff-off-trace") {
+    friends_handoff_off_trace(); return 0;
+  }
+  if (argc > 1 && std::string(argv[1]) == "--handoff-join") {
+    friends_handoff_agreement(); friends_handoff_flow(); friends_handoff_chunks(); friends_handoff_live_transfer(); friends_handoff_guest_transfer();
+    std::printf("Friends handoff agreement: %d cases, %d checks passed\n",cases,checks.load()); return 0;
+  }
+  friends_guest_waits_for_next_start();
+  friends_reenter_held_room();
+  friends_order_phase_a();
+  if (argc > 1 && std::string(argv[1]) == "--blocked-card-io") {
+    blocked_card_io();
+    std::printf("blocked card IO: %d cases, %d checks passed\n",cases,checks.load()); return 0;
+  }
+  if (argc > 1 && std::string(argv[1]) == "--room-refusals") {
+    room_upgrade_refusals();
+    std::printf("console room refusals: %d cases, %d checks passed\n",cases,checks.load()); return 0;
+  }
+  if (argc > 1 && std::string(argv[1]) == "--card-agreement") {
+    card_transfers(); card_final_repeats(); blocked_card_io();
+    std::printf("console card agreement: %d cases, %d checks passed\n",cases,checks.load()); return 0;
+  }
   if (argc > 1 && std::string(argv[1]) == "--pacing") {
     ack_and_pacing(argc > 2 && std::string(argv[2]) == "--measure"); return 0;
   }
@@ -1101,9 +1841,12 @@ int main(int argc,char** argv) {
     watchdog_receive_clock(); background_boot_service();
     std::printf("console watchdog: %d cases, %d checks passed\n",cases,checks.load()); return 0;
   }
+  room_upgrade_refusals();
+  relink_failures(); relink_async_leave(); relink_engines(0); relink_engines(1); relink_engines(1,true);
   watchdog_receive_clock();
-  card_transfers();
+  card_transfers(); card_final_repeats(); blocked_card_io();
   ack_and_pacing(false);
+  failed_session_new_invite();
   boot_liveness(); background_boot_service(); interruption_shapes(); relaunch_no_leave(); app_launch_contract(); final_rooms_contract(); rejoin(); routes_and_delay(); human_room_start(); real_delay_mesh();
   intake(); starts(); agent_create_join(); host_waits_for_seats(); failure_cases(); invalid_start(); mesh(2,false); mesh(2,true); mesh(4,true); departures_and_waits(); common_end_reason();
   sparse_starts(); sparse_invalid_rosters(); sparse_relaunch(); sparse_peer_logs(); setup_throw_names_step();

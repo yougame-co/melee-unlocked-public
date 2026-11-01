@@ -1,8 +1,12 @@
-// In-process presentation evidence, staging agent sessions only. No environment controls.
+// In-process presentation evidence, staging agent builds only. Apple hook builds also
+// accept MELEE_PRESENT_LOG for standalone (no app bridge) runs.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include "yougame_agent_paths.h"
+#if defined(YOUGAME_AGENT_TEST_HOOK) && defined(__APPLE__)
+#include "../host/test_env.h"
+#endif
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -99,7 +103,8 @@ struct Budget {
   }
 };
 
-// One producer (render thread). All opens, writes, flushes and closes occur on the worker.
+// One producer (render thread). Writes, flushes and closes occur on the worker;
+// standalone startup preopens/truncates its log, while app output opens on the worker.
 // Its mutex protects queue operations only, never filesystem I/O or image processing.
 class Recorder {
  public:
@@ -128,6 +133,30 @@ class Recorder {
     return true;
   }
   bool enabled() const { return config_.enabled(); }
+#if defined(YOUGAME_AGENT_TEST_HOOK) && defined(__APPLE__)
+  // Explicit standalone capability: retain only the opened log, never publish a
+  // session root/policy or permit frame dumps. Truncate now, even before a present.
+  const char* arm_standalone(const char* name) {
+    // Replaces any earlier config; today only start_standalone calls it, once, before any session.
+    stop();
+    const auto path = std::filesystem::u8path(name);
+    if (!path.is_absolute()) return "path must be absolute";
+    if (!plain_name(path.filename().u8string())) return "invalid filename";
+    agent_paths::Root parent;
+    if (!parent.load(path.parent_path())) return "parent missing or refused";
+    FILE* log = agent_paths::open(parent.path, path.filename().u8string(),
+                                  agent_paths::Mode::Truncate, false, parent);
+    if (!log) return "file open refused";
+    config_.log = path.filename().u8string();
+    startup_log_ = log; stopping_ = false;
+    worker_ = std::thread([this] { write_loop(); });
+    return nullptr;
+  }
+#endif
+#ifdef __APPLE__
+  // Metal must allow drawable readback before acquiring its first drawable.
+  bool frames_enabled() const { return config_.every != 0; }
+#endif
   bool wants_frame(uint64_t present) {
     if (!config_.every || frames_failed_ || budget_.stopped) return false;
     if (const auto reason = budget_.reserve(present, 0)) enqueue_notice(reason);
@@ -175,6 +204,9 @@ class Recorder {
   std::condition_variable ready_;
   std::deque<Job> queue_;
   std::thread worker_;
+#if defined(YOUGAME_AGENT_TEST_HOOK) && defined(__APPLE__)
+  FILE* startup_log_ = nullptr; // Ownership transfers to the worker.
+#endif
   void enqueue(Job job) {
     { std::lock_guard<std::mutex> lock(mutex_); queue_.push_back(std::move(job)); }
     ready_.notify_one();
@@ -183,6 +215,9 @@ class Recorder {
   void write_loop() {
     FILE* log = nullptr;
     std::array<char, 64 * 1024> buffer{};
+#if defined(YOUGAME_AGENT_TEST_HOOK) && defined(__APPLE__)
+    log = startup_log_; startup_log_ = nullptr;
+#endif
     for (;;) {
       Job job;
       {
@@ -192,7 +227,10 @@ class Recorder {
         job = std::move(queue_.front()); queue_.pop_front();
       }
       if (!job.header.empty() && !config_.log.empty()) {
-        log = agent_paths::open(root_.path, config_.log, agent_paths::Mode::Truncate, false, root_);
+#if defined(YOUGAME_AGENT_TEST_HOOK) && defined(__APPLE__)
+        if (!log)
+#endif
+          log = agent_paths::open(root_.path, config_.log, agent_paths::Mode::Truncate, false, root_);
         if (!log) {
           log_failed_ = true;
           std::fprintf(stderr, "agent-test: present_log open refused; ignored\n");
@@ -231,5 +269,18 @@ class Recorder {
   }
 };
 inline Recorder& recorder() { static Recorder value; return value; }
+#if defined(YOUGAME_AGENT_TEST_HOOK) && defined(__APPLE__)
+// Called once after bridge/agent-test startup, with the same bridge state as load().
+inline void start_standalone(bool active) {
+  // test_env works outside YouGame. Check raw presence in app sessions solely to
+  // report the ignored switch: test_env deliberately hides it there.
+  const char* path = active ? std::getenv("MELEE_PRESENT_LOG") :
+                             host::test_env::getenv("MELEE_PRESENT_LOG");
+  if (!path) return;
+  const char* reason = active ? "app bridge active" : recorder().arm_standalone(path);
+  if (reason) std::fprintf(stderr, "present log: MELEE_PRESENT_LOG ignored (%s)\n", reason);
+  else std::fprintf(stderr, "present log: standalone %s\n", path);
+}
+#endif
 } // namespace yougame::agent_present
 #endif

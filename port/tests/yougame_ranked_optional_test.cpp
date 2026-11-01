@@ -9,7 +9,7 @@
 
 static int checks;
 #define CHECK(x) do { ++checks; if (!(x)) { std::cerr << __LINE__ << ": " << #x << '\n'; std::exit(1); } } while (0)
-static_assert(MU_HOST_API_VERSION == 26 && MU_GAME_API_VERSION == 9);
+static_assert(MU_HOST_API_VERSION == 27 && MU_GAME_API_VERSION == 9);
 
 // Only the command declaration from mu_native.h is needed by this portable shim.
 #define MU_NATIVE_H

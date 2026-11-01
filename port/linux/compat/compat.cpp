@@ -34,6 +34,7 @@
 #include <sys/wait.h>
 #include <atomic>
 #include <cerrno>
+#include <cstdio>
 #include <cstdint>
 #include <chrono>
 #include <cstdlib>
@@ -1177,7 +1178,11 @@ BOOL WinHttpReceiveResponse(HINTERNET request, LPVOID) {
     return r->done;
   }
   CURL* curl = curl_easy_init();
-  if (!curl) return FALSE;
+  if (!curl) {
+    const int code = errno;
+    std::fprintf(stderr,"slippi http: curl-init errno %d\n",code);
+    g_last_error = code ? DWORD(code) : 12002u; return FALSE;
+  }
   const bool default_port = r->connect->port == 0 || r->connect->port == (r->secure ? 443 : 80);
   std::string url = std::string(r->secure ? "https://" : "http://") + r->connect->host +
                     (default_port ? "" : ":" + std::to_string(r->connect->port)) + r->path;
@@ -1200,7 +1205,11 @@ BOOL WinHttpReceiveResponse(HINTERNET request, LPVOID) {
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r->response);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
   const CURLcode rc = winhttp_perform(curl, r->cancelled);
+  long os_error = 0;
+  curl_easy_getinfo(curl, CURLINFO_OS_ERRNO, &os_error);
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r->status);
+  // Shared Linux/macOS HTTP implementation. Numeric diagnostics only: no URL, headers or body.
+  if (rc != CURLE_OK) std::fprintf(stderr,"slippi http: curl-perform %d errno %ld\n",int(rc),os_error);
   curl_slist_free_all(list);
   curl_easy_cleanup(curl);
   if (rc != CURLE_OK) { g_last_error = 12002u; return FALSE; }   // ERROR_WINHTTP_TIMEOUT-like

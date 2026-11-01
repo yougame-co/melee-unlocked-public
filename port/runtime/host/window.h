@@ -89,3 +89,7 @@ void window_client_size(int* w, int* h);
 bool input_load_script(const char* path);
 void input_mark_match_start();   // online match reached frame 1: `@match` script sections begin now
 }  // namespace host
+
+#ifdef YOUGAME_AGENT_TEST_HOOK
+namespace host { void input_console_script(PadState out[4], int local_port); }
+#endif

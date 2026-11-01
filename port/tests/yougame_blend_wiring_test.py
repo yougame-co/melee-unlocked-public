@@ -203,7 +203,7 @@ class BlendWiringTest(unittest.TestCase):
     def test_app_login_file_is_the_only_one_read(self):
         account = code(source("port/runtime/hle/slippi_account.h"))
         resolve = function(account, "resolve")
-        self.assertRegex(resolve, r"^\s*if \(const auto app = app_sign_in\(\); !app.empty\(\)\) return read\(app\);")
+        self.assertRegex(resolve, r"^\s*if \(host::test_env::agent_copy\(\)\) return \{\};\s*if \(const auto app = app_sign_in\(\); !app.empty\(\)\) return read\(app\);")
         unusable = function(account, "why_unusable")
         self.assertIn("app.empty() ? sign_in_files(local_user_dir, roots) : std::vector<std::filesystem::path>{app}", unusable)
         # Read only: nothing in the account code writes a file.

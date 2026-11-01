@@ -16,10 +16,7 @@ static bool settings_close_hit(const char* id, ImVec2 size) {
   return pressed;
 }
 
-// Controller focus on slanted rows and chips. ImGui frames the focused item with an upright
-// rectangle around its hit box, which on a parallelogram sat off the shape and across its
-// neighbours. These buttons hide that rectangle; the caller then draws the same frame (focus
-// color, 2 px line, 4 px outside the edge, as ImGui draws it) around the shape it painted.
+// Shaped buttons suppress the rectangular nav cursor; callers outline the painted face.
 static bool settings_shaped_hit_button(const char* id, ImVec2 size) {
   ImGui::PushStyleColor(ImGuiCol_NavCursor, IM_COL32(0, 0, 0, 0));
   const bool pressed = settings_hit_button(id, size);
@@ -34,26 +31,12 @@ static bool settings_nav_frame_on_item() {
          !ImGui::GetCurrentWindow()->DC.NavHideHighlightOneFrame;
 }
 
-// The focus frame around a convex quad, offset outward along each edge.
+// Two-pixel focus outline on the exact face, with a light tint of this panel's accent.
 static void settings_nav_frame(ImDrawList* draw, const ImVec2 (&quad)[4]) {
-  constexpr float distance = 4.0f, thickness = 2.0f;
-  float area = 0.0f;
-  for (int i = 0; i < 4; ++i) {
-    const ImVec2& a = quad[i], & b = quad[(i + 1) % 4];
-    area += a.x * b.y - b.x * a.y;
-  }
-  const float side = area >= 0.0f ? 1.0f : -1.0f;
-  const auto normal = [&](const ImVec2& a, const ImVec2& b) {
-    const float ex = b.x - a.x, ey = b.y - a.y, length = std::sqrt(ex * ex + ey * ey);
-    return length > 0.0f ? ImVec2(side * ey / length, -side * ex / length) : ImVec2(0, 0);
-  };
-  ImVec2 frame[4];
-  for (int i = 0; i < 4; ++i) {
-    const ImVec2 n0 = normal(quad[(i + 3) % 4], quad[i]), n1 = normal(quad[i], quad[(i + 1) % 4]);
-    const float k = distance / std::max(0.2f, 1.0f + n0.x * n1.x + n0.y * n1.y);
-    frame[i] = ImVec2(quad[i].x + (n0.x + n1.x) * k, quad[i].y + (n0.y + n1.y) * k);
-  }
-  draw->AddPolyline(frame, 4, ImGui::GetColorU32(ImGuiCol_NavCursor), ImDrawFlags_Closed, thickness);
+  const ImVec4 accent = ImGui::ColorConvertU32ToFloat4(ImGui::GetColorU32(ImGuiCol_NavCursor));
+  const ImU32 light = ImGui::ColorConvertFloat4ToU32(
+      ImVec4(.75f + accent.x * .25f, .75f + accent.y * .25f, .75f + accent.z * .25f, 1.0f));
+  draw->AddPolyline(quad, 4, light, ImDrawFlags_Closed, 2.0f);
 }
 
 // Hovering a category must not change the active page. Only an explicit
@@ -244,9 +227,9 @@ static SettingsGdRow settings_gd_row(const char* label) {
   row.quad(96+row.lift,row.y+row.lift,540+row.lift,row.y+30+row.lift,
            row.selected ? settings_accent(2) : IM_COL32(46,54,64,255));
   if (nav_frame) {
-    // Lifted face and its shadow together, in the rows' own slant.
-    const ImVec2 frame[] = {row.point(96+row.lift,row.y+row.lift), row.point(540,row.y+row.lift),
-                            row.point(540,row.y+30), row.point(96+row.lift,row.y+30)};
+    // Follow all four corners of the animated lifted face.
+    const ImVec2 frame[] = {row.point(96+row.lift,row.y+row.lift), row.point(540+row.lift,row.y+row.lift),
+                            row.point(540+row.lift,row.y+30+row.lift), row.point(96+row.lift,row.y+30+row.lift)};
     settings_nav_frame(ImGui::GetWindowDrawList(), frame);
   }
   const char* display_label=std::strcmp(label,"Exclusive fullscreen (experimental)")==0?
@@ -869,7 +852,8 @@ static void settings_dashboard_tiles(SettingsState& state) {
     const float y = top + row * (tile_h + gap) + (1.0f - eased) * 45.0f;
     ImGui::SetCursorScreenPos(ImVec2(x, y));
     ImGui::PushID(i);
-    const bool activated = settings_hit_button("##toy_tile", ImVec2(tile_w, tile_h));
+    const bool activated = settings_shaped_hit_button("##toy_tile", ImVec2(tile_w, tile_h));
+    const bool nav_frame = settings_nav_frame_on_item();
     if (i == state.active_tab) ImGui::SetItemDefaultFocus();
     if (state.home_focus_reset && i == 0) {
       ImGui::SetFocusID(ImGui::GetItemID(), ImGui::GetCurrentWindow());
@@ -907,6 +891,8 @@ static void settings_dashboard_tiles(SettingsState& state) {
     settings_rounded_gradient(draw,ImVec2(a.x+5,a.y+4),
         ImVec2(b.x-5,a.y+tile_h*.55f),rounding-5,
         IM_COL32(255,255,255,42),IM_COL32(255,255,255,0),ImDrawFlags_RoundCornersTop);
+    if (nav_frame)
+      draw->AddRect(a, ImVec2(b.x,b.y-5), settings_mix_color(tile_color,IM_COL32_WHITE,.75f), rounding, 0, 2.0f);
     draw->PushClipRect(ImVec2(a.x+5,a.y+4),ImVec2(b.x-5,b.y-7),true);
     draw->AddEllipseFilled(ImVec2(a.x+tile_w*.46f,a.y+tile_h*.06f),
                            ImVec2(tile_w*.53f,tile_h*.31f),

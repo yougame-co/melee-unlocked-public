@@ -37,6 +37,13 @@ inline std::string slippi_link_line(bool linked, const std::string& tag) {
   return R"(yg {"slippi":{"linked":true,"tag":")" + clean + R"("}})";
 }
 
+inline std::string slippi_stop_reason(const std::string& error) {
+  if (error.rfind("Slippi ", 0) == 0 && error.find(" is out. Update Melee Unlocked") != std::string::npos) return error;
+  if (error.rfind("Invalid", 0) == 0) return "Slippi sent an invalid reply";
+  if (error.rfind("Sign in", 0) == 0) return "Sign in to Slippi to search its players";
+  return "Slippi isn't reachable right now";
+}
+
 class Coordinator {
  public:
   explicit Coordinator(uint64_t now) : start_(now) {}
@@ -112,6 +119,8 @@ class Coordinator {
   // Still searching (or, for the committed side, connecting): its work goes on.
   bool live(Side side) const { return (side == Side::YouGame ? yougame_ : slippi_) == Run::Live; }
   bool committed(Side* side = nullptr) const { if (committed_ && side) *side = winner_; return committed_; }
+  // A Slippi stop leaves YouGame searching alone; commits and cancellation no longer search.
+  bool yougame_only() const { return !over_for_new_work() && yougame_ == Run::Live && slippi_ == Run::Done; }
   // Nothing committed and neither side can still find an opponent: the search has failed.
   bool over() const { return !committed_ && !stopped_ && yougame_ == Run::Done && slippi_ == Run::Done; }
   // The log lines decided so far, oldest first ("yougame: unranked blend: ...").

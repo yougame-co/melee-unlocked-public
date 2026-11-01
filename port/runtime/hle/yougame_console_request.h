@@ -56,6 +56,7 @@ inline bool parse_request(const json& j, json& out) {
   if (j.count("cardDigest") && (!j["cardDigest"].is_string() ||
       j["cardDigest"].get<std::string>().size() != 64 ||
       j["cardDigest"].get<std::string>().find_first_not_of("0123456789abcdef") != std::string::npos)) return false;
+  if (j.count("card")) return false; // Save choice is game-local, never an app launch field.
   out = {{"type", "consoleSession"}, {"room", room}, {"players", j["players"]}};
   for (auto key : {"sessionId", "port", "seed", "epochMs", "inputDelay", "cardDigest"})
     if (j.count(key)) out[key] = j[key];
@@ -78,6 +79,7 @@ class Requests {
     return std::exchange(pending_, std::nullopt);
   }
   bool claim() { std::lock_guard<std::mutex> lock(mutex_); if (active_) return false; active_ = true; pending_.reset(); return true; }
+  void clear() { std::lock_guard<std::mutex> lock(mutex_); pending_.reset(); }
   void release() { std::lock_guard<std::mutex> lock(mutex_); active_ = false; }
  private:
   std::mutex mutex_;

@@ -8,6 +8,8 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <set>
+#include "yougame_console_menu.h"
 
 namespace yougame::friends {
 using json = nlohmann::json;
@@ -161,7 +163,11 @@ inline bool native_ready(bool yougame, int, const std::string&, const std::strin
 // The ordinary Direct winner path locks in on START without another code/stage screen.
 // A random first stage is already supplied by native_start_match, as for other searches.
 inline constexpr int kFirstCssWinner = 1;
-inline json picker() { return {{"type", "mpFriend"}, {"mode", "singles"}, {"players", 2}}; }
+inline json picker(const std::string& held = {}) {
+  json q = {{"type", "mpFriend"}, {"mode", "singles"}, {"players", 2}};
+  if (!held.empty()) q["room"] = held;
+  return q;
+}
 inline bool version_request(const json& request) {
   return request.value("type", "") == "mpFriend" ||
       (request.value("type", "") == "mpTicket" && request.value("mode", "") == "singles" &&
@@ -191,7 +197,7 @@ json request_ticket(const std::string& compatibility, const std::string& invite,
 }
 // Restrict scene changes to the initialized main menu or online CSS/stage/results menus.
 // Every match (including local play), replay and other scene remains untouched.
-inline bool menu_safe(int major, int minor) { return major == 1 || (major == 8 && (minor == 0 || minor == 1 || minor == 3)); }
+inline bool menu_safe(int major, int minor) { return major == 1 || (major == 8 && (minor == 0 || minor == 1 || minor == 3)) || console::menu_select(major,minor); }
 
 class Events {
  public:
@@ -200,7 +206,7 @@ class Events {
     if (hello_seen_) return;
     hello_seen_ = true;
     const auto code = room(value);
-    if (pending_.empty() && code != current_room_) pending_ = code;  // a newer push wins over the launch invite
+    if (pending_.empty() && code != current_room_ && !retired_.count(code)) pending_ = code;  // a newer push wins over the launch invite
   }
   bool push(const json& value, uint64_t now) {
     const auto type = text(value, "type", 16);
@@ -208,7 +214,13 @@ class Events {
       const auto code = room(value);
       if (code.empty()) return false;
       std::lock_guard<std::mutex> lock(mutex_);
-      if (code == current_room_) return false;
+      if (code == current_room_) { fresh_invite_ = false; return false; }
+      // Old page pushes carry only a room code. A new invite notice grants one new
+      // acceptance, including a retry of a still-live retired room. Never let that
+      // old room displace a pending invite or another active session.
+      if (retired_.count(code) && (!fresh_invite_ || !pending_.empty() || !current_room_.empty() ||
+          (!invite_room_.empty() && invite_room_ != code))) return false;
+      retired_.erase(code); fresh_invite_ = false; invite_room_.clear();
       pending_ = code;
       return true;
     }
@@ -218,10 +230,24 @@ class Events {
       toast_ = kVersion; toast_until_ = now + 6000;
       return true;
     }
+    if (type == "notice" && text(value, "kind", 16) == "message") {
+      // A friend's chat line or direct message (page caps these with invites at 5 a minute).
+      // Display only: its own line under the invite toast, never an invite or a room.
+      const auto from = text(value, "from", 40), line = text(value, "text", 140), id = text(value, "id", 32);
+      if (from.empty() || line.empty()) return false;
+      std::lock_guard<std::mutex> lock(mutex_);
+      // Ids are a page counter that restarts with the page, so a repeat is the same id AND line.
+      auto shown = from + ": " + line;
+      if (!id.empty() && id == message_id_ && shown == message_) return false;
+      message_id_ = id; message_ = std::move(shown);
+      message_until_ = now + 6000;
+      return true;
+    }
     if (type != "notice" || text(value, "kind", 16) != "invite") return false;
     const auto from = text(value, "from", 40), line = text(value, "text", 80);
     if (from.empty() || line.empty()) return false;
     std::lock_guard<std::mutex> lock(mutex_);
+    fresh_invite_ = true; invite_room_ = room(value);
     toast_ = from + " " + line;
     toast_until_ = now + 6000;
     return true;
@@ -250,9 +276,15 @@ class Events {
     std::lock_guard<std::mutex> lock(mutex_);
     return now < toast_until_ ? toast_ : std::string();
   }
+  std::string message(uint64_t now) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return now < message_until_ ? message_ : std::string();
+  }
   void current_room(const std::string& code) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (!current_room_.empty() && code != current_room_) retired_.insert(current_room_);
     current_room_ = code;
+    if (!code.empty()) { fresh_invite_ = false; invite_room_.clear(); }
     if (!code.empty() && pending_ == code) pending_.clear();
   }
   void picker_error(std::string error) {
@@ -273,10 +305,14 @@ class Events {
   bool picker_context() const { std::lock_guard<std::mutex> lock(mutex_); return friend_entry_; }
   // What asked for the picker last ("pad N buttons XXXX" or the keyboard/overlay path), for the entry log line.
   std::string trigger() const { std::lock_guard<std::mutex> lock(mutex_); return trigger_; }
+  // connected = the pad is present. Not window focus: app-relayed pads and the GC adapter reach the
+  // game while the page holds the keyboard, and the game's own menu takes that A (regression report, 11-01: "I just
+  // pressed A on friends and nothing happened"). An open picker counts as away, so the A or START that
+  // closed it must be let go before it can open another.
   bool poll_pad(int port, bool connected, uint16_t buttons) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (port < 0 || port >= 4) return false;
-    if (!edges_[port].poll(connected, buttons, friend_entry_)) return false;
+    if (!edges_[port].poll(connected && !picker_open_, buttons, friend_entry_)) return false;
     char why[40];
     std::snprintf(why, sizeof why, "pad %d buttons %04x", port + 1, buttons);
     trigger_ = why;
@@ -293,15 +329,26 @@ class Events {
     std::lock_guard<std::mutex> lock(mutex_);
     return std::exchange(host_requested_, false);
   }
+  void picker_open(bool open) { std::lock_guard<std::mutex> lock(mutex_); picker_open_ = open; }
+  // One line on screen for a Friends press the host could not act on; never silence.
+  void notice(std::string line, uint64_t now) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    toast_ = std::move(line);
+    toast_until_ = now + 6000;
+  }
  private:
   mutable std::mutex mutex_;
   InviteEdge edges_[4];
   std::string trigger_;
   bool menu_scene_ = false;
   bool online_menu_ = false, friend_entry_ = false, version_notice_ = false, version_logged_ = false;
-  bool hello_seen_ = false, host_requested_ = false;
-  std::string pending_, toast_, current_room_, picker_error_;
+  bool hello_seen_ = false, host_requested_ = false, picker_open_ = false;
+  std::set<std::string> retired_; // Retired room pushes need a fresh invite acceptance.
+  bool fresh_invite_ = false;
+  std::string invite_room_, pending_, toast_, current_room_, picker_error_;
   uint64_t toast_until_ = 0;
+  std::string message_, message_id_;
+  uint64_t message_until_ = 0;
 };
 inline Events events;
 }  // namespace yougame::friends

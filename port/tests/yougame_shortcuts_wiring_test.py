@@ -101,7 +101,10 @@ class ShortcutsWiringTest(unittest.TestCase):
     def test_every_caps_variant_and_chat_stdout(self):
         parity = source("port/runtime/hle/yougame_parity.h")
         variants = re.findall(r'k(?:Toplevel)?Caps = ("[^\n]+");', parity)
-        self.assertEqual(len(variants), 3)
+        self.assertEqual(len(variants), 4)
+        mac = re.search(r'#elif defined\(__APPLE__\)\ninline constexpr const char\* kCaps = ("[^\n]+");', parity)
+        self.assertIsNotNone(mac)
+        self.assertIn(mac[1], variants)
         for variant in variants:
             caps = json.loads(json.loads(variant)[3:])["caps"]
             self.assertEqual(caps.count('chat'), 1)
