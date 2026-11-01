@@ -4,8 +4,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
+#include <cstring>
 
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
+static int checks;
+#define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
 
 namespace dd = yougame::display_defaults;
 
@@ -26,10 +28,23 @@ int main() {
   CHECK(!dd::own_vsync_key(true, false));
   CHECK(dd::vsync(true, false, true, -1) && !dd::vsync(true, false, false, 1));
 
-  // FPS counter: outside YouGame the saved "showfps" key; inside, on unless turned off there.
-  CHECK(!dd::show_fps(false, false, -1) && dd::show_fps(false, true, 0));
-  CHECK(dd::show_fps(true, false, -1) && dd::show_fps(true, false, 1));
-  CHECK(!dd::show_fps(true, true, 0));
-  std::puts("yougame display defaults: ok");
+  for (bool agent : {false, true}) for (bool saved : {false, true})
+    for (int choice : {-1, 0, 1}) {
+      CHECK(dd::show_fps(false, saved, choice, agent) == saved);
+      CHECK(dd::show_fps(true, saved, choice, agent) == (choice < 0 ? agent : choice == 1));
+      CHECK(std::strcmp(dd::fps_source(choice, agent), choice >= 0 ? "YouGame saved choice" :
+          agent ? "YouGame agent test default" : "YouGame player default") == 0);
+    }
+  // Every staging zip carries the agent hook, so only a run that read an agent-test.json shows the
+  // counter by default; a player on the same build starts with it off.
+  dd::agent_test_run = false;
+  CHECK(!dd::show_fps(true, true, -1));
+  CHECK(std::strcmp(dd::fps_source(-1), "YouGame player default") == 0);
+  dd::agent_test_run = true;
+  CHECK(dd::show_fps(true, false, -1));
+  CHECK(std::strcmp(dd::fps_source(-1), "YouGame agent test default") == 0);
+  dd::agent_test_run = false;
+  CHECK(dd::show_fps(true, false, 1)); // Player's existing enabled toggle survives.
+  std::printf("yougame display defaults: %d checks\n", checks);
   return 0;
 }

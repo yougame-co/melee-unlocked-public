@@ -255,7 +255,7 @@ int32_t mu_slippi_command(uint8_t command, const uint8_t* payload, uint32_t payl
 
 static void mu_state_snapshot(MuStatePod* out)
 {
-    _Static_assert(sizeof(MuStatePod) == 76 * sizeof(uint32_t), "state POD layout");
+    _Static_assert(sizeof(MuStatePod) == 103 * sizeof(uint32_t), "state POD layout");
     mu_state_snapshot_words((uint32_t*) out);
 }
 
@@ -315,6 +315,9 @@ static void mu_dump_stock_icon_map(void)
 
 static int32_t mu_run(void)
 {
+    uint32_t seed;
+    void mu_apply_seed(uint32_t seed);
+    if (mu_host->console_seed && mu_host->console_seed(&seed)) mu_apply_seed(seed);
     mu_fill_from_dol();   /* the font atlases the sources take from the retail binary */
     mu_dump_stock_icon_map();
     mu_general_codes_boot();   /* before main: Legacy applies its code set ahead of the game */
@@ -337,6 +340,9 @@ static void mu_early_rng_seed(void)
     static int parsed, enabled;
     static uint32_t seed;
     static unsigned at;
+    /* Frame zero is seeded before main; console sessions never accept test reseeding. */
+    uint32_t console_seed;
+    if (mu_host->console_seed && mu_host->console_seed(&console_seed)) return;
     if (!parsed) {
         const char* text = mu_test_getenv("MELEE_TEST_EARLY_RNG_SEED");
         char* end = 0;

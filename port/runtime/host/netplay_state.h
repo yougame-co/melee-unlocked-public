@@ -284,6 +284,7 @@ inline std::array<std::string, 4> player_names_for_overlay() { return host::netp
 inline int ping_ms() { return host::netplay::ping_ms(); }
 inline int session_mode() { return host::netplay::session_mode(); }
 inline bool in_online_menus() { return host::netplay::in_online_menus(); }
+inline bool online_status_visible() { return in_online_menus() && !is_online_match(); }
 }  // namespace online
 
 // The settings panel draws a search panel over offline play when one is offered. Nothing offers one

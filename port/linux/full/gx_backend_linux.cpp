@@ -7,10 +7,14 @@
 #include "host.h"
 #include "window.h"
 #include "renderer_gl.h"
+#include "gx_vulkan.h"
 #include "exi_slippi.h"
 #include "gx_shader.h"
 #include <GL/glew.h>
 #include <SDL.h>
+#ifndef __APPLE__
+#include <SDL_vulkan.h>
+#endif
 #include <algorithm>
 #include <memory>
 #include <string>
@@ -32,9 +36,9 @@ std::unique_ptr<LinuxPresentation> g_presentation;
 // Dolphin's "Auto (Window Size)": the integer EFB scale that covers the window, as the Windows
 // renderers pick it; a fixed choice from the settings is used as is.
 int linux_scale(const RenderOptions& options, int client_h) {
-  // Supersampling renders at twice the chosen scale and the present pass averages it down, as the
+  // Supersampling renders at 2x, 3x or 4x the chosen scale and the present pass averages it down, as the
   // Windows renderers do (up to the 6x the GL renderer supports).
-  const int ssaa = std::clamp(options.ssaa, 1, 2);
+  const int ssaa = std::clamp(options.ssaa, 1, 4);
   if (options.efb_scale > 0) return std::clamp(options.efb_scale * ssaa, 1, 6);
   return std::clamp((client_h + EFB_HEIGHT - 1) / EFB_HEIGHT * ssaa, 1, 6);
 }
@@ -44,6 +48,34 @@ bool d3d11_available() { return false; }
 
 Backend* create_render_backend(void* hwnd, int client_w, int client_h, const RenderOptions& options) {
   auto* window = static_cast<SDL_Window*>(hwnd);
+#ifndef __APPLE__
+  // Vulkan (PC settings > Graphics backend): the same renderer as on Windows, with its own settings
+  // panel. main.cpp made this a Vulkan window; if Vulkan does not start, the game cannot fall back to
+  // OpenGL on it, so it stops with the reason (set the backend back to OpenGL in melee_settings.txt).
+  if (options.api == RenderApi::Vulkan) {
+    VulkanWindow vw;
+    vw.window = window;
+    vw.drawable_size = [window](int* w, int* h) {
+      // The app can resize its X11 child without updating SDL's stored window size.
+      if (host::window_embedded()) host::window_client_size(w, h);
+      else SDL_Vulkan_GetDrawableSize(window, w, h);
+    };
+    vw.instance_extensions = [window] {
+      unsigned n = 0;
+      SDL_Vulkan_GetInstanceExtensions(window, &n, nullptr);
+      std::vector<const char*> names(n);
+      SDL_Vulkan_GetInstanceExtensions(window, &n, names.data());
+      return names;
+    };
+    vw.create_surface = [window](void* instance, void* surface) {
+      return SDL_Vulkan_CreateSurface(window, static_cast<VkInstance>(instance), static_cast<VkSurfaceKHR*>(surface)) == SDL_TRUE;
+    };
+    RenderOptions vulkan_options = options;
+    vulkan_options.dlss_mode = 0;
+    if (Backend* backend = create_vulkan_backend(vw, client_w, client_h, vulkan_options)) return record_started_backend(backend, "Vulkan");
+    host::die("Vulkan did not start on this system (see melee_port.log). Choose OpenGL: delete the line \"backend vulkan\" from melee_settings.txt.");
+  }
+#endif
   g_presentation = std::make_unique<LinuxPresentation>();
   g_presentation->options = options;
   RenderOptions& opts = g_presentation->options;
@@ -123,7 +155,7 @@ Backend* create_render_backend(void* hwnd, int client_w, int client_h, const Ren
   hooks.after_swap = [](uint64_t frame) { host::window_presented(frame); };
 #endif
   linux_renderer::set_hooks(*renderer, std::move(hooks));
-  return renderer.release();
+  return record_started_backend(renderer.release(), "OpenGL");
 }
 
 }  // namespace gx

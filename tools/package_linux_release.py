@@ -379,7 +379,7 @@ def main():
                     shutil.copy2(os.path.realpath(path), lib / soname)
         else:
             print(f'warning: {wanted} not found on this system; mod archives will need it installed')
-    # A desktop entry players can copy to ~/.local/share/applications.
+    # A desktop entry players can copy to their applications directory.
     (folder / 'MeleeUnlocked.desktop').write_text(
         '[Desktop Entry]\nType=Application\nName=Melee Unlocked\nComment=Super Smash Bros. Melee, natively\n'
         'Exec=sh -c \'cd "$(dirname "$(readlink -f "%k")")" && ./MeleeUnlocked\'\nTerminal=false\nCategories=Game;\n',

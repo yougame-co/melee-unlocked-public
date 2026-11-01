@@ -62,14 +62,19 @@ class YouGame0965MergeTest(unittest.TestCase):
         self.assertIn("startYouGameMatchmaking();", agent)
         self.assertIn("return;", agent)
         self.assertIn("search_settings_.mode == UNRANKED && search_settings_.friend_room.empty()", search)
-        self.assertIn("std::make_unique<User>(user_->dir(), true)", search)
-        refusal = search.split("if (!slippi_user_->CheckOnlineCompatibility(&error)) {", 1)[1].split("}", 1)[0]
-        self.assertIn("fail(", refusal)
-        self.assertIn("return;", refusal)
+        self.assertIn("User::GrantedSlippiUser(user_->dir())", search)
+        # Since blended Unranked (yougame_blend.h) the app's Slippi search runs beside YouGame's: the
+        # selected login's version is checked before its ticket, and a refusal stops Slippi's side only.
+        blend = function(net, "blendMatchmaking")
+        check = blend.split("slippi_user_->PollOnlineCompatibility(&error)", 1)[1]
+        refusal = check.split("if (version < 0) {", 1)[1].split("}", 1)[0]
+        self.assertIn("slippi_failed(", refusal)
         self.assertNotIn("startYouGameMatchmaking", refusal)
-        self.assertLess(search.index("slippi_user_->CheckOnlineCompatibility"),
-                        search.index("yougame::prepare_slippi_match"))
-        self.assertLess(search.index("yougame::prepare_slippi_match"), search.index("enet_host_create"))
+        self.assertLess(check.index("if (version < 0)"), check.index("openSlippiTicket("))
+        commit = blend.split("coord.matched(Side::Slippi", 1)[1]
+        self.assertLess(commit.index("yougame::prepare_slippi_match"), commit.index("ingest_ticket("))
+        ticket = function(net, "openSlippiTicket")
+        self.assertLess(ticket.index("yougame::with_native_udp(create)"), ticket.index("enet_host_create"))
         connecting = function(net, "handleConnecting")
         self.assertRegex(connecting, r"^\s*if \(\(!yougame::active\(\) \|\| slippi_user_\) && !local_peer.enabled\) \{")
         self.assertIn("User* user = slippi_user_ ? slippi_user_.get() : user_;", connecting)
@@ -83,7 +88,7 @@ class YouGame0965MergeTest(unittest.TestCase):
         prepare = function(link, "prepare_slippi_match")
         self.assertLess(prepare.index("close_room(Leave::Quit)"), prepare.index("retired.wait_for"))
         self.assertLess(prepare.index("retired.wait_for"), prepare.index("select_match_transport(true)"))
-        self.assertIn("if (epoch != g_search_epoch || cancelled()) return false;", prepare)
+        self.assertIn("if (!g_search_generation.current(epoch) || cancelled()) return false;", prepare)
         self.assertIn("yg_enet_enable(0);", prepare)
         select = function(link, "select_match_transport")
         self.assertIn("yg_enet_select(!slippi && g_direct);", select)

@@ -32,6 +32,7 @@ if(NOT EXISTS "${D}/src/melee/gm/gmmain.c")
   message(FATAL_ERROR "melee_game: no game sources at ${D}")
 endif()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+include("${REPO}/tools/rank_badges.cmake")
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # LP64 must never widen the console's explicit long fields or its audio sample
   # buffers. Keep the original source/Windows build intact; compile a lexical
@@ -49,6 +50,14 @@ endif()
 set(SDK "${D}/libs/dolphin/src/dolphin")
 # ---- how game code is compiled: one definition, shared by the game and by the parity library ----
 add_library(game_flags INTERFACE)
+option(YOUGAME_RANKED_BRANCH "Ranked: visible Ranked and local CPU practice" ON)   # ON in the main staging build (Luis 10-31: Friends + Ranked on the main build)
+if(YOUGAME_RANKED_BRANCH)
+  target_compile_definitions(game_flags INTERFACE YOUGAME_RANKED_BRANCH=1)
+endif()
+option(YOUGAME_AGENT_TEST_HOOK "Compile test-only local Ranked CPU prep" OFF)
+if(YOUGAME_AGENT_TEST_HOOK)
+  target_compile_definitions(game_flags INTERFACE YOUGAME_AGENT_TEST_HOOK)
+endif()
 target_include_directories(game_flags INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/include" "${D}/src" "${D}/src/MSL" "${D}/libs/dolphin/include" "${SDK}"
   "${CMAKE_CURRENT_SOURCE_DIR}/include_stub" "${REPO}/port/runtime/abi")
@@ -291,7 +300,7 @@ set(MU_NO_SLIPPI_ONLY mu_noslippi.c mu_match_info.c mu_p2p_entry.c)
 if(MU_NO_SLIPPI)
   foreach(removed mu_slippi_menu.c mu_slippi_css.c mu_slippi_chat.c mu_slippi_splash.c mu_slippi_sss.c
                   mu_replay.c mu_replay_abi.c mu_practice.c mu_online_rules.c mu_framedata.c
-                  mu_replay_defend.c)
+                  mu_replay_defend.c mu_ranked_setup.c mu_ranked_setup_online.c mu_ranked_rank.c mu_ranked_reveal.c)
     list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/${removed}")
   endforeach()
   target_compile_definitions(game_flags INTERFACE MU_NO_SLIPPI)
@@ -384,7 +393,7 @@ endif()
 
 # rogueMelee's Rogue Mode, native (rogue/): its own C under rogue/melee/rogue (the include root is
 # rogue/, so the decomp's <melee/rogue/...> includes find it), and its edits to the game's source in
-# melee-native.patch, each under #if MU_ROGUE. Offered only with its disc, offline (shim side:
+# Rogue patch routines are gated by MU_ROGUE and require the player's disc.
 # rogue/mu_rogue.c). The flags are the release values of its own build (tools/lib/integration.py).
 option(MU_ROGUE "Build rogueMelee's Rogue Mode natively (rogue/)" ON)
 if(MU_ROGUE)
@@ -464,6 +473,7 @@ set_source_files_properties(${TMCE_OBJECTS} PROPERTIES EXTERNAL_OBJECT TRUE GENE
 
 add_library(melee_game SHARED ${GAME_SOURCES} ${LIBC_SOURCES} ${SDK_SOURCES} ${SHIM_SOURCES} $<TARGET_OBJECTS:sdk_math>
   ${TMCE_OBJECTS})
+add_dependencies(melee_game mu_rank_badge_assets)
 set_target_properties(melee_game PROPERTIES PREFIX "" C_STANDARD 11 C_EXTENSIONS ON EXCLUDE_FROM_ALL ON)
 target_link_libraries(melee_game PRIVATE game_flags)
 # Right after MEM1 (see port/app/source_host.cpp): the image's statics then have physical addresses

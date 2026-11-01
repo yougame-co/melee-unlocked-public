@@ -7,6 +7,7 @@
 #include "commdlg.h"
 #include "winhttp.h"
 #include "winhttp_ws_internal.h"
+#include "winhttp_cancel.h"
 #include <curl/curl.h>
 #ifdef __APPLE__
 #include <CommonCrypto/CommonDigest.h>
@@ -1085,6 +1086,7 @@ struct HttpRequest {
   int connect_ms, receive_ms;
   bool upgrade = false;
   HINTERNET websocket = nullptr;
+  std::function<bool()> cancelled;
   ~HttpRequest() { if (websocket) winhttp_ws_close(websocket); }
 };
 enum class Kind { Session, Connect, Request };
@@ -1118,6 +1120,10 @@ HINTERNET WinHttpOpenRequest(HINTERNET connect, LPCWSTR verb, LPCWSTR path, LPCW
   auto* r = new HttpRequest{c, verb ? narrow(verb) : "GET", narrow(path), (flags & WINHTTP_FLAG_SECURE) != 0};
   r->follow = c->session->follow; r->connect_ms = c->session->connect_ms; r->receive_ms = c->session->receive_ms;
   return new Any{Kind::Request, r};
+}
+void WinHttpSetCancelCallback(HINTERNET request, const std::function<bool()>& cancelled) {
+  auto* a = static_cast<Any*>(request);
+  if (a && a->kind == Kind::Request) static_cast<HttpRequest*>(a->p)->cancelled = cancelled;
 }
 BOOL WinHttpSetTimeouts(HINTERNET handle, int, int connect, int, int receive) {
   auto* a = static_cast<Any*>(handle);
@@ -1167,7 +1173,7 @@ BOOL WinHttpReceiveResponse(HINTERNET request, LPVOID) {
   if (r->done) return TRUE;
   if (r->upgrade) {
     r->done = winhttp_ws_open(r->connect->host, r->connect->port, r->secure, r->path, r->headers,
-                             r->connect_ms, r->receive_ms, r->status, r->websocket);
+                             r->connect_ms, r->receive_ms, r->status, r->websocket, r->cancelled);
     return r->done;
   }
   CURL* curl = curl_easy_init();
@@ -1193,7 +1199,7 @@ BOOL WinHttpReceiveResponse(HINTERNET request, LPVOID) {
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &r->response);
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-  const CURLcode rc = curl_easy_perform(curl);
+  const CURLcode rc = winhttp_perform(curl, r->cancelled);
   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r->status);
   curl_slist_free_all(list);
   curl_easy_cleanup(curl);

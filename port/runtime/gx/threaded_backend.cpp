@@ -9,6 +9,7 @@
 #include "threaded_backend.h"
 #include "frame_queue.h"
 #include "gx_backend.h"
+#include "gx_vulkan.h"
 #include "render_options.h"
 #include "host.h"
 #include "rollback_perf.h"
@@ -699,6 +700,11 @@ class ThreadedBackend final : public Backend {
       SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
       bool started = false;
       try {
+        if (options.api == RenderApi::Vulkan && !vulkan_available()) {
+          host::log("vulkan: not usable on this system; starting on the default renderer");
+          options.api = options_.api = RenderApi::D3D12;
+        }
+        host::window_prefer_vulkan(options.api == RenderApi::Vulkan);
         void* window = host::window_create(options.window_w, options.window_h, host::window_title_base().c_str(), visible
 #ifdef _WIN32
             , true

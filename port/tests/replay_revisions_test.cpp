@@ -1,3 +1,4 @@
+#include <cstdint>
 #include "replay_revisions.h"
 #include <cstdio>
 #include <set>

@@ -158,10 +158,12 @@ char* getenv(const char* name);
  * code kept, so a dump holds music and sound effects as Dolphin's DSP dump of a replay does. */
 int mu_jukebox_music(void)
 {
+    int mu_console_active(void);
 #ifdef MU_NO_SLIPPI
     return 0;   /* no host music player in this build: the game's own stream through AX, always */
 #endif
     static int no_jukebox = -1;
+    if (mu_console_active()) return 1; // canonical music path; ignore local comparison flags
     if (no_jukebox < 0) {
         no_jukebox = getenv("MELEE_NO_JUKEBOX") != 0;
     }

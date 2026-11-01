@@ -35,6 +35,7 @@
 #include <sysdolphin/baselib/mobj.h>
 #include <sysdolphin/baselib/sislib.h>
 #include <mu_native.h>
+#include <mu_ranked.h>
 
 extern char mnNameNew_CurrentNameText[];
 
@@ -140,6 +141,11 @@ void mu_slippi_css_enter(CSSData** css, u8* chosen, s8* port, u8* request, s8* n
     name_entry_port = name_port;
     single_menu = menu_root;
 
+    if (st->mode == MU_SLP_MODE_RANKED) {
+        u8 screen = 3; /* E6: a new Ranked CSS visit, one mpRank read for this screen. */
+        mu_slippi_cmd(0xE6, &screen, 1, NULL, 0, NULL);
+    }
+
     /* FN_InitBuffers: nothing to allocate natively. CSS data table zeroed. */
     memset(&dt, 0, sizeof dt);
 
@@ -202,6 +208,19 @@ static int picked_stage(void)
     return (b[0x1E] << 8) | b[0x1F];
 }
 
+/* Shared by the hint and input path so the screen never advertises a dead Z. */
+static int mu_slippi_practice_available(void)
+{
+#if defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH
+    return mu_slippi_state()->mode == MU_SLP_MODE_RANKED && mu_slippi_ranked_available() &&
+           dt.msrb.connection_state == MU_SLP_MM_IDLE && !mu_online_p2p_menus() &&
+           !dt.chat_window_opened && char_chosen && *char_chosen && gm_801A4BB8() &&
+           mu_ranked_practice_allowed();
+#else
+    return 0;
+#endif
+}
+
 /* HandleInputsOnCSS at fn_80262F44's `mnCharSel_804D6CF2 == 0 && START` test (only called when
  * mnCharSel_804D6CF2 == 0). Returns 1 when both players are ready: the caller continues into the
  * vanilla START path. */
@@ -235,6 +254,18 @@ int mu_slippi_css_inputs(unsigned int trigger)
              * entry. Its host never reports this state; a reply that could not be read does. */
             return 0;
         }
+#if defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH
+        /* Same lock-in path as search, with the CPU bridge installed first.
+         * The host must acknowledge the local entry before any B5/B4 is sent. */
+        if (mu_slippi_practice_available() && (trigger & HSD_PAD_Z)) {
+            if (mu_ranked_practice_control(MU_YG_PRACTICE_START)) {
+                st->is_winner = MU_SLP_WINNER_NULL;
+                st->chose_stage = 0;
+                lock_in_and_search(SB_RAND);
+            }
+            return 0;
+        }
+#endif
         if (dt.chat_window_opened || !(trigger & HSD_PAD_START) || gm_801A4BB8() == 0) {
             return 0;
         }
@@ -243,6 +274,13 @@ int mu_slippi_css_inputs(unsigned int trigger)
         if (*char_chosen == 0) {
             return 0;
         }
+#if defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH
+        if (st->mode == MU_SLP_MODE_RANKED) {
+            /* Returning from a practice reveal: restore the real backend before
+             * the ordinary Ranked B5/B4, without changing its matchmaking path. */
+            mu_ranked_practice_control(MU_YG_PRACTICE_STOP);
+        }
+#endif
         switch (st->mode) {
         case MU_SLP_MODE_RANKED:
         case MU_SLP_MODE_UNRANKED:
@@ -278,8 +316,9 @@ int mu_slippi_css_inputs(unsigned int trigger)
     if ((u32) gm_GetButtonsPressed((u8) *ctrl_port) & HSD_PAD_Z) {
         dt.z_hold_timer++;
         if (dt.z_hold_timer > DISCONNECT_HOLD_DELAY) {
+            u8 reason = 1;   /* Same Slippi cleanup command, with the native CSS's Z reason. */
             dt.z_hold_timer = 0;
-            mu_slippi_cleanup_connections();
+            mu_slippi_cmd(0xBA, &reason, 1, NULL, 0, NULL);
             return 0;
         }
     } else {
@@ -468,26 +507,16 @@ enum {
     ST_PLAYING_OPP = 10,
     ST_ERR1 = 11,
     ST_ERR4 = 14,
+    ST_RANK_OPPONENT = 15,
 };
 
-/* The Ranked header: the host's ("Ranked - Gold II - 1534", "Ranked - Placements 2/5", see
- * yougame_ranked.h RankCache::header) under YouGame, else "Ranked Mode". The same text, drawn
- * smaller when it is longer than the other modes' headers so it stays inside the panel. */
-static void ranked_header(void)
+/* RankInfo owns the standing, opponent and game-owned score below this title.
+ * Keep the host query below: it starts the existing per-CSS YouGame mpRank read. */
+static void ranked_header(const char* header)
 {
-    char header[64];
-    int glyphs = 0, i;
-    if (!mu_slippi_ranked_header(header, sizeof header) || header[0] == 0) {
-        set_text_fmt(ST_HEADER, "%s Mode", "Ranked");
-        return;
-    }
-    for (i = 0; header[i] != 0; i++, glyphs++) {
-        if ((header[i] & 0x80) && header[i + 1] != 0) {
-            i++;   /* a Shift-JIS pair is one glyph */
-        }
-    }
-    HSD_SisLib_803A7548(dt.text, ST_HEADER, glyphs > 22 ? 0.4f : 0.5f, glyphs > 22 ? 0.4f : 0.5f);
-    set_text(ST_HEADER, header);
+    (void) header;
+    HSD_SisLib_803A7548(dt.text, ST_HEADER, 0.5f, 0.5f);
+    set_text(ST_HEADER, mu_ranked_practice() ? "Practice - not rated" : "Ranked");
 }
 
 static void text_think(HSD_GObj* gobj)
@@ -496,6 +525,7 @@ static void text_think(HSD_GObj* gobj)
     MuMatchState* m = &dt.msrb;
     char opp_code[19] = "--//--//--//--//00";
     char opp_name[32];
+    char rank_lines[6][128] = { { 0 } };
     const char* s;
     int idx, i;
     u8 conn = m->connection_state;
@@ -506,6 +536,7 @@ static void text_think(HSD_GObj* gobj)
     int p2p_connecting = p2p && conn < MU_SLP_MM_CONNECTION_SUCCESS;
 
     (void) gobj;
+    if (st->mode == MU_SLP_MODE_RANKED) mu_slippi_ranked_lines(rank_lines);
     code_sjis18((u8*) opp_code);
 
     /* Mode title: slpCSS mode matanim on SingleMenu child 36, MELEE (0) or TEAM MATCH (16). */
@@ -528,10 +559,17 @@ static void text_think(HSD_GObj* gobj)
         switch (st->mode) {
         case MU_SLP_MODE_UNRANKED: set_text_fmt(ST_HEADER, "%s Mode", "Unranked"); break;
         case MU_SLP_MODE_DIRECT: set_text_fmt(ST_HEADER, "%s Mode", p2p ? "P2P" : "Direct"); break;
-        case MU_SLP_MODE_RANKED: ranked_header(); break;
+        case MU_SLP_MODE_RANKED: ranked_header(rank_lines[0]); break;
         case MU_SLP_MODE_TEAMS: set_text_fmt(ST_HEADER, "%s Mode", "Teams"); break;
         case MU_SLP_MODE_PARTY: set_text_fmt(ST_HEADER, "%s Mode", "Party"); break;
         default: set_text(ST_HEADER, "Error"); break;
+        }
+    }
+
+    /* Hand the old R1 rows to RankInfo and the authoritative result reveal. */
+    if (st->mode == MU_SLP_MODE_RANKED && mu_slippi_ranked_available()) {
+        for (i = 0; i < 5; i++) {
+            set_text(ST_RANK_OPPONENT + i, "");
         }
     }
 
@@ -542,7 +580,11 @@ static void text_think(HSD_GObj* gobj)
                              conn == MU_SLP_MM_OPPONENT_CONNECTING ? "Found:" : "");
     set_text(ST_PLAYING_OPP, conn == MU_SLP_MM_CONNECTION_SUCCESS ||
                            conn == MU_SLP_MM_OPPONENT_CONNECTING ? opp_name : "");
-    set_text(ST_PRESS_D, conn == MU_SLP_MM_CONNECTION_SUCCESS && !p2p ? "Use D-Pad to Chat" : "");
+    set_text(ST_PRESS_D, conn == MU_SLP_MM_CONNECTION_SUCCESS && !p2p && !mu_ranked_practice() ? "Use D-Pad to Chat" : "");
+#if defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH
+    if (mu_slippi_practice_available())
+        set_text(ST_PRESS_D, "Z: Practice vs CPU");
+#endif
 
     /* Press / hold Z */
     if (conn == MU_SLP_MM_CONNECTION_SUCCESS) {
@@ -723,6 +765,11 @@ void mu_slippi_css_text_init(void)
         static const f32 err_y[4] = { 52.0f, 70.0f, 88.0f, 106.0f };
         for (i = 0; i < 4; i++) {
             create_subtext(t, &color_red, 0.4f, 70.0f, err_y[i]);
+        }
+    }
+    if (mu_slippi_state()->mode == MU_SLP_MODE_RANKED && mu_slippi_ranked_available()) {
+        for (i = 0; i < 5; i++) {
+            create_subtext(t, &color_white, 0.32f, 70.0f, 178.0f + (float) i * 18.0f);
         }
     }
 }

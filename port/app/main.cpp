@@ -8,6 +8,12 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include "yougame_link.h"
+#ifdef MELEE_SOURCE_PORT
+#include "replay_bar.h"
+#include "yougame_console_boot.h"
+#include "yougame_console_engine.h"
+#include "yougame_console_entry.h"
+#endif
 #include "yougame_mode_policy.h"
 #include "yougame_memcard.h"
 #include "host.h"
@@ -38,12 +44,14 @@
 #endif
 #include "audio.h"
 #include "guest_registry.h"
+#include "gx_vulkan.h"
 #include "gx_backend.h"
 #include "settings_log.h"
 #include "gx_core.h"
 #include "render_options.h"
 #include "gx_retro.h"
 #include "pc_settings.h"
+#include "yougame_display_defaults.h"
 #include "texture_pack.h"
 #include "cosmetic_mods.h"
 #include "disc_skin_scan.h"
@@ -63,6 +71,7 @@ namespace app { int run_settings_window(gx::RenderOptions& options, unsigned lon
 #endif
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include "yougame_agent_test.h"
+#include "yougame_ranked_cpu.h"
 #include "yougame_agent_script.h"
 #include "yougame_agent_pad.h"
 #include "yougame_agent_fight.h"
@@ -748,7 +757,7 @@ static void usage() {
               "           [--dlss-mode 0..5 --frame-generation[=2x|3x|4x|5x|6x|dynamic]] [--ssao 0..1]\n"
               "           [--aspect auto|73:60|4:3|16:9|stretch] [--widescreen|--true-widescreen]\n"
               "           [--fps N|monitor|unlocked] [--frame-mode extrapolate|interpolate|authored|off] [--threaded-renderer]\n"
-              "           [--fullscreen] [--backend d3d12|d3d11] [--dlss off|dlaa|quality|balanced|performance|ultra] [--frame-times out.csv] [--music 0-100|--no-music] [--volume 0-100] [--audio-dump out.wav]\n"
+              "           [--fullscreen] [--backend d3d12|d3d11|vulkan] [--dlss off|dlaa|quality|balanced|performance|ultra] [--frame-times out.csv] [--music 0-100|--no-music] [--volume 0-100] [--audio-dump out.wav]\n"
               "           [--vanilla-only] [--no-mod-autodetect]\n"
               "           [--sys-dir folder] [--user-dir folder] [--sysgen-data-dir writable-data-folder]\n"
               "           [--settings-path file --load-settings --import-cosmetic file|--scan-disc-skins mod.iso|--select-cosmetic id|--deselect-cosmetic slot|--enable-project-effects|--restore-vanilla-cosmetics|--cosmetic-status]\n"
@@ -1493,7 +1502,10 @@ static int melee_main(int argc, char** argv) {
   constexpr auto agent_engine = yougame::agent_test::Engine::Static;
 #endif
   const auto agent_test = yougame::agent_test::load(yougame::active(), std::getenv("YOUGAME_DATA"), agent_engine);
+  yougame::display_defaults::agent_test_run = agent_test.agent_file;   // the FPS counter's default (read with the settings)
+  yougame::ranked_cpu::practice_allowed = agent_test.agent_file;
   yougame::net_test::install(agent_test.net);
+  yougame::ranked_cpu::enabled = agent_test.ranked_cpu;
   for (const auto& [name, value] : agent_test.environment) _putenv_s(name.c_str(), value.c_str());
 #endif
   user_gecko::set_sources_allowed(yougame::mode_policy::mod_sources(yougame::active()).folders);
@@ -1517,6 +1529,9 @@ static int melee_main(int argc, char** argv) {
   // cores, Windows can move a throttled process onto the efficiency cores, and the game then runs
   // slow for as long as it stays there. The game sleeps most of each frame, so this costs no power
   // while it waits. Ignored by Windows versions without the setting.
+#ifdef _WIN32
+  DWORD timer_resolution_error = 0, timer_fallback_error = 0;
+#endif
   {
     PROCESS_POWER_THROTTLING_STATE throttling{};
     throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
@@ -1525,9 +1540,17 @@ static int melee_main(int argc, char** argv) {
     throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | 0x4 /* PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION */;
     throttling.StateMask = 0;   // execution speed never throttled, timer resolution never ignored
     if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof throttling)) {
+#ifdef _WIN32
+      timer_resolution_error = GetLastError();
+#endif
       // Windows 10 does not know the timer bit and refuses the whole request: ask for the speed part alone.
       throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+#ifdef _WIN32
+      if (!SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof throttling))
+        timer_fallback_error = GetLastError();
+#else
       SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof throttling);
+#endif
     }
   }
   host::Options& o = host::options;
@@ -1584,6 +1607,28 @@ static int melee_main(int argc, char** argv) {
   // melee_port.log let it rotate the game's log away at its start, so a player's log held only the
   // panel's three lines and every desync line of the match was lost.
   if (settings_window_only && host::options.log_file.empty()) host::options.log_file = "melee_settings.log";
+#ifdef _WIN32
+  // Log only after the early --log-file parse, so the report uses the game's chosen run log.
+  host::log("timing: timeBeginPeriod(1) %s", timer_resolution.raised ? "ok" : "failed");
+  const bool timer_unsupported = timer_resolution_error == ERROR_INVALID_PARAMETER ||
+      timer_resolution_error == ERROR_NOT_SUPPORTED || timer_resolution_error == ERROR_CALL_NOT_IMPLEMENTED ||
+      timer_resolution_error == ERROR_INVALID_FUNCTION;
+  if (timer_resolution_error)
+    host::log("timing: timer resolution never ignored %s (%lu); execution-speed fallback %s (%lu)",
+              timer_unsupported ? "unsupported" : "denied", (unsigned long)timer_resolution_error,
+              timer_fallback_error ? "failed" : "ok", (unsigned long)timer_fallback_error);
+  else host::log("timing: timer resolution never ignored ok (0)");
+  HANDLE diagnostic_token = nullptr;
+  DWORD is_appcontainer = 0, token_bytes = 0;
+  if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &diagnostic_token)) {
+    const BOOL readable = GetTokenInformation(diagnostic_token, TokenIsAppContainer,
+        &is_appcontainer, sizeof is_appcontainer, &token_bytes);
+    const DWORD token_error = readable ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(diagnostic_token);
+    if (readable) host::log("timing: sandbox appcontainer %s", is_appcontainer ? "yes" : "no");
+    else host::log("timing: sandbox appcontainer unknown (%lu)", (unsigned long)token_error);
+  } else host::log("timing: sandbox appcontainer unknown (%lu)", (unsigned long)GetLastError());
+#endif
   yougame::relay_pads::logging_ready();
   gfx.pc_settings = !automated;
   // In YouGame's player box the app reports a stop from the exit code; a dialog there only kept the
@@ -1740,8 +1785,9 @@ static int melee_main(int argc, char** argv) {
     else if (a == "--fullscreen") gfx.fullscreen = true;
     else if (a == "--backend") { std::string v = next();
       if (v == "d3d11" || v == "dx11" || v == "11") gfx.api = gx::RenderApi::D3D11;
+      else if (v == "vulkan" || v == "vk") gfx.api = gx::RenderApi::Vulkan;
       else if (v == "d3d12" || v == "dx12" || v == "12") gfx.api = gx::RenderApi::D3D12;
-      else { std::fprintf(stderr, "--backend d3d12|d3d11\n"); return 2; } }
+      else { std::fprintf(stderr, "--backend d3d12|d3d11|vulkan\n"); return 2; } }
 #ifdef GX_DLSS5
     else if (a == "--dlss5") gfx.dlss5 = true;                  // EXPERIMENTAL (gx_dlss5.h); needs --dlss
 #endif
@@ -1916,7 +1962,11 @@ static int melee_main(int argc, char** argv) {
     // compiler's nesting limit in the Source Port build.
     else if (a == "--border") { gfx.border_art = next(); if (gfx.border_art.rfind("sharp:", 0) == 0) { gfx.border_edge = 0; gfx.border_art.erase(0, 6); } }
     else if (a == "--shader") gfx.shader_preset = next();
-    else if (a == "--ssaa") gfx.ssaa = std::atoi(next()) >= 2 ? 2 : 1;
+    // One branch for both: this else-if chain is at MSVC's nesting limit (C1061) with DLSS 5 built in.
+    else if (a == "--ssaa" || a == "--msaa") {
+      const int n = std::atoi(next());
+      if (a == "--ssaa") gfx.ssaa = std::clamp(n, 1, 4); else gfx.msaa = n >= 8 ? 8 : n >= 4 ? 4 : n >= 2 ? 2 : 1;
+    }
     else if (a == "--anisotropy") gfx.anisotropy = std::clamp(std::atoi(next()), 1, 16);
     // Hidden runs never load the settings file, so the quality level needs a flag to be measurable.
     // The same for the "Lightweight" ladder; the backend stays the one asked for (no Direct3D 11
@@ -2217,6 +2267,12 @@ static int melee_main(int argc, char** argv) {
   if (!headless && threaded) {
     backend = gx::create_threaded_backend(gfx, !hidden);
   } else if (!headless) {
+    // Vulkan chosen but not usable here: choose the fallback before creating the SDL window.
+    if (gfx.api == gx::RenderApi::Vulkan && !gx::vulkan_available()) {
+      host::log("vulkan: not usable on this system; starting on the default renderer");
+      gfx.api = gx::RenderApi::D3D12;
+    }
+    host::window_prefer_vulkan(gfx.api == gx::RenderApi::Vulkan);
 #ifdef __APPLE__
     // An app older than 0.13.1048 asks for the player box (YOUGAME_EMBED=1) but passes no parent window: the game
     // can't embed there, so it starts in full screen on its own, as before (native-experience-lead #15888).
@@ -2272,9 +2328,9 @@ static int melee_main(int argc, char** argv) {
   arm_test_crash(automated);   // no-op unless MELEE_TEST_CRASH is set on a hidden run
   // The settings that decide how a match feels, in one line, so a report on stutter or lag says them.
   {
-    const char* saved_backend = gfx.api == gx::RenderApi::D3D11 ? "D3D11" : "D3D12";
+    const char* saved_backend = gfx.api == gx::RenderApi::D3D11 ? "D3D11" : gfx.api == gx::RenderApi::Vulkan ? "Vulkan" : "D3D12";
     const auto backend_label = app::settings_backend_label(saved_backend,
-        backend ? app::settings_backend_in_use(saved_backend) : saved_backend);
+        backend ? gx::started_render_backend() : "none (headless)");
     static const char* const subframes[] = {"off", "extrapolate", "interpolate", "authored", "authored + interpolate"};
     host::log("settings: %s, frame cap %s, sub-frame %s, internal resolution %s, upscaler %d, vsync %s, %s",
               backend_label.c_str(),
@@ -2316,6 +2372,8 @@ static int melee_main(int argc, char** argv) {
   static std::unique_ptr<gx::Backend>* backend_at_exit = &backend;
   auto shutdown = [](int) {
     host::set_process_ending();
+    // Join the console link service before tearing down the host/bridge.
+    yougame::console::console_engine().end("window closed");
     host::report_sim_work();
     g_profiler.report();   // no-op without --profile
     backend_at_exit->reset();
@@ -2339,6 +2397,19 @@ static int melee_main(int argc, char** argv) {
   // this returns at once and the run is what it was.
   source_p2p::start(hidden || headless || scripted);
   if (g_profile) g_profiler.start();   // the native game runs on this thread; shutdown() reports
+  if (yougame::active()) {
+    // Hello launches and pending manual relaunches enter before loading/running the game DLL.
+    if (yougame::console::requests.pending()) yougame::console_boot_ready();
+    yougame::console::responsive_wait([] { return yougame::wait_identity(10000); }, [] { host::window_pump(); });
+    yougame::console::take_pending_launch();
+    yougame::console::boot(yougame::console::take_request(),
+        [](const auto& q, auto& c, auto& e) { return yougame::console::start_session(q, c, e); },
+        [](auto link, const auto& c) { return yougame::console::console_begin(std::move(link), c); },
+        [] { yougame::console_boot_ready(); }, [] { host::window_pump(); },
+        [](const char* text) { screen_label::show(text, 12.0); },
+        [](const std::string& text) { host::log("%s", text.c_str()); });
+  }
+  if (host::exit_requested()) { shutdown(0); host::end_process(0); }
   const int source_code = source_port::run(shutdown);
   shutdown(source_code);
   host::end_process(source_code);   // everything is saved: do not run the libraries' unload code

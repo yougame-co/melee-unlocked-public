@@ -55,3 +55,6 @@ target_include_directories(port_friends_label_test PRIVATE "${CMAKE_CURRENT_BINA
   "${FRIENDS_LABEL_ROOT}/sourceport/game/shim")
 target_compile_features(port_friends_label_test PRIVATE cxx_std_17)
 add_test(NAME port_friends_label COMMAND port_friends_label_test)
+
+add_test(NAME port_online_menu COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_LIST_DIR}/online_menu_test.py")
+add_test(NAME port_slippi_title COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_LIST_DIR}/slippi_title_test.py")

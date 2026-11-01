@@ -9,6 +9,7 @@
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <cstring>
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
 
@@ -42,12 +43,13 @@ struct Fixture {
   int writer, reader;
   PadMirror* view;
   Fixture() {
-    char path[] = "/tmp/mu-pad-mirror-XXXXXX";
-    writer = mkstemp(path);
+    const char* temp = std::getenv("TMPDIR");
+    std::string path = std::string(temp ? temp : "/tmp") + "/mu-pad-mirror-XXXXXX";
+    writer = mkstemp(path.data());
     CHECK(writer >= 3);
     CHECK(ftruncate(writer, 4096) == 0);
-    reader = open(path, O_RDONLY);
-    CHECK(unlink(path) == 0);
+    reader = open(path.c_str(), O_RDONLY);
+    CHECK(unlink(path.c_str()) == 0);
     CHECK(reader >= 3);
     struct stat st{};
     CHECK(fstat(reader, &st) == 0 && st.st_nlink == 0);

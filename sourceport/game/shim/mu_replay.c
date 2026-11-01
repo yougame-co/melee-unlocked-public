@@ -89,7 +89,8 @@ int mu_replay_on(void)
  * Dolphin always runs the sections these codes come from). */
 int mu_replay_code(unsigned int code)
 {
-    return (mu_replay_abi_codes() & code) != 0 || (mu_online_codes() & code) != 0;
+    return (mu_replay_abi_codes() & code) != 0 || (mu_online_codes() & code) != 0 ||
+           (mu_console_rollback_codes() & code) != 0;
 }
 
 /* A code the native game runs as part of the General Codes: during playback it runs only when the

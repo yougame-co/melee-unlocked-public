@@ -89,3 +89,40 @@ void mu_online_abi_log(const char* text)
 {
     mu_host->log(text);
 }
+
+/* Console adapter to the native predictor's RXB shape, with no Slippi device command. */
+static void console_put32(uint8_t* p, uint32_t v)
+{
+    p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v;
+}
+static void console_wire(uint8_t* out, const MuPadStatus* p)
+{
+    out[0] = p->button >> 8; out[1] = p->button;
+    out[2] = p->stick_x; out[3] = p->stick_y; out[4] = p->sub_x; out[5] = p->sub_y;
+    out[6] = p->trigger_l; out[7] = p->trigger_r;
+    out[8] = p->analog_a; out[9] = p->analog_b; out[10] = p->err; out[11] = 0;
+}
+int mu_console_abi(int operation, unsigned int body, unsigned char* local, unsigned char* rxb,
+                   unsigned int* epoch, int* local_port)
+{
+    MuConsoleInputs inputs = {0};
+    int r, k;
+    int32_t smallest = (int32_t) body;
+    if (mu_host->version < 26 || !mu_host->console_rollback ||
+        !mu_host->console_rollback(operation, body, &inputs)) return 0;
+    if (epoch) *epoch = inputs.epoch;
+    if (local_port) *local_port = inputs.local_port;
+    if (local) console_wire(local, &inputs.local);
+    if (rxb) {
+        /* RXB_RESULT=0, COUNT=1, DESYNC=2 (24 bytes), FRAMES=26, MIN=38, PADS=42. */
+        for (k = 0; k < 297; ++k) rxb[k] = 0;
+        rxb[0] = 1;
+        for (r = 0; r < 3; ++r) {
+            console_put32(rxb + 26 + 4 * r, (uint32_t) inputs.latest[r]);
+            if (inputs.latest[r] < smallest) smallest = inputs.latest[r];
+            for (k = 0; k < 7; ++k) console_wire(rxb + 42 + (r * 7 + k) * 12, &inputs.remote[r][k]);
+        }
+        console_put32(rxb + 38, (uint32_t) smallest);
+    }
+    return 1;
+}

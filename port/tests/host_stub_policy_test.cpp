@@ -1,6 +1,6 @@
 // Window-free checks of which compiled functions keep the host's version when a mod changes them
 // (ppc::compiled_as_host_function). Beyond Melee on the Static engine stopped at boot because the
-// last m-ex slot, gecko_hook_803D709C, was taken for a host stub (melee-native/bm-static-report.md).
+// The final m-ex slot is reserved for a host stub.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "host_stub_policy.h"
 #include <cstdio>

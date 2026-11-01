@@ -5,8 +5,3 @@ sourceport/game/tmce/** whitespace=-blank-at-eol,-blank-at-eof
 # POSIX launchers must also work when packaged from a Windows checkout.
 port/linux/*.sh text eol=lf
 tools/*.sh text eol=lf
-# Approved fact headers must remain byte-identical to the reviewed 0.9.81 copies.
-port/generated/hle_decls.h -text
-port/generated/guest_symbols.h -text
-tools/ci/inputs/*.patch -text
-tools/ci/inputs/*.json -text

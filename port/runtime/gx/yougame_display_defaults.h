@@ -1,5 +1,7 @@
-// Display defaults when YouGame launches the game (Luis, 10-30: V-Sync off, and "an fps counter on
-// by default to make it easier for people to see when there are frame drops").
+// YouGame display defaults: V-Sync off on Windows; FPS hidden for players, visible by default
+// Applied when a game test runs. Every staging package carries the configuration.
+// agent hook, so the build flag cannot tell an agent run from a player: main() sets
+// agent_test_run when it read an agent-test.json from the game's data folder.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
@@ -17,9 +19,15 @@ constexpr bool vsync(bool yougame, bool windows, bool saved, int saved_yougame) 
   return own_vsync_key(yougame, windows) ? saved_yougame == 1 : saved;
 }
 
-// FPS counter inside YouGame, every platform: on unless the player turned it off there.
-constexpr bool show_fps(bool yougame, bool saved, int saved_yougame) {
-  return yougame ? saved_yougame != 0 : saved;
+inline bool agent_test_run = false;
+
+// The existing YouGame toggle's saved choice wins over either default.
+constexpr bool show_fps(bool yougame, bool saved, int saved_yougame, bool agent_test = agent_test_run) {
+  return yougame ? (saved_yougame < 0 ? agent_test : saved_yougame == 1) : saved;
+}
+constexpr const char* fps_source(int saved_yougame, bool agent_test = agent_test_run) {
+  return saved_yougame >= 0 ? "YouGame saved choice" :
+         agent_test ? "YouGame agent test default" : "YouGame player default";
 }
 
 }  // namespace yougame::display_defaults

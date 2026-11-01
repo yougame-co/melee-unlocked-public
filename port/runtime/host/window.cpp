@@ -22,7 +22,9 @@
 #include <thread>
 #include "yougame_link.h"
 #include "yougame_friends.h"
+#include "yougame_console_entry.h"
 #include "yougame_parity.h"
+#include "yougame_shortcuts.h"
 #ifdef _WIN32
 #include "yougame_embed_view.h"
 #include "yougame_embed_toplevel.h"
@@ -43,6 +45,7 @@
 #include "sim_work.h"
 #include "early_input.h"
 #include "window.h"
+#include "cursor_idle.h"   // window_sdl.inl (Linux) hides the pointer after a rest
 #include "replay_control.h"
 #include "input_bindings.h"
 #include "controller_relay.h"
@@ -82,7 +85,8 @@ HWND g_hwnd = nullptr;
 bool g_keys[256];
 std::mutex g_keys_mutex;
 bool g_closed = false;
-yougame::parity::OverlayKey g_overlay_key;   // window thread only
+yougame::shortcuts::Keys g_shortcut_keys;   // protected by g_keys_mutex
+auto& g_overlay_key = g_shortcut_keys.menu();   // window thread's scripted taps
 int g_client_w = 1280, g_client_h = 960;
 ResizeCallback g_on_resize;
 DpiCallback g_on_dpi;
@@ -110,6 +114,31 @@ int g_ui_agent_step = -1;   // protected by g_ui_pad_mutex, alongside the snapsh
 bool g_ui_practice_chord_held[4]{};
 #ifdef _WIN32
 void raw_input(HRAWINPUT raw);
+// Caller holds g_keys_mutex. Only the window thread updates the chord machines.
+void apply_shortcuts() {
+  const auto config = yougame::shortcuts::commands.snapshot();
+  for (const char* line : g_shortcut_keys.configure(config).lines) yougame::parity::signals.emit(line);
+  if (!yougame::stdio_bridge()) return;
+  static bool logged = false;
+  static yougame::shortcuts::Config last;
+  if (logged && config == last) return;
+  logged = true;
+  last = config;
+  static constexpr const char* actions[] = {
+    "A", "B", "X", "Y", "Z", "Start", "L", "R", "DUp", "DDown", "DLeft", "DRight",
+    "CUp", "CDown", "CLeft", "CRight", "SUp", "SDown", "SLeft", "SRight", "LAnalog", "RAnalog",
+    "ModX", "ModY", "LightShield", "MidShield", "StickMod"
+  };
+  static_assert(std::size(actions) == static_cast<size_t>(BindAction::Count));
+  for (size_t i = 0; i < std::size(actions); ++i) {
+    const int vk = g_key_bindings.vk[i];
+    if (vk && (vk == config.menu.key || vk == config.chat.key))
+      log("embed: shortcut overrides keyboard action %s (key %d)", actions[i], vk);
+  }
+}
+bool shortcut_swallowed(int vk) {
+  return g_shortcut_keys.swallows(yougame::stdio_bridge(), vk);
+}
 #else
 // Linux: /dev/hidraw reports, read on hid_linux.cpp's thread, go to the same readers.
 void hidraw_start();
@@ -223,18 +252,29 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
   // the screen for the rest of the match. It comes back the moment the panel opens or focus leaves.
   // Before the ImGui handler, which would otherwise set the arrow itself.
   if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && !g_ui_capture.load() && window_focused(h)) { SetCursor(nullptr); return TRUE; }
-  // The page owns Shift+Tab in stdio mode, including repeats and release after Shift
-  // was released. Handle focus/close before ImGui can consume the notification.
+  // App shortcuts run before ImGui, bindings, Tab's practice toggle and Alt+Enter.
+  // Handle system-key messages too: Windows uses them for Alt chords.
   if (m == WM_KILLFOCUS || (m == WM_ACTIVATE && LOWORD(w) == WA_INACTIVE) ||
-      (m == WM_ACTIVATEAPP && !w) || m == WM_CLOSE || m == WM_DESTROY)
-    yougame::parity::signals.emit(g_overlay_key.cancel());
-  if ((m == WM_KEYDOWN || m == WM_KEYUP) && w == VK_TAB) {
-    const auto event = g_overlay_key.tab(yougame::stdio_bridge(), m == WM_KEYDOWN,
-        (GetKeyState(VK_SHIFT) & 0x8000) != 0, (l & (1LL << 30)) != 0);
-    yougame::parity::signals.emit(event.line);
-    if (event.swallowed) {
-      std::lock_guard<std::mutex> lock(g_keys_mutex); g_keys[VK_TAB] = false; return 0;
-    }
+      (m == WM_ACTIVATEAPP && !w) || m == WM_CLOSE || m == WM_DESTROY) {
+    std::lock_guard<std::mutex> lock(g_keys_mutex);
+    for (const char* line : g_shortcut_keys.cancel().lines) yougame::parity::signals.emit(line);
+  }
+  if (m == WM_KEYDOWN || m == WM_KEYUP || m == WM_SYSKEYDOWN || m == WM_SYSKEYUP) {
+    std::lock_guard<std::mutex> lock(g_keys_mutex);
+    apply_shortcuts();
+    const unsigned mods = ((GetKeyState(VK_SHIFT) & 0x8000) ? yougame::shortcuts::Shift : 0) |
+                          ((GetKeyState(VK_CONTROL) & 0x8000) ? yougame::shortcuts::Ctrl : 0) |
+                          ((GetKeyState(VK_MENU) & 0x8000) ? yougame::shortcuts::Alt : 0);
+    const auto event = g_shortcut_keys.window_event(g_keys, yougame::stdio_bridge(), static_cast<int>(w),
+        m == WM_KEYDOWN || m == WM_SYSKEYDOWN, m == WM_SYSKEYDOWN || m == WM_SYSKEYUP,
+        mods, (l & (1LL << 30)) != 0);
+    for (const char* line : event.lines) yougame::parity::signals.emit(line);
+    if (event.swallowed) return 0;
+  }
+  if (m == WM_CHAR || m == WM_SYSCHAR) {
+    std::lock_guard<std::mutex> lock(g_keys_mutex);
+    const int vk = static_cast<int>(MapVirtualKeyW((l >> 16) & 0xFF, MAPVK_VSC_TO_VK));
+    if (shortcut_swallowed(vk)) return 0;
   }
   // Reserve Tab before ImGui or the game's keyboard bindings see it. The edge reaches the practice
   // UI whether a text field is active or the overlay is closed.
@@ -271,7 +311,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
       const bool visible = g_embed_view.has_view ? yg_embed_view_visible(&g_embed_view) : w != 0;
       // A hidden game must not keep the keyboard. The page hides the box without a blur (its play menu,
       // a sheet, the box scrolled away) and nobody can click a hidden window to take the keys back, so
-      // they stopped reaching the page after a match (yougame-lead #33557, native-experience #33649).
+      // Keep input routed to the page after a match.
       if (!visible && GetFocus() == h) {
         SetLastError(0);
         const HWND rc = SetFocus(GetParent(h));
@@ -403,6 +443,8 @@ bool window_focused(HWND) { return linux_compat::window_focused(); }
 }  // namespace
 
 #ifdef _WIN32
+void window_prefer_vulkan(bool) {}   // a Win32 window takes any renderer
+
 void* window_create(int w, int h, const wchar_t* title, bool visible, bool flip) {
   if (yougame::embed_toplevel()) {
     g_toplevel_rect = false;
@@ -452,6 +494,7 @@ void* window_create(int w, int h, const wchar_t* title, bool visible, bool flip)
   g_hwnd = CreateWindowExW(style.exstyle, wc.lpszClassName, boxed ? kBoxTitle : title, style.style, CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top, nullptr, nullptr, inst, nullptr);
   if (!g_hwnd) die("cannot create native window");
+  { std::lock_guard<std::mutex> lock(g_keys_mutex); apply_shortcuts(); }
   yougame::embed_window_ready(reinterpret_cast<uintptr_t>(g_hwnd));
   if (boxed) {
     HWND window = g_hwnd;
@@ -679,11 +722,19 @@ bool window_take_escape() { return g_escape_press.exchange(false); }
 const char* window_menu_key() { return yougame::stdio_bridge() ? yougame::parity::kMenuHint : "Esc"; }
 
 void window_destroy() {
-  yougame::parity::signals.emit(g_overlay_key.cancel());
+  {
+    std::lock_guard<std::mutex> lock(g_keys_mutex);
+    for (const char* line : g_shortcut_keys.cancel().lines) yougame::parity::signals.emit(line);
+  }
   if (g_hwnd) { DestroyWindow(g_hwnd); g_hwnd = nullptr; }
 }
 
 void window_pump() {
+  if (yougame::stdio_bridge() && yougame::shortcuts::commands.take_settings()) g_escape_press.store(true);
+  {
+    std::lock_guard<std::mutex> lock(g_keys_mutex);
+    apply_shortcuts();
+  }
   if (uint64_t want = g_pending_client_size.exchange(0))
     apply_client_size((int)(want >> 32), (int)(want & 0xFFFFFFFFu));
   MSG msg;
@@ -1033,7 +1084,11 @@ bool input_poll_capture(CaptureDevice& device, int& value, int& device_index) {
     const bool want_keyboard = g_capture_want == CaptureDevice::None || g_capture_want == CaptureDevice::Keyboard;
     for (int vk = 0; vk < 256 && want_keyboard; ++vk) {
       if (vk == VK_ESCAPE) continue;
-      if (g_keys[vk] && !g_capture_key_baseline[vk]) {
+      if (g_keys[vk] && !g_capture_key_baseline[vk]
+#ifdef _WIN32
+          && !shortcut_swallowed(vk)
+#endif
+          ) {
         g_capturing.store(false); device = CaptureDevice::Keyboard; value = vk; device_index = 0; return true;
       }
     }
@@ -1545,6 +1600,9 @@ static void read_devices(PadState out[4], InputDebugSnapshot& debug, bool side_e
     auto key = [&](int vk) {
       vk &= 0xFF;
       if (!focused) return false;
+#ifdef _WIN32
+      if (shortcut_swallowed(vk)) return false;
+#endif
       if (live && vk >= 8 && vk != VK_TAB) return (GetAsyncKeyState(vk) & 0x8000) != 0;
       return g_keys[vk];
     };
@@ -1763,8 +1821,13 @@ void input_poll(PadState out[4]) {
         uint16_t menu_buttons = raw_buttons;
         yougame::parity::signals.emit(g_overlay_pad.poll(yougame::stdio_bridge(), i,
             pads[i].err == 0, menu_buttons, menu_now, g_ui_settings_chord_held[i]));
-        if (yougame::active() && !opened_here && !g_ui_capture.load())
-          yougame::friends::events.poll_pad(i, pads[i].err == 0 && invite_focused, menu_buttons);
+        if (yougame::active() && !opened_here && !g_ui_capture.load()) {
+          if (yougame::console::entry.poll(i, pads[i].err == 0 && invite_focused, menu_buttons)) {
+            const auto err = pads[i].err;
+            pads[i] = {}; pads[i].err = err;
+            menu_buttons = 0;
+          } else yougame::friends::events.poll_pad(i, pads[i].err == 0 && invite_focused, menu_buttons);
+        }
         if (!(menu_buttons & 0x1000)) pads[i].button &= static_cast<uint16_t>(~0x1000);
         toggle_settings |= opened_here;
         if (opened_here) g_settings_controller_port.store(i, std::memory_order_release);
@@ -1874,6 +1937,18 @@ void input_read_devices(PadState out[4]) {
   InputDebugSnapshot debug{};
   std::lock_guard<std::mutex> devices(g_devices_mutex);
   read_devices(out, debug, false);
+}
+
+void input_read_console_devices(PadState out[4]) {
+  InputDebugSnapshot debug{};
+  std::lock_guard<std::mutex> devices(g_devices_mutex);
+  for (int i = 0; i < 4; ++i) { out[i] = {}; out[i].err = -1; }
+  read_devices(out, debug, false);
+  bool controller = false;
+  for (int i = 0; i < 4; ++i)
+    controller |= out[i].err == 0 && debug.feeding[i].kind != DeviceKind::Keyboard;
+  if (controller) for (int i = 0; i < 4; ++i)
+    if (debug.feeding[i].kind == DeviceKind::Keyboard) { out[i] = {}; out[i].err = -1; }
 }
 
 bool input_script_active() {
@@ -2024,7 +2099,13 @@ void input_debug_snapshot(InputDebugSnapshot& snapshot) {
   PadState kb{}; kb.err = 0;
   {
     std::lock_guard<std::mutex> lock(g_keys_mutex);
-    auto key = [](int vk) { return g_keys[vk & 0xFF]; };
+    auto key = [](int vk) {
+      vk &= 0xFF;
+#ifdef _WIN32
+      if (shortcut_swallowed(vk)) return false;
+#endif
+      return g_keys[vk];
+    };
     snapshot.keyboard_actions = keyboard_apply_bindings(kb, key, g_box_keyboard[1]);
   }
 

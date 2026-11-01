@@ -1,7 +1,8 @@
-﻿// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include "test_env.h"
 #include "pc_settings.h"
 #include "settings_imgui_input.h"
+#include "settings_page_navigation.h"
 #ifdef __APPLE__
 #include "../../mac/platform_paths.h"
 #endif
@@ -28,6 +29,7 @@
 #include "ui_sources/gd_melee/motion.h"
 #include "radial_navigation.h"
 #include "gx_backend.h"
+#include "gx_vulkan.h"
 #include "gx_shader.h"
 #include "gx_d3d12.h"
 #ifdef MELEE_NO_SLIPPI
@@ -53,9 +55,15 @@
 #include "yougame_link.h"
 #include "yougame_parity.h"
 #include "yougame_friends.h"
+#include "yougame_console_entry.h"
 #include <chrono>
 #include "yougame_mode_policy.h"
+#include "yougame_update.h"
+#ifdef YOUGAME_AGENT_TEST_HOOK
+#include "yougame_agent_test.h"
+#endif
 #include "yougame_display_defaults.h"
+#include "yougame_blend.h"
 #include "hid_pad.h"
 #include "phob_menu.h"
 #include "updater.h"
@@ -1065,22 +1073,22 @@ static bool gecko_add_code_button() {
       static char add_name[64] = "";
       static char add_body[32768] = "";   // room for the longest codes going around (a few hundred lines)
       static std::string add_error;
-      if (ImGui::Button("+ Add Gecko code")) { add_name[0] = 0; add_body[0] = 0; add_error.clear(); ImGui::OpenPopup("add_gecko_code"); }
+      if (settings_widgets::Button("+ Add Gecko code")) { add_name[0] = 0; add_body[0] = 0; add_error.clear(); ImGui::OpenPopup("add_gecko_code"); }
       if (ImGui::BeginPopup("add_gecko_code")) {
         ImGui::TextUnformatted("Name");
         ImGui::SetNextItemWidth(300.0f);
         if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
-        ImGui::InputText("##gecko_name", add_name, sizeof add_name);
+        settings_widgets::InputText("##gecko_name", add_name, sizeof add_name);
         ImGui::TextUnformatted("Code lines: paste them here (XXXXXXXX YYYYYYYY, one pair per line).");
         ImGui::TextUnformatted("If the paste starts with a $Name line, that name is used.");
-        ImGui::InputTextMultiline("##gecko_body", add_body, sizeof add_body, ImVec2(440.0f, 180.0f));
+        settings_widgets::InputTextMultiline("##gecko_body", add_body, sizeof add_body, ImVec2(440.0f, 180.0f));
         if (!add_error.empty()) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "%s", add_error.c_str());
-        if (ImGui::Button("Add")) {
+        if (settings_widgets::Button("Add")) {
           add_error = user_gecko::add(add_name, add_body);
           if (add_error.empty()) { user_gecko::save(); changed = true; ImGui::CloseCurrentPopup(); }
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        if (settings_widgets::Button("Cancel")) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
       }
   return changed;
@@ -1122,10 +1130,10 @@ static bool draw_profile_row(host::CaptureDevice kind, int index, int tab) {
   ImGui::TextUnformatted("Profile");
   ImGui::SameLine();
   ImGui::SetNextItemWidth(220.0f);
-  if (ImGui::BeginCombo("##profile", current.c_str())) {
+  if (settings_widgets::BeginCombo("##profile", current.c_str())) {
     // The defaults, always one click away. The player's own profile is left as it is, and changes
     // made after this go to a new profile, so neither layout is lost.
-    if (ImGui::Selectable("Default", is_default)) {
+    if (settings_widgets::Selectable("Default", is_default)) {
       set_bindings_of(tab, g_default_bindings[tab]);
       g_active_profile[tab] = next_free_profile_name(device);
       g_named_profile_active[tab] = false;
@@ -1133,7 +1141,7 @@ static bool draw_profile_row(host::CaptureDevice kind, int index, int tab) {
       changed = true;
     }
     for (const std::string& name : list) {
-      if (ImGui::Selectable(name.c_str(), !is_default && name == current)) {
+      if (settings_widgets::Selectable(name.c_str(), !is_default && name == current)) {
         host::ProfileBindings pb = bindings_of(tab);   // an older profile keeps the current stick keys
         // Pre-modifier profiles keep the factory defaults for the five appended actions.
         for (int i = (int)host::BindAction::ModX; i < host::kProfileActions; ++i) pb[i] = g_default_bindings[tab][i];
@@ -1162,11 +1170,11 @@ static bool draw_profile_row(host::CaptureDevice kind, int index, int tab) {
                       "Profiles belong to a kind of controller: the same number is a different button\n"
                       "on a different controller.");
   ImGui::SameLine();
-  if (ImGui::Button("New")) { std::snprintf(new_name, sizeof new_name, "%s", next_free_profile_name(device).c_str()); ImGui::OpenPopup("new_profile"); }
+  if (settings_widgets::Button("New")) { std::snprintf(new_name, sizeof new_name, "%s", next_free_profile_name(device).c_str()); ImGui::OpenPopup("new_profile"); }
   if (ImGui::IsItemHovered()) ImGui::SetTooltip("Keep these buttons as a new profile, under a name you choose.");
   ImGui::SameLine();
   ImGui::BeginDisabled(is_default || std::find(list.begin(), list.end(), current) == list.end());
-  if (ImGui::Button("Delete")) {
+  if (settings_widgets::Button("Delete")) {
     status[tab] = host::profile_delete(device, current) ? "Deleted " + current + "." : "Could not delete " + current + ".";
     set_bindings_of(tab, g_default_bindings[tab]);
     g_active_profile[tab].clear();
@@ -1180,7 +1188,7 @@ static bool draw_profile_row(host::CaptureDevice kind, int index, int tab) {
   // keyboard and XInput pads, since those are the devices whose Dolphin names map one to one.
   if (kind == host::CaptureDevice::Keyboard || kind == host::CaptureDevice::XInputPad) {
     ImGui::SameLine();
-    if (ImGui::Button("Import from Dolphin...")) {
+    if (settings_widgets::Button("Import from Dolphin...")) {
       const std::string path = host::dolphin_profile_choose_file();
       if (!path.empty()) {
         std::string name;
@@ -1222,10 +1230,10 @@ static bool draw_profile_row(host::CaptureDevice kind, int index, int tab) {
     ImGui::TextUnformatted("Name");
     ImGui::SetNextItemWidth(200.0f);
     if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
-    const bool enter = ImGui::InputText("##new_name", new_name, sizeof new_name, ImGuiInputTextFlags_EnterReturnsTrue);
+    const bool enter = settings_widgets::InputText("##new_name", new_name, sizeof new_name, ImGuiInputTextFlags_EnterReturnsTrue);
     const std::string clean = host::profile_clean_name(new_name);
     ImGui::BeginDisabled(clean.empty());
-    if ((ImGui::Button("Save") || enter) && !clean.empty()) {
+    if ((settings_widgets::Button("Save") || enter) && !clean.empty()) {
       status[tab] = host::profile_save(device, clean, bindings_of(tab)) ? "Saved " + clean + "." : "Could not save to " + host::profiles_folder() + ".";
       g_active_profile[tab] = clean;
       g_named_profile_active[tab] = true;
@@ -1914,13 +1922,13 @@ static bool draw_swpro_bind_picture(int index, uint16_t raw, ImVec2 lstick, ImVe
     const int current = action_of(bit);
     ImGui::TextDisabled("This button does");
     ImGui::Separator();
-    if (ImGui::Selectable("Nothing", current < 0)) {
+    if (settings_widgets::Selectable("Nothing", current < 0)) {
       for (int i = 0; i < (int)A::Count; ++i) if (!host::is_cstick_action(i) && bind.mask[i] == bit) bind.mask[i] = 0;
       changed = true;
     }
     for (int i = 0; i < (int)A::Count; ++i) {
       if (host::is_cstick_action(i)) continue;
-      if (ImGui::Selectable(kActionTitles[i], i == current)) {
+      if (settings_widgets::Selectable(kActionTitles[i], i == current)) {
         // One button per Melee button: this button takes the action, and stops doing any other.
         for (int j = 0; j < (int)A::Count; ++j) if (!host::is_cstick_action(j) && bind.mask[j] == bit) bind.mask[j] = 0;
         bind.mask[i] = bit;
@@ -1937,13 +1945,16 @@ static bool draw_swpro_bind_picture(int index, uint16_t raw, ImVec2 lstick, ImVe
 // red flash players already know from the Gecko code. What is left here is the notice that says
 // the automatic press is switched off because this is a matchmaking mode.
 static void draw_lcancel_overlays() {
-  // Ranked always shows its rule; other matchmaking modes warn when the saved assist is on.
-  if ((lcancel::automatic_enabled() || lcancel::automatic_setting_locked()) && lcancel::online_session_pending()) {
+  // Every matchmaking mode, Ranked included, warns only when the saved assist is on: a player who
+  // never turned it on gains nothing from the notice (10-31: it sat over Ranked setup's game boxes).
+  if (lcancel::automatic_enabled() && lcancel::online_session_pending()) {
     if (const char* mode = lcancel::auto_suppressed_mode()) {
       std::string lower = mode;
       for (char& c : lower) c = (char)std::tolower((unsigned char)c);
       const OverlayBounds bounds = overlay_bounds();
-      ImGui::SetNextWindowPos(ImVec2((bounds.left + bounds.right) * 0.5f, bounds.top + 10), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+      // Left of center: the top-center band holds Ranked setup's game boxes, the top-left corner the
+      // FPS counter and the top-right the YouGame menu hint.
+      ImGui::SetNextWindowPos(ImVec2(bounds.left + (bounds.right - bounds.left) * 0.28f, bounds.top + 10), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
       ImGui::SetNextWindowBgAlpha(0.75f);
       ImGui::Begin("LCancelModeNotice", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                                                      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
@@ -2144,7 +2155,8 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "contrast") options.contrast = std::clamp(std::stof(value), 0.5f, 1.5f);
       else if (key == "vibrance") options.vibrance = std::clamp(std::stof(value), 0.0f, 2.0f);
       else if (key == "anisotropy") { int a = std::stoi(value); if (a == 1 || a == 2 || a == 4 || a == 8 || a == 16) options.anisotropy = a; }
-      else if (key == "ssaa") { int a = std::stoi(value); if (a == 1 || a == 2) options.ssaa = a; }
+      else if (key == "ssaa") { int a = std::stoi(value); if (a >= 1 && a <= 4) options.ssaa = a; }
+      else if (key == "msaa") { int a = std::stoi(value); if (a == 1 || a == 2 || a == 4 || a == 8) options.msaa = a; }
       else if (key == "subframe") options.subframe = value == "0" ? SubFrameMode::Off : value == "2" ? SubFrameMode::AuthoredInterpolate : SubFrameMode::Authored;
       else if (key == "onlineframeprotection") options.online_frame_protection = value == "1";
       else if (key == "music") slippi::jukebox::set_user_volume(std::stoi(value));
@@ -2176,7 +2188,9 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "early_inputs") options.early_inputs = value == "1";
       else if (key == "performance") options.performance_overlay = value == "1";
       else if (key == "showfps") { options.show_fps = value == "1"; showfps_seen = true; }
-      else if (key == "showfps_yougame") saved_showfps_yougame = value == "1";
+      // showfps_yougame2: builds before 10-31 saved showfps_yougame 1 on every save (the old default),
+      // so a new key lets every player start from today's default (off; on for agent runs) once.
+      else if (key == "showfps_yougame2") saved_showfps_yougame = value == "1";
       else if (key == "showvram") options.show_vram = value == "1";
       else if (key == "showping") options.show_ping = value == "1";
       else if (key == "netoverlay") net_overlay::set_enabled(value == "1");
@@ -2341,7 +2355,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "lowspec_prev_backend") options.low_spec_previous.api = value == "d3d11" ? RenderApi::D3D11 : RenderApi::D3D12;
       else if (key == "lowspec_prev_fps") { double rate = std::stod(value); if (rate == -1 || rate == 0 || rate >= 30) options.low_spec_previous.fps_cap = std::min(rate, 2000.0); }
       else if (key == "lowspec_prev_scale") { int n = std::stoi(value); if (n >= 0 && n <= 8) options.low_spec_previous.efb_scale = n; }
-      else if (key == "lowspec_prev_ssaa") { int n = std::stoi(value); if (n == 1 || n == 2) options.low_spec_previous.ssaa = n; }
+      else if (key == "lowspec_prev_ssaa") { int n = std::stoi(value); if (n >= 1 && n <= 4) options.low_spec_previous.ssaa = n; }
       else if (key == "lowspec_prev_anisotropy") { int n = std::stoi(value); if (n == 1 || n == 2 || n == 4 || n == 8 || n == 16) options.low_spec_previous.anisotropy = n; }
       else if (key == "lowspec_prev_effects") { int n = std::stoi(value); if (n >= 0 && n <= 3) options.low_spec_previous.effects_level = n; }
       else if (key == "lowspec_prev_dlss") { int n = std::stoi(value); if (n >= 0 && n <= 10) options.low_spec_previous.dlss_mode = n; }
@@ -2356,7 +2370,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       // 20XX Hack Pack choices (MU_HP_SET_*): playlists, stage variants and page, its menu's switches.
       else if (key == "hp_settings") source_port::hackpack::settings_parse(value);
       else if (key == "discord_app_id") { if (value.find_first_not_of("0123456789") == std::string::npos && value.size() <= 24) options.discord_app_id = value; }
-      else if (key == "backend") options.api = value == "d3d11" ? RenderApi::D3D11 : RenderApi::D3D12;
+      else if (key == "backend") options.api = value == "d3d11" ? RenderApi::D3D11 : value == "vulkan" ? RenderApi::Vulkan : RenderApi::D3D12;
       else if (key == "volume") { volume = std::clamp(std::stoi(value), 0, 100); g_volume = volume; }
       else if (key.rfind("key_", 0) == 0) {
         for (int i = 0; i < (int)host::BindAction::Count; ++i)
@@ -2459,8 +2473,9 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   options.vsync = yougame::display_defaults::vsync(g_display_keys.yougame, kWindows, options.vsync, saved_vsync_yougame);
   options.show_fps = yougame::display_defaults::show_fps(g_display_keys.yougame, options.show_fps, saved_showfps_yougame);
   if (g_display_keys.yougame)
-    host::log("settings: vsync %s%s, fps counter %s (YouGame)", options.vsync ? "on" : "off",
-              g_display_keys.own_vsync && saved_vsync_yougame < 0 ? " (YouGame default)" : "", options.show_fps ? "on" : "off");
+    host::log("settings: vsync %s%s, fps counter %s (%s)", options.vsync ? "on" : "off",
+              g_display_keys.own_vsync && saved_vsync_yougame < 0 ? " (YouGame default)" : "", options.show_fps ? "on" : "off",
+              yougame::display_defaults::fps_source(saved_showfps_yougame));
   // The old Ultra preset (4x supersampling under DLAA) becomes the new one (DLAA alone); see the
   // presets. Only that exact combination is changed.
   if (options.efb_scale == 0 && options.ssaa == 2 && options.anisotropy == 16 && options.dlss_mode == 1) options.ssaa = 1;
@@ -2688,7 +2703,7 @@ static void restart_now_button(const char* id) {
   if (g_settings_standalone) return;
   char label[96];
   std::snprintf(label, sizeof label, "Restart now##%s", id);
-  if (ImGui::Button(label)) g_settings_restart_asked = true;
+  if (settings_widgets::Button(label)) g_settings_restart_asked = true;
 }
 
 static void settings_gd_chrome(ImVec2 origin, float scale, const char* title = "SETTINGS") {
@@ -3223,7 +3238,7 @@ static bool settings_nav_tile(int index, bool selected, int overlay_style, ImVec
                                     ImVec4(0.40f, 0.27f, 0.62f, 1));
   ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.68f, 0.47f, 0.90f, 1));
   ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, dashboard ? 14.0f : 3.0f);
-  bool clicked = ImGui::Button("##category", size);
+  bool clicked = settings_widgets::Button("##category", size);
   if (selected) ImGui::SetItemDefaultFocus();
   const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
   ImDrawList* draw = ImGui::GetWindowDrawList();
@@ -3267,6 +3282,8 @@ void settings_context_create(void* window, bool open_at_startup) {
   (void)open_at_startup;
   IMGUI_CHECKVERSION(); ImGui::CreateContext();
   auto& io = ImGui::GetIO(); io.IniFilename = nullptr;
+  // The duplicate-ID tooltip offers a debugger break; without a debugger that click crashed the game.
+  io.ConfigDebugHighlightIdConflicts = false; io.ConfigDebugHighlightIdConflictsShowItemPicker = false;
   g_settings_old_font = io.Fonts->AddFontDefault();
 #ifdef _WIN32
   if (GetFileAttributesW(L"C:\\Windows\\Fonts\\segoeui.ttf") != INVALID_FILE_ATTRIBUTES)
@@ -3324,7 +3341,8 @@ void settings_context_create(void* window, bool open_at_startup) {
     g_input_overlay_style = legacy;
   }
 #ifndef _WIN32
-  ImGui_ImplSDL2_InitForOpenGL(static_cast<SDL_Window*>(window), SDL_GL_GetCurrentContext());
+  if (SDL_GetWindowFlags(static_cast<SDL_Window*>(window)) & SDL_WINDOW_VULKAN) ImGui_ImplSDL2_InitForVulkan(static_cast<SDL_Window*>(window));
+  else ImGui_ImplSDL2_InitForOpenGL(static_cast<SDL_Window*>(window), SDL_GL_GetCurrentContext());
   ImGui_ImplSDL2_SetGamepadMode(ImGui_ImplSDL2_GamepadMode_Manual, nullptr, 0);
   // The window code decides when the pointer shows (window_sdl.inl show_cursor). Without this the
   // SDL backend turned it back on every frame, so it never hid on Linux.
@@ -3499,7 +3517,7 @@ void heading(const char* title, const char* subtitle = nullptr) {
 
 // One option of an odds group: name, a weight bar 0..100, and its share of the group.
 bool odds_row(const char* label, uint8_t* weight, int total) {
-  ImGui::PushID(label);
+  ImGui::PushID(weight);  // two options of a group can share a name
   const float avail = ImGui::GetContentRegionAvail().x;
   const float name_w = std::min(190.0f, avail * 0.38f);
   ImGui::AlignTextToFramePadding();
@@ -3513,7 +3531,8 @@ bool odds_row(const char* label, uint8_t* weight, int total) {
   ImGui::SetNextItemWidth(std::max(80.0f, avail - name_w - 64.0f));
   // The bar's fill shows the share at a glance.
   const ImVec2 bar = ImGui::GetCursorScreenPos();
-  const bool changed = ImGui::SliderInt("##w", &v, 0, 100, v == 0 ? "never" : "%d");
+  const bool changed = settings_widgets::SliderInt("##w", &v, 0, 100, v == 0 ? "never" : "%d");
+  settings_page::label_item(label);
   const ImVec2 bmin = ImGui::GetItemRectMin(), bmax = ImGui::GetItemRectMax();
   (void)bar;
   if (share > 0)
@@ -3546,7 +3565,8 @@ bool percent_row(const char* label, uint8_t* value, const char* tip) {
   int v = *value;
   ImGui::PushStyleColor(ImGuiCol_SliderGrab, kPinkV);
   ImGui::SetNextItemWidth(std::max(80.0f, avail - name_w - 64.0f));
-  const bool changed = ImGui::SliderInt("##v", &v, 0, 100, "%d%%");
+  const bool changed = settings_widgets::SliderInt("##v", &v, 0, 100, "%d%%");
+  settings_page::label_item(label);
   ImGui::PopStyleColor();
   if (tip && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
   if (changed) *value = (uint8_t)v;
@@ -3565,7 +3585,8 @@ bool number_row(const char* label, uint8_t* value, int low, int high, const char
   int v = *value;
   ImGui::PushStyleColor(ImGuiCol_SliderGrab, kPinkV);
   ImGui::SetNextItemWidth(std::max(80.0f, avail - name_w - 64.0f));
-  const bool changed = ImGui::SliderInt("##v", &v, low, high, format);
+  const bool changed = settings_widgets::SliderInt("##v", &v, low, high, format);
+  settings_page::label_item(label);
   ImGui::PopStyleColor();
   if (tip && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
   if (changed) *value = (uint8_t)v;
@@ -3803,7 +3824,7 @@ static bool draw_practice_cpu_tabs(RenderOptions& options, int tab) {
       ImGui::PopID();
     }
     ImGui::Dummy(ImVec2(0, 6));
-    if (ImGui::Button("Reset everything to the defaults", ImVec2(-1, 34))) {
+    if (settings_widgets::Button("Reset everything to the defaults", ImVec2(-1, 34))) {
       const uint8_t tools = c.tools, enabled = c.enabled;
       mu_pc_defaults(&c);
       c.tools = tools;
@@ -3821,10 +3842,10 @@ static bool draw_practice_cpu_tabs(RenderOptions& options, int tab) {
       if (have) ImGui::TextDisabled("saved"); else ImGui::TextDisabled("empty");
       const float bw = 110.0f;
       ImGui::SameLine(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - 2 * bw - 22.0f);
-      if (ImGui::Button("Save here", ImVec2(bw, 30))) { practice_cpu::set_slot(i, c); changed = true; }
+      if (settings_widgets::Button("Save here", ImVec2(bw, 30))) { practice_cpu::set_slot(i, c); changed = true; }
       ImGui::SameLine();
       ImGui::BeginDisabled(!have);
-      if (ImGui::Button("Load", ImVec2(bw, 30))) {
+      if (settings_widgets::Button("Load", ImVec2(bw, 30))) {
         const uint8_t tools = c.tools;
         c = saved;
         c.tools = tools;
@@ -4039,7 +4060,7 @@ static void draw_native_practice(SettingsState& state, RenderOptions& options,
   if (ImGui::BeginTabBar("##practice_tabs", ImGuiTabBarFlags_FittingPolicyScroll)) {
     for (int i = 0; i < kTabCount; ++i) {
       const ImGuiTabItemFlags f = g_tab_request == i ? ImGuiTabItemFlags_SetSelected : 0;
-      if (ImGui::BeginTabItem(kTabs[i], nullptr, f)) { g_tab = i; ImGui::EndTabItem(); }
+      if (settings_widgets::BeginTabItem(kTabs[i], nullptr, f)) { g_tab = i; ImGui::EndTabItem(); }
     }
     g_tab_request = -1;
     ImGui::EndTabBar();
@@ -4062,10 +4083,10 @@ static void draw_native_practice(SettingsState& state, RenderOptions& options,
   practice_ui::heading("Search while you practice", "The match starts as soon as one is found.");
 
   ImGui::BeginDisabled(!practice.can_start);
-  const bool start_unranked = ImGui::Button("Unranked", ImVec2(126, 32));
+  const bool start_unranked = settings_widgets::Button("Unranked", ImVec2(126, 32));
   ImGui::EndDisabled();
   ImGui::SameLine();
-  if (ImGui::Button("Direct", ImVec2(126, 32))) state.practice_focus_code = true;
+  if (settings_widgets::Button("Direct", ImVec2(126, 32))) state.practice_focus_code = true;
   ImGui::TextDisabled("Unranked starts immediately; Direct uses a code.");
   ImGui::Separator();
 
@@ -4086,7 +4107,7 @@ static void draw_native_practice(SettingsState& state, RenderOptions& options,
     ImGui::Text("Search time: %s", elapsed.c_str());
     if (!practice.opponent.empty()) ImGui::Text("Opponent: %s", practice.opponent.c_str());
     ImGui::TextWrapped("Close this popup with Tab to keep practicing while the search continues.");
-    if (ImGui::Button("Cancel search", ImVec2(-1, 36))) {
+    if (settings_widgets::Button("Cancel search", ImVec2(-1, 36))) {
       slippi::native_practice::submit_cancel();
       state.practice_open = false;
       state.practice_release_capture = true;
@@ -4097,14 +4118,14 @@ static void draw_native_practice(SettingsState& state, RenderOptions& options,
       ImGui::SetKeyboardFocusHere();
       state.practice_focus_code = false;
     }
-    const bool enter = ImGui::InputText("##direct_code", state.practice_code,
+    const bool enter = settings_widgets::InputText("##direct_code", state.practice_code,
                                         sizeof state.practice_code,
                                         ImGuiInputTextFlags_CharsUppercase |
                                         ImGuiInputTextFlags_CharsNoBlank |
                                         ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::TextDisabled("Type or paste a code such as NAME#123.");
     ImGui::BeginDisabled(!practice.can_start);
-    const bool start = ImGui::Button("Search Direct", ImVec2(-1, 36)) || enter;
+    const bool start = settings_widgets::Button("Search Direct", ImVec2(-1, 36)) || enter;
     ImGui::EndDisabled();
     if (start && practice.can_start) {
       std::string code, error;
@@ -4172,8 +4193,8 @@ static bool write_settings_file(const SettingsState& state, const RenderOptions&
        << "\naudio_mode " << options.audio_mode << "\naudio_buffer_ms " << options.audio_buffer_ms << "\naudio_device " << options.audio_device
        << "\naudio_asio_driver " << options.audio_asio_driver << "\naudio_asio_buffer " << options.audio_asio_buffer
        << "\nshowfps " << (g_display_keys.yougame ? g_display_keys.show_fps : options.show_fps)
-       << (g_display_keys.yougame ? std::string("\nshowfps_yougame ") + (options.show_fps ? "1" : "0")
-           : g_display_keys.saved_showfps_yougame >= 0 ? "\nshowfps_yougame " + std::to_string(g_display_keys.saved_showfps_yougame) : std::string())
+       << (g_display_keys.yougame ? std::string("\nshowfps_yougame2 ") + (options.show_fps ? "1" : "0")
+           : g_display_keys.saved_showfps_yougame >= 0 ? "\nshowfps_yougame2 " + std::to_string(g_display_keys.saved_showfps_yougame) : std::string())
        << "\nshowvram " << (options.show_vram ? 1 : 0) << "\nshowping " << options.show_ping
        << "\nnetoverlay " << (net_overlay::enabled() ? 1 : 0)
        << "\ndlss " << options.dlss_mode << "\nframegen " << options.frame_generation_mode
@@ -4195,10 +4216,10 @@ static bool write_settings_file(const SettingsState& state, const RenderOptions&
        << "\ndlss5reconstruction " << options.dlss5_tuning.reconstruction
        << "\ndlss5defaults 2"
 #endif
-       << "\nbackend " << (options.api == RenderApi::D3D11 ? "d3d11" : "d3d12")
+       << "\nbackend " << (options.api == RenderApi::D3D11 ? "d3d11" : options.api == RenderApi::Vulkan ? "vulkan" : "d3d12")
        << "\ncrt_filter " << options.crt_filter << "\ncrt_curve " << options.crt_curve << "\nborderart " << options.border_art << "\nborderedge " << options.border_edge << "\nshaderpreset " << options.shader_preset <<"\nsharpness " << options.sharpness << "\nssao " << options.screen_space_ao << "\nbrightness " << options.brightness
        << "\ncontrast " << options.contrast << "\nvibrance " << options.vibrance
-       << "\nanisotropy " << options.anisotropy << "\nssaa " << options.ssaa
+       << "\nanisotropy " << options.anisotropy << "\nssaa " << options.ssaa << "\nmsaa " << options.msaa
        << "\nsubframe " << (options.subframe == SubFrameMode::Off ? 0 : options.subframe == SubFrameMode::AuthoredInterpolate ? 2 : 1) << "\nmusic " << slippi::jukebox::user_volume()
        << "\nonlineframeprotection " << (options.online_frame_protection ? 1 : 0)
        << "\nmusicpacks " << (slippi::jukebox::music_packs_enabled() ? 1 : 0)
@@ -4376,7 +4397,9 @@ static bool write_settings_file(const SettingsState& state, const RenderOptions&
     if (g_named_profile_active[t] && !g_active_profile[t].empty()) file << "\nactiveprofile" << t << " " << g_active_profile[t];
   file << '\n';
   file.close();
-  return file.good() && MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+  const bool saved = file.good() && MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+  host::log(saved ? "settings: file saved" : "settings: file save failed");
+  return saved;
 }
 
 bool save_pc_settings(const RenderOptions& options, int volume) {
@@ -4453,12 +4476,12 @@ static bool settings_lcancel_flash(RenderOptions& options) {
   const bool locked = have_te && (options.te_options2 & kTeLockSettings) != 0;
   int mode = mu_lcancel_flash_mode(options.te_options2, lcancel::flash_mode());
   bool changed = false;
-  if (ImGui::BeginCombo("L-cancel flash", modes[mode])) {
+  if (settings_widgets::BeginCombo("L-cancel flash", modes[mode])) {
     for (int i : {0, 1, 5, 6, 2, 3, 4}) {
       const bool te_mode = i >= MU_LCFLASH_TE_MISSED && i <= MU_LCFLASH_TE_BOTH;
       const bool unavailable = te_mode && !have_te;
       ImGui::BeginDisabled(unavailable || (te_mode && locked));
-      if (ImGui::Selectable(modes[i], i == mode)) {
+      if (settings_widgets::Selectable(modes[i], i == mode)) {
         mode = i;
         options.te_options2 = mu_lcancel_with_flash_mode(options.te_options2, mode);
         RenderOptions::live_te_options2() = options.te_options2;
@@ -4520,7 +4543,7 @@ static bool settings_advanced_group(int which, bool* changed) {
     }
   }
   ImGui::SetNextItemOpen(g_advanced_open[which], ImGuiCond_Always);
-  const bool open = ImGui::CollapsingHeader(which == 0 ? "Advanced##video_advanced" : "Advanced##overlays_advanced");
+  const bool open = settings_widgets::CollapsingHeader(which == 0 ? "Advanced##video_advanced" : "Advanced##overlays_advanced");
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip("%s\nClosed until you open it; it stays open after that.",
                       which == 0 ? "Diagnostics, texture dumping for pack makers, and DLSS 5 internals."
@@ -4599,7 +4622,8 @@ static bool binding_press_at_slider(host::CaptureDevice kind, int index, int act
   if (!level || binding_level_kind(kind, index, action) != 1) return false;
   int shown = *level ? (*level * 100 + 127) / 255 : 0;
   ImGui::SetNextItemWidth(width);
-  const bool changed = ImGui::SliderInt("##press_at", &shown, 0, 99, shown ? "Press at %d%%" : "Press at default");
+  const bool changed = settings_widgets::SliderInt("##press_at", &shown, 0, 99, shown ? "Press at %d%%" : "Press at default");
+  settings_page::label_item((std::string(kActionTitles[action]) + " press depth").c_str());
   if (changed) {
     int value = shown ? std::clamp((shown * 255 + 50) / 100, 1, 254) : 0;
     // The PlayStation reader reports nothing below its own press point.
@@ -4623,14 +4647,14 @@ static void game_mods_panel(const RenderOptions& options) {
   ImGui::TextUnformatted("Game mods");
   ImGui::TextWrapped("Put your mod files in the Mods folder. Recognized packs turn on once; your On/Off choices are saved. "
                      "To get, update or remove a pack, use Mods in the launcher.");
-  if (ImGui::Button("Open Mods folder")) mods::open_mods_folder();
+  if (settings_widgets::Button("Open Mods folder")) mods::open_mods_folder();
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip("This page switches packs on or off and sets 20XX TE's options.\n"
                       "The launcher's Mods window (Play page) gets, updates and removes them.");
   ImGui::SameLine();
   ImGui::BeginDisabled(view.scanning || view.importing);
-  if (ImGui::Button("Scan again")) mods::rescan_async();
-  if (ImGui::Button("Add a mod file...")) {
+  if (settings_widgets::Button("Scan again")) mods::rescan_async();
+  if (settings_widgets::Button("Add a mod file...")) {
     const std::string picked = mods::choose_mod_file();
     if (!picked.empty()) mods::import_async(std::filesystem::u8path(picked));
   }
@@ -4687,7 +4711,7 @@ static void game_mods_panel(const RenderOptions& options) {
     ImGui::Separator();
     ImGui::TextDisabled("%s", name);
     ImGui::TextDisabled("Put the file in the Mods folder.");
-    if (ImGui::SmallButton("Open official page")) mods::open_official_page(kind);
+    if (settings_widgets::SmallButton("Open official page")) mods::open_official_page(kind);
     ImGui::PopID();
   };
   if (!have_te) missing(mods::Kind::Te, "20XX Tournament Edition");
@@ -4698,6 +4722,8 @@ static void game_mods_panel(const RenderOptions& options) {
 }
 
 bool settings_frame(SettingsState& state, RenderOptions& options) {
+  state.page_navigation.active = false;
+  settings_page::observer = nullptr;
 #ifdef YOUGAME_AGENT_TEST_HOOK
   ImGuiID agent_menu_focus = 0;
   const char* agent_menu_label = "none";
@@ -4723,7 +4749,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   // through HasGamepad when navigation is closed, disconnected or waiting for neutral.
   {
     auto& io = ImGui::GetIO();
-    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+    settings_input::navigation(io, state.open || state.menu_open || practice_nav || state.fill_window);
     io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
   }
 #ifdef _WIN32
@@ -4773,7 +4799,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   if (!state.practice_release_capture) state.practice_release_seconds = 0.0f;
   const int shortcut_port = host::window_take_settings_controller_port();
   if (shortcut_port >= 0 && shortcut_port < 4) state.settings_controller_port = shortcut_port;
-  const bool nav_active = state.open || state.menu_open || practice_nav;
+  const bool nav_active = state.open || state.menu_open || practice_nav || state.fill_window;
   // The panel follows the pad that was last picked up, not the first one that reads as active.
   const int followed = host::settings_nav::follow(nav_pads, state.settings_pad_was_at_rest.data(),
                                                   state.settings_controller_port, nav_active && !practice_nav);
@@ -4807,6 +4833,14 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                 have_pad ? pad.stick_x : 0, have_pad ? pad.stick_y : 0, have_pad ? pad.sub_x : 0, have_pad ? pad.sub_y : 0);
     }
   }
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  if (const int socket = yougame::agent_test::phob_menu_socket.exchange(0)) {
+    state.open = true;
+    state.active_tab = 3; // Controls
+    state.settings_controller_port = socket - 1;
+    phob_native_request(socket - 1);
+  }
+#endif
   // Test runs (MELEE_TEST_PHOB): the PhobGCC menu opens on adapter socket 1 with the panel.
   {
     static bool phob_test_opened = false;
@@ -4820,7 +4854,6 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       io.AddKeyEvent(k, false);
   } else if (have_pad && nav_active && state.practice_pad_armed) {
     auto& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
     io.AddKeyEvent(ImGuiKey_GamepadStart, (pad.button & 0x1000) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadBack, (pad.button & 0x10) != 0);
@@ -4832,11 +4865,12 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     io.AddKeyEvent(ImGuiKey_GamepadDpadRight, (pad.button & 2) || pad.stick_x > 40);
   }
   ImGui::NewFrame();
-  if (yougame::active()) {
+  if (yougame::active() || slippi::online::online_status_visible()) {
     const auto now = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     const auto toast = yougame::friends::events.toast(now);
-    const auto status = yougame::status_line();
+    const auto console_status = yougame::console::entry.status();
+    const auto status = console_status.empty() ? yougame::status_line() : console_status;
     const auto screen = ImGui::GetIO().DisplaySize;
     const auto passive_flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing;
@@ -4849,28 +4883,16 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::PopTextWrapPos();
       ImGui::End();
     }
-    if (!slippi::online::is_online_match() && (status == yougame::friends::kWaiting ||
-        status == yougame::friends::kJoined || status == yougame::friends::kFailed || status == yougame::friends::kVersion)) {
+    // Online menu/CSS visibility alone must not create an empty or version-only pill.
+    const bool show_status = !console_status.empty() || status == yougame::update::kMessage ||
+        status == yougame::friends::kWaiting || status == yougame::friends::kJoined ||
+        status == yougame::friends::kFailed || status == yougame::friends::kVersion ||
+        status == yougame::blend::kSearchBoth || status == yougame::blend::kSearchYouGameOnly;
+    if (!slippi::online::is_online_match() && show_status) {
       ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, screen.y - 60), ImGuiCond_Always, ImVec2(0.5f, 1));
       ImGui::Begin("##yougame_friend_waiting", nullptr, passive_flags);
       ImGui::TextUnformatted(status.c_str());
-      if (status == yougame::friends::kWaiting) ImGui::TextDisabled("Z: cancel");
-      ImGui::End();
-    }
-    if (yougame::friends::events.code_screen()) {
-      ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, screen.y - 16), ImGuiCond_Always, ImVec2(0.5f, 1));
-      ImGui::Begin("##yougame_code_friends", nullptr,
-          ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
-      ImGui::TextUnformatted("YouGame: Code / Friends");
-      ImGui::TextUnformatted(yougame::friends::kHint);
-      const auto picker_error = yougame::friends::events.picker_error();
-      if (!picker_error.empty()) ImGui::TextWrapped("%s", picker_error.c_str());
-      if (yougame::friends::events.code_empty()) {
-        if (ImGui::Button("Invite friend (Enter / START)") || ImGui::IsKeyPressed(ImGuiKey_Enter, false)) {
-          yougame::friends::events.request_host();
-        }
-      }
+      if (status == yougame::friends::kWaiting || !console_status.empty()) ImGui::TextDisabled("Z: cancel");
       ImGui::End();
     }
   }
@@ -5497,7 +5519,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       const int requested_old_tab = state.active_tab;
       if (ImGui::BeginTabBar("settings_tabs")) {
         for (int i = 0; i < 8; ++i) {
-          if (ImGui::BeginTabItem(tabs[i], nullptr, !old_tabs_initialized && requested_old_tab == i ? ImGuiTabItemFlags_SetSelected : 0)) {
+          if (settings_widgets::BeginTabItem(tabs[i], nullptr, !old_tabs_initialized && requested_old_tab == i ? ImGuiTabItemFlags_SetSelected : 0)) {
             state.active_tab = i;
             ImGui::EndTabItem();
           }
@@ -5516,7 +5538,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         ImGui::PushStyleColor(ImGuiCol_Button, selected ? ImVec4(.34f,.23f,.58f,1.0f) :
                                                         ImVec4(.10f,.18f,.29f,1.0f));
         const ImVec2 label_size=ImGui::CalcTextSize(legacy_tabs[i]);
-        if (ImGui::Button(legacy_tabs[i], ImVec2(label_size.x + 18.0f, 23.0f)))
+        if (settings_widgets::Button(legacy_tabs[i], ImVec2(label_size.x + 18.0f, 23.0f)))
           state.active_tab = i;
         ImGui::PopStyleColor();
         ImGui::PopID();
@@ -5561,18 +5583,13 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::EndChild();
       ImGui::SameLine();
     }
-    bool content_tab_changed = false;
     if (state.content_anim_tab < 0) {
       state.content_anim_tab = state.active_tab;
       state.content_anim_frame = 12.0f;
-      content_tab_changed = true;
     } else if (state.content_anim_tab != state.active_tab) {
       state.content_anim_tab = state.active_tab;
       state.content_anim_frame = 0.0f;
-      content_tab_changed = true;
     }
-    g_settings_focus_next_gd_row = content_tab_changed && options.overlay_style == 2 &&
-                                   !state.fill_window;
     constexpr float kContentTransitionFrames = 8.0f;
     state.content_anim_frame = std::min(kContentTransitionFrames,
         state.content_anim_frame + ImGui::GetIO().DeltaTime * 60.0f);
@@ -5667,8 +5684,8 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       settings_content_size.x = std::max(300.0f, window_size.x - content_x - kRadialDetailSideInset);
     }
     ImGui::BeginChild("##settings_content", settings_content_size,
-                      (radial_detail_page || wide_detail_theme) ?
-                          ImGuiChildFlags_AlwaysUseWindowPadding : ImGuiChildFlags_None,
+                      ImGuiChildFlags_NavFlattened | ((radial_detail_page || wide_detail_theme) ?
+                          ImGuiChildFlags_AlwaysUseWindowPadding : ImGuiChildFlags_None),
                       ImGuiWindowFlags_NoScrollWithMouse);
     {
       // Smooth wheel scrolling at the presented frame rate. ImGui's own wheel scroll jumps a whole
@@ -5723,6 +5740,16 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                        "%s", titles[state.active_tab]);
     ImGui::PopFont();
     ImGui::Separator();
+    }
+    const bool page_active = state.fill_window || options.overlay_style >= 5 ||
+        (options.overlay_style == 0 && state.clean_detail_open) ||
+        (options.overlay_style == 1 && state.dashboard_detail_open) ||
+        (options.overlay_style == 2 && state.gd_detail_open) ||
+        (options.overlay_style == 3 && state.radial_detail_open) ||
+        (options.overlay_style == 4 && state.wide_detail_open);
+    if (state.open && page_active) {
+      state.page_navigation.begin(state.active_tab, options.overlay_style);
+      settings_page::observer = &state.page_navigation;
     }
     if (state.active_tab == 0) {
     // One width for every combo and slider on this tab, so their labels all begin at the same x.
@@ -5791,7 +5818,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           ImGui::PushID(i);
           const bool selected=picked==i;
           if (selected) ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(.34f,.23f,.58f,1.0f));
-          if (ImGui::Button(preset_labels[i],ImVec2(82.0f,22.0f))) {
+          if (settings_widgets::Button(preset_labels[i],ImVec2(82.0f,22.0f))) {
             picked=i;
             preset_changed=true;
           }
@@ -5827,7 +5854,14 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     const char* names[] = {"Match monitor", "Unlocked", "60", "120", "144", "165", "200", "240", "360", "480"};
     int selected = -1; for (int i = 0; i < 10; ++i) if (options.fps_cap == rates[i]) selected = i;
     if (settings_combo("Frame rate", &selected, names, 10)) { options.fps_cap = rates[selected]; changed = true; }
+#ifdef _WIN32
+    const bool diagnostic_vsync_before = options.vsync;
+#endif
     changed |= settings_toggle("VSync (prevents tearing)", &options.vsync);
+#ifdef _WIN32
+    if (options.vsync != diagnostic_vsync_before)
+      host::log("present: vsync %s (settings)", options.vsync ? "on" : "off");
+#endif
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip("Prevents horizontal screen tearing; may add display latency.\n"
                         "With VSync off, tearing is possible when automatic variable-refresh detection is unavailable.");
@@ -5867,7 +5901,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       if (options.true_widescreen && !options.widescreen && options.true_aspect == TrueAspect::Custom) {
         int wh[2] = {options.true_custom_w, options.true_custom_h};
         ImGui::SetNextItemWidth(160.0f);
-        if (ImGui::InputInt2("Custom shape (W:H)", wh)) {
+        if (settings_widgets::InputInt2("Custom shape (W:H)", wh)) {
           options.true_custom_w = std::clamp(wh[0], 1, 100);
           options.true_custom_h = std::clamp(wh[1], 1, 100);
           changed = true;
@@ -5967,10 +6001,16 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     changed |= settings_combo("Internal resolution", &options.efb_scale, scales, 9);
     // DLSS (DLAA included) does its own anti-aliasing, so supersampling on top would render larger
     // for a second pass over the same edges: grey it out rather than let the two stack.
-    const char* aa[] = {"None", "4x SSAA (supersampling)"};
-    int aa_index = options.ssaa == 2 ? 1 : 0;
+    // MSAA smooths polygon edges only and costs little; SSAA renders every pixel 4, 9 or 16 times
+    // (factor 2, 3, 4 per side) and also smooths textures and effects. One choice, never both.
+    const char* aa[] = {"None", "2x MSAA (light)", "4x MSAA", "8x MSAA", "4x SSAA (supersampling)", "9x SSAA (heavier)", "16x SSAA (heaviest)"};
+    int aa_index = options.ssaa > 1 ? 2 + std::clamp(options.ssaa, 2, 4) : options.msaa >= 8 ? 3 : options.msaa >= 4 ? 2 : options.msaa >= 2 ? 1 : 0;
     if (options.dlss_mode && !dlss_picks_resolution) ImGui::BeginDisabled();
-    if (settings_combo("Anti-aliasing", &aa_index, aa, 2)) { options.ssaa = aa_index ? 2 : 1; changed = true; }
+    if (settings_combo("Anti-aliasing", &aa_index, aa, 7)) {
+      options.msaa = aa_index >= 1 && aa_index <= 3 ? 1 << aa_index : 1;
+      options.ssaa = aa_index >= 4 ? aa_index - 2 : 1;
+      changed = true;
+    }
     if (options.dlss_mode && !dlss_picks_resolution) ImGui::EndDisabled();
     if (dlss_picks_resolution) ImGui::EndDisabled();
     const char* anis[] = {"1x", "2x", "4x", "8x", "16x"};
@@ -5986,7 +6026,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // Each port's shield (and KO blast) colour: a colour wheel, the game's preset colours one click away,
     // and the port's own. "Online" is the player's own colour in online matches; Melee Unlocked opponents
     // are sent it and show it, Slippi Dolphin opponents keep the port colour. Display only.
-    if (ImGui::CollapsingHeader("Shield colours##shields")) {
+    if (settings_widgets::CollapsingHeader("Shield colours##shields")) {
       ImGui::Indent(8.0f);
       auto shield_row = [&](const char* label, uint32_t* value, int port_colour) {
         ImGui::PushID(label);
@@ -5994,19 +6034,19 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                                       : ((uint32_t)kShieldColorRgb[port_colour][0] << 16 | (uint32_t)kShieldColorRgb[port_colour][1] << 8 |
                                          kShieldColorRgb[port_colour][2]);
         float c[3] = {((shown >> 16) & 0xFF) / 255.0f, ((shown >> 8) & 0xFF) / 255.0f, (shown & 0xFF) / 255.0f};
-        if (ImGui::ColorEdit3(label, c, ImGuiColorEditFlags_PickerHueWheel | ImGuiColorEditFlags_DisplayRGB)) {
+        if (settings_widgets::ColorEdit3(label, c, ImGuiColorEditFlags_PickerHueWheel | ImGuiColorEditFlags_DisplayRGB)) {
           *value = 0x1000000u | ((uint32_t)(c[0] * 255 + 0.5f) << 16) | ((uint32_t)(c[1] * 255 + 0.5f) << 8) | (uint32_t)(c[2] * 255 + 0.5f);
           changed = true;
         }
         ImGui::SameLine();
         if (!*value) ImGui::TextDisabled("port colour");
-        else if (ImGui::SmallButton("Port colour")) { *value = 0; changed = true; }
+        else if (settings_widgets::SmallButton("Port colour")) { *value = 0; changed = true; }
         // The game's own presets, one click each.
         for (int i = 0; i < kShieldColorCount; ++i) {
           const uint8_t* rgb = kShieldColorRgb[i];
           if (i) ImGui::SameLine(0.0f, 3.0f);
           ImGui::PushID(i);
-          if (ImGui::ColorButton(kShieldColorNames[i], ImVec4(rgb[0] / 255.0f, rgb[1] / 255.0f, rgb[2] / 255.0f, 1.0f), 0, ImVec2(16, 16))) {
+          if (settings_widgets::ColorButton(kShieldColorNames[i], ImVec4(rgb[0] / 255.0f, rgb[1] / 255.0f, rgb[2] / 255.0f, 1.0f), 0, ImVec2(16, 16))) {
             *value = 0x1000000u | ((uint32_t)rgb[0] << 16) | ((uint32_t)rgb[1] << 8) | rgb[2];
             changed = true;
           }
@@ -6043,7 +6083,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           enable_animelee = false;
         }
       }
-      if (ImGui::CollapsingHeader("Get mod looks##official", diet.installed && anim.installed ? 0 : ImGuiTreeNodeFlags_DefaultOpen)) {
+      if (settings_widgets::CollapsingHeader("Get mod looks##official", diet.installed && anim.installed ? 0 : ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Indent(8.0f);
         struct Card { const char* name; const char* credit; const char* page; const char* size; };
         static const Card cards[2] = {
@@ -6069,7 +6109,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             if (which == 1 && animelee_new && options.native_source) restart_now_button("official_animelee");
           } else {
             ImGui::BeginDisabled(s.any_busy);
-            if (ImGui::Button("Install")) {
+            if (settings_widgets::Button("Install")) {
               const std::string disc = host::options.mod_base_iso.empty() ? host::options.iso : host::options.mod_base_iso;
               std::string tool;
 #ifdef _WIN32
@@ -6088,7 +6128,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             if (!s.message.empty()) ImGui::TextWrapped("%s", s.message.c_str());
           }
 #ifdef _WIN32
-          if (ImGui::SmallButton("Authors' page")) ShellExecuteA(nullptr, "open", card.page, nullptr, nullptr, SW_SHOWNORMAL);
+          if (settings_widgets::SmallButton("Authors' page")) ShellExecuteA(nullptr, "open", card.page, nullptr, nullptr, SW_SHOWNORMAL);
 #endif
           ImGui::PopID();
           if (which == 0) ImGui::Separator();
@@ -6099,7 +6139,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // ---- Low poly and lightweight ----
     // Every setting that trades looks for frame rate on slow PCs, in one sub-section: Look, Visual effects and
     // the Lightweight ladder up front, the exact looks and the fine controls folded under them. Open by default.
-    if (ImGui::CollapsingHeader("Low-Detail Modes##lightweight", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (settings_widgets::CollapsingHeader("Low-Detail Modes##lightweight", ImGuiTreeNodeFlags_DefaultOpen)) {
     // Hidden capture hook: scroll to this section and optionally open its list for review.
     if (const char* shot = host::test_env::getenv("MELEE_TEST_LOOK_MENU")) {
       ImGui::SetScrollHereY(0.05f);
@@ -6121,7 +6161,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       static const char* const gain[] = {"", "High", "High", "High", "High", "Modest", "Modest",
                                          "High", "High", "Very high", "Very high", "Very high", "High", "High", "High"};
       const char* preview = current < 0 ? "Custom" : current == 11 ? presets[9].name : presets[current].name;
-      if (ImGui::BeginCombo("Look", preview, ImGuiComboFlags_HeightLarge)) {
+      if (settings_widgets::BeginCombo("Look", preview, ImGuiComboFlags_HeightLarge)) {
         auto group = [&](const char* title, std::initializer_list<int> entries) {
           ImGui::Separator(); ImGui::TextDisabled("%s", title);
           for (int i : entries) {
@@ -6131,7 +6171,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             if (*gain[i]) { label += "  ("; label += gain[i]; label += " boost)"; }
             if (!available) label += " (setup required)";
             ImGui::BeginDisabled(!available);
-            if (ImGui::Selectable(label.c_str(), current == i || (i == 9 && current == 11) || (i == 5 && current == 6))) {
+            if (settings_widgets::Selectable(label.c_str(), current == i || (i == 9 && current == 11) || (i == 5 && current == 6))) {
               apply_look_preset(options, i, d3d11_available());
               set_lightweight_level(options.lightweight);
               changed = true;
@@ -6184,7 +6224,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // below it. 1 to 3 are display only and change live; 4 and 5 also hold the image settings at
     // their cheapest (the Low spec pair: what the player had is kept and given back). The hint
     // under it is the last match frame's draw count, so a player sees what each step removes.
-    if (ImGui::TreeNodeEx("Advanced lightweight levels##lightweightlevels", 0)) {
+    if (settings_widgets::TreeNodeEx("Advanced lightweight levels##lightweightlevels", 0)) {
       const char* names[kLightweightLevels] = {
           "Off", "1  Low poly fighters", "2  + No stage backgrounds", "3  + Flat shading",
           "4  + Lowest image", "5  Wireframe"};
@@ -6220,7 +6260,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // Exact looks: Diet Classic, Diet 64 and Crystal exactly as made, built once on this PC from the player's own
     // game disc and the published patch files (nothing of them ships with the game). The build runs on a worker
     // thread; the line under the button says how it went. Folded away: it is needed once.
-    if (ImGui::TreeNodeEx("Set up mod artwork (Diet and Crystal)##exactlooks", 0)) {
+    if (settings_widgets::TreeNodeEx("Set up mod artwork (Diet and Crystal)##exactlooks", 0)) {
       static std::mutex build_mutex;
       static std::string build_message;
       static std::atomic<bool> building{false};
@@ -6240,10 +6280,10 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         if (std::any_of(packs.begin(), packs.end(), [&](const auto& pack) { return pack.name == chosen && pack.built; }))
           restart_now_button("look_pack");
       }
-      ImGui::InputText("Patch folder##exactlooks", patcher_folder, sizeof patcher_folder);
+      settings_widgets::InputText("Patch folder##exactlooks", patcher_folder, sizeof patcher_folder);
 #ifdef _WIN32
       ImGui::SameLine();
-      if (ImGui::Button("Browse...##lookpatch")) {
+      if (settings_widgets::Button("Browse...##lookpatch")) {
         wchar_t path[32768]{};
         OPENFILENAMEW dialog{};
         dialog.lStructSize = sizeof dialog;
@@ -6262,7 +6302,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         ImGui::SetTooltip("The folder of the looks' patcher download (it holds the three .xdelta files).\n"
                           "Your own game disc is patched on this PC; nothing is downloaded or shipped.");
       ImGui::BeginDisabled(building.load() || !patcher_folder[0]);
-      if (ImGui::Button(building.load() ? "Preparing..." : "Prepare mod artwork")) {
+      if (settings_widgets::Button(building.load() ? "Preparing..." : "Prepare mod artwork")) {
         building = true;
         const std::string folder = patcher_folder;
         const std::string disc = host::options.mod_base_iso.empty() ? host::options.iso : host::options.mod_base_iso;
@@ -6292,7 +6332,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SetNextItemOpen(true);
       ImGui::SetScrollHereY(0.0f);
     }
-    if (ImGui::TreeNodeEx("Customise the look##lookcontrols", 0)) {
+    if (settings_widgets::TreeNodeEx("Customise the look##lookcontrols", 0)) {
       static const char* surfaces[] = {"Textured", "Retro 64 (64 x 64)", "Flat colours", "White", "Posterised", "Wireframe"};
       if (settings_combo("Fighters", &options.look_fighter, surfaces, kSurfaceCount)) changed = true;
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("How the fighters are textured in a match. Flat colours: one colour per texture.");
@@ -6310,7 +6350,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       if (options.look_background == 2) {
         float rgb[3] = {((options.look_background_rgb >> 16) & 0xFF) / 255.0f, ((options.look_background_rgb >> 8) & 0xFF) / 255.0f,
                         (options.look_background_rgb & 0xFF) / 255.0f};
-        if (ImGui::ColorEdit3("Background colour", rgb, ImGuiColorEditFlags_NoInputs)) {
+        if (settings_widgets::ColorEdit3("Background colour", rgb, ImGuiColorEditFlags_NoInputs)) {
           options.look_background_rgb = ((uint32_t)(rgb[0] * 255 + 0.5f) << 16) | ((uint32_t)(rgb[1] * 255 + 0.5f) << 8) | (uint32_t)(rgb[2] * 255 + 0.5f);
           changed = true;
         }
@@ -6326,7 +6366,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         const auto colour_row = [&changed](const char* label, uint32_t* value, uint32_t look_colour) {
           const uint32_t shown = *value ? (*value & 0xFFFFFFu) : look_colour;
           float c[3] = {((shown >> 16) & 0xFF) / 255.0f, ((shown >> 8) & 0xFF) / 255.0f, (shown & 0xFF) / 255.0f};
-          if (ImGui::ColorEdit3(label, c, ImGuiColorEditFlags_DisplayRGB)) {
+          if (settings_widgets::ColorEdit3(label, c, ImGuiColorEditFlags_DisplayRGB)) {
             *value = 0x1000000u | ((uint32_t)(c[0] * 255 + 0.5f) << 16) | ((uint32_t)(c[1] * 255 + 0.5f) << 8) | (uint32_t)(c[2] * 255 + 0.5f);
             changed = true;
           }
@@ -6336,7 +6376,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         settings_hint("Team games keep their team colours.");
         colour_row("Background colour##lab", &options.lab_colour_background, lab::kDefaultBackground);
         colour_row("Stage colour", &options.lab_colour_stage, lab::kDefaultStage);
-        if (ImGui::Button("Reset colours##lab")) {
+        if (settings_widgets::Button("Reset colours##lab")) {
           for (uint32_t& c : options.lab_colour) c = 0;
           options.lab_colour_background = options.lab_colour_stage = 0;
           changed = true;
@@ -6349,7 +6389,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // ---- Arcade look ----
     // Picture-only switches for a 2D-fighter look. The hitboxes widen the game's own debug draw tests
     // (MU_DISPLAY_OPTION_HITBOXES and the next two); the game ignores them in a network match.
-    if (ImGui::CollapsingHeader("Arcade look##arcade")) {
+    if (settings_widgets::CollapsingHeader("Arcade look##arcade")) {
     if (host::test_env::getenv("MELEE_TEST_ARCADE_MENU")) ImGui::SetScrollHereY(0.05f);   // hidden capture hook
     ImGui::Indent(8.0f);
     changed |= settings_toggle("Show attack hitboxes", &options.arcade_hitboxes);
@@ -6384,23 +6424,23 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       if (options.arcade_backdrop >= 1) {
         const uint32_t c = options.arcade_background_rgb;
         float rgb[3] = {((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f};
-        if (ImGui::ColorEdit3("Background colour##arcade", rgb, ImGuiColorEditFlags_DisplayRGB)) {
+        if (settings_widgets::ColorEdit3("Background colour##arcade", rgb, ImGuiColorEditFlags_DisplayRGB)) {
           options.arcade_background_rgb = ((uint32_t)(rgb[0] * 255 + 0.5f) << 16) | ((uint32_t)(rgb[1] * 255 + 0.5f) << 8) |
                                           (uint32_t)(rgb[2] * 255 + 0.5f);
           changed = true;
         }
         ImGui::SameLine();
-        if (ImGui::Button("Reset colour##arcade")) { options.arcade_background_rgb = RenderOptions{}.arcade_background_rgb; changed = true; }
+        if (settings_widgets::Button("Reset colour##arcade")) { options.arcade_background_rgb = RenderOptions{}.arcade_background_rgb; changed = true; }
         if (options.arcade_backdrop == 2) {
           const uint32_t g = options.arcade_grid_rgb;
           float grid[3] = {((g >> 16) & 0xFF) / 255.0f, ((g >> 8) & 0xFF) / 255.0f, (g & 0xFF) / 255.0f};
-          if (ImGui::ColorEdit3("Grid colour##arcade", grid, ImGuiColorEditFlags_DisplayRGB)) {
+          if (settings_widgets::ColorEdit3("Grid colour##arcade", grid, ImGuiColorEditFlags_DisplayRGB)) {
             options.arcade_grid_rgb = ((uint32_t)(grid[0] * 255 + 0.5f) << 16) | ((uint32_t)(grid[1] * 255 + 0.5f) << 8) |
                                       (uint32_t)(grid[2] * 255 + 0.5f);
             changed = true;
           }
           ImGui::SameLine();
-          if (ImGui::Button("Reset##arcadegrid")) { options.arcade_grid_rgb = RenderOptions{}.arcade_grid_rgb; changed = true; }
+          if (settings_widgets::Button("Reset##arcadegrid")) { options.arcade_grid_rgb = RenderOptions{}.arcade_grid_rgb; changed = true; }
         }
       }
     }
@@ -6410,9 +6450,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       options.arcade_backdrop = on ? 2 : 0;
       changed = true;
     };
-    if (ImGui::Button("Arcade preset##arcade")) set_all(true);
+    if (settings_widgets::Button("Arcade preset##arcade")) set_all(true);
     ImGui::SameLine();
-    if (ImGui::Button("Reset##arcade")) set_all(false);
+    if (settings_widgets::Button("Reset##arcade")) set_all(false);
     if (gx::arcade_display() & ~arcade_settings_bits(options))
       settings_hint("Some of these are on for now from the Practice menu or the active mod.");
     ImGui::Unindent(8.0f);
@@ -6420,19 +6460,29 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // Creating a device and a swapchain on another API means restarting; the choice is saved and
     // read again at the next launch (see load_pc_settings and --backend).
 #ifndef _WIN32
-    // Linux draws with OpenGL only; Direct3D, DLSS and XeSS are Windows parts.
-    ImGui::TextUnformatted("Graphics backend: OpenGL");
+    // Linux: OpenGL, or Vulkan where a Vulkan 1.3 GPU is present. Direct3D, DLSS and XeSS are Windows parts.
+    {
+      const char* linux_backends[] = {"OpenGL (default)", "Vulkan (experimental)"};
+      int linux_index = options.api == RenderApi::Vulkan ? 1 : 0;
+      if (vulkan_available()) {
+        if (settings_combo("Graphics backend", &linux_index, linux_backends, 2)) { options.api = linux_index ? RenderApi::Vulkan : RenderApi::D3D12; changed = true; }
+        settings_hint("Takes effect at the next launch: save settings, then restart.");
+      } else ImGui::TextUnformatted("Graphics backend: OpenGL");
+    }
     const bool d3d11 = true;   // the upscaler row below stays disabled
     if (false)
 #endif
     {
-    const char* backends[] = {"Direct3D 12 (default)", "Direct3D 11 (older GPUs and drivers)"};
-    int api_index = options.api == RenderApi::D3D11 ? 1 : 0;
-    if (settings_combo("Graphics backend", &api_index, backends, 2)) { options.api = api_index ? RenderApi::D3D11 : RenderApi::D3D12; changed = true; }
+    // Vulkan is offered only where a Vulkan 1.3 GPU is present; it draws without DLSS, XeSS and the CRT model.
+    const char* backends[] = {"Direct3D 12 (default)", "Direct3D 11 (older GPUs and drivers)", "Vulkan (experimental)"};
+    int api_index = options.api == RenderApi::D3D11 ? 1 : options.api == RenderApi::Vulkan ? 2 : 0;
+    if (settings_combo("Graphics backend", &api_index, backends, vulkan_available() ? 3 : 2)) {
+      options.api = api_index == 1 ? RenderApi::D3D11 : api_index == 2 ? RenderApi::Vulkan : RenderApi::D3D12; changed = true;
+    }
     settings_hint("Takes effect at the next launch: save settings, then restart.");
     }
 #ifdef _WIN32
-    const bool d3d11 = options.api == RenderApi::D3D11;
+    const bool d3d11 = options.api == RenderApi::D3D11 || options.api == RenderApi::Vulkan;   // no upscalers on either
 #endif
     const char* upscalers[] = {"Native", "DLAA", "DLSS Quality", "DLSS Balanced", "DLSS Performance", "DLSS Ultra Performance",
                                "XeSS AA", "XeSS Ultra Quality", "XeSS Quality", "XeSS Balanced", "XeSS Performance"};
@@ -6677,7 +6727,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         if (t.passes > 1)
           ImGui::TextWrapped("More than one pass darkens moving fighters and can leave trails behind them.");
         // The scaling filters and reconstruction are under Advanced, with the other DLSS 5 internals.
-        if (ImGui::Button("Reset to NVIDIA defaults")) { t = dlss5::Tuning{}; changed = true; }
+        if (settings_widgets::Button("Reset to NVIDIA defaults")) { t = dlss5::Tuning{}; changed = true; }
         // Named tuning profiles: a saved sliders-and-all setup under a name, one text file per name
         // in Dlss5Profiles beside port-settings.ini. Loading one applies it immediately.
         {
@@ -6689,9 +6739,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           ImGui::TextUnformatted("Profile");
           ImGui::SameLine();
           ImGui::SetNextItemWidth(200.0f);
-          if (ImGui::BeginCombo("##dlss5_profile", active_name.empty() ? "(unsaved)" : active_name.c_str())) {
+          if (settings_widgets::BeginCombo("##dlss5_profile", active_name.empty() ? "(unsaved)" : active_name.c_str())) {
             for (const std::string& name : list) {
-              if (ImGui::Selectable(name.c_str(), name == active_name)) {
+              if (settings_widgets::Selectable(name.c_str(), name == active_name)) {
                 if (dlss5::profile_load(name, t)) { active_name = name; status = "Loaded " + name + "."; changed = true; }
                 else status = "Could not read " + name + ".";
               }
@@ -6699,24 +6749,24 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             ImGui::EndCombo();
           }
           ImGui::SameLine();
-          if (ImGui::Button("Save as...")) { new_name[0] = 0; status.clear(); ImGui::OpenPopup("dlss5_save"); }
+          if (settings_widgets::Button("Save as...")) { new_name[0] = 0; status.clear(); ImGui::OpenPopup("dlss5_save"); }
           if (ImGui::BeginPopup("dlss5_save")) {
             ImGui::TextUnformatted("Name");
             ImGui::SetNextItemWidth(220.0f);
             if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
-            const bool enter = ImGui::InputText("##dlss5_name", new_name, sizeof new_name, ImGuiInputTextFlags_EnterReturnsTrue);
-            if ((ImGui::Button("Save") || enter) && new_name[0]) {
+            const bool enter = settings_widgets::InputText("##dlss5_name", new_name, sizeof new_name, ImGuiInputTextFlags_EnterReturnsTrue);
+            if ((settings_widgets::Button("Save") || enter) && new_name[0]) {
               if (dlss5::profile_save(new_name, t)) { active_name = new_name; status = "Saved " + active_name + "."; }
               else status = "Could not save. Check the name.";
               ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();
-            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            if (settings_widgets::Button("Cancel")) ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
           }
           ImGui::SameLine();
           ImGui::BeginDisabled(active_name.empty());
-          if (ImGui::Button("Delete")) {
+          if (settings_widgets::Button("Delete")) {
             status = dlss5::profile_delete(active_name) ? "Deleted " + active_name + "." : "Could not delete " + active_name + ".";
             active_name.clear();
           }
@@ -6744,7 +6794,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         } else {
           char label[64];
           std::snprintf(label, sizeof label, "Download DLSS 5 (%s)", host::updater::kDlss5ModelSize);
-          if (ImGui::Button(label, ImVec2(0, 32)) && !game_dir.empty()) host::updater::dlss5_model_download(game_dir);
+          if (settings_widgets::Button(label, ImVec2(0, 32)) && !game_dir.empty()) host::updater::dlss5_model_download(game_dir);
           if (ms == ModelState::Failed) settings_hint("%s", host::updater::dlss5_model_message().c_str());
           else settings_hint("NVIDIA's DLSS 5 model is a separate download. It goes beside the game and stays there through updates.");
         }
@@ -6786,7 +6836,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                           "Put PNG, JPG, BMP or MP4 files in the Borders folder and pick one here.\n"
                           "It is scaled to cover the window. Display only: it cannot affect online play.");
       ImGui::SameLine();
-      if (ImGui::SmallButton("+ Open Borders folder")) video_bg::open_border_folder();
+      if (settings_widgets::SmallButton("+ Open Borders folder")) video_bg::open_border_folder();
       if (!options.border_art.empty()) {
         const char* edges[] = {"Sharp", "Soft shadow"};
         int edge = options.border_edge ? 1 : 0;
@@ -6823,7 +6873,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     {
       ImGui::TextUnformatted("Shader preset");
       ImGui::SameLine();
-      if (ImGui::SmallButton("+ Open Shaders folder")) user_shader::open_folder();
+      if (settings_widgets::SmallButton("+ Open Shaders folder")) user_shader::open_folder();
       if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Runs a RetroArch shader preset (.slangp) over the game picture, CRT-Royale for example.\n"
                           "Put the whole slang shader pack in the Shaders folder with its subfolders, then pick a preset below.\n"
@@ -6916,14 +6966,14 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           observed_shader = options.shader_preset;
           pending_initialized = true;
         }
-        if (ImGui::SmallButton("Refresh presets")) { user_shader::refresh_presets(); listed = false; }
-        if (ImGui::CollapsingHeader("Browse shader presets")) {
+        if (settings_widgets::SmallButton("Refresh presets")) { user_shader::refresh_presets(); listed = false; }
+        if (settings_widgets::CollapsingHeader("Browse shader presets")) {
           static char shader_filter[64] = "";
           ImGui::SetNextItemWidth(260.0f);
-          ImGui::InputTextWithHint("##shaderfilter", "type to search presets", shader_filter, sizeof shader_filter);
+          settings_widgets::InputTextWithHint("##shaderfilter", "type to search presets", shader_filter, sizeof shader_filter);
           if (entries.empty()) ImGui::TextDisabled("Nothing in the Shaders folder yet. Put a shader pack folder in it.");
           if (ImGui::BeginListBox("##shaderlist", ImVec2(-1.0f, entries.empty() ? 30.0f : 150.0f))) {
-            if (ImGui::Selectable("None (unfiltered)", pending_shader.empty())) pending_shader.clear();
+            if (settings_widgets::Selectable("None (unfiltered)", pending_shader.empty())) pending_shader.clear();
             std::string needle = shader_filter;
             for (char& ch : needle) ch = (char)std::tolower((unsigned char)ch);
             int shown = 0;
@@ -6936,25 +6986,25 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                 last_heading = &entry.heading;
               }
               ImGui::PushID(entry.path.c_str());
-              if (ImGui::Selectable(entry.label.c_str(), entry.path == pending_shader)) pending_shader = entry.path;
+              if (settings_widgets::Selectable(entry.label.c_str(), entry.path == pending_shader)) pending_shader = entry.path;
               if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", entry.path.c_str());
               ImGui::PopID();
             }
             ImGui::EndListBox();
           }
         }
-        if (recommended_present && ImGui::SmallButton("Select recommended Trinitron")) pending_shader = recommended;
+        if (recommended_present && settings_widgets::SmallButton("Select recommended Trinitron")) pending_shader = recommended;
         const std::string applied = options.shader_preset.empty() ? "None" : friendly(options.shader_preset);
         const std::string selected = pending_shader.empty() ? "None" : friendly(pending_shader);
         ImGui::TextWrapped("Applied: %s", applied.c_str());
         if (pending_shader != options.shader_preset) {
           ImGui::TextWrapped("Selected: %s", selected.c_str());
-          if (ImGui::Button("Apply shader preset")) {
+          if (settings_widgets::Button("Apply shader preset")) {
             options.shader_preset = observed_shader = pending_shader;
             changed = true;
           }
           ImGui::SameLine();
-          if (ImGui::SmallButton("Cancel selection")) pending_shader = options.shader_preset;
+          if (settings_widgets::SmallButton("Cancel selection")) pending_shader = options.shader_preset;
           ImGui::TextDisabled("Applying a preset may pause briefly while its shaders compile.");
         }
         const std::string why = user_shader::status();
@@ -7026,7 +7076,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     const auto installed = texpack::packs();
     ImGui::TextUnformatted("HUD and texture packs");
     ImGui::SameLine();
-    if (ImGui::SmallButton("+ Add")) texpack::open_packs_folder();
+    if (settings_widgets::SmallButton("+ Add")) texpack::open_packs_folder();
     wrapped_tooltip("Opens TexturePacks. Drop a folder of replacement PNGs there; HUD, menus, and stages are supported.");
     ImGui::TextWrapped("Texture packs can replace the HUD, menu art, and stage textures. Put a pack folder in TexturePacks, then turn it on here.");
     if (installed.empty()) {
@@ -7049,7 +7099,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, pack.enabled ? on : off);
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, pack.enabled ? on : off);
         ImGui::PushID(pack.name.c_str());
-        if (ImGui::Button(pack.enabled ? "ON" : "OFF", ImVec2(44, 0))) {
+        if (settings_widgets::Button(pack.enabled ? "ON" : "OFF", ImVec2(44, 0))) {
           texpack::set_pack_enabled(pack.name, !pack.enabled);
           g_textures_dirty.store(true, std::memory_order_relaxed);
           changed = true;
@@ -7075,7 +7125,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     ImGui::Separator();
     ImGui::TextUnformatted("Animated menu backgrounds");
     ImGui::SameLine();
-    if (ImGui::SmallButton("+ Open folder")) video_bg::open_folder();
+    if (settings_widgets::SmallButton("+ Open folder")) video_bg::open_folder();
     bool video_on = options.video_backgrounds;
     if (settings_toggle("Use looping MP4 backgrounds", &video_on)) {
       options.video_backgrounds = video_on;
@@ -7093,13 +7143,13 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       const std::string preview = current.empty() ? "Choose observed texture..." : current;
       ImGui::PushID(slot == 0 ? "css-video-target" : "sss-video-target");
       ImGui::SetNextItemWidth(-1.0f);
-      if (ImGui::BeginCombo(label, preview.c_str())) {
+      if (settings_widgets::BeginCombo(label, preview.c_str())) {
         for (const auto& texture : observed) {
           const std::string item = texture.name + ": " + std::to_string(texture.width) + "x" +
               std::to_string(texture.height) + ", " +
               std::to_string(texture.distinct_frames) + " frames / " +
               std::to_string(texture.observations) + " observations";
-          if (ImGui::Selectable(item.c_str(), texture.name == current))
+          if (settings_widgets::Selectable(item.c_str(), texture.name == current))
             video_bg::choose_target(slot, texture.name);
           if (texture.name == current) ImGui::SetItemDefaultFocus();
         }
@@ -7109,11 +7159,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     };
     ImGui::Text("Character select: %s", css_status.c_str());
     ImGui::SameLine();
-    if (ImGui::SmallButton("Relearn CSS")) video_bg::relearn(0);
+    if (settings_widgets::SmallButton("Relearn CSS")) video_bg::relearn(0);
     target_picker(0, "CSS texture target");
     ImGui::Text("Stage select: %s", sss_status.c_str());
     ImGui::SameLine();
-    if (ImGui::SmallButton("Relearn SSS")) video_bg::relearn(1);
+    if (settings_widgets::SmallButton("Relearn SSS")) video_bg::relearn(1);
     target_picker(1, "SSS texture target");
 
     // ---- Graphics backend change ----
@@ -7121,7 +7171,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // new launch: say so here.
     {
       // The backend is the one thing here that cannot change while the game is running.
-      const RenderApi running = state.running_d3d11 ? RenderApi::D3D11 : RenderApi::D3D12;
+      const RenderApi running = state.running_d3d11 ? RenderApi::D3D11 : state.running_vulkan ? RenderApi::Vulkan : RenderApi::D3D12;
 #ifdef _WIN32
       if (options.api != running)
 #else
@@ -7130,7 +7180,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
 #endif
       {
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "Graphics backend: %s at the next launch. Save settings, then restart.",
-                           options.api == RenderApi::D3D11 ? "Direct3D 11" : "Direct3D 12");
+                           options.api == RenderApi::D3D11 ? "Direct3D 11" : options.api == RenderApi::Vulkan ? "Vulkan" : "Direct3D 12");
         restart_now_button("backend");
       }
     }
@@ -7171,7 +7221,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         ImGui::SetTooltip("Saves every texture the game draws into Dump\\Textures\\GALE01 with the exact\n"
                           "filenames a replacement has to use. Only useful if you are making a pack.");
       ImGui::SameLine();
-      if (ImGui::SmallButton("Open texture dump")) texpack::open_dump_folder();
+      if (settings_widgets::SmallButton("Open texture dump")) texpack::open_dump_folder();
       if (RenderOptions::kPathTracingAvailable) {
         ImGui::BeginDisabled(!path_available);
         if (settings_toggle("DXR diffuse path tracing (experimental)", &options.path_tracing)) changed = true;
@@ -7237,7 +7287,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       changed = true;
     }
     ImGui::SameLine();
-    if (ImGui::Button("Open music packs")) slippi::jukebox::open_music_packs_folder();
+    if (settings_widgets::Button("Open music packs")) slippi::jukebox::open_music_packs_folder();
     ImGui::TextWrapped("1. Enable Use custom music.\n"
                        "2. Open music packs, then Tracks.txt for the disc track names.\n"
                        "3. For /audio/name.hps, put name.mp3 in MusicPacks/audio/. "
@@ -7277,9 +7327,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       static const std::string asio_at_start = options.audio_asio_driver;
       static const int asio_buffer_at_start = options.audio_asio_buffer;
       if (options.audio_asio_driver.empty() && !drivers.empty()) { options.audio_asio_driver = drivers.front(); changed = true; }
-      if (ImGui::BeginCombo("ASIO driver", options.audio_asio_driver.empty() ? "No ASIO driver installed" : options.audio_asio_driver.c_str())) {
+      if (settings_widgets::BeginCombo("ASIO driver", options.audio_asio_driver.empty() ? "No ASIO driver installed" : options.audio_asio_driver.c_str())) {
         for (const auto& d : drivers)
-          if (ImGui::Selectable(d.c_str(), d == options.audio_asio_driver)) { options.audio_asio_driver = d; changed = true; }
+          if (settings_widgets::Selectable(d.c_str(), d == options.audio_asio_driver)) { options.audio_asio_driver = d; changed = true; }
         ImGui::EndCombo();
       }
       const char* buffer_names[] = {"Driver default", "64 samples", "96 samples", "128 samples", "192 samples", "256 samples", "384 samples", "512 samples"};
@@ -7320,10 +7370,10 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       std::string current = "Windows default";
       for (const auto& d : devices) if (d.id == options.audio_device) current = d.name;
       ImGui::BeginDisabled(options.audio_mode == 3);
-      if (ImGui::BeginCombo("Output device", current.c_str())) {
-        if (ImGui::Selectable("Windows default", options.audio_device.empty())) { options.audio_device.clear(); changed = true; }
+      if (settings_widgets::BeginCombo("Output device", current.c_str())) {
+        if (settings_widgets::Selectable("Windows default", options.audio_device.empty())) { options.audio_device.clear(); changed = true; }
         for (const auto& d : devices)
-          if (ImGui::Selectable(d.name.c_str(), d.id == options.audio_device)) { options.audio_device = d.id; changed = true; }
+          if (settings_widgets::Selectable(d.name.c_str(), d.id == options.audio_device)) { options.audio_device = d.id; changed = true; }
         ImGui::EndCombo();
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -7634,14 +7684,14 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         {
           ImGui::TextUnformatted("Menu style");
           ImGui::TextDisabled("Choose a picture to change the menu layout.");
-          if (ImGui::Button("Choose menu style...",ImVec2(-1.0f,30.0f))) {
+          if (settings_widgets::Button("Choose menu style...",ImVec2(-1.0f,30.0f))) {
             ImGui::OpenPopup("Menu styles");
             g_menu_style_gallery_open=true;
           }
           if (ImTextureData* current_preview=cosmetic_preview(ui_source_asset_path(
                   "menu_previews",appearance_images[std::clamp(options.overlay_style,0,5)]))) {
             const ImVec2 preview_size(160.0f,120.0f);
-            if (ImGui::ImageButton("##current_menu_style",current_preview->GetTexRef(),preview_size)) {
+            if (settings_widgets::ImageButton("##current_menu_style",current_preview->GetTexRef(),preview_size)) {
               ImGui::OpenPopup("Menu styles");
               g_menu_style_gallery_open=true;
             }
@@ -7708,7 +7758,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           }
           ImGui::EndDisabled();
           ImGui::Spacing();
-          if (ImGui::Button("Close",ImVec2(110.0f,26.0f))) {
+          if (settings_widgets::Button("Close",ImVec2(110.0f,26.0f))) {
             ImGui::CloseCurrentPopup();
             g_menu_style_gallery_open=false;
           }
@@ -7721,7 +7771,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             if (i) ImGui::SameLine(0.0f,10.0f);
             ImGui::PushID(i);
             const ImVec2 swatch_size(40.0f,24.0f);
-            const bool clicked=ImGui::ColorButton("##palette_swatch",
+            const bool clicked=settings_widgets::ColorButton("##palette_swatch",
                 ImGui::ColorConvertU32ToFloat4(settings_accent_for(options.overlay_style,i)),
                 ImGuiColorEditFlags_NoTooltip,swatch_size);
             const ImVec2 a=ImGui::GetItemRectMin(),b=ImGui::GetItemRectMax();
@@ -7739,12 +7789,12 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           }
           ImGui::Spacing();
           ImGui::TextUnformatted("Custom menu accent");
-          ImGui::Checkbox("Use custom accent",&options.settings_custom_color_enabled);
+          settings_widgets::Checkbox("Use custom accent",&options.settings_custom_color_enabled);
           if (ImGui::IsItemDeactivatedAfterEdit()) changed=true;
           // Collapsed by default: the full wheel is large and most players never open it.
-          if (ImGui::TreeNode("Show colour picker")) {
+          if (settings_widgets::TreeNode("Show colour picker")) {
             ImGui::SetNextItemWidth(std::min(220.0f, ImGui::GetContentRegionAvail().x));
-            if (ImGui::ColorPicker3("##menu_accent_wheel",options.settings_custom_color.data(),
+            if (settings_widgets::ColorPicker3("##menu_accent_wheel",options.settings_custom_color.data(),
                                     ImGuiColorEditFlags_PickerHueWheel|ImGuiColorEditFlags_NoSidePreview|
                                     ImGuiColorEditFlags_NoInputs)) {
               options.settings_custom_color_enabled=true;
@@ -7870,7 +7920,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           if (!yougame::active() && !mod_status.detected && !from_command_line && options.mod_profile != mod_status.requested) {
             ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "Profile changed. Restart to apply it.");
             if (!state.fill_window) {
-              if (ImGui::Button("Restart to apply profile")) state.confirm = SettingsState::Confirm::Restart;
+              if (settings_widgets::Button("Restart to apply profile")) state.confirm = SettingsState::Confirm::Restart;
             } else settings_hint("Close settings, then launch the game to apply this profile.");
           }
           if (mod_status.identity.empty()) {
@@ -7896,7 +7946,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
               char skins_header[96];
               std::snprintf(skins_header, sizeof skins_header, "Cosmetics in this mod (%zu on, %zu swapped)###pack_skins",
                             skins_on, mod_status.pack_skins.size() - skins_on);
-              if (ImGui::CollapsingHeader(skins_header)) {
+              if (settings_widgets::CollapsingHeader(skins_header)) {
                 for (const auto& skin : mod_status.pack_skins) {
                   if (skin.served)
                     ImGui::TextColored(ImVec4(.37f, .84f, .53f, 1), "%s: stays on (%s)", skin.path.c_str(), skin.reason.c_str());
@@ -7965,7 +8015,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           }
           if (te_on) {
             if (settings_lcancel_flash(options)) changed = true;
-            if (ImGui::TreeNode("20XX TE settings")) {
+            if (settings_widgets::TreeNode("20XX TE settings")) {
             bool tournament = (options.te_options & 0x20u) != 0;
             if (te_locked_all) ImGui::BeginDisabled();
             const bool tournament_changed = settings_toggle("Tournament Mode", &tournament);
@@ -8055,7 +8105,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         }
         ImGui::TextUnformatted("Cosmetic mods");
         bool random_stage_skins = host::cosmetics::random_stage_skins();
-        if (ImGui::Checkbox("Random installed stage skin each match", &random_stage_skins)) {
+        if (settings_widgets::Checkbox("Random installed stage skin each match", &random_stage_skins)) {
           std::string error;
           if (!host::cosmetics::set_random_stage_skins(random_stage_skins, &error)) mod_message = error;
         }
@@ -8069,7 +8119,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           const std::string label = pack.name + ": " + std::to_string(pack.skins) +
               (pack.skins == 1 ? " stage skin" : " stage skins") + " for " + std::to_string(pack.stages) +
               (pack.stages == 1 ? " stage" : " stages") + ", in the random pick";
-          if (ImGui::Checkbox(label.c_str(), &in_pick)) {
+          if (settings_widgets::Checkbox(label.c_str(), &in_pick)) {
             std::string error;
             mod_message = host::cosmetics::set_stage_pack_random(pack.key, in_pick, &error) ?
                 host::cosmetics::last_message() : error;
@@ -8096,7 +8146,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           if (!failed.empty()) text += " Not imported:\n" + failed;
           return text;
         };
-        if (ImGui::Button("Import / Refresh...")) {
+        if (settings_widgets::Button("Import / Refresh...")) {
           const auto files = host::cosmetics::choose_import_files();
           if (!files.empty()) mod_message = import_all(files, [](const std::string& f) { return host::cosmetics::import_file(f); });
         }
@@ -8108,7 +8158,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         ImGui::SameLine();
         static std::vector<std::string> stage_dat_paths;
         static int stage_dat_target = 0;
-        if (ImGui::Button("Add stage DAT...")) {
+        if (settings_widgets::Button("Add stage DAT...")) {
           stage_dat_paths = host::cosmetics::choose_import_files();
           if (!stage_dat_paths.empty()) ImGui::OpenPopup("Import stage DAT");
         }
@@ -8125,18 +8175,18 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             ImGui::TextWrapped("Choose the stage this DAT replaces. Full custom stages are available offline.");
           ImGui::SetNextItemWidth(280.f);
           settings_combo("Stage to replace", &stage_dat_target, names.data(), (int)names.size());
-          if (ImGui::Button(stage_dat_paths.size() > 1 ? "Import stages" : "Import stage")) {
+          if (settings_widgets::Button(stage_dat_paths.size() > 1 ? "Import stages" : "Import stage")) {
             const std::string target = slots[stage_dat_target].target_path;
             mod_message = import_all(stage_dat_paths, [&](const std::string& f) { return host::cosmetics::import_stage_dat(f, target); });
             ImGui::CloseCurrentPopup();
           }
           ImGui::SameLine();
-          if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+          if (settings_widgets::Button("Cancel")) ImGui::CloseCurrentPopup();
           ImGui::EndPopup();
         }
         ImGui::SameLine();
         // A portrait or stock icon for one costume, with no costume file: the player picks the costume.
-        if (ImGui::Button("Add portrait...")) ImGui::OpenPopup("add_portrait");
+        if (settings_widgets::Button("Add portrait...")) ImGui::OpenPopup("add_portrait");
         if (ImGui::IsItemHovered())
           ImGui::SetTooltip("Give one costume its own character select portrait or stock icon from a PNG.\n"
                             "It shows on the original costume and on a skin that has no picture of its own.\n"
@@ -8163,7 +8213,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           const char* picture_kinds[] = {"Portrait", "Stock icon"};
           ImGui::SetNextItemWidth(260.0f);
           settings_combo("Picture", &picture_kind, picture_kinds, 2);
-          if (ImGui::Button("Choose PNG...", ImVec2(150, 0))) {
+          if (settings_widgets::Button("Choose PNG...", ImVec2(150, 0))) {
             std::string path = host::cosmetics::choose_portrait_file();
             if (!path.empty()) {
               const auto result = host::cosmetics::import_portrait(path, slots[(size_t)(begin + costume)].target_path,
@@ -8174,11 +8224,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             }
           }
           ImGui::SameLine();
-          if (ImGui::Button("Cancel", ImVec2(100, 0))) ImGui::CloseCurrentPopup();
+          if (settings_widgets::Button("Cancel", ImVec2(100, 0))) ImGui::CloseCurrentPopup();
           ImGui::EndPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Refresh catalog")) {
+        if (settings_widgets::Button("Refresh catalog")) {
           std::string error;
           if (!host::cosmetics::refresh_catalog(&error)) mod_message = error;
           else mod_message = host::cosmetics::last_message();
@@ -8216,7 +8266,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
               if (pack.selected) summary += ", " + std::to_string(pack.selected) + " selected";
               ImGui::TextWrapped("%s", summary.c_str());
               auto ask = [&](const char* label, const std::string& variant) {
-                if (!ImGui::SmallButton(label)) return;
+                if (!settings_widgets::SmallButton(label)) return;
                 pending_pack = pack.key; pending_variant = variant; pending_label = pack.name;
                 pending_preview = host::cosmetics::apply_pack_set(pack.key, variant, true);
                 if (!pending_preview.ok) { mod_message = pending_preview.message; pending_pack.clear(); }
@@ -8237,14 +8287,14 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                 if (pending_variant != "none" && !pending_preview.set) ask_line = "Nothing to change: this set is already in use.";
                 ImGui::TextColored(ImVec4(1, .75f, .25f, 1), "%s", ask_line.c_str());
                 ImGui::SameLine();
-                if (ImGui::SmallButton("Apply")) {
+                if (settings_widgets::SmallButton("Apply")) {
                   const auto result = host::cosmetics::apply_pack_set(pending_pack, pending_variant, false);
                   mod_message = result.message;
                   if (result.ok) changed = true;
                   pending_pack.clear();
                 }
                 ImGui::SameLine();
-                if (ImGui::SmallButton("Cancel")) pending_pack.clear();
+                if (settings_widgets::SmallButton("Cancel")) pending_pack.clear();
               }
               ImGui::PopID();
             }
@@ -8280,7 +8330,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             return target && std::strcmp(target, "skins") == 0;
           }();
           if (skins_shot) ImGui::SetNextItemOpen(true, ImGuiCond_Once);
-          if (ImGui::CollapsingHeader("Characters")) {
+          if (settings_widgets::CollapsingHeader("Characters")) {
             {
               static int scroll_frames = 0;
               if (skins_shot && scroll_frames < 30) { ImGui::SetScrollHereY(0.0f); ++scroll_frames; }
@@ -8354,7 +8404,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             const float tile_w = 34.0f, tile_h = 47.0f;   // a portrait is 136 by 188
             for (const auto& character : fighters) {
               if (skins_shot && character.skins) ImGui::SetNextItemOpen(true, ImGuiCond_Once);
-              if (!ImGui::TreeNode(character.node.c_str())) continue;
+              if (!settings_widgets::TreeNode(character.node.c_str())) continue;
               for (const auto& costume : character.rows) {
                 const auto& variants = costume.variants;
                 const std::string& target = costume.target;
@@ -8393,14 +8443,14 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                 // it, what online play does with it.
                 int selected = current;
                 ImGui::SetNextItemWidth(280.0f);
-                if (ImGui::BeginCombo("##variant", option_storage[(size_t)current].c_str(), ImGuiComboFlags_HeightLarge)) {
+                if (settings_widgets::BeginCombo("##variant", option_storage[(size_t)current].c_str(), ImGuiComboFlags_HeightLarge)) {
                   float names_w = 0.0f;
                   for (const auto& option : option_storage) names_w = std::max(names_w, ImGui::CalcTextSize(option.c_str()).x);
                   for (int i = 0; i < (int)option_storage.size(); ++i) {
                     const CosmeticAsset* item = i > 0 ? variants[(size_t)i - 1] : nullptr;
                     ImGui::PushID(i);
                     const ImVec2 at = ImGui::GetCursorScreenPos();
-                    if (ImGui::Selectable("##pick", i == current, 0, ImVec2(0.0f, tile_h))) selected = i;
+                    if (settings_widgets::Selectable("##pick", i == current, 0, ImVec2(0.0f, tile_h))) selected = i;
                     if (i == current) ImGui::SetItemDefaultFocus();
                     if (ImGui::IsItemVisible()) {
                       ImDrawList* draw = ImGui::GetWindowDrawList();
@@ -8433,7 +8483,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                 ImGui::TextDisabled("%zu %s", variants.size(), variants.size() == 1 ? "skin" : "skins");
                 if (current != 0) {
                   ImGui::SameLine();
-                  if (ImGui::SmallButton("Use standard costume")) {
+                  if (settings_widgets::SmallButton("Use standard costume")) {
                     std::string error;
                     if (!host::cosmetics::disable_target(target, &error)) mod_message = error;
                     else { mod_message = host::cosmetics::last_message(); changed = true; }
@@ -8455,7 +8505,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                 }
                 const CosmeticAsset* details = current > 0 ? variants[(size_t)current - 1] : variants.front();
                 std::string details_label = "Details: " + details->name;
-                if (ImGui::TreeNode(details_label.c_str())) {
+                if (settings_widgets::TreeNode(details_label.c_str())) {
                   draw_cosmetic_preview(*details);
                   ImGui::Text("Target: %s", details->target_path.c_str());
                   ImGui::TextWrapped("Content ID: %s", details->id.c_str());
@@ -8509,14 +8559,14 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                   if (!details->voice.empty()) {
                     // The skin's own fighter sounds: heard in a match while this skin is the costume worn.
                     ImGui::TextWrapped("Voice: %s (from %s). Online: stays on.", details->voice.c_str(), details->voice_source.c_str());
-                    if (ImGui::SmallButton("Remove voice")) {
+                    if (settings_widgets::SmallButton("Remove voice")) {
                       std::string error;
                       if (!host::cosmetics::remove_voice(details->id, &error)) mod_message = error;
                       else { mod_message = host::cosmetics::last_message(); changed = true; }
                     }
                     ImGui::SameLine();
                   }
-                  if (ImGui::SmallButton("Rename...")) {
+                  if (settings_widgets::SmallButton("Rename...")) {
                     rename_id = details->id;
                     rename_text.fill(0);
                     std::copy_n(details->name.data(), std::min(details->name.size(), rename_text.size() - 1),
@@ -8524,14 +8574,14 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                     ImGui::OpenPopup("Rename variant");
                   }
                   if (ImGui::BeginPopupModal("Rename variant", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-                    ImGui::InputText("Display name", rename_text.data(), rename_text.size());
-                    if (ImGui::Button("Save", ImVec2(100, 0))) {
+                    settings_widgets::InputText("Display name", rename_text.data(), rename_text.size());
+                    if (settings_widgets::Button("Save", ImVec2(100, 0))) {
                       std::string error;
                       if (!host::cosmetics::rename_asset(rename_id, rename_text.data(), &error)) mod_message = error;
                       else { mod_message = host::cosmetics::last_message(); changed = true; ImGui::CloseCurrentPopup(); }
                     }
                     ImGui::SameLine();
-                    if (ImGui::Button("Cancel", ImVec2(100, 0))) ImGui::CloseCurrentPopup();
+                    if (settings_widgets::Button("Cancel", ImVec2(100, 0))) ImGui::CloseCurrentPopup();
                     ImGui::EndPopup();
                   }
                   ImGui::TreePop();
@@ -8589,14 +8639,14 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
               ImGui::TextWrapped("%s", details->availability_message.c_str());
             ImGui::PopID();
           };
-          if (!pictures.empty() && ImGui::CollapsingHeader("Portraits and stock icons", ImGuiTreeNodeFlags_DefaultOpen))
+          if (!pictures.empty() && settings_widgets::CollapsingHeader("Portraits and stock icons", ImGuiTreeNodeFlags_DefaultOpen))
             for (const auto& slot : pictures) draw_resource_slot(slot.first, slot.second);
-          if (!stages.empty() && ImGui::CollapsingHeader("Stages", ImGuiTreeNodeFlags_DefaultOpen))
+          if (!stages.empty() && settings_widgets::CollapsingHeader("Stages", ImGuiTreeNodeFlags_DefaultOpen))
             for (const auto& stage : stages) draw_resource_slot(stage.second.back()->costume, stage.second);
-          if (!fighter_sounds.empty() && ImGui::CollapsingHeader("Fighter move sounds", ImGuiTreeNodeFlags_DefaultOpen))
+          if (!fighter_sounds.empty() && settings_widgets::CollapsingHeader("Fighter move sounds", ImGuiTreeNodeFlags_DefaultOpen))
             for (const auto& sounds : fighter_sounds) draw_resource_slot(sounds.first + " move sounds", sounds.second);
-          if (!effects.empty() && ImGui::CollapsingHeader("Effects")) {
-            if (ImGui::Button("Enable project effects")) {
+          if (!effects.empty() && settings_widgets::CollapsingHeader("Effects")) {
+            if (settings_widgets::Button("Enable project effects")) {
               std::string error;
               if (!host::cosmetics::enable_project_effects(&error)) mod_message = error;
               else { mod_message = host::cosmetics::last_message(); changed = true; }
@@ -8605,34 +8655,34 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
               ImGui::SetTooltip("Validates each move against this clean ISO and combines compatible changes.\n"
                                 "Conflicting changes are reported. Character and stage choices are preserved.");
             for (const auto& group : effects) {
-              if (!ImGui::TreeNode(group.first.c_str())) continue;
+              if (!settings_widgets::TreeNode(group.first.c_str())) continue;
               for (const auto& slot : group.second) draw_resource_slot(slot.first, slot.second);
               ImGui::TreePop();
             }
           }
         }
         ImGui::Separator();
-        if (ImGui::Button("Restore Vanilla")) ImGui::OpenPopup("restore_vanilla_cosmetics");
+        if (settings_widgets::Button("Restore Vanilla")) ImGui::OpenPopup("restore_vanilla_cosmetics");
         if (ImGui::IsItemHovered())
           ImGui::SetTooltip("Disables every asset override. No backup is needed: the clean ISO is never modified.");
         if (ImGui::BeginPopupModal("restore_vanilla_cosmetics", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
           ImGui::TextWrapped("Disable all cosmetic overrides and clear every slot selection?\n"
                              "Imported files stay in the catalog so they can be selected again.");
-          if (ImGui::Button("Restore Vanilla", ImVec2(150, 0))) {
+          if (settings_widgets::Button("Restore Vanilla", ImVec2(150, 0))) {
             std::string error;
             if (!host::cosmetics::restore_vanilla(&error)) mod_message = error;
             else { mod_message = host::cosmetics::last_message(); changed = true; }
             ImGui::CloseCurrentPopup();
           }
           ImGui::SameLine();
-          if (ImGui::Button("Cancel", ImVec2(100, 0))) ImGui::CloseCurrentPopup();
+          if (settings_widgets::Button("Cancel", ImVec2(100, 0))) ImGui::CloseCurrentPopup();
           ImGui::EndPopup();
         }
         if (host::cosmetics::pending_restart()) {
           ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
                              "Profile changed. Restart to apply it and clear affected guest/render caches.");
           if (!state.fill_window) {
-            if (ImGui::Button("Restart to apply mods")) state.confirm = SettingsState::Confirm::Restart;
+            if (settings_widgets::Button("Restart to apply mods")) state.confirm = SettingsState::Confirm::Restart;
           } else settings_hint("Close settings, then launch the game to apply this profile.");
         }
         if (mod_message.empty()) mod_message = host::cosmetics::last_message();
@@ -8643,7 +8693,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     ImGui::TextUnformatted("In-game overlay");
     changed |= settings_toggle("Auto-open in-game overlay on startup", &options.settings_open);
     if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("%s", yougame::stdio_bridge() ? yougame::parity::kMenuHint : "Off starts directly in the game. Press F1 to open the overlay anytime.");
+      ImGui::SetTooltip("%s", yougame::stdio_bridge() ? yougame::parity::kSettingsHint : "Off starts directly in the game. Press F1 to open the overlay anytime.");
 
     // ---- Input ----
     ImGui::TextUnformatted("Input");
@@ -8798,7 +8848,20 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       const bool ranked = lcancel::automatic_setting_locked();
       bool automatic = ranked ? false : lcancel::automatic_enabled();
       ImGui::BeginDisabled(host::gameplay::vanilla_only() || ranked);
-      if (settings_toggle("Auto L-cancel", &automatic)) lcancel::set_automatic(automatic);
+      if (settings_toggle("Auto L-cancel", &automatic)) {
+        lcancel::set_automatic(automatic);
+        host::log("settings: Auto L-cancel %s", automatic ? "on" : "off");
+        changed = true;
+      }
+      // Disabled controls cannot take navigation focus. Log the lock once on entering it,
+      // and on a mouse attempt, while preserving the saved preference and vanilla-only gate.
+      static bool auto_ranked_seen = false;
+      static int auto_ranked_frame = -2;
+      if (ranked && (!auto_ranked_seen || auto_ranked_frame + 1 != ImGui::GetFrameCount() ||
+          (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && ImGui::IsMouseClicked(0))))
+        host::log("settings: Auto L-cancel off (locked in Ranked)");
+      auto_ranked_seen = ranked;
+      auto_ranked_frame = ImGui::GetFrameCount();
       ImGui::EndDisabled();
       if (ranked) settings_hint(lcancel::policy::ranked_hint);
       if (host::gameplay::vanilla_only()) settings_hint("Disabled for this vanilla-only session.");
@@ -8951,7 +9014,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           ImGui::SameLine();
           ImGui::SetNextItemWidth(110.0f);
           char id[24]; std::snprintf(id, sizeof id, "##blockcode%d", i);
-          if (ImGui::InputTextWithHint(id, "CODE#123", buf, sizeof buf, ImGuiInputTextFlags_CharsUppercase)) {
+          if (settings_widgets::InputTextWithHint(id, "CODE#123", buf, sizeof buf, ImGuiInputTextFlags_CharsUppercase)) {
             slippi::online::config().blocked_codes[i] = buf;
             changed = true;
           }
@@ -8986,7 +9049,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SameLine();
       int spectator_port = options.slippi_spectator_port;
       ImGui::SetNextItemWidth(110.0f);
-      if (ImGui::InputInt("Port##spectator", &spectator_port, 0, 0)) {
+      if (settings_widgets::InputInt("Port##spectator", &spectator_port, 0, 0)) {
         options.slippi_spectator_port = std::clamp(spectator_port, 1, 65535);
         RenderOptions::live_slippi_spectator_port() = options.slippi_spectator_port;
         changed = true;
@@ -9008,9 +9071,10 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     ImGui::TextUnformatted("Discord");
     char app_id[32];
     std::snprintf(app_id, sizeof app_id, "%s", options.discord_app_id.c_str());
-    if (ImGui::InputText("Application ID", app_id, sizeof app_id, ImGuiInputTextFlags_CharsDecimal)) {
+    if (settings_widgets::InputText("Application ID", app_id, sizeof app_id, ImGuiInputTextFlags_CharsDecimal)) {
       options.discord_app_id = app_id;
       host::discord::configure(options.discord_app_id);
+      changed = true;
     }
     const bool discord_was = options.discord_presence;
 #ifdef MELEE_NO_SLIPPI   // presence only: this build publishes no code for Join to hand over
@@ -9019,6 +9083,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     settings_toggle("Discord presence (show what you are playing; friends can press Join)", &options.discord_presence);
 #endif
     if (options.discord_presence != discord_was) {
+      changed = true;
       host::discord::configure(options.discord_app_id);
       host::discord::enable(options.discord_presence);   // starts or stops one background thread
     }
@@ -9136,7 +9201,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.0f, 0.5f));
       ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
       const std::string padded = std::string("  ") + text;
-      const bool pressed = ImGui::Button(padded.c_str(), ImVec2(width, 28));
+      const bool pressed = settings_widgets::Button(padded.c_str(), ImVec2(width, 28));
       ImGui::PopStyleVar(2);
       ImGui::PopStyleColor(2);
       if (show_light) {
@@ -9239,7 +9304,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         // The arrow: what plays as this port.
         ImGui::SetCursorScreenPos(ImVec2(o.x + card_w - 30, o.y + 8));
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,ImVec2(4.0f,3.0f));
-        if (ImGui::ArrowButton("pick", ImGuiDir_Down)) ImGui::OpenPopup("port_source");
+        if (settings_widgets::ArrowButton("pick", ImGuiDir_Down)) ImGui::OpenPopup("port_source");
         ImGui::PopStyleVar();
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Choose what plays as port %d.", port + 1);
         else if (hovered_card)
@@ -9256,7 +9321,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             std::string item = c == 0 ? std::string("Nobody") : st == 0 ? std::string("Keyboard") : device_title(st) + "  |  " + device_where(st);
             if (st > 0 && !tab_connected(st)) item += "  (not plugged in)";
             item += "##src" + std::to_string(c);   // unnamed boxes share a label
-            if (ImGui::Selectable(item.c_str(), c == cur)) {
+            if (settings_widgets::Selectable(item.c_str(), c == cur)) {
               host::g_port_sources[port] = src;
               host::g_port_device_names[port] = src.kind == host::DeviceKind::HidPad ? host::port_device_key(host::hidpad_name(src.index)) : std::string();
               changed = true;
@@ -9297,16 +9362,16 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::TextUnformatted("Editing");
       ImGui::SameLine();
       ImGui::SetNextItemWidth(std::max(100.0f, ImGui::GetContentRegionAvail().x - 40.0f));
-      if (ImGui::BeginCombo("##editing", label_of(edit_tab).c_str())) {
+      if (settings_widgets::BeginCombo("##editing", label_of(edit_tab).c_str())) {
         static const int kOrder[] = {9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16, 17, 18, 19, 20, 0};
         for (int t : kOrder)
           if (t == 0 || tab_connected(t))
-            if (ImGui::Selectable((label_of(t) + "##dev" + std::to_string(t)).c_str(), t == edit_tab)) select_tab(t, true);
+            if (settings_widgets::Selectable((label_of(t) + "##dev" + std::to_string(t)).c_str(), t == edit_tab)) select_tab(t, true);
         // Every other controller, to set one up before plugging it in.
         if (ImGui::BeginMenu("Not plugged in")) {
           for (int t : kOrder)
             if (t != 0 && !tab_connected(t))
-              if (ImGui::Selectable((label_of(t) + "  (not plugged in)##dev" + std::to_string(t)).c_str(), t == edit_tab)) select_tab(t, true);
+              if (settings_widgets::Selectable((label_of(t) + "  (not plugged in)##dev" + std::to_string(t)).c_str(), t == edit_tab)) select_tab(t, true);
           ImGui::EndMenu();
         }
         ImGui::EndCombo();
@@ -9351,7 +9416,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       } else {
         const bool resetting = host::gcadapter_reset_pending();
         ImGui::BeginDisabled(resetting);
-        if (ImGui::Button(resetting ? "Resetting adapter..." : "Reset GameCube adapter"))
+        if (settings_widgets::Button(resetting ? "Resetting adapter..." : "Reset GameCube adapter"))
           host::gcadapter_request_reset();
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
@@ -9536,17 +9601,17 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             changed |= binding_level_slider(tab_kind, tab_index, i);
           }
         }
-        if (tab_kind == host::CaptureDevice::GCAdapter && ImGui::CollapsingHeader("PhobGCC")) {
+        if (tab_kind == host::CaptureDevice::GCAdapter && settings_widgets::CollapsingHeader("PhobGCC")) {
           ImGui::PushID("phob");
           draw_phob_menu(tab_index);
           ImGui::PopID();
         }
-        if (tab_kind == host::CaptureDevice::HidPad && ImGui::CollapsingHeader("Box layouts")) {
-          if (ImGui::Button("B0XX (vJoy / b0xx-ahk)")) { host::g_hid_bindings[tab_index] = host::vjoy_b0xx_bindings(); changed = true; }
+        if (tab_kind == host::CaptureDevice::HidPad && settings_widgets::CollapsingHeader("Box layouts")) {
+          if (settings_widgets::Button("B0XX (vJoy / b0xx-ahk)")) { host::g_hid_bindings[tab_index] = host::vjoy_b0xx_bindings(); changed = true; }
           ImGui::SameLine();
-          if (ImGui::Button("B0XX-layout box (HayBox)")) { host::g_hid_bindings[tab_index] = host::haybox_dinput_bindings(); changed = true; }
+          if (settings_widgets::Button("B0XX-layout box (HayBox)")) { host::g_hid_bindings[tab_index] = host::haybox_dinput_bindings(); changed = true; }
           ImGui::SameLine();
-          if (ImGui::Button("Generic")) { host::g_hid_bindings[tab_index] = host::default_hid_bindings()[0]; changed = true; }
+          if (settings_widgets::Button("Generic")) { host::g_hid_bindings[tab_index] = host::default_hid_bindings()[0]; changed = true; }
           settings_hint("vJoy and HayBox boxes in DInput mode get their layout automatically.");
           const host::HidPadAxes axes = host::hidpad_axes(tab_index);
           if (axes.count) {
@@ -9555,7 +9620,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             settings_hint("%s", line.c_str());
           }
         }
-        if (ImGui::CollapsingHeader("All buttons as a list")) {
+        if (settings_widgets::CollapsingHeader("All buttons as a list")) {
           if (ImGui::BeginTable("bindings", 2, ImGuiTableFlags_SizingStretchSame)) {
             for (int i = 0; i < (int)host::BindAction::Count; ++i) {
               if (analog_c && host::is_cstick_action(i) && tab_kind != host::CaptureDevice::HidPad) continue;
@@ -9570,7 +9635,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
               // An analog source gets its press point beside the binding; a digital one nothing.
               const float press_w = binding_level_kind(tab_kind, tab_index, i) == 1 ? 132.0f : 0.0f;
               const float press_gap = press_w > 0.0f ? press_w + ImGui::GetStyle().ItemSpacing.x : 0.0f;
-              if (ImGui::Selectable(row, i == waiting || i == hovered, ImGuiSelectableFlags_None, ImVec2(ImGui::GetContentRegionAvail().x - 58.0f - press_gap, 0))) begin_rebind(i);
+              if (settings_widgets::Selectable(row, i == waiting || i == hovered, ImGuiSelectableFlags_None, ImVec2(ImGui::GetContentRegionAvail().x - 58.0f - press_gap, 0))) begin_rebind(i);
               if (pressed_now) ImGui::PopStyleColor();
               if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) unbind(i);
               if (press_w > 0.0f) {
@@ -9578,7 +9643,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                 changed |= binding_press_at_slider(tab_kind, tab_index, i, press_w);
               }
               ImGui::SameLine();
-              if (ImGui::SmallButton("Clear")) unbind(i);
+              if (settings_widgets::SmallButton("Clear")) unbind(i);
               ImGui::PopID();
             }
             ImGui::EndTable();
@@ -9590,8 +9655,8 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       if (state.active_tab == 4) {
     changed |= settings_toggle("Show player nicknames above fighters", &options.show_player_nicknames);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shows each online player's name at Melee's player-tag anchor. Local display only.");
-    changed |= settings_toggle(yougame::stdio_bridge() ? "Show the YouGame menu reminder" : "Show the \"Settings: F1\" reminder", &options.settings_hint);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", yougame::stdio_bridge() ? yougame::parity::kMenuHint : "F1, or Start + D-pad Down + Z on a GameCube controller, opens settings.");
+    changed |= settings_toggle("Show the \"Settings: F1\" reminder", &options.settings_hint);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", yougame::stdio_bridge() ? yougame::parity::kSettingsHint : "F1, or Start + D-pad Down + Z on a GameCube controller, opens settings.");
 #ifndef MELEE_NO_SLIPPI   // no matchmaking panel in the build without that layer
     changed |= settings_toggle("Show the Practice menu hint in Training", &options.matchmaking_hint);
     if (ImGui::IsItemHovered())
@@ -9609,7 +9674,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                           "the window also works with the mouse.");
     }
 #endif
-    settings_toggle("Performance overlay", &options.performance_overlay);
+    changed |= settings_toggle("Performance overlay", &options.performance_overlay);
     changed |= settings_toggle("FPS counter (top left)", &options.show_fps);
     // VRAM has its own line in the Video tab, right by the settings that move it; no overlay needed.
     changed |= settings_toggle("Ping while online (under the FPS)", &options.show_ping);
@@ -9804,7 +9869,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       std::string to_remove;
       for (user_gecko::Code& c : user_gecko::codes()) {
         ImGui::PushID(&c);
-        if (ImGui::SmallButton("-")) to_remove = c.name;
+        if (settings_widgets::SmallButton("-")) to_remove = c.name;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove this code.");
         ImGui::SameLine();
         ImGui::BeginDisabled(!c.supported);
@@ -9825,6 +9890,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     if (gecko_add_code_button()) changed = true;
     ImGui::EndDisabled();
     }
+    settings_page::observer = nullptr;
     if (gd_page && g_settings_gd_list && g_settings_gd_list == ImGui::GetCurrentWindow() &&
         g_settings_gd_snap_found) {
       // GD Melee: once the wheel or the scrollbar has stopped, the nearest row's top moves to the
@@ -9872,7 +9938,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     g_settings_standalone = state.fill_window;
     if (g_settings_restart_asked) { g_settings_restart_asked = false; state.confirm = SettingsState::Confirm::Restart; }
     const bool autosave = state.dirty && !ImGui::IsAnyItemActive();
-    if ((state.fill_window && ImGui::Button("Save settings")) || autosave) {
+    if ((state.fill_window && settings_widgets::Button("Save settings")) || autosave) {
       state.dirty = false;
       state.saved = write_settings_file(state, options);
     }
@@ -9883,7 +9949,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SameLine();
       // The window itself has to be told: state.open is the panel's own flag and the standalone
       // window loop cannot see it, so pressing Close left the window sitting there open.
-      if (ImGui::Button("Close")) { state.open = false; g_close_requested.store(true, std::memory_order_relaxed); }
+      if (settings_widgets::Button("Close")) { state.open = false; g_close_requested.store(true, std::memory_order_relaxed); }
     }
     if (state.saved && ImGui::IsItemHovered()) ImGui::SetTooltip("Settings saved");
 
@@ -9898,7 +9964,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                                        : "Quit now? The current match will end.");
         if (!state.saved) ImGui::TextDisabled("Unsaved changes in this panel will be lost.");
         ImGui::Separator();
-        if (ImGui::Button(restart ? "Restart" : "Quit", ImVec2(110, 0))) {
+        if (settings_widgets::Button(restart ? "Restart" : "Quit", ImVec2(110, 0))) {
           state.confirm = SettingsState::Confirm::None;
           ImGui::CloseCurrentPopup();
           // The new process reads its settings from the file: an unsaved choice (the look or audio
@@ -9907,7 +9973,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           if (restart) host::request_restart(); else host::request_exit(0);
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(110, 0))) {
+        if (settings_widgets::Button("Cancel", ImVec2(110, 0))) {
           state.confirm = SettingsState::Confirm::None;
           ImGui::CloseCurrentPopup();
         }
@@ -9989,6 +10055,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))))
         host::log("[yougame] agent test: menu activated %s (%s)", label, id);
 #endif
+      if (pressed || (state.menu_quit && index == 0 &&
+          (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))))
+        host::log("menu: activated %s", label);
       const bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
       const ImVec2 q(p.x + x, p.y + y - (hot ? 4.0f : 0.0f));
       const ImVec2 shadow[] = {ImVec2(q.x + 9, q.y + 7), ImVec2(q.x + button_w, q.y + 7),
@@ -10060,7 +10129,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                    ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                    ImGuiWindowFlags_NoSavedSettings);
       ImGui::TextUnformatted("OPTIONS");
-      if (ImGui::Button("PC Settings", ImVec2(190.0f, 36.0f))) {
+      if (settings_widgets::Button("PC Settings", ImVec2(190.0f, 36.0f))) {
         state.open = true;
         reset_settings_home("Options overlay PC Settings button");
       }
@@ -10077,7 +10146,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SetNextWindowBgAlpha(ImGui::GetTime() < 20.0 ? 0.8f : 0.35f);
       ImGui::Begin("SettingsButton", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings);
       clamp_overlay_window();
-      ImGui::TextUnformatted(yougame::stdio_bridge() ? yougame::parity::kMenuHint : "Settings: F1  /  START + DOWN + Z");
+      ImGui::TextUnformatted(yougame::stdio_bridge() ? yougame::parity::kSettingsHint : "Settings: F1  /  START + DOWN + Z");
     ImGui::End();
     }
   }
@@ -10210,6 +10279,10 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   // "not captured" while the top said "captured", so the pointer was shown and hidden every frame.
   host::window_input_capture(state.open || state.menu_open || practice_capture ||
                              state.practice_release_capture || replay_bar::wants_cursor());
+  // Open/close actions above also apply to this frame's resulting state. The
+  // neutral-release capture still prevents a closing A/B/Start reaching Melee.
+  settings_input::navigation(ImGui::GetIO(), state.open || state.menu_open || state.practice_open ||
+      practice.phase == slippi::native_practice::Phase::Failure || state.fill_window);
   if (!state.fill_window && !state.open && !state.menu_open && options.show_player_nicknames)
     draw_player_nicknames();
   if (!state.fill_window && !state.open && !state.menu_open && !g_hud_match && yougame::stdio_bridge())
@@ -10234,6 +10307,30 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     if (sound) host::audio_ui_sound(sound);
     snd_init = true; snd_open = state.open; snd_tab = state.active_tab;
     snd_detail = detail_now; snd_focus = focus_now;
+  }
+  {
+    static constexpr const char* pages[] = {
+        "Video", "Audio", "Game", "Controls", "Overlays", "Customize", "Gecko Codes", "Mods"};
+    static constexpr const char* styles[] = {
+        "Clean side", "Icon tiles", "GD Melee", "Radial", "Wide tabs", "Simple", "Classic", "Legacy Old"};
+    static bool logged_open = false, logged_menu = false;
+    static int logged_page = -1;
+    if (state.open && !logged_open)
+      host::log("settings: overlay opened (port %d, page %s, style %s)",
+                state.settings_controller_port + 1, pages[std::clamp(state.active_tab, 0, 7)],
+                styles[std::clamp(options.overlay_style, 0, 7)]);
+    if (state.open && state.active_tab != logged_page)
+      host::log("settings: page %s", pages[std::clamp(state.active_tab, 0, 7)]);
+    if (state.open && state.page_navigation.active)
+      if (const char* label = state.page_navigation.changed_focus())
+        host::log("settings: focus %s", label);
+    if (!state.open && logged_open) host::log("settings: overlay closed");
+    if (state.menu_open != logged_menu)
+      host::log(state.menu_open ? "menu: opened" : "menu: closed");
+    logged_open = state.open;
+    logged_menu = state.menu_open;
+    logged_page = state.open ? state.active_tab : -1;
+    if (!state.open || !state.page_navigation.active) state.page_navigation.leave();
   }
   if (g_ui_diag) {
     // One line per change, so a report of "the menu jumped" can be read back from the log.

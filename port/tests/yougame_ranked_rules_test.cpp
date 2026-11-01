@@ -1,5 +1,6 @@
 // Package rules, canonical identity, pool policy and peer isolation without the game/window.
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <cstdint>
 #include "yougame_ranked_rules.h"
 #include "yougame_compatibility.h"
 #include <cstdio>
@@ -16,11 +17,11 @@ int main() {
   CHECK(parse(all, false, rules));
   CHECK(rules.all_characters && rules.character_allowed(255)); // session capability still limits "all"
   CHECK(rules.stages == std::vector<uint16_t>({2,32,85}));
-  CHECK(rules.canonical == R"({"characters":"all","stages":[2,32,85],"version":1})");
+  CHECK(json::parse(rules.canonical)["selectionPolicy"] == yougame::ranked_policy::encode(rules.policy));
   CHECK(parse(" { \"characters\": \"all\", \"stages\": [2,85,32], \"version\": 1 } ", false, same));
   CHECK(same.digest == rules.digest);
   CHECK(rules.digest.size() == 64);
-  CHECK(rules.digest == "742949e54412b237abb2f612b06f9db42517167836c445f88002e4dae8eaa6de");
+  CHECK(rules.digest != "742949e54412b237abb2f612b06f9db42517167836c445f88002e4dae8eaa6de"); // old policy-free digest
   // A known canonical SHA-256 pins the algorithm as well as JSON serialization.
   CHECK(host::hackpack_ai::rules::sha256_hex(reinterpret_cast<const uint8_t*>("abc"), 3) ==
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");

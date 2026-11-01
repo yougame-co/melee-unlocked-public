@@ -28,7 +28,9 @@ class YouGame0968MergeTest(unittest.TestCase):
         for name in BACKENDS:
             with self.subTest(backend=name):
                 backend = source("port/runtime/gx/" + name)
-                self.assertEqual(backend.count("swapchain_->Present("), 1)
+                self.assertEqual(backend.count("swapchain_->Present("), 2)
+                self.assertIn("if (test_only) return swapchain_->Present(0, DXGI_PRESENT_TEST);", backend)
+                self.assertIn("&& !yougame::embedded();", backend)
                 present = re.search(
                     r"const HRESULT present_result = \[&\] \{(.*?)\}\(\);",
                     backend, re.S)
@@ -50,7 +52,7 @@ class YouGame0968MergeTest(unittest.TestCase):
         for name in BACKENDS:
             with self.subTest(backend=name):
                 backend = source("port/runtime/gx/" + name)
-                signal = "yougame::parity::signals.presented(SUCCEEDED(present_result) && frame.test_fill < 0);"
+                signal = "yougame::parity::signals.presented(!test_only && SUCCEEDED(present_result) && frame.test_fill < 0);"
                 self.assertEqual(backend.count(signal), 1)
                 present = backend.index("const HRESULT present_result =")
                 ready = backend.index(signal)

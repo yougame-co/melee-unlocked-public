@@ -113,22 +113,29 @@ class Stream {
   Stream(Events& events, Request request, std::function<uint64_t()> clock = now_ms)
       : events_(events), request_(std::move(request)), clock_(std::move(clock)) {}
   ~Stream() { close(1000, 4000); }
-  bool open(const std::string& ticket, const std::string& room, int ms) {
+  bool open(const std::string& ticket, const std::string& room, int ms, const std::string& session = {}, const std::function<bool()>& cancelled = {}) {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (cancelled && cancelled()) return false;
     const uint64_t until = clock_() + ms;
     // An open timeout is not a close. Keep waiting for this connection's app event;
     // replacing it could deliberately evict a seat which connected after the timeout.
-    if (conn_ && !closed_) return ready_ || wait_open(until);
+    if (conn_ && !closed_) return ready_ || wait_open(until, cancelled);
     if (conn_) events_.retire(conn_);
     conn_ = 0; pending_.clear(); ready_ = false; code_ = 1006;
     json q = {{"type", "netOpen"}, {"ticket", ticket}};
     if (!room.empty()) q["room"] = room;
+    if (!session.empty()) q["session"] = session;
 #ifdef YOUGAME_AGENT_TEST_HOOK
     if (!first_open_recorded_) { first_open_recorded_ = true; first_open_at_ = clock_(); }
 #endif
     conn_ = request_(q, std::max(1, ms)).value("conn", 0);
     closed_ = conn_ <= 0;
-    return !closed_ && wait_open(until);
+    return !closed_ && !(cancelled && cancelled()) && wait_open(until, cancelled);
+  }
+  // Keep cancellation-only callers and console session callers source-compatible.
+  bool open(const std::string& ticket, const std::string& room, int ms,
+            const std::function<bool()>& cancelled) {
+    return open(ticket, room, ms, {}, cancelled);
   }
   bool send(const json& m) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -184,10 +191,13 @@ class Stream {
   }
 #endif
  private:
-  bool wait_open(uint64_t until) {
+  bool wait_open(uint64_t until, const std::function<bool()>& cancelled) {
     while (clock_() < until) {
+      if (cancelled && cancelled()) return false;
       json p;
-      if (!events_.next(conn_, p, (int)std::max<int64_t>(0, (int64_t)until - clock_()))) break;
+      const int slice = (int)std::min<uint64_t>(50, until - clock_());
+      if (!events_.next(conn_, p, slice)) continue;
+      if (cancelled && cancelled()) return false;
       const auto event = str(p, "event");
       if (event == "open") { ready_ = true; return true; }
       if (event == "message") pending_.push_back(std::move(p));

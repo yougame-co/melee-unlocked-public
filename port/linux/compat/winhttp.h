@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include "windows.h"
+#include <functional>
 
 typedef void* HINTERNET;
 typedef WORD INTERNET_PORT;
@@ -70,6 +71,7 @@ BOOL WinHttpQueryHeaders(HINTERNET request, DWORD level, LPCWSTR name, LPVOID bu
 BOOL WinHttpQueryDataAvailable(HINTERNET request, LPDWORD available);
 BOOL WinHttpReadData(HINTERNET request, LPVOID buffer, DWORD size, LPDWORD read);
 BOOL WinHttpCloseHandle(HINTERNET handle);
+void WinHttpSetCancelCallback(HINTERNET request, const std::function<bool()>& cancelled);
 HINTERNET WinHttpWebSocketCompleteUpgrade(HINTERNET request, DWORD_PTR context);
 DWORD WinHttpWebSocketSend(HINTERNET socket, WINHTTP_WEB_SOCKET_BUFFER_TYPE type, LPVOID buffer, DWORD size);
 DWORD WinHttpWebSocketReceive(HINTERNET socket, LPVOID buffer, DWORD size, LPDWORD got, WINHTTP_WEB_SOCKET_BUFFER_TYPE* type);

@@ -18,8 +18,11 @@ int main() {
         for (bool agent : {false, true}) {
           for (bool friend_room : {false, true}) {
             for (bool vanilla : {false, true}) {
-              const auto expected = agent || (active && (mode != 1 || !login || friend_room || !vanilla))
-                  ? MatchmakingRoute::YouGame : MatchmakingRoute::Slippi;
+              const auto expected = active && slippi_menu_mode(mode, friend_room)
+                  ? (login && !agent ? MatchmakingRoute::Slippi : MatchmakingRoute::Locked)
+                  : agent ? MatchmakingRoute::YouGame
+                  : !active ? MatchmakingRoute::Slippi
+                  : mode == 1 && login && !friend_room && vanilla ? MatchmakingRoute::Blend : MatchmakingRoute::YouGame;
               CHECK(matchmaking_route(mode, active, login, agent, friend_room, vanilla) == expected);
               ++route_cases;
             }
@@ -29,9 +32,24 @@ int main() {
     }
   }
   CHECK(route_cases == 160);
+  // The three Slippi submenu modes ignore listing type; a missing grant or script locks
+  // instead of entering any YouGame search. Explicit Friends rooms keep their route.
+  for (int mode : {2, 3, 4}) for (bool vanilla : {false, true}) {
+    CHECK(matchmaking_route(mode, true, true, false, false, vanilla) == MatchmakingRoute::Slippi);
+    CHECK(matchmaking_route(mode, true, false, false, false, vanilla) == MatchmakingRoute::Locked);
+    CHECK(matchmaking_route(mode, true, true, true, false, vanilla) == MatchmakingRoute::Locked);
+    CHECK(matchmaking_route(mode, true, true, false, true, vanilla) == MatchmakingRoute::YouGame);
+  }
   // A remix (not vanilla-only) never reaches Slippi, even signed in to Slippi on plain Unranked.
   CHECK(matchmaking_route(1, true, true, false, false, false) == MatchmakingRoute::YouGame);
-  CHECK(matchmaking_route(1, true, true, false, false, true) == MatchmakingRoute::Slippi);
+  // The base listing signed in to Slippi searches both pools (#33357); standalone stays on Slippi.
+  CHECK(matchmaking_route(1, true, true, false, false, true) == MatchmakingRoute::Blend);
+  CHECK(matchmaking_route(1, false, true, false, false, true) == MatchmakingRoute::Slippi);
+  // Only that one case blends: Ranked, Direct, Teams, Party, a friend room or an agent never do.
+  CHECK(matchmaking_route(0, true, true, false, false, true) == MatchmakingRoute::YouGame);
+  CHECK(matchmaking_route(1, true, true, false, true, true) == MatchmakingRoute::YouGame);
+  CHECK(matchmaking_route(1, true, true, true, false, true) == MatchmakingRoute::YouGame);
+  CHECK(matchmaking_route(1, false, true, true, false, true) == MatchmakingRoute::YouGame);
   // Ranked stays off the YouGame Online menu until it plays like Slippi's (Luis, 2026-10-29).
   CHECK(!yougame_ranked_offered);
   std::printf("yougame_mode_policy: %d matchmaking route cases passed\n", route_cases);

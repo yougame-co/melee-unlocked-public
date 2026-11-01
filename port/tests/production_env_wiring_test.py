@@ -25,7 +25,9 @@ class WiringTest(unittest.TestCase):
         bridge = (ROOT / 'port/runtime/hle/yougame_link.cpp').read_text()
         self.assertIn('host::test_env::yougame_session = active();', bridge)
         host = (ROOT / 'port/app/source_host.cpp').read_text()
-        self.assertIn('h.test_getenv = host::test_env::getenv;', host)
+        # Through the policy; a console session reads none (same input on every machine).
+        self.assertIn('h.test_getenv = [](const char* name) -> const char* {\n'
+                      '    return yougame::console::console_active() ? nullptr : host::test_env::getenv(name);', host)
         layer = host.split('std::string iso_layer_fingerprint(', 1)[1].split('std::string dir_layer_fingerprint', 1)[0]
         self.assertIn('layer_fingerprint(g_mod_overlay', layer)
         self.assertNotIn('fingerprints.txt', layer)

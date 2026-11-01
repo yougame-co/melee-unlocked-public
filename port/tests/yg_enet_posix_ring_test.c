@@ -36,7 +36,10 @@ static uint64_t ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
 static void delay(unsigned n) { struct timespec t={n/1000,(long)(n%1000)*1000000}; while(nanosleep(&t,&t) && errno==EINTR) {} }
 static void nonblock(int fd) { CHECK(fcntl(fd,F_SETFL,fcntl(fd,F_GETFL)|O_NONBLOCK)==0); }
 static void lease(Lease *l) {
-    char path[]="/tmp/mu-ring-XXXXXX"; unsigned i;
+    char path[4096]; unsigned i;
+    const char* temp = getenv("TMPDIR");
+    int length = snprintf(path, sizeof path, "%s/mu-ring-XXXXXX", temp ? temp : "/tmp");
+    CHECK(length > 0 && (size_t)length < sizeof path);
     memset(l,0,sizeof *l); l->section=mkstemp(path); CHECK(l->section>=3); CHECK(unlink(path)==0);
     CHECK(ftruncate(l->section,YG_SECTION_SIZE)==0);
     l->m=mmap(NULL,YG_SECTION_SIZE,PROT_READ|PROT_WRITE,MAP_SHARED,l->section,0); CHECK(l->m!=MAP_FAILED);

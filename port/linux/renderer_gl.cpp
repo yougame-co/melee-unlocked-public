@@ -397,6 +397,7 @@ void main() {
         samplers_.clear();
       }
     }
+    apply_msaa(hooks_.options ? hooks_.options->msaa : 1);
     ++sequence_; bind_vertex_array(vao_);
     const size_t original_count = frame.vertices.size();
     vertex_offsets_.assign(frame.draws.size(), 0);
@@ -515,6 +516,7 @@ void main() {
     if (!f) throw std::runtime_error("Cannot write frame capture: " + path.string());
   }
   void capture(const std::filesystem::path& path) {
+    resolve_msaa();
     // XFB submission can clear the EFB immediately. Preserve the displayed
     // source before that clear so an end-of-run capture shows the actual frame.
     glBindFramebuffer(GL_READ_FRAMEBUFFER, have_last_ ? last_frame_ : efb_);
@@ -1144,7 +1146,7 @@ void main() {
 #endif
       return;   // its shader is still being translated
     }
-    use_program(p); attributes(p); glBindFramebuffer(GL_FRAMEBUFFER, efb_);
+    use_program(p); attributes(p); glBindFramebuffer(GL_FRAMEBUFFER, draw_fbo());
     const float* vp = reinterpret_cast<const float*>(&dc.xf_regs[0x1A]);
     float x = (vp[3] - vp[0] - 342) * scale_, y = (vp[4] + vp[1] - 342) * scale_;
     float w = vp[0] * 2 * scale_, h = -vp[1] * 2 * scale_;
@@ -1231,6 +1233,41 @@ void main() {
     glDrawElements(topology == gx::DrawTopology::Lines ? GL_LINES : GL_TRIANGLES, index_scratch_.size(), GL_UNSIGNED_INT, nullptr);
     if (wire) glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
   }
+  // MSAA (Anti-aliasing 2x/4x/8x MSAA): draws go to multisampled renderbuffers, blitted into the EFB
+  // textures (colour and depth) before every copy, present and capture.
+  GLuint draw_fbo() const { return msaa_fbo_ ? msaa_fbo_ : efb_; }
+  void apply_msaa(int wanted) {
+    GLint max_samples = 1; glGetIntegerv(GL_MAX_SAMPLES, &max_samples);
+    int n = 1;
+    for (int k = std::clamp(wanted, 1, 8); k > 1; k /= 2) if (k <= max_samples) { n = k; break; }
+    if (n == msaa_samples_) return;
+    invalidate_state(); // MSAA allocation/clear changes cached masks and scissor state.
+    if (msaa_fbo_) { glDeleteFramebuffers(1, &msaa_fbo_); glDeleteRenderbuffers(2, msaa_rb_); msaa_fbo_ = 0; msaa_rb_[0] = msaa_rb_[1] = 0; }
+    msaa_samples_ = n;
+    if (n > 1) {
+      glGenRenderbuffers(2, msaa_rb_);
+      glBindRenderbuffer(GL_RENDERBUFFER, msaa_rb_[0]); glRenderbufferStorageMultisample(GL_RENDERBUFFER, n, GL_RGBA8, width_, height_);
+      glBindRenderbuffer(GL_RENDERBUFFER, msaa_rb_[1]); glRenderbufferStorageMultisample(GL_RENDERBUFFER, n, GL_DEPTH_COMPONENT32F, width_, height_);
+      glGenFramebuffers(1, &msaa_fbo_); glBindFramebuffer(GL_FRAMEBUFFER, msaa_fbo_);
+      glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, msaa_rb_[0]);
+      glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, msaa_rb_[1]);
+      if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        glDeleteFramebuffers(1, &msaa_fbo_); glDeleteRenderbuffers(2, msaa_rb_); msaa_fbo_ = 0; msaa_samples_ = 1;
+        std::fprintf(stderr, "opengl: %dx MSAA unavailable\n", n);
+      } else {
+        glDisable(GL_SCISSOR_TEST); glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); glDepthMask(GL_TRUE);
+        glClearColor(0, 0, 0, 1); glClearDepth(0); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+      }
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, draw_fbo());
+  }
+  void resolve_msaa() {
+    if (!msaa_fbo_) return;
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, msaa_fbo_); glBindFramebuffer(GL_DRAW_FRAMEBUFFER, efb_);
+    glBlitFramebuffer(0, 0, width_, height_, 0, 0, width_, height_, GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, efb_);
+  }
   GLuint white_texture() {
     if (white_) return white_;
     invalidate_state(); // Allocation changes the current unit's texture binding.
@@ -1242,7 +1279,7 @@ void main() {
   }
   void clear(const gx::EfbCopy& c) {
     invalidate_state();
-    glBindFramebuffer(GL_FRAMEBUFFER, efb_); glEnable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_FRAMEBUFFER, draw_fbo()); glEnable(GL_SCISSOR_TEST);
     glScissor(c.src_x * scale_, height_ - (c.src_y + c.src_h) * scale_, c.src_w * scale_, c.src_h * scale_);
     glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE); glDepthMask(GL_TRUE);
     const uint32_t clear_colour = gx::look_clear_colour(lightweight_filter_.in_match, c.clear_color);   // the look's background
@@ -1254,6 +1291,7 @@ void main() {
     bind_vertex_array(vao_);
     GlProbeScope cost(probe_.slot(probe_.copy));
     if (!c.src_w || !c.src_h) return;
+    resolve_msaa();
     const uint32_t w = std::max(1u, c.src_w / (c.half_scale ? 2 : 1)) * scale_, h = std::max(1u, c.src_h / (c.half_scale ? 2 : 1)) * scale_;
     auto& e = copies_[c.dest_addr & 0x3FFFFFFFu];
     if (!e.id || e.width != w || e.height != h) {
@@ -1272,11 +1310,12 @@ void main() {
     glUniform1i(copy_kind_, c.is_depth ? 2 : (c.efb_alpha ? 0 : 1));
     // EFB is stored bottom-up by OpenGL; sampled GX textures store their first (top) row at y=0.
     glUniform4f(copy_rect_, c.src_w / float(gx::EFB_WIDTH), c.src_h / float(gx::EFB_HEIGHT), c.src_x / float(gx::EFB_WIDTH), 1 - (c.src_y + c.src_h) / float(gx::EFB_HEIGHT));
-    glDrawArrays(GL_TRIANGLES, 0, 3); glBindFramebuffer(GL_FRAMEBUFFER, efb_);
+    glDrawArrays(GL_TRIANGLES, 0, 3); glBindFramebuffer(GL_FRAMEBUFFER, draw_fbo());
     invalidate_state();
   }
   void present(const gx::EfbCopy& c, const gx::Frame& frame) {
     const int test_fill = frame.test_fill;
+    resolve_msaa();
     invalidate_state();
     int w = 0, h = 0;
 #ifdef MELEE_LINUX_X11_EMBED
@@ -1389,14 +1428,14 @@ void main() {
       GlProbeScope cost(probe_.slot(probe_.prewarm));
       prewarm_some(frame_ms);
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, efb_);
+    glBindFramebuffer(GL_FRAMEBUFFER, draw_fbo());
 #else
     SDL_GL_SwapWindow(window_); ++presented_;
 #ifdef YOUGAME_AGENT_TEST_HOOK
     record_present();
 #endif
     if (hooks_.after_swap) hooks_.after_swap(presented_);
-    glBindFramebuffer(GL_FRAMEBUFFER, efb_);
+    glBindFramebuffer(GL_FRAMEBUFFER, draw_fbo());
 #endif
     const GLenum error = glGetError();
     if (error != GL_NO_ERROR) throw std::runtime_error("OpenGL GX frame failed with error " + std::to_string(error));
@@ -1635,7 +1674,7 @@ void main() {
     const GLuint id = video_texture(f, slot);
     if (!id) return;
     glBindVertexArray(vao_);
-    glBindFramebuffer(GL_FRAMEBUFFER, efb_);
+    glBindFramebuffer(GL_FRAMEBUFFER, draw_fbo());
     glEnable(GL_SCISSOR_TEST);
     const GLint x = GLint(screen.src_x * scale_), y = GLint(height_ - (screen.src_y + screen.src_h) * scale_);
     glViewport(x, y, GLsizei(screen.src_w * scale_), GLsizei(screen.src_h * scale_));
@@ -1702,6 +1741,8 @@ void main() {
   GLint copy_source_ = -1, copy_kind_ = -1, copy_rect_ = -1;
   int scale_, width_, height_; bool skip_ = false; uint64_t sequence_ = 0; uint32_t presented_ = 0, source_retrace_ = 0;
   GLuint vao_ = 0, vertices_ = 0, indices_ = 0, uniform_[2]{}, efb_ = 0, color_ = 0, depth_ = 0, copy_program_ = 0;
+  GLuint msaa_fbo_ = 0, msaa_rb_[2]{};
+  int msaa_samples_ = 1;
   GLuint last_frame_ = 0, last_color_ = 0; bool have_last_ = false;
 #ifdef __APPLE__
   int drawable_w_ = 0, drawable_h_ = 0, surface_probe_ = 0;

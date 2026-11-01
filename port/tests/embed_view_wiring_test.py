@@ -57,8 +57,8 @@ class EmbedViewWiringTest(unittest.TestCase):
                           r'#else\s*inline constexpr const char\* kCaps = ("[^\n]+?");\s*#endif', header)
         self.assertIsNotNone(match)
         supported, mac = (json.loads(json.loads(value)[3:])["caps"] for value in match.groups())
-        self.assertEqual(supported, ["ready", "overlay", "join", "notice", "pads", "rumble", "view", "volume"])
-        self.assertEqual(mac, ["ready", "overlay", "join", "notice", "pads", "rumble"])
+        self.assertEqual(supported, ["ready", "overlay", "join", "notice", "pads", "rumble", "chat", "settings", "view", "volume"])
+        self.assertEqual(mac, ["ready", "overlay", "join", "notice", "pads", "rumble", "chat", "settings"])
         self.assertEqual(header.count('kCaps ='), 2)
 
     def test_proof_logs(self):

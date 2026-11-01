@@ -13,12 +13,7 @@ int main() {
         "settings: saved D3D12, using OpenGL" + tail);
   CHECK(app::settings_backend_label("D3D11", "OpenGL") == "saved D3D11, using OpenGL");
   CHECK(app::settings_backend_label("OpenGL", "OpenGL") == "OpenGL");
-#ifdef __APPLE__
-  CHECK(std::string(app::settings_backend_in_use("D3D12")) == "OpenGL");
-  CHECK(std::string(app::settings_backend_in_use("D3D11")) == "OpenGL");
-#else
-  CHECK(std::string(app::settings_backend_in_use("D3D12")) == "D3D12");
-  CHECK(std::string(app::settings_backend_in_use("D3D11")) == "D3D11");
-#endif
+  CHECK(app::settings_backend_label("Vulkan", "D3D12") == "saved Vulkan, using D3D12");
+  CHECK(app::settings_backend_label("D3D12", "none (headless)") == "saved D3D12, using none (headless)");
   std::puts("7 checks passed");
 }

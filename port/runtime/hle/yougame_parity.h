@@ -10,13 +10,14 @@
 #endif
 
 namespace yougame::parity {
+inline constexpr const char* kSettingsHint = "F1: game settings";
 inline constexpr const char* kMenuHint = "Escape / YouGame menu (D-pad + Start)";
 #if defined(_WIN32) || defined(__linux__)
-inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"view\",\"volume\"]}";
+inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\"]}";
 #else
-inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\"]}";
+inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\"]}";
 #endif
-inline constexpr const char* kToplevelCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"view\",\"volume\",\"toplevel\"]}";
+inline constexpr const char* kToplevelCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\",\"toplevel\"]}";
 inline constexpr const char* caps(bool toplevel) { return toplevel ? kToplevelCaps : kCaps; }
 inline constexpr const char* kReady = "yg {\"ready\":true}";
 inline constexpr const char* kDown = "yg {\"overlay\":\"down\"}";
@@ -43,6 +44,11 @@ class Signals {
     return true;
   }
 #endif
+  // A console boot waits for room/link setup before simulation can present a frame.
+  // Keep this explicit: ordinary launches still become ready on their first present.
+  void console_boot_ready() {
+    if (auto writer = writer_.load()) if (!ready_.exchange(true)) writer(kReady);
+  }
   // Called after a successful swap of a visible game frame, never a loading panel.
   void presented(bool eligible
 #ifdef YOUGAME_AGENT_TEST_HOOK
@@ -110,6 +116,15 @@ class OverlayKey {
     return was_down ? kUp : nullptr;
   }
 #endif
+  // End a real chord on its first modifier release, retaining the main-key reservation.
+  const char* modifiers_released() {
+#ifdef YOUGAME_AGENT_TEST_HOOK
+    if (scripted_) return nullptr;
+#endif
+    const bool was_down = down_;
+    down_ = false;
+    return was_down ? kUp : nullptr;
+  }
   const char* cancel() {
 #ifdef YOUGAME_AGENT_TEST_HOOK
     scripted_ = false;

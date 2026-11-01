@@ -42,6 +42,7 @@ void gcadapter_test_script_start() {}
 #include "pad_mirror_posix.h"
 #endif
 #include "phob.h"
+#include "phob_adapter_input.h"
 #define NOMINMAX
 #include <windows.h>
 #ifdef _WIN32
@@ -132,17 +133,7 @@ GCScopeSample g_scope[4][kScopeLen];
 uint32_t g_scope_head[4] = {};
 
 phob::HardwareInput phob_input(const uint8_t* c, const Origin& o) {
-  phob::HardwareInput in;
-  uint16_t b = 0;
-  if (c[1] & 0x01) b |= PAD_A; if (c[1] & 0x02) b |= PAD_B; if (c[1] & 0x04) b |= PAD_X; if (c[1] & 0x08) b |= PAD_Y;
-  if (c[1] & 0x10) b |= PAD_LEFT; if (c[1] & 0x20) b |= PAD_RIGHT; if (c[1] & 0x40) b |= PAD_DOWN; if (c[1] & 0x80) b |= PAD_UP;
-  if (c[2] & 0x01) b |= PAD_START; if (c[2] & 0x02) b |= PAD_Z; if (c[2] & 0x04) b |= PAD_R; if (c[2] & 0x08) b |= PAD_L;
-  in.buttons = b;
-  in.ax = c[3]; in.ay = c[4]; in.cx = c[5]; in.cy = c[6];
-  in.ax0 = o.sx; in.ay0 = o.sy; in.cx0 = o.cx; in.cy0 = o.cy;
-  in.la = (uint8_t)(c[7] > o.tl ? c[7] - o.tl : 0);
-  in.ra = (uint8_t)(c[8] > o.tr ? c[8] - o.tr : 0);
-  return in;
+  return phob::adapter_input(c, o);
 }
 
 // Called with g_mutex held, for each new report.
@@ -989,8 +980,13 @@ phob::Settings gcadapter_phob_get(int port) {
 }
 
 bool gcadapter_phob_raw(int port, phob::HardwareInput& in) {
-  if (port < 0 || port > 3) return false;
+  if (port < 0 || port > 3 || options.no_gc_adapter) return false;
   std::lock_guard<std::mutex> lk(g_mutex);
+  if (yougame::stdio_bridge()) {
+    attach_mirror();
+    uint8_t report[37];
+    return mirror_live(report) && phob::mirror_input(report, port, g_origin[port], in);
+  }
   if (!g_have_report || !g_origin[port].set) return false;
   const uint8_t* c = g_report + 1 + port * 9;
   if (!(c[0] & 0x30)) return false;
@@ -1000,6 +996,13 @@ bool gcadapter_phob_raw(int port, phob::HardwareInput& in) {
 
 int gcadapter_scope(int port, GCScopeSample* out, int max) {
   if (port < 0 || port > 3 || max <= 0) return 0;
+  if (yougame::stdio_bridge()) {
+    phob::HardwareInput in;
+    if (!gcadapter_phob_raw(port, in)) return 0;
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    out[0] = phob::live_sample<GCScopeSample>(in, (uint32_t)us);
+    return 1;
+  }
   std::lock_guard<std::mutex> lk(g_mutex);
   const uint32_t head = g_scope_head[port];
   const int n = (int)std::min<uint32_t>((uint32_t)std::min(max, kScopeLen), head);

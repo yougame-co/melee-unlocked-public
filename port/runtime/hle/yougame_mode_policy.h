@@ -6,27 +6,36 @@
 
 namespace yougame::mode_policy {
 
-enum class MatchmakingRoute { YouGame, Slippi };
+// Direct, Teams and Party in the Slippi submenu never use YouGame's queues. An explicit
+// friend room is the separate Friends flow, which retains its existing routing.
+enum class MatchmakingRoute { YouGame, Slippi, Blend, Locked };
+constexpr bool slippi_menu_mode(int mode, bool friend_room) {
+  return mode >= 2 && mode <= 4 && !friend_room;
+}
 
-// Slippi's mode ids: 0 Ranked, 1 Unranked, 2 Direct, 3 Teams, 4 Party.
-// Launched by YouGame, only a plain Unranked search with a Slippi login on the base listing goes to
-// Slippi: `vanilla` is host::gameplay::vanilla_only() (a verified retail disc, no mods). A remix
-// build would desync against Slippi players, so it keeps YouGame's own pool (yougame-lead #33582).
+// Slippi mode ids: 0 Ranked, 1 Unranked, 2 Direct, 3 Teams, 4 Party.
+// Plain Unranked keeps its mixed search on the base listing. Direct, Teams and Party
+// require the app's granted Slippi account, independent of connect-code syntax.
 constexpr MatchmakingRoute matchmaking_route(int mode, bool yougame_mode, bool slippi_login,
                                              bool agent_script, bool friend_room, bool vanilla) {
+  if (yougame_mode && slippi_menu_mode(mode, friend_room))
+    return slippi_login && !agent_script ? MatchmakingRoute::Slippi : MatchmakingRoute::Locked;
   if (agent_script) return MatchmakingRoute::YouGame;
-  return !yougame_mode || (mode == 1 && slippi_login && !friend_room && vanilla)
-      ? MatchmakingRoute::Slippi : MatchmakingRoute::YouGame;
+  if (!yougame_mode) return MatchmakingRoute::Slippi;
+  return mode == 1 && slippi_login && !friend_room && vanilla ? MatchmakingRoute::Blend : MatchmakingRoute::YouGame;
 }
 
 // Whether the Online menu offers Ranked in YouGame mode. Off until Ranked plays like Slippi's
 // (rank shown, best of 3, stage striking, rating change): Luis, 2026-10-29. The site's ladder
 // switch is off for these listings too, and the page turns a ranked request into a casual one.
+#if defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH
+constexpr bool yougame_ranked_offered = true;
+#else
 constexpr bool yougame_ranked_offered = false;
-// The Online menu's Friends row: off in the main build until its label renders right (Luis 10-30 saw "Fsjfoet") and a
-// real-input pass confirms it; the Friends branch build turns it on with -DYOUGAME_FRIENDS_ROW=1.
+#endif
+// The Online menu offers Friends by default in YouGame launches.
 #ifndef YOUGAME_FRIENDS_ROW
-#define YOUGAME_FRIENDS_ROW 0
+#define YOUGAME_FRIENDS_ROW 1
 #endif
 constexpr bool friends_offered(bool yougame_mode) { return YOUGAME_FRIENDS_ROW != 0 && yougame_mode; }
 

@@ -31,6 +31,53 @@ class RankedMenuWiringTest(unittest.TestCase):
         self.assertIn("mu_slippi_cmd(CMD_YOUGAME_RANKED, NULL, 0, r, sizeof r, &got)", menu)
         self.assertIn("(sel == MU_SLP_MODE_RANKED && ranked_offered)", menu)
 
+    def test_presentation_does_not_offer_the_hidden_row(self):
+        policy = source("port/runtime/hle/yougame_mode_policy.h")
+        self.assertIn("constexpr bool yougame_ranked_offered = false;", policy)
+        online = source("port/runtime/hle/slippi_online.cpp")
+        query = online.split("case CMD_YOUGAME_RANKED:", 1)[1].split("default:", 1)[0]
+        self.assertIn("if (yougame::active())", query)
+        self.assertIn("q[0] |= 4;", query)
+        self.assertIn("if (yougame::mode_policy::yougame_ranked_offered) q[0] |= 1;", query)
+        menu = source("sourceport/game/shim/mu_slippi_menu.c")
+        self.assertIn("if (out == NULL) return (r[0] & 1) != 0;", menu)
+        self.assertIn("int mu_slippi_ranked_available(void) { return ranked_supported; }", menu)
+
+    def test_first_frame_queues_the_negotiated_id_without_socket_io(self):
+        online = source("port/runtime/hle/slippi_online.cpp")
+        self.assertIn("yougame::game_started(g_game_facts.rng, g_game_facts.stage)", online)
+        link = source("port/runtime/hle/yougame_link.cpp")
+        start = link.split("void game_started(", 1)[1].split("void game_ended(", 1)[0]
+        self.assertIn("g_room->set.start_game(ranked::game_key(rng, stage))", start)
+        self.assertNotIn("->send(", start)
+        self.assertIn("std::lock_guard<std::mutex> lock(g_mutex)", start)
+
+    def test_ranked_css_splash_and_opponent_byte_use_the_new_state(self):
+        css = source("sourceport/game/shim/mu_slippi_css.c")
+        self.assertEqual(css.count("mu_slippi_ranked_lines(rank_lines)"), 1)
+        self.assertNotIn("mu_slippi_ranked_line(", css)
+        self.assertIn("ranked_header(rank_lines[0])", css)
+        self.assertIn('set_text(ST_RANK_OPPONENT + i, "")', css)
+        panel = source("sourceport/game/shim/mu_ranked_rank.c")
+        self.assertIn("mu_ranked_read_ranks(&ranks)", panel)
+        self.assertIn("mu_rank_badge_create(", panel)
+        self.assertIn("set = mu_ranked_set()", panel)
+        self.assertIn('"Game %u - %u:%u"', panel)
+        splash = source("sourceport/game/shim/mu_slippi_splash.c")
+        self.assertIn("const MuRankedSet* set = mu_ranked_set()", splash)
+        self.assertIn('"Game %u - %u:%u"', splash)
+        self.assertNotIn("mu_slippi_ranked_line(2,", splash)
+        self.assertNotIn("mu_slippi_ranked_line(3,", splash)  # no stale "comes next" note
+        self.assertIn("set->score[me], (unsigned) set->score[!me]", splash)  # local first
+        online = source("port/runtime/hle/slippi_online.cpp")
+        self.assertIn("ranks[1 - g_local_player_index] = yougame::opponent_rank()", online)
+        link = source("port/runtime/hle/yougame_link.cpp")
+        self.assertNotIn("Stage striking comes next", link)
+        self.assertIn("g_rank_score = g_room->set.score_text()", link)
+        before_ticket = link.split("ranked::set_contract(request);", 1)[1].split("ticket = bridge(request, 30000)", 1)[0]
+        self.assertIn("ranked_header();", before_ticket)
+        self.assertIn("if (!g_rank_read.in_flight) break;", before_ticket)
+
 
 if __name__ == "__main__":
     unittest.main()

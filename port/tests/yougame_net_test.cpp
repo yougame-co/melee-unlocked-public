@@ -1,5 +1,6 @@
 // Window-free fake-clock scheduling, startup parsing and Direct-only policy checks.
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <cstdint>
 #include "yougame_net_test.h"
 #include "yougame_agent_test.h"
 #ifdef YOUGAME_AGENT_TEST_HOOK

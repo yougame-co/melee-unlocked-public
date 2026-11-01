@@ -19,8 +19,8 @@
 extern "C" {
 #endif
 
-#define MU_HOST_API_VERSION 22
-#define MU_GAME_API_VERSION 6
+#define MU_HOST_API_VERSION 26
+#define MU_GAME_API_VERSION 9
 #define MU_SLIPPI_RESPONSE_CAPACITY 4096u
 
 /* Values are raw IEEE-754 bits so the two builds can be compared exactly. */
@@ -41,6 +41,14 @@ typedef struct MuStatePod {
     uint32_t rng, scene;
     MuFighterState player[6];
     uint32_t scene_major, match_frame;
+    /* Canonical main/rules menu navigation, without pointers or padding. */
+    uint32_t menu_kind, menu_previous, menu_selection, menu_entering;
+    /* Version 8: console rollback diagnostics only. Explicit scalar words, never raw rules or
+     * pointer-containing result memory. valid=0 keeps the legacy 80-word console digest. */
+    uint32_t console_valid, console_result, console_pauser, console_seconds, console_timer_frames;
+    uint32_t console_stage, console_teams, console_time_limit, console_timer_enabled;
+    uint32_t console_timer_up, console_item_frequency;
+    uint32_t console_stocks[6], console_damage[6];
 } MuStatePod;
 
 /* The console's 40.5 MHz timebase, which the host advances deterministically. */
@@ -147,6 +155,21 @@ typedef struct MuNativeRenderScopeEvent {
     uint32_t phase; /* 1: begin PObj; 2: end PObj */
     uint32_t reserved;
 } MuNativeRenderScopeEvent;
+
+/* Console-only adapter, never transmitted. Remote order is ports ascending, skipping local.
+ * latest is a match body key (including pause); absent ports are confirmed disconnected.
+ * Version 26 adds VALIDATED: an exclusive boundary checked/replayed by the game predictor. */
+enum { MU_CONSOLE_QUERY, MU_CONSOLE_MATCH_BEGIN, MU_CONSOLE_FORWARD,
+       MU_CONSOLE_INPUTS, MU_CONSOLE_REPLAY, MU_CONSOLE_MATCH_END, MU_CONSOLE_FAIL,
+       MU_CONSOLE_BOUNDARY, MU_CONSOLE_BODY_END, MU_CONSOLE_CONFIRM, MU_CONSOLE_COMMIT, MU_CONSOLE_SERVICE,
+       MU_CONSOLE_VALIDATED };
+typedef struct MuConsoleInputs {
+    uint32_t epoch;
+    int32_t local_port;
+    int32_t latest[3];
+    MuPadStatus local;
+    MuPadStatus remote[3][7];
+} MuConsoleInputs;
 
 typedef struct MuHostApi {
     uint32_t version;   /* MU_HOST_API_VERSION */
@@ -375,6 +398,18 @@ typedef struct MuHostApi {
     int32_t (*card_boot_confirm)(uint32_t channel, uint32_t decision);
     /* Version 22. Session-gated diagnostic environment; NULL means unset. */
     const char* (*test_getenv)(const char* name);
+    /* Version 23. Console session body boundary, before consuming the raw pad queue.
+     * Nonzero replaces its next entry with the confirmed four pads. Inactive returns zero. */
+    int32_t (*console_frame_begin)(void);
+    /* Returns the agreed initial RNG seed only during a console boot. */
+    int32_t (*console_seed)(uint32_t* seed);
+    /* Version 24. Explicit console match lifecycle and input history; zero means failure/inactive.
+     * FORWARD issues once and admits a body, REPLAY injects retained history without issuance.
+     * B1/B2 remain the snapshot commands. QUERY is the console-only opt-in switch. */
+    int32_t (*console_rollback)(int32_t operation, uint32_t body, MuConsoleInputs* inputs);
+    /* Version 25. Non-advancing clock domains for console rollback alarm scheduling.
+     * Zero preserves the ordinary SDK clock path (including console rollback OFF). */
+    int32_t (*console_alarm_clock)(uint64_t* simulation, uint64_t* hardware);
 } MuHostApi;
 
 /* Start each new sound in the sound frame being mixed now instead of the next one (5 ms sooner):

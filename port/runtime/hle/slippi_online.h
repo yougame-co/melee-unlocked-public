@@ -87,6 +87,8 @@ int local_player_index();
 // True while the game is polling the online menus (mode select, the online character select screen,
 // waiting for an opponent) and not running a match.
 bool in_online_menus();
+// Online submenu and CSS, including when the Friends row is hidden.
+bool online_status_visible();
 
 // Native practice uses the same Slippi matchmaking implementation as the game's online menus.
 // These calls are simulation-thread only. native_poll_match is deliberately side-effecting and

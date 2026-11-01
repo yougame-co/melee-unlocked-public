@@ -546,6 +546,12 @@ typedef struct MuExclusion {
  * sites those codes patch. Every hook does nothing unless an online match is running. */
 struct PADStatus;
 int mu_online_active(void);
+/* Console-only backend: never asserts Slippi online status or installs its rules. */
+void mu_console_match_setup(void);
+int mu_console_rollback_active(void);
+int mu_console_rumble_owned(void);
+int mu_online_scene_terminal(void); /* pre-break terminal confirmation; 1 re-runs the body */
+unsigned int mu_console_rollback_codes(void);
 unsigned int mu_online_codes(void);   /* MU_RC_* an online match plays with (0 offline) */
 int mu_online_is_test_run(void);      /* the host asked for a match without menus (kinds 1 and 2) */
 int mu_online_p2p_menus(void);        /* 1: a peer-to-peer session through the online menus (kind 3) */
@@ -573,6 +579,8 @@ void mu_online_audio_frame_begin(void);
 void mu_online_audio_frame_end(void);
 void mu_online_audio_rollback_end(void);
 void mu_online_audio_match_exit(void);
+void mu_online_audio_console_restore(int body);
+void mu_online_audio_console_commit(int body);
 void* mu_online_audio_state_address(void);
 unsigned int mu_online_audio_state_size(void);
 int mu_online_sfx_begin(int sound_id, int track, int* adopted_id);   /* PreventDuplicateSounds */
@@ -595,12 +603,12 @@ void mu_pad_motor(int port, int on);                                 /* shim/mu_
 #define MU_OPTION_SLIPPI_MENUS 0x8u
 enum { MU_SLP_MODE_RANKED, MU_SLP_MODE_UNRANKED, MU_SLP_MODE_DIRECT, MU_SLP_MODE_TEAMS,
        MU_SLP_MODE_PARTY };
-enum { MU_SLP_OPT_LOGIN = 5, MU_SLP_OPT_LOGOUT = 6, MU_SLP_OPT_UPDATE = 7, MU_SLP_OPT_FRIENDS = 8, MU_SLP_OPT_COUNT = 9 };
+enum { MU_SLP_OPT_LOGIN = 5, MU_SLP_OPT_LOGOUT = 6, MU_SLP_OPT_UPDATE = 7, MU_SLP_OPT_FRIENDS = 8, MU_SLP_OPT_SLIPPI = 9, MU_SLP_OPT_COUNT = 10 };
 enum { MU_SLP_APP_LOGGED_OUT, MU_SLP_APP_LOGGED_IN, MU_SLP_APP_UPDATE };
 enum { MU_SLP_MM_IDLE, MU_SLP_MM_INITIALIZING, MU_SLP_MM_MATCHMAKING, MU_SLP_MM_OPPONENT_CONNECTING,
        MU_SLP_MM_CONNECTION_SUCCESS, MU_SLP_MM_ERROR };
 enum { MU_SLP_STATE_CSS, MU_SLP_STATE_SSS, MU_SLP_STATE_VS, MU_SLP_STATE_RESULTS,
-       MU_SLP_STATE_SPLASH };
+       MU_SLP_STATE_SPLASH, MU_SLP_STATE_GAME_SETUP };
 enum { MU_SLP_WINNER_NULL = -1, MU_SLP_WINNER_LOST = 0, MU_SLP_WINNER_WON = 1 };
 enum { MU_SLP_CB_NONE, MU_SLP_CB_CODE_LOCK_IN, MU_SLP_CB_SSS_LOCK_IN };
 enum { MU_SLP_STAGE_UNSET = 0, MU_SLP_STAGE_PICK = 1, MU_SLP_STAGE_RANDOM = 3 };
@@ -659,14 +667,29 @@ MuSlippiMenuState* mu_slippi_state(void);
 int mu_slippi_cmd(unsigned int cmd, const void* payload, unsigned int size, void* reply,
                   unsigned int reply_cap, unsigned int* reply_size);
 int mu_slippi_fetch_app_state(void);                      /* B9 (and FA: is Ranked offered) */
-/* FA, this fork's own: nonzero when the host offers Ranked (YouGame mode; Ranked v1 plays the
- * Unranked screens). mu_slippi_ranked_header also copies the Ranked character select's header
- * (game text, NUL-terminated) into `out`; it returns 0 and leaves `out` empty otherwise. */
+/* FA: menu visibility is independent of YouGame's Ranked presentation capability.
+ * A NULL output asks whether the hidden Ranked row is offered; a text output reads its header.
+ * available() allows the YouGame random-stage flow even while the menu row stays hidden. */
 int mu_slippi_ranked_available(void);
 int mu_slippi_friends_available(void);
+int mu_slippi_yougame_menu(void);
+int mu_slippi_menu_option(int row);
+int mu_slippi_menu_count(void);
+int mu_slippi_menu_label_kind(int row);
+int mu_slippi_title_active(void);
+void mu_slippi_title_panel_init(struct HSD_GObj* panel);
+void mu_slippi_title_panel_update(struct HSD_GObj* panel, int canvas);
+void mu_slippi_signin_notice(struct HSD_GObj* menu);
+struct HSD_Text;
+void mu_slippi_menu_description(struct HSD_Text* text, const char* message);
 struct HSD_JObj;
-void mu_slippi_friends_label(struct HSD_JObj* label, int menu_kind, int selection); /* shim/mu_menu_label.c */
+void mu_slippi_friends_label(struct HSD_JObj* label, int menu_kind, int selection, int capture); /* shim/mu_menu_label.c */
+struct StaticModelSyms;
+void mu_slippi_menu_labels_init(struct StaticModelSyms* model, int menu_kind);
 int mu_slippi_ranked_header(char* out, unsigned int cap);
+/* FA presentation: header, opponent, score, stage note, result rating, result change. */
+int mu_slippi_ranked_line(unsigned int line, char* out, unsigned int cap);
+int mu_slippi_ranked_lines(char lines[6][128]);
 int mu_slippi_app_state(void);
 const char* mu_slippi_user_name(void);
 const char* mu_slippi_user_code(void);
@@ -694,6 +717,14 @@ int mu_slippi_first_unlocked(void);
 void mu_online_arm(int mode, int input_port);             /* shim/mu_online.c */
 /* Hook-site entry points (core's own decomp sites). */
 struct HSD_GObj;
+/* Shared Ranked hooks: track A setup, track B CSS ranks, track C CSS reveal. */
+void mu_ranked_setup_load(void* data);
+void mu_ranked_setup_think(void);
+void mu_ranked_setup_exit(void* data);
+void mu_ranked_rank_enter(void);
+void mu_ranked_rank_frame(void);
+void mu_ranked_reveal_enter(void);
+void mu_ranked_reveal_frame(void);
 void mu_slippi_scene_install(void);                       /* gm_801A4510 */
 unsigned char mu_slippi_boot_mode(unsigned char mode);    /* bootOnLeave */
 void mu_slippi_menu_prep(void);                           /* gmmenumode onEnter */

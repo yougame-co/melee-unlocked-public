@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include "../abi/mu_ranked_wire.h"
 
 namespace slippi::online {
 
@@ -14,9 +15,12 @@ enum Cmd : uint8_t {
   CMD_OVERWRITE_SELECTIONS = 0xBF, CMD_GP_COMPLETE_STEP = 0xC0, CMD_GP_FETCH_STEP = 0xC1, CMD_REPORT_SET_COMPLETE = 0xC2,
   CMD_GET_PLAYER_SETTINGS = 0xC3, CMD_REPORT_MATCH_STATUS_UPDATE = 0xC4, CMD_GET_DELAY = 0xD5,
   CMD_GET_RANK = 0xE3, CMD_FETCH_RANK = 0xE4, CMD_GET_RANK_VISIBILITY = 0xE5,
-  // This fork's own (the Source Port host owns 0xF0-0xF9): is Ranked offered (YouGame mode), and the
-  // Ranked character select's header (slippi_online.cpp, shim/mu_slippi_menu.c).
+  // This fork's empty-payload query (0xF0-0xF9 belong to the Source Port host): flags bit 0
+  // offers Ranked, bit 1 Friends, bit 2 Ranked presentation; then six 128-byte game-text lines
+  // (header, opponent, score, stage note, result rating, result change), each NUL-terminated.
   CMD_YOUGAME_RANKED = 0xFA,
+  // Fixed-size versioned replies, documented field-by-field in mu_ranked_wire.h.
+  CMD_YOUGAME_DATA = MU_YG_COMMAND,
   CMD_YOUGAME_FRIENDS_MENU = 0xE6,
 };
 
@@ -34,6 +38,8 @@ inline uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint3
 
 // Fixed EXI payload sizes. Unknown commands pass here; the dispatcher reports them itself.
 inline bool command_payload_valid(uint8_t cmd, const uint8_t* payload, uint32_t payload_len) {
+  if (cmd == CMD_CLEANUP_CONNECTION)
+    return payload_len == 0 || (payload_len == 1 && payload && payload[0] == 1);
   uint32_t expected = 0;
   switch (cmd) {
     case CMD_ONLINE_INPUTS: expected = 25; break;
@@ -41,6 +47,12 @@ inline bool command_payload_valid(uint8_t cmd, const uint8_t* payload, uint32_t 
     case CMD_FIND_OPPONENT: expected = 19; break;
     case CMD_SET_MATCH_SELECTIONS: expected = 9; break;
     case CMD_YOUGAME_FRIENDS_MENU: expected = 1; break;
+    case CMD_YOUGAME_DATA:
+      expected = 1;
+#if defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH
+      if (payload && payload_len && payload[0] == MU_YG_SUB_PRACTICE) expected = 2;
+#endif
+      break;
     case CMD_SEND_CHAT_MESSAGE: expected = 2; break;
     case CMD_REPORT_GAME: expected = 368; break;
     case CMD_FETCH_CODE_SUGGESTION: expected = 31; break;
@@ -51,7 +63,8 @@ inline bool command_payload_valid(uint8_t cmd, const uint8_t* payload, uint32_t 
     case CMD_GET_MATCH_STATE: case CMD_OPEN_LOGIN: case CMD_LOGOUT: case CMD_UPDATE:
     case CMD_GET_ONLINE_STATUS: case CMD_CLEANUP_CONNECTION: case CMD_GET_NEW_SEED:
     case CMD_GET_PLAYER_SETTINGS: case CMD_GET_DELAY: case CMD_GET_RANK:
-    case CMD_FETCH_RANK: case CMD_GET_RANK_VISIBILITY: case CMD_YOUGAME_RANKED: expected = 0; break;
+    case CMD_FETCH_RANK: case CMD_GET_RANK_VISIBILITY: case CMD_YOUGAME_RANKED:
+    expected = 0; break;
     default: return true;
   }
   if (payload_len != expected || (expected && !payload)) return false;

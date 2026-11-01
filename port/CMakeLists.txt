@@ -71,7 +71,7 @@ if(MELEE_NO_SLIPPI)
   add_library(runtime_ns STATIC ${RUNTIME_NS_SOURCES} app/source_noslippi.cpp
     third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c)   # mu_net: keys, signatures, packet sealing
   target_include_directories(runtime_ns PUBLIC third_party/monocypher)
-  target_compile_definitions(runtime_ns PRIVATE MELEE_NO_SLIPPI MELEE_PORT_VERSION="${MELEE_PORT_VERSION}"
+  target_compile_definitions(runtime_ns PRIVATE MELEE_NO_SLIPPI YOUGAME_COMPAT_TAG="${YOUGAME_COMPAT_TAG}" MELEE_PORT_VERSION="${MELEE_PORT_VERSION}"
     MELEE_PLAYBACK_GCT_BASE=0u MELEE_PLAYBACK_GCT_SIZE=0u)
   if(WIN32)
     set(MELEE_ASIO_SOURCES third_party/asio/asio.cpp third_party/asio/asiodrivers.cpp third_party/asio/asiolist.cpp)
@@ -131,8 +131,11 @@ if(MELEE_NO_SLIPPI)
   add_library(port_imgui STATIC
     third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
     third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
-    third_party/imgui/backends/imgui_impl_dx12.cpp third_party/imgui/backends/imgui_impl_win32.cpp)
-  target_include_directories(port_imgui PUBLIC third_party/imgui)
+    third_party/imgui/backends/imgui_impl_dx12.cpp third_party/imgui/backends/imgui_impl_win32.cpp
+    third_party/imgui/backends/imgui_impl_vulkan.cpp)
+  # The Vulkan renderer (gx_vulkan.cpp) opens the loader at run time: headers only, no import library.
+  target_include_directories(port_imgui PUBLIC third_party/imgui third_party/vulkan-headers/include)
+  target_compile_definitions(port_imgui PUBLIC IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
   target_compile_features(port_imgui PUBLIC cxx_std_17)
   target_compile_definitions(port_imgui PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
   target_compile_options(port_imgui PRIVATE ${MELEE_ARCH_FLAG})
@@ -370,6 +373,7 @@ add_test(NAME port_yougame_0969_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_C
 add_test(NAME port_yougame_0971_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/yougame_0971_merge_test.py")
 add_test(NAME port_yougame_0981_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/yougame_0981_merge_test.py")
 add_test(NAME port_yougame_0982_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/yougame_0982_merge_test.py")
+add_test(NAME port_yougame_0983_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/yougame_0983_merge_test.py")
 add_executable(port_yougame_mod_online_test tests/yougame_mod_online_test.cpp)
 target_include_directories(port_yougame_mod_online_test PRIVATE runtime/hle)
 target_compile_features(port_yougame_mod_online_test PRIVATE cxx_std_17)
@@ -446,10 +450,13 @@ target_include_directories(port_settings_chord_test PRIVATE runtime/host)
 target_compile_features(port_settings_chord_test PRIVATE cxx_std_17)
 add_test(NAME port_settings_chord COMMAND port_settings_chord_test)
 
-add_executable(port_settings_nav_test tests/settings_nav_test.cpp)
-target_include_directories(port_settings_nav_test PRIVATE runtime/host)
-target_compile_features(port_settings_nav_test PRIVATE cxx_std_17)
-add_test(NAME port_settings_nav COMMAND port_settings_nav_test)
+# port/tests/settings_mouse.cmake (included from the top level on every platform) builds this test too.
+if(NOT TARGET port_settings_nav_test)
+  add_executable(port_settings_nav_test tests/settings_nav_test.cpp)
+  target_include_directories(port_settings_nav_test PRIVATE runtime/host)
+  target_compile_features(port_settings_nav_test PRIVATE cxx_std_17)
+  add_test(NAME port_settings_nav COMMAND port_settings_nav_test)
+endif()
 
 add_executable(port_net_trace_test tests/net_trace_test.cpp runtime/host/net_trace_file.cpp runtime/host/net_trace_read.cpp)
 target_include_directories(port_net_trace_test PRIVATE runtime/host)
@@ -639,27 +646,17 @@ add_test(NAME port_signed_halfword_loads COMMAND port_load_test)
 # subdirectory is added, so native_animation (built there) also gets the right /arch flag.
 message(STATUS "melee: CPU baseline ${MELEE_CPU_BASELINE}")
 
-option(MELEE_SOURCE_ONLY "Build Source without configuring any translated guest targets" OFF)
 set(PORT_GEN "${CMAKE_CURRENT_SOURCE_DIR}/generated" CACHE PATH "Guest translation source directory")
-if(MELEE_SOURCE_ONLY)
-  foreach(header hle_decls.h guest_symbols.h)
-    if(NOT EXISTS "${PORT_GEN}/${header}")
-      message(FATAL_ERROR "Source requires the approved fact header: ${PORT_GEN}/${header}")
-    endif()
-  endforeach()
-else()
 if(NOT EXISTS "${PORT_GEN}/guest_sources.cmake")
   message(FATAL_ERROR "port: generated code missing; run python port/recomp/recomp.py")
 endif()
 include("${PORT_GEN}/guest_sources.cmake")
-endif()
 # The memory card test above includes hle.h, which needs the generated hle_decls.h: follow
 # PORT_GEN when the translation is somewhere other than port/generated.
 target_include_directories(port_hle_card_test PRIVATE "${PORT_GEN}")
 
 # Guest library: large generated translation units. A second checkout of the same generated code can
 # link an existing guest.lib instead of compiling it again (several GB of objects).
-if(NOT MELEE_SOURCE_ONLY)
 set(MELEE_PREBUILT_GUEST "" CACHE FILEPATH "Link this guest.lib (built from identical port/generated) instead of compiling it")
 if(MELEE_PREBUILT_GUEST)
   add_library(guest STATIC IMPORTED GLOBAL)
@@ -674,8 +671,6 @@ target_compile_features(guest PUBLIC cxx_std_17)
 target_compile_options(guest PRIVATE /bigobj /EHsc ${MELEE_ARCH_FLAG} /fp:precise /wd4102 /wd4101 /wd4189 /W1)
 target_compile_definitions(guest PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
 endif()
-
-endif() # NOT MELEE_SOURCE_ONLY
 
 # Host runtime: CPU helpers, memory, HLE, host services.
 file(GLOB RUNTIME_SOURCES runtime/ppc/*.cpp runtime/hle/*.cpp runtime/host/*.cpp runtime/gx/*.cpp)
@@ -742,7 +737,7 @@ endwhile()
 list(SUBLIST MELEE_VERSION_PARTS 0 4 MELEE_VERSION_PARTS)
 list(JOIN MELEE_VERSION_PARTS "," MELEE_VERSION_COMMAS)
 add_library(runtime STATIC ${RUNTIME_SOURCES} third_party/slippilib/SlippiGame.cpp)
-target_compile_definitions(runtime PRIVATE MELEE_PORT_VERSION="${MELEE_PORT_VERSION}")
+target_compile_definitions(runtime PRIVATE YOUGAME_COMPAT_TAG="${YOUGAME_COMPAT_TAG}" MELEE_PORT_VERSION="${MELEE_PORT_VERSION}")
 # ASIO output (audio mode 3): the Steinberg ASIO SDK host files only, under the SDK's GPL Version 3
 # option (asio.cpp, asiodrivers.cpp, asiolist.cpp; see third_party/asio/README.txt). Windows only. The
 # SDK's registry helpers use the ANSI API, so these three build without UNICODE.
@@ -764,9 +759,7 @@ target_include_directories(runtime PUBLIC runtime/ppc runtime/host runtime/hle r
 target_compile_features(runtime PUBLIC cxx_std_17)
 target_compile_options(runtime PRIVATE /EHsc ${MELEE_ARCH_FLAG} /fp:precise /W3)
 target_compile_definitions(runtime PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING)
-if(NOT MELEE_SOURCE_ONLY)
-  include(runtime/ppc/ram_translator.cmake)
-endif()
+include(runtime/ppc/ram_translator.cmake)
 target_link_libraries(runtime PUBLIC native_animation port_enet port_libusb bcrypt comdlg32 d3d12 d3d11 dxgi d3dcompiler xinput9_1_0 winmm user32 gdi32 setupapi winusb hid mfplat mfreadwrite mfuuid ole32 shell32)
 
 # mu_net: the project's own peer-to-peer session (no Slippi code). Keys, signatures and packet
@@ -791,9 +784,7 @@ endif()
 
 # WIN32: no console window when the game is double-clicked or started from the launcher. Command-line
 # use still works, because main() reattaches to a parent console when there is one (see app/main.cpp).
-if(NOT MELEE_SOURCE_ONLY)
-  add_executable(melee_port WIN32 app/main.cpp app/settings_window.cpp app/melee_unlocked.rc app/utf8.manifest)
-endif()
+add_executable(melee_port WIN32 app/main.cpp app/settings_window.cpp app/melee_unlocked.rc app/utf8.manifest)
 # The source port: the whole application (renderers, DLSS, sub-frame, input, panel) with the game
 # coming from melee_game.dll, built from the decompiled sources by sourceport/game with GCC.
 # melee_source_probe is the bare first stage (no window, no runtime), for chasing boot crashes.
@@ -822,18 +813,23 @@ target_compile_definitions(melee_source PRIVATE MELEE_SOURCE_PORT NOMINMAX _CRT_
   MELEE_VERSION_COMMAS=${MELEE_VERSION_COMMAS})
 # Staging test builds only: read agent-test.json (runtime/hle/yougame_agent_test.h) in app-launched YouGame mode.
 # Off by default; never on for a build that goes to a production listing (tests/agent_test_hook_absent.sh checks it).
+option(YOUGAME_RANKED_BRANCH "Ranked: visible Ranked and local CPU practice" ON)   # ON in the main staging build (Luis 10-31: Friends + Ranked on the main build)
+if(YOUGAME_RANKED_BRANCH)
+  target_compile_definitions(melee_source PRIVATE YOUGAME_RANKED_BRANCH=1)
+  if(TARGET melee_port)
+    target_compile_definitions(melee_port PRIVATE YOUGAME_RANKED_BRANCH=1)
+  endif()
+  target_compile_definitions(runtime PRIVATE YOUGAME_RANKED_BRANCH=1)
+endif()
 option(YOUGAME_AGENT_TEST_HOOK "Staging test builds: read agent-test.json in app-launched YouGame mode" OFF)
 if(YOUGAME_AGENT_TEST_HOOK)
   target_compile_definitions(melee_source PRIVATE YOUGAME_AGENT_TEST_HOOK)
-  if(TARGET melee_port)
-    target_compile_definitions(melee_port PRIVATE YOUGAME_AGENT_TEST_HOOK)
-  endif()
+  target_compile_definitions(melee_port PRIVATE YOUGAME_AGENT_TEST_HOOK)
   target_compile_definitions(runtime PRIVATE YOUGAME_AGENT_TEST_HOOK)
 endif()
 add_test(NAME source_card_roundtrip COMMAND melee_source --hidden --volume 0
   --log-file "${CMAKE_CURRENT_BINARY_DIR}/source-card-roundtrip.log"
   --card-self-test "${CMAKE_CURRENT_BINARY_DIR}/source-card-roundtrip")
-if(NOT MELEE_SOURCE_ONLY)
 add_executable(melee_source_probe app/main_source.cpp)
 target_include_directories(melee_source_probe PRIVATE runtime/abi)
 add_executable(port_mm_probe tests/mm_probe.cpp)
@@ -882,8 +878,6 @@ target_compile_definitions(melee_port PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS M
   MELEE_CPU_BASELINE_NAME="${MELEE_CPU_BASELINE}"
   MELEE_VERSION_COMMAS=${MELEE_VERSION_COMMAS})
 
-endif() # NOT MELEE_SOURCE_ONLY (probes and tests that link the guest)
-
 # Compile the D3D12 ray-tracing library with the matching Windows SDK DXC. Keeping DXIL beside the
 # executable makes the D3D12 renderer independent of the user's developer tools; the package tool
 # includes this binary with the game files. Shader Model 6.3 keeps the pass usable on DXR 1.0 RTX
@@ -900,16 +894,12 @@ add_custom_command(OUTPUT "${MELEE_DXR_DXIL}"
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gx/shaders/dxr_pathtrace.hlsl"
   VERBATIM)
 add_custom_target(melee_dxr_shader DEPENDS "${MELEE_DXR_DXIL}")
-foreach(shader_host melee_source melee_port)
-  if(TARGET ${shader_host})
-    add_dependencies(${shader_host} melee_dxr_shader)
-    add_custom_command(TARGET ${shader_host} POST_BUILD
-      COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${MELEE_DXR_DXIL}"
-              "$<TARGET_FILE_DIR:${shader_host}>/dxr_pathtrace.dxil"
-      VERBATIM)
-  endif()
-endforeach()
-if(TARGET melee_port AND MELEE_CPU_BASELINE STREQUAL "AVX2")
+add_dependencies(melee_port melee_dxr_shader)
+add_custom_command(TARGET melee_port POST_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${MELEE_DXR_DXIL}"
+          "$<TARGET_FILE_DIR:melee_port>/dxr_pathtrace.dxil"
+  VERBATIM)
+if(MELEE_CPU_BASELINE STREQUAL "AVX2")
   target_compile_definitions(melee_port PRIVATE MELEE_NEEDS_AVX2)
 endif()
 
@@ -1023,7 +1013,7 @@ target_link_libraries(port_lobby_dht_probe PRIVATE ws2_32 bcrypt)
 if(NOT PORT_GEN_PLAYBACK)
   set(PORT_GEN_PLAYBACK "${CMAKE_CURRENT_SOURCE_DIR}/generated_playback")
 endif()
-if(NOT MELEE_SOURCE_ONLY AND EXISTS "${PORT_GEN_PLAYBACK}/guest_sources.cmake")
+if(EXISTS "${PORT_GEN_PLAYBACK}/guest_sources.cmake")
   include("${PORT_GEN_PLAYBACK}/guest_sources.cmake")
   set(MELEE_PREBUILT_GUEST_PLAYBACK "" CACHE FILEPATH "Link this guest_playback.lib (built from identical port/generated_playback) instead of compiling it")
   if(MELEE_PREBUILT_GUEST_PLAYBACK)
@@ -1056,7 +1046,7 @@ if(NOT MELEE_SOURCE_ONLY AND EXISTS "${PORT_GEN_PLAYBACK}/guest_sources.cmake")
     MELEE_RC_INTERNAL_NAME="melee_port_playback"
     MELEE_RC_ORIGINAL_FILENAME="melee_port_playback.exe")
 endif()
-if(TARGET melee_port AND EXISTS "${PROJECT_SOURCE_DIR}/melee/orig/GALE01/sys/main.dol")
+if(EXISTS "${PROJECT_SOURCE_DIR}/melee/orig/GALE01/sys/main.dol")
   add_test(NAME port_image_identity COMMAND "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/image_identity_test.py" "$<TARGET_FILE:melee_port>"
     "${PROJECT_SOURCE_DIR}/melee/orig/GALE01/sys/main.dol")
@@ -1118,8 +1108,11 @@ endforeach()
 add_library(port_imgui STATIC
   third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
   third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
-  third_party/imgui/backends/imgui_impl_dx12.cpp third_party/imgui/backends/imgui_impl_win32.cpp)
-target_include_directories(port_imgui PUBLIC third_party/imgui)
+  third_party/imgui/backends/imgui_impl_dx12.cpp third_party/imgui/backends/imgui_impl_win32.cpp
+  third_party/imgui/backends/imgui_impl_vulkan.cpp)
+# The Vulkan renderer (gx_vulkan.cpp) opens the loader at run time: headers only, no import library.
+target_include_directories(port_imgui PUBLIC third_party/imgui third_party/vulkan-headers/include)
+target_compile_definitions(port_imgui PUBLIC IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
 target_compile_features(port_imgui PUBLIC cxx_std_17)
 target_compile_definitions(port_imgui PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
 target_compile_options(port_imgui PRIVATE ${MELEE_ARCH_FLAG})
@@ -1157,39 +1150,29 @@ if(EXISTS "${MELEE_STREAMLINE_ROOT}/include/sl.h" AND
   target_compile_definitions(runtime PRIVATE GX_STREAMLINE)
   target_include_directories(runtime PRIVATE "${MELEE_STREAMLINE_ROOT}/include")
   target_link_libraries(runtime PUBLIC "${MELEE_STREAMLINE_ROOT}/lib/x64/sl.interposer.lib" wintrust crypt32 delayimp)
-  if(TARGET melee_port)
-    target_link_options(melee_port PRIVATE /DELAYLOAD:sl.interposer.dll)
-  endif()
+  target_link_options(melee_port PRIVATE /DELAYLOAD:sl.interposer.dll)
   target_link_options(melee_source PRIVATE /DELAYLOAD:sl.interposer.dll)   # same folder, same DLLs
   foreach(sl_dll sl.interposer.dll sl.common.dll sl.dlss.dll nvngx_dlss.dll sl.dlss_d.dll nvngx_dlssd.dll sl.dlss_g.dll nvngx_dlssg.dll sl.reflex.dll sl.pcl.dll)
     if(EXISTS "${MELEE_STREAMLINE_ROOT}/bin/x64/${sl_dll}")
-      if(TARGET melee_port)
-        add_custom_command(TARGET melee_port POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-          "${MELEE_STREAMLINE_ROOT}/bin/x64/${sl_dll}" "$<TARGET_FILE_DIR:melee_port>/${sl_dll}")
-      endif()
+      add_custom_command(TARGET melee_port POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${MELEE_STREAMLINE_ROOT}/bin/x64/${sl_dll}" "$<TARGET_FILE_DIR:melee_port>/${sl_dll}")
       add_custom_command(TARGET melee_source POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${MELEE_STREAMLINE_ROOT}/bin/x64/${sl_dll}" "$<TARGET_FILE_DIR:melee_source>/${sl_dll}")
     endif()
   endforeach()
   # Intel XeSS (loaded at run time; missing file = no XeSS modes)
-  if(TARGET melee_port)
-    add_custom_command(TARGET melee_port POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xess/bin/libxess.dll" "$<TARGET_FILE_DIR:melee_port>/libxess.dll")
-  endif()
+  add_custom_command(TARGET melee_port POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xess/bin/libxess.dll" "$<TARGET_FILE_DIR:melee_port>/libxess.dll")
   add_custom_command(TARGET melee_source POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xess/bin/libxess.dll" "$<TARGET_FILE_DIR:melee_source>/libxess.dll")
   # librashader (player-chosen shader presets; loaded at run time; missing file = the setting is off)
-  if(TARGET melee_port)
-    add_custom_command(TARGET melee_port POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/librashader/bin/librashader.dll" "$<TARGET_FILE_DIR:melee_port>/librashader.dll")
-  endif()
+  add_custom_command(TARGET melee_port POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/librashader/bin/librashader.dll" "$<TARGET_FILE_DIR:melee_port>/librashader.dll")
   add_custom_command(TARGET melee_source POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/librashader/bin/librashader.dll" "$<TARGET_FILE_DIR:melee_source>/librashader.dll")
   foreach(dxc_dll dxcompiler.dll dxil.dll)   # the compiler librashader uses on Direct3D 12
-    if(TARGET melee_port)
-      add_custom_command(TARGET melee_port POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dxc/bin/${dxc_dll}" "$<TARGET_FILE_DIR:melee_port>/${dxc_dll}")
-    endif()
+    add_custom_command(TARGET melee_port POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dxc/bin/${dxc_dll}" "$<TARGET_FILE_DIR:melee_port>/${dxc_dll}")
     add_custom_command(TARGET melee_source POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
       "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dxc/bin/${dxc_dll}" "$<TARGET_FILE_DIR:melee_source>/${dxc_dll}")
   endforeach()
@@ -1209,9 +1192,7 @@ if(EXISTS "${MELEE_STREAMLINE_ROOT}/include/sl.h" AND
     target_link_libraries(dlss5_forwarder PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ngx/lib/nvsdk_ngx_d.lib" advapi32 user32)
     target_link_options(dlss5_forwarder PRIVATE /MAP:$<TARGET_FILE_DIR:dlss5_forwarder>/dlss5_forwarder.map)
     set_target_properties(dlss5_forwarder PROPERTIES OUTPUT_NAME "nvngx.dll_meleedlss5" PREFIX "" SUFFIX ".dll")
-    if(TARGET melee_port)
-      add_dependencies(melee_port dlss5_forwarder)
-    endif()
+    add_dependencies(melee_port dlss5_forwarder)
     add_dependencies(melee_source dlss5_forwarder)
     if(TARGET melee_port_playback)
       add_dependencies(melee_port_playback dlss5_forwarder)
@@ -1224,10 +1205,8 @@ if(EXISTS "${MELEE_STREAMLINE_ROOT}/include/sl.h" AND
         target_link_options(${ngx_host_target} PRIVATE /MAP:$<TARGET_FILE_DIR:${ngx_host_target}>/$<TARGET_FILE_BASE_NAME:${ngx_host_target}>.map)
       endif()
     endforeach()
-    if(TARGET melee_port)
-      add_custom_command(TARGET melee_port POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "$<TARGET_FILE:dlss5_forwarder>" "$<TARGET_FILE_DIR:melee_port>/nvngx.dll_meleedlss5.dll")
-    endif()
+    add_custom_command(TARGET melee_port POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "$<TARGET_FILE:dlss5_forwarder>" "$<TARGET_FILE_DIR:melee_port>/nvngx.dll_meleedlss5.dll")
     add_custom_command(TARGET melee_source POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
       "$<TARGET_FILE:dlss5_forwarder>" "$<TARGET_FILE_DIR:melee_source>/nvngx.dll_meleedlss5.dll")
   endif()

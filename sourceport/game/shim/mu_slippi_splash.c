@@ -6,6 +6,7 @@
  * the menus flag is on and the matching online scene is current. Console struct offsets from the
  * asm are translated to decomp field names; MSRB game info stays console layout (raw bytes). */
 #include <string.h>
+#include <stdio.h>
 #include <melee/gm/gm_1601.h>
 #include <melee/gm/gmmain_lib.h>
 #include <melee/gm/types.h>
@@ -25,6 +26,7 @@
 #include <sysdolphin/baselib/sislib.h>
 #include <sysdolphin/baselib/sislib_font.h>
 #include <mu_native.h>
+#include <mu_ranked.h>
 
 /* MSRB game info (console StartMeleeData): rules 0x60 bytes, then 0x24 per player. */
 #define GI_IS_TEAMS 0x8
@@ -143,6 +145,21 @@ void mu_slippi_splash_text(void)
         }
         fc = (float) count;
         splash_player(t, ms, p, base + fc * -22.0f, 80.0f + fc * -22.0f);
+    }
+
+    if (mu_slippi_state()->mode == MU_SLP_MODE_RANKED) {
+        char score[64];
+        const MuRankedSet* set = mu_ranked_set();
+        /* The set's score is by port; the local player is always drawn on the left, so the local
+         * count comes first (build 25 read "0:1" under Ada | Bo after Ada won game 1). The line
+         * sits in the black band above the names, clear of the character art. The splash follows
+         * the setup screen, so there is no "what comes next" line: the game starts. */
+        const unsigned me = local == 1;
+        if (set->cur_game && set->max_games) {
+            sprintf(score, "Game %u - %u:%u", (unsigned) set->cur_game,
+                    (unsigned) set->score[me], (unsigned) set->score[!me]);
+            create_subtext(t, &splash_colors[4], 0.5f, 250.0f, 45.0f, "%s", score);
+        }
     }
 
     /* Stage name */

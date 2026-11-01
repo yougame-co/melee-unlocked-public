@@ -98,7 +98,9 @@ class RelayOutputWiringTest(unittest.TestCase):
         d11 = source("port/runtime/gx/gx_d3d11.cpp")
         self.assertIn("flip_model_ = sd.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD;", d11)
         d12 = source("port/runtime/gx/gx_d3d12.cpp")
-        self.assertIn("if (!skip_present_) wait_frame_latency();", d12)
+        # v0.9.85: a shown frame waits for its display-queue place after it is recorded and submitted.
+        self.assertIn("if (!occluded_) wait_frame_latency();", d12)
+        self.assertLess(d12.index("queue_->ExecuteCommandLists(1, lists);"), d12.index("if (!occluded_) wait_frame_latency();"))
         self.assertIn("fg_applied_ <= 0 && opts_.reflex_mode <= 0", d12)
 
     def test_registrations_precede_linux_return(self):

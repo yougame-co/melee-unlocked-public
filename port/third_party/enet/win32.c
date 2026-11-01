@@ -364,6 +364,7 @@ enet_socket_receive (ENetSocket socket,
     DWORD flags = 0,
           recvLength;
     struct sockaddr_in sin;
+    int truncated = 0;
 
     if (WSARecvFrom (socket,
                      (LPWSABUF) buffers,
@@ -380,13 +381,13 @@ enet_socket_receive (ENetSocket socket,
        case WSAEWOULDBLOCK:
        case WSAECONNRESET:
           return 0;
+       case WSAEMSGSIZE:
+          truncated = 1;
+          break;
+       default:
+          return -1;
        }
-
-       return -1;
     }
-
-    if (flags & MSG_PARTIAL)
-      return -1;
 
     if (address != NULL)
     {
@@ -394,7 +395,9 @@ enet_socket_receive (ENetSocket socket,
         address -> port = ENET_NET_TO_HOST_16 (sin.sin_port);
     }
 
-    return (int) recvLength;
+    if (truncated || (flags & MSG_PARTIAL))
+      return ENET_SOCKET_RECEIVE_TRUNCATED;
+    return recvLength == 0 ? ENET_SOCKET_RECEIVE_EMPTY : (int) recvLength;
 }
 
 int

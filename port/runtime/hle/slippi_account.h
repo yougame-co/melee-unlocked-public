@@ -39,8 +39,8 @@ inline Profile search(const std::filesystem::path& root, int depth, size_t& rema
   if (depth < 0 || remaining == 0) return {};
   --remaining;
   if (auto profile = read(root / "User" / "Slippi" / "user.json")) return profile;
-  // On Linux and macOS Slippi Dolphin's user folder is itself the root (~/.config/SlippiOnline,
-  // ~/.local/share/SlippiDolphin): the file is Slippi/user.json with no User folder above it.
+  // On Linux and macOS the Slippi user folder is itself the data root.
+  // Its account file has no additional User folder above it.
   if (auto profile = read(root / "Slippi" / "user.json")) return profile;
   std::error_code ec;
   std::vector<std::filesystem::path> directories;
@@ -112,8 +112,25 @@ inline std::vector<std::filesystem::path> settings_builds(const std::filesystem:
   return builds;
 }
 
+// The YouGame app names the Slippi sign-in file it found (YOUGAME_SLIPPI_USER_JSON): then exactly that
+// file is read, never written, and no launcher folder is searched. Empty when unset.
+inline std::filesystem::path app_sign_in() {
+#ifdef _WIN32
+  wchar_t* value = nullptr;
+  size_t length = 0;
+  std::filesystem::path file;
+  if (_wdupenv_s(&value, &length, L"YOUGAME_SLIPPI_USER_JSON") == 0 && value && *value) file = value;
+  free(value);
+  return file;
+#else
+  const char* value = std::getenv("YOUGAME_SLIPPI_USER_JSON");
+  return value && *value ? std::filesystem::path(value) : std::filesystem::path();
+#endif
+}
+
 inline Profile resolve(const std::filesystem::path& local_user_dir,
                        const std::vector<std::filesystem::path>& roots = launcher_roots()) {
+  if (const auto app = app_sign_in(); !app.empty()) return read(app);
   if (auto profile = read(local_user_dir / "user.json")) return profile;
   for (const auto& root : roots) {
     for (const char* build : {"netplay", "playback"})
@@ -130,20 +147,63 @@ inline Profile resolve(const std::filesystem::path& local_user_dir,
 // who has: no Slippi Launcher folder at all, a launcher with no sign-in file, or a sign-in file
 // without a connect code (an account that was created but never finished).
 enum class Missing { Launcher, SignIn, ConnectCode };
-inline Missing why_missing(const std::filesystem::path& local_user_dir,
-                           const std::vector<std::filesystem::path>& roots = launcher_roots()) {
+// Where a sign-in file can be: the local folder, then each launcher folder that exists (`launcher`
+// says whether one did).
+inline std::vector<std::filesystem::path> sign_in_files(const std::filesystem::path& local_user_dir,
+                                                        const std::vector<std::filesystem::path>& roots,
+                                                        bool* launcher = nullptr) {
   std::error_code ec;
   std::vector<std::filesystem::path> files{local_user_dir / "user.json"};
-  bool launcher = false;
   for (const auto& root : roots) {
     if (!std::filesystem::is_directory(root, ec)) continue;
-    launcher = true;
+    if (launcher) *launcher = true;
     for (const char* build : {"netplay", "netplay-beta", "playback"}) files.push_back(root / build / "User" / "Slippi" / "user.json");
     for (const auto& build : settings_builds(root)) files.push_back(build / "User" / "Slippi" / "user.json");
     files.push_back(root / "Slippi" / "user.json");
   }
-  for (const auto& file : files)
+  return files;
+}
+inline Missing why_missing(const std::filesystem::path& local_user_dir,
+                           const std::vector<std::filesystem::path>& roots = launcher_roots()) {
+  std::error_code ec;
+  bool launcher = false;
+  for (const auto& file : sign_in_files(local_user_dir, roots, &launcher))
     if (std::filesystem::is_regular_file(file, ec)) return Missing::ConnectCode;
   return launcher ? Missing::SignIn : Missing::Launcher;
+}
+
+// Why the YouGame app's Unranked cannot use a Slippi login, for a log line that names no path: no
+// sign-in file, one that is not a whole account (unreadable, not JSON, no uid or play key), or an
+// account that was never finished (no connect code). The first file found decides; the app's file
+// (app_sign_in) is the only one when it names one.
+enum class Unusable { FileMissing, Unreadable, NoConnectCode };
+inline Unusable why_unusable_grant() {
+  const auto file = app_sign_in();
+  if (file.empty()) return Unusable::FileMissing;
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(file, ec)) return Unusable::FileMissing;
+  std::ifstream input(file, std::ios::binary);
+  if (!input) return Unusable::Unreadable;
+  const auto data = nlohmann::json::parse(input, nullptr, false);
+  if (text(data, "uid").empty() || text(data, "playKey").empty()) return Unusable::Unreadable;
+  if (text(data, "connectCode").empty()) return Unusable::NoConnectCode;
+  return Unusable::FileMissing; // As with why_unusable(), called only after login failed.
+}
+inline Unusable why_unusable(const std::filesystem::path& local_user_dir,
+                             const std::vector<std::filesystem::path>& roots = launcher_roots()) {
+  std::error_code ec;
+  const auto app = app_sign_in();
+  for (const auto& file : app.empty() ? sign_in_files(local_user_dir, roots) : std::vector<std::filesystem::path>{app}) {
+    if (!std::filesystem::is_regular_file(file, ec)) continue;
+    std::ifstream input(file, std::ios::binary);
+    if (!input) return Unusable::Unreadable;
+    const auto data = nlohmann::json::parse(input, nullptr, false);
+    if (text(data, "uid").empty() || text(data, "playKey").empty()) return Unusable::Unreadable;
+    if (text(data, "connectCode").empty()) return Unusable::NoConnectCode;
+  }
+  return Unusable::FileMissing;
+}
+inline const char* unusable_text(Unusable why) {
+  return why == Unusable::FileMissing ? "file missing" : why == Unusable::Unreadable ? "unreadable" : "no connect code";
 }
 }  // namespace slippi::account

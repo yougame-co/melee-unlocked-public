@@ -6,9 +6,7 @@ build/
 __pycache__/
 dependencies/
 
-/port/generated/*
-!/port/generated/hle_decls.h
-!/port/generated/guest_symbols.h
+/port/generated/
 /port/generated_playback/
 /build-review/
 /melee/

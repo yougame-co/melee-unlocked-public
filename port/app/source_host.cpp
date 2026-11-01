@@ -74,6 +74,7 @@
 #include "yougame_link.h"
 #include "yougame_mode_policy.h"
 #include "yougame_memcard.h"
+#include "yougame_console_engine.h"
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include "yougame_agent_fight.h"
 #endif
@@ -87,6 +88,9 @@
 #include "source_p2p.h"
 #include "exi_slippi.h"
 #include "native_slippi_bridge.h"
+#if defined(YOUGAME_AGENT_TEST_HOOK) || (defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH)
+#include "yougame_ranked_cpu.h"
+#endif
 #include "native_replay_stream.h"
 #include "slippi_spectate.h"
 #include "slippi_net.h"
@@ -118,6 +122,22 @@ namespace gecko { extern bool option_no_screen_shake; extern bool option_pal_sto
 
 namespace source_port {
 namespace {
+bool g_console_boot = false; // retain pad/card isolation after a session ends
+std::filesystem::path g_console_card;
+yougame::console::Pads console_hardware() {
+  host::PadState raw[4]{};
+  host::input_read_console_devices(raw); // no UI capture, offline delay, scripts, or practice overrides
+  yougame::console::Pads pads{};
+  for (int i = 0; i < 4; ++i) {
+    pads[i].button = raw[i].button;
+    pads[i].stick_x = raw[i].stick_x; pads[i].stick_y = raw[i].stick_y;
+    pads[i].sub_x = raw[i].sub_x; pads[i].sub_y = raw[i].sub_y;
+    pads[i].trigger_l = raw[i].trig_l; pads[i].trigger_r = raw[i].trig_r;
+    pads[i].analog_a = raw[i].analog_a; pads[i].analog_b = raw[i].analog_b;
+    pads[i].err = raw[i].err;
+  }
+  return pads;
+}
 
 constexpr uintptr_t MEM1_BASE = 0x80000000u;
 constexpr uint32_t MEM1_SIZE = 40u << 20;   // the console's 24 MB, grown for 8-byte pointers; the game image follows
@@ -372,6 +392,7 @@ std::string dir_layer_fingerprint(const std::string& profile) {
 // layer here (its save stays out of the card): it switches on TE's native features. Card mods and
 // code mods need the Static Recomp and are not loaded.
 void apply_detected_mods() {
+  if (yougame::console::console_active()) return; // startup() scans/protects the ordinary card
   if (!gx::RenderOptions::mod_features_available() || !mods::auto_detect()) return;
   mods::StartupOptions options;
   options.card_dir = std::filesystem::u8path(host::options.card_dir);
@@ -634,7 +655,7 @@ void load_mod_overlay() {
 
   // The profile's own memory card, named after the profile, or after the content for layers given
   // on the command line. The ordinary card is never written by a modded session.
-  {
+  if (!g_console_boot) {
     const fs::path ordinary = fs::u8path(host::options.card_dir);
     const std::string folder = !g_mod_profile_name.empty() ? mods::safe_name(g_mod_profile_name)
                                                           : "mods-" + g_mod_fingerprint.substr(0, 12);
@@ -849,7 +870,7 @@ std::vector<SystemFile> g_system_files;
 constexpr uint32_t kSystemFileBase = 0x90000000u;
 const char* const kSystemFileNames[] = {
   "MnMaAll.usd", "MnMaAll.dat", "SdMenu.usd", "SdMenu.dat", "MnSlMap.usd", "MnSlMap.dat",
-  "SdSlChr.usd", "SdSlChr.dat", "MnExtAll.usd", "MnExtAll.dat", "slpCSS.dat",
+  "SdSlChr.usd", "SdSlChr.dat", "MnExtAll.usd", "MnExtAll.dat", "slpCSS.dat", "GameSetup_gui.dat",
 };
 
 uint32_t fnv1a(const uint8_t* p, size_t n) {
@@ -1052,12 +1073,35 @@ void h_panic(const char* file, int32_t line, const char* message) {
   host::die("game stopped at %s:%d: %s", file ? file : "?", line, message ? message : "");
 }
 uint64_t h_ticks() {
+  if (yougame::console::console_active()) return yougame::console::console_engine().ticks(0);
   if (g_resim) rollback_frame_callback();
   return host::cpu->tb;
 }
 // The date the game's calendar works from. It was zero, so every save and every Training Mode CE
 // export was dated January 1, 2000.
-uint64_t h_boot_time() { return host::console_epoch_ticks(); }
+uint64_t h_boot_time() {
+  if (yougame::console::console_active()) return yougame::console::console_engine().boot_ticks(0);
+  return host::console_epoch_ticks();
+}
+int32_t h_console_seed(uint32_t* seed) {
+  if (!yougame::console::console_active()) return 0;
+  *seed = static_cast<uint32_t>(yougame::console::console_engine().config().seed);
+  return 1;
+}
+int32_t h_console_frame_begin() {
+  if (!g_console_boot) return 0;
+  auto& engine = yougame::console::console_engine();
+  if (engine.active()) {
+    // Match VI counts are logical and rewindable. Pacing uses the host's physical count.
+    static uint32_t presented = 0;
+    if (engine.match_active() && host::retrace_count() == presented) host::retrace();
+    presented = host::retrace_count();
+    MuStatePod state{};
+    if (g_game.state_snapshot) g_game.state_snapshot(&state);
+    engine.advance(engine.needs_sample() ? console_hardware() : yougame::console::Pads{}, state);
+  }
+  return 1; // also replace any queued remote sample after a loss
+}
 
 void native_audio_done(void*) {
   if (g_game.ai_dma_done) g_game.ai_dma_done();
@@ -1067,12 +1111,41 @@ void native_audio_tick() {
   audio_core::tick(g_audio, host::cpu->tb, host::TB_HZ, native_audio_done, nullptr);
 }
 
+bool g_console_in_retrace = false;
+struct ConsoleServiceScope {
+  yougame::console::Engine& engine = yougame::console::console_engine();
+  ConsoleServiceScope() { engine.service_clock(true); }
+  ~ConsoleServiceScope() { engine.service_clock(false); }
+};
 void h_poll() {
+  if (yougame::console::console_engine().rollback_enabled()) {
+    auto& engine = yougame::console::console_engine();
+    engine.poll(); // replay executes the same game-clock step as first execution
+    if (engine.body_active() && !engine.servicing()) return;
+    guarded([&] {
+      host::advance_time(2048);
+      const bool logical_due = !engine.match_active() && !engine.servicing() && engine.retrace_due();
+      const bool service_due = (engine.match_active() || engine.servicing()) && engine.service_retrace_due();
+      if (logical_due) engine.logical_retrace();
+      ConsoleServiceScope service;
+      native_audio_tick();
+      if ((logical_due || service_due) && !g_console_in_retrace) host::retrace();
+      else g_game.fire_alarms(engine.alarm_ticks());
+    });
+    return;
+  }
   // A re-simulated frame never waits on the machine; count it if something does.
   if (g_resim) { ++g_resim_polls; rollback_frame_callback(); return; }
   guarded([] {
     host::advance_time(2048);   // time flows in busy waits, as it does for the recompiled build
     native_audio_tick();
+    if (yougame::console::console_active()) {
+      auto& engine = yougame::console::console_engine();
+      engine.poll();
+      if (engine.retrace_due() && !g_console_in_retrace) host::retrace();
+      else g_game.fire_alarms(engine.clock_ticks());
+      return;
+    }
     if (host::retrace_due()) host::retrace();
     else g_game.fire_alarms(host::cpu->tb);
   });
@@ -1081,9 +1154,20 @@ void h_poll() {
 static void (*g_look_snapshot)(MuLookSnapshot*) = nullptr;
 static void (*g_look_items)(MuLookItems*) = nullptr;
 void native_retrace() {
+  ConsoleServiceScope service;
+  struct ConsoleRetraceScope {
+    bool previous = g_console_in_retrace;
+    ConsoleRetraceScope() { g_console_in_retrace = true; }
+    ~ConsoleRetraceScope() { g_console_in_retrace = previous; }
+  } console_retrace_scope;
   rollback_log();
   native_audio_tick();
-  g_game.fire_alarms(host::cpu->tb);
+  if (yougame::console::console_active()) {
+    auto& engine = yougame::console::console_engine();
+    if (engine.rollback_enabled()) engine.service_retrace();
+    else engine.retrace();
+    g_game.fire_alarms(engine.alarm_ticks());
+  } else g_game.fire_alarms(host::cpu->tb);
   g_game.retrace();
   if (g_look_snapshot && lab::styles_on()) {
     MuLookSnapshot snapshot{};
@@ -1123,6 +1207,7 @@ static_assert(gx::kArcadeHitboxes == MU_DISPLAY_OPTION_HITBOXES &&
 // Display-only options (MU_DISPLAY_OPTION_*), read live by the native game's draw code. Never part
 // of a replay or of the match the opponent plays: the viewer's own, as the HUD sizes are.
 uint32_t h_display_options() {
+  if (yougame::console::console_active()) return 0;
   return (gx::low_poly_fighters_active() ? MU_DISPLAY_OPTION_LOW_POLY : 0u) |
          (gx::player_tags_always_active() ? MU_DISPLAY_OPTION_PLAYER_TAGS : 0u) |
          (gx::fod_reflections_active() ? MU_DISPLAY_OPTION_FOD_REFLECTIONS : 0u) |
@@ -1168,6 +1253,7 @@ bool hp_te_words() { return !mods::status().te_owned && hackpack::loaded(); }
 uint32_t te_words_mask1() { return mods::status().te_owned ? 0x00007FF0u : hp_te_words() ? kHpTeOptions : 0u; }
 uint32_t te_words_mask2() { return mods::status().te_owned ? 0xFFFFFFFFu : hp_te_words() ? kHpTeOptions2 : 0u; }
 uint32_t h_game_options2() {
+  if (yougame::console::console_active()) return 0;
   if (host::gameplay::vanilla_only()) return 0;
   if (g_replaying) return g_replay_feature_options2;
   return (gx::RenderOptions::live_te_options2() & te_words_mask2() & ~(MU_GAME_OPTION2_STADIUM_FROZEN | MU_GAME_OPTION2_ARCADE_PACK)) |
@@ -1181,8 +1267,12 @@ uint32_t h_game_options2() {
 // them when a match is picked and they ride in the same word, so a replay records and replays them.
 // Faster sound effects (MU_AUDIO_OPTION_EARLY_KEYON): MELEE_AUDIO_EARLY_KEYON=0|1 over the setting;
 // never during an online match or a replay (see mu_host.h).
-float h_picture_widen() { return gx::true_widescreen_active() ? 1.0f / gx::true_widescreen_factor() : 1.0f; }
+float h_picture_widen() {
+  if (yougame::console::console_active()) return 1.0f;
+  return gx::true_widescreen_active() ? 1.0f / gx::true_widescreen_factor() : 1.0f;
+}
 uint32_t h_audio_options() {
+  if (yougame::console::console_active()) return 0;
   if (g_replaying || slippi::online::session_mode() >= 0 || source_p2p::requested()) return 0;
   static const int env = [] { const char* v = std::getenv("MELEE_AUDIO_EARLY_KEYON"); return v && *v ? (*v == '1' ? 1 : 0) : -1; }();
   const bool on = env >= 0 ? env == 1 : gx::RenderOptions::live_audio_early_keyon();
@@ -1192,6 +1282,7 @@ uint32_t h_audio_options() {
 }
 
 uint32_t h_game_options3() {
+  if (yougame::console::console_active()) return MU_GAME_OPTION3_LOCKED_CONTENT;
   if (g_replaying) return g_replay_feature_options3;
   return (host::gameplay::vanilla_only() ? 0u :
           (gx::RenderOptions::live_cpu_training() & MU_GAME_OPTION3_CPU_ALL) | hackpack::stage_bits()) |
@@ -1199,6 +1290,7 @@ uint32_t h_game_options3() {
          (gx::RenderOptions::live_results_screen() ? 0u : MU_GAME_OPTION3_SKIP_RESULTS);
 }
 uint32_t h_game_options() {
+  if (yougame::console::console_active()) return 0; // canonical normal menus and language
   return (gecko::option_no_screen_shake ? MU_GAME_OPTION_NO_SCREEN_SHAKE : 0u) |
          (gecko::option_pal_stock_icons ? MU_GAME_OPTION_PAL_STOCK_ICONS : 0u) |
          (gecko::option_widescreen ? MU_GAME_OPTION_WIDESCREEN : 0u) |   // the viewer's own, also in replays
@@ -1444,8 +1536,69 @@ void native_load(int32_t frame, const uint8_t* payload) {
   // The frame the game finishes next continues from this older state; the renderer must not blend
   // across the jump.
   gx::mark_discontinuity(true);
-  slippi::online::note_rollback(frame);
+  if (!yougame::console::console_engine().match_active()) slippi::online::note_rollback(frame);
   if (g_savestates.stats().loads % 200 == 0) log_savestate_stats("so far");
+}
+
+int32_t h_console_rollback(int32_t operation, uint32_t body, MuConsoleInputs* inputs) {
+  auto& engine = yougame::console::console_engine();
+  // Loss may already have ended input ownership before the shim observes the failure.
+  if (g_console_boot && operation == MU_CONSOLE_FAIL) {
+    g_savestates.end();
+    engine.end("console rollback failed at body " + std::to_string(body));
+    return 1;
+  }
+  if (!engine.rollback_enabled()) return 0;
+  switch (operation) {
+  case MU_CONSOLE_QUERY: return 1;
+  case MU_CONSOLE_SERVICE: engine.service_clock(body != 0); return 1;
+  case MU_CONSOLE_MATCH_BEGIN:
+    if (!engine.begin_match()) return 0;
+    // Loading and VS on_enter have finished. Never depend on Slippi's first B0.
+    begin_native_savestates();
+    if (!g_savestates.active()) { engine.end("console rollback snapshot initialization failed"); return 0; }
+    if (inputs) { inputs->epoch = engine.match_epoch(); inputs->local_port = engine.config().my_port - 1; }
+    return 1;
+  case MU_CONSOLE_FORWARD:
+    if (!engine.match_active() || !h_console_frame_begin()) return 0;
+    if (engine.frame() != engine.match_origin() + body) {
+      engine.end("console rollback body/session frame mismatch"); return 0;
+    }
+    return inputs && engine.inputs(body, true, *inputs);
+  case MU_CONSOLE_REPLAY:
+    if (!engine.replay(body)) return 0;
+    return inputs && engine.inputs(body, false, *inputs);
+  case MU_CONSOLE_INPUTS: return inputs && engine.inputs(body, false, *inputs);
+  case MU_CONSOLE_VALIDATED: return engine.validated(body);
+  case MU_CONSOLE_BOUNDARY: {
+    MuStatePod state{};
+    if (g_game.state_snapshot) g_game.state_snapshot(&state);
+    return engine.boundary(body, state);
+  }
+  case MU_CONSOLE_BODY_END: return engine.finish_body(body);
+  case MU_CONSOLE_CONFIRM:
+    return engine.confirm(body) && inputs && engine.inputs(body, false, *inputs);
+  case MU_CONSOLE_COMMIT: {
+    MuStatePod state{};
+    if (g_game.state_snapshot) g_game.state_snapshot(&state);
+    if (!engine.commit_match(body, state)) return 0;
+    g_savestates.end();
+    return 1;
+  }
+  case MU_CONSOLE_MATCH_END:
+    engine.end_match();
+    g_savestates.end();
+    return 1;
+  default: return 0;
+  }
+}
+
+int32_t h_console_alarm_clock(uint64_t* simulation, uint64_t* hardware) {
+  auto& engine = yougame::console::console_engine();
+  if (!engine.rollback_enabled()) return 0;
+  *simulation = engine.servicing() ? engine.alarm_ticks() : engine.clock_ticks();
+  *hardware = engine.alarm_ticks();
+  return 1;
 }
 
 // Determinism self-test (MELEE_ONLINE_SELFTEST, game side in mu_online.c): the game keeps its state
@@ -1673,10 +1826,45 @@ void plan_voice_banks(const uint8_t* p, std::vector<uint8_t>& reply) {
 
 int32_t h_slippi_command(uint8_t command, const uint8_t* payload, uint32_t payload_size,
                          uint8_t* response, uint32_t response_capacity, uint32_t* response_size) {
+  // Console capture/load bypass Slippi dispatch altogether. A failed load never resumes as if
+  // it succeeded; the shim exits this session with an explicit epoch/body diagnostic.
+  auto& console = yougame::console::console_engine();
+  if (console.match_active() && (command == 0xB1 || command == 0xB2)) {
+    if (response_size) *response_size = 0;
+    if (payload_size != 32 || !g_savestates.active()) return -1;
+    const int32_t frame = (int32_t)read_be32(payload);
+    if (command == 0xB2 && !g_savestates.has(frame)) {
+      host::log("console: required snapshot missing: epoch %u body %d", console.match_epoch(), frame);
+      g_savestates.end();
+      console.end("required console rollback snapshot missing");
+      return -1;
+    }
+    if (command == 0xB1) {
+      native_capture(frame);
+      console.capture_clock(frame);
+    } else {
+      if (!console.restore_clock(frame)) {
+        console.end("required console rollback clock missing");
+        return -1;
+      }
+      native_load(frame, payload);
+    }
+    return 0;
+  }
+  if (yougame::console::console_active() &&
+      (command == CMD_LAB_SAVE || command == CMD_LAB_LOAD || command == CMD_GHOST_AI ||
+       command == CMD_PRACTICE_CPU || command == CMD_SKIN_CYCLE || command == CMD_STAGE_SKIN_CYCLE)) {
+    if (response_size) *response_size = 0;
+    return 0;
+  }
   return slippi::online::native_command(
       command, payload, payload_size, response, response_capacity, response_size,
       MU_SLIPPI_RESPONSE_CAPACITY, true,
       [](uint8_t c, const uint8_t* p, uint32_t n, std::vector<uint8_t>& reply) {
+#if defined(YOUGAME_AGENT_TEST_HOOK) || (defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH)
+        // CPU prep uses the ordinary B3/B5/BF/C0/C1 bridge, entirely locally.
+        if (yougame::ranked_cpu::intercept(c, p, n, reply, yougame::active())) return true;
+#endif
         // Music: the game hands its songs to the jukebox as the static recomp's Slippi codes do
         // (StartSong D6, Stop D7, VolumeChange D8; shim/mu_audio.c).
         if (c == 0xD6 && n == 8) {
@@ -1994,6 +2182,13 @@ void h_resim_phase(int32_t entering) {
 // matchmaking starts (local test peering, from --local-peer); the game then waits for the match.
 void ranked_harness_tick();
 int32_t h_online_test_match(MuOnlineMatch* out) {
+  if (yougame::console::console_active()) return 0;
+#if defined(YOUGAME_AGENT_TEST_HOOK) && !defined(MELEE_NO_SLIPPI)
+  if (yougame::ranked_cpu::enabled) {
+    if (out) { std::memset(out, 0, sizeof *out); out->mode = 0; }
+    return 3; // boots through the online menus, never starts real matchmaking
+  }
+#endif
 #ifdef MELEE_NO_SLIPPI
   // A session asks for a match through the neutral state (netplay_state.h). The game calls this at
   // boot, to pick its first scene, and again in that scene before it waits for the match state.
@@ -2069,10 +2264,24 @@ int32_t h_online_test_match(MuOnlineMatch* out) {
 void h_vi_configure(uint32_t w, uint32_t h, uint32_t interlaced) { host::log("VI: %ux%u%s", w, h, interlaced ? " interlaced" : ""); }
 void h_vi_set_next_framebuffer(void*) {}   // presentation follows the EFB copy, as in the recompiled build
 void h_vi_flush() {}
-uint32_t h_vi_retrace_count() { return host::retrace_count(); }
-uint32_t h_vi_next_field() { return host::retrace_count() & 1; }
+uint32_t h_vi_retrace_count() {
+  if (yougame::console::console_active()) return yougame::console::console_engine().retrace_count();
+  return host::retrace_count();
+}
+uint32_t h_vi_next_field() {
+  if (yougame::console::console_active()) return yougame::console::console_engine().retrace_count() & 1;
+  return host::retrace_count() & 1;
+}
 void h_vi_set_black(int32_t) {}
 void h_vi_wait_retrace() {
+  auto& console = yougame::console::console_engine();
+  if (console.rollback_enabled()) {
+    console.logical_retrace();
+    // An explicit game VI wait inside a body has the same logical effect during replay.
+    if (console.body_active() && !console.servicing()) return;
+    guarded([] { host::retrace(); });
+    return;
+  }
   if (g_resim) { ++g_resim_vi_waits; rollback_frame_callback(); return; }
   guarded([] { host::retrace(); });
 }
@@ -2082,6 +2291,7 @@ void h_vi_wait_retrace() {
 // retrace itself stay where they were (native_retrace), so game code runs in the same order.
 // MELEE_AUDIO_PACING=0 turns it off for comparisons.
 int32_t h_vi_idle_step() {
+  if (yougame::console::console_active()) return 0; // wall-time audio pacing cannot schedule game work
   static const bool enabled = [] { const char* v = std::getenv("MELEE_AUDIO_PACING"); return !(v && *v == '0'); }();
   // MELEE_AUDIO_PACING_TRACE=1: why the idle loop stops, counted and logged every 600 calls.
   static const bool trace = [] { const char* v = std::getenv("MELEE_AUDIO_PACING_TRACE"); return v && *v == '1'; }();
@@ -2143,6 +2353,13 @@ void ranked_harness_tick() {
 }
 
 void h_pad_read(MuPadStatus out[4]) {
+  if (g_console_boot) {
+    yougame::console::Pads composed{};
+    auto& engine = yougame::console::console_engine();
+    engine.read(engine.active() ? yougame::console::Pads{} : console_hardware(), composed);
+    std::copy(composed.begin(), composed.end(), out);
+    return;
+  }
   if (g_online_test_mode == 0) ranked_harness_tick();
   host::PadState pads[4];
 #ifdef YOUGAME_AGENT_TEST_HOOK
@@ -2238,6 +2455,10 @@ void h_pad_read(MuPadStatus out[4]) {
 // rumble setting, the device actually feeding that port, and online only the local player's slot.
 // Sending them straight to the adapter ignored the setting. A replay rumbles nobody.
 void h_pad_rumble(int32_t port, int32_t on) {
+  if (g_console_boot) {
+    if (port + 1 == yougame::console::console_engine().config().my_port) host::input_rumble_local(on != 0);
+    return;
+  }
   if (g_replaying) on = 0;
   // Online the game already keeps only the local player's motor (mu_online_motor_port), and what
   // it passes is the controller port that player's input comes from, not their slot in the match.
@@ -2481,10 +2702,11 @@ void card_clear_files() {
 }
 void card_mount_files() {
   if (g_card_mounted) return;
-  g_card_dir = g_profile_card.empty() ? std::filesystem::u8path(host::options.card_dir) : g_profile_card;
+  g_card_dir = g_console_boot ? g_console_card :
+      g_profile_card.empty() ? std::filesystem::u8path(host::options.card_dir) : g_profile_card;
   std::error_code ec;
   std::filesystem::create_directories(g_card_dir, ec);
-  host::backup_card_folder(g_card_dir);
+  if (!g_console_boot) host::backup_card_folder(g_card_dir);
   card_clear_files();
   g_card_files.assign(CARD_MAX_FILES, nullptr);
   size_t slot = 0;
@@ -2527,6 +2749,7 @@ void card_mount_files() {
   // file. Writes create a private copy in the port's card directory; on later
   // mounts that private copy takes precedence over the original import.
   for (const auto& source : g_mod_gcis) {
+    if (g_console_boot) break; // no save imports into a session card
     if (slot >= CARD_MAX_FILES) host::die("card: no free file slot for imported GCI");
     const auto length = std::filesystem::file_size(source, ec);
     if (ec || length < 64 || length > uint64_t(CARD_TOTAL_BLOCKS) * CARD_SECTOR + 64) {
@@ -2571,7 +2794,10 @@ void card_mount_files() {
 void card_reset_mount() { card_clear_files(); g_card_mounted = false; }
 // Seconds since 2000-01-01 on the console clock (its date at start plus game time), as the game's
 // own calendar reads it: a save file used to be stamped January 1, 2000.
-uint32_t card_time_2000() { return host::cpu ? (uint32_t)((host::console_epoch_ticks() + host::cpu->tb) / host::TB_HZ) : 0; }
+uint32_t card_time_2000() {
+  if (yougame::console::console_active()) return (uint32_t)((h_boot_time() + h_ticks()) / host::TB_HZ);
+  return host::cpu ? (uint32_t)((host::console_epoch_ticks() + host::cpu->tb) / host::TB_HZ) : 0;
+}
 void card_fill_stat(const SourceCardFile& file, SourceCardStat& stat) {
   std::memset(&stat, 0, sizeof stat);
   std::memcpy(stat.fileName, file.dir + 8, 32);
@@ -2605,6 +2831,7 @@ void card_fill_stat(const SourceCardFile& file, SourceCardStat& stat) {
 // The Lossless adapter's lag test (host/lag_test_codes.h): its app boots Dolphin with no memory card,
 // and the "Skip Memcard Prompt" code it relies on skips only that case, so slot A is empty too.
 static bool card_slot_missing(int32_t chan) {
+  if (g_console_boot) return chan != 0;
   static const bool lag_test = std::getenv("MELEE_LAG_TEST") != nullptr && !std::getenv("MELEE_LAG_TEST_KEEP_CARD");
   return chan != 0 || lag_test;
 }
@@ -2814,6 +3041,7 @@ void h_native_free(void* ptr) { std::free(ptr); }
 
 uint32_t h_mem1_size() { return MEM1_SIZE; }
 uint32_t h_mod_flags() {
+  if (yougame::console::console_active()) return 0;
   return (g_mod_overlay.files().empty() ? 0 : MU_MOD_ASSETS_PRESENT) | (hackpack::loaded() ? MU_MOD_HACKPACK : 0u) |
          (mods::status().rogue ? MU_MOD_ROGUE : 0u) | (mods::status().maker ? MU_MOD_MAKER : 0u);
 }
@@ -2833,12 +3061,16 @@ void h_stop(int32_t reason, int32_t code) {
 // only asks for it where a VS match's rules are finalised.
 MuMatchOverride g_match{};
 bool g_match_set = false;
-const MuMatchOverride* h_match_override() { return g_match_set ? &g_match : nullptr; }
+const MuMatchOverride* h_match_override() {
+  if (yougame::console::console_active()) return nullptr;
+  return g_match_set ? &g_match : nullptr;
+}
 
 // --rng-seed: forced from host::options once at startup (see main.cpp's flag parsing), read by the
 // game at the same first GS_VS frame callback, so a scripted run reaches identical RNG in both the source port and a
 // --rng-seed recomp run from the first in-match frame.
 void h_rng_seed_override(uint32_t* seed, int32_t* has_value) {
+  if (yougame::console::console_active()) { *has_value = 0; return; }
   *has_value = host::options.rng_seed_set ? 1 : 0;
   if (host::options.rng_seed_set) *seed = host::options.rng_seed;
 }
@@ -3207,6 +3439,7 @@ void h_replay_finished() {
 #endif
 
 int32_t h_card_boot_confirm(uint32_t channel, uint32_t decision) {
+  if (yougame::console::console_active()) return yougame::memcard::confirm(true, channel, decision);
 #ifdef __APPLE__
   // The isolated Mac memory-card check records the two automatic boot confirmations.
   const bool answer = yougame::memcard::confirm(yougame::active(), channel, decision);
@@ -3222,7 +3455,13 @@ int32_t h_card_boot_confirm(uint32_t channel, uint32_t decision) {
 MuHostApi make_host() {
   MuHostApi h{};
   h.version = MU_HOST_API_VERSION;
-  h.test_getenv = host::test_env::getenv;
+  h.test_getenv = [](const char* name) -> const char* {
+    return yougame::console::console_active() ? nullptr : host::test_env::getenv(name);
+  };
+  h.console_frame_begin = h_console_frame_begin;
+  h.console_seed = h_console_seed;
+  h.console_rollback = h_console_rollback;
+  h.console_alarm_clock = h_console_alarm_clock;
   h.log = h_log; h.panic = h_panic; h.ticks = h_ticks; h.boot_time = h_boot_time; h.poll = h_poll;
   h.gx_fifo = h_gx_fifo; h.vi_configure = h_vi_configure; h.vi_set_next_framebuffer = h_vi_set_next_framebuffer;
   h.vi_flush = h_vi_flush; h.vi_retrace_count = h_vi_retrace_count; h.vi_next_field = h_vi_next_field;
@@ -3379,6 +3618,37 @@ LONG CALLBACK on_game_exception(EXCEPTION_POINTERS* info) {
 }  // namespace
 
 bool card_self_test(const char* directory) { return card_self_test_impl(directory); }
+
+bool begin_console(std::unique_ptr<yougame::console::SessionLink> link,
+                   const yougame::console::SessionConfig& config) {
+  if (g_console_boot || g_game.run || g_replaying || g_online_test_mode >= 0 || source_p2p::requested() ||
+      !link || !yougame::console::Engine::valid(config)) return false;
+  const char* data = std::getenv("YOUGAME_DATA"); // path only; never reads bridge credentials
+  std::filesystem::path card;
+  if (!data || !yougame::console::prepare_card(std::filesystem::u8path(data), config, card)) {
+    host::log("console: cannot prepare fresh session card"); return false;
+  }
+  yougame::console::EngineHooks hooks;
+  hooks.log = [](const std::string& line) { host::log("%s", line.c_str()); };
+  hooks.notice = [](const char* text) { screen_label::show(text, 8.0); };
+  hooks.responsive = [] {
+    host::window_pump(); // same message pump as host::retrace, without time, alarms, or game callbacks
+    if (host::exit_requested()) yougame::console::console_engine().end("window closed");
+  };
+  const bool rollback = yougame::console::rollback_setting(std::getenv("MELEE_CONSOLE_ROLLBACK"));
+  if (!yougame::console::console_engine().begin(std::move(link), config, std::move(hooks), rollback)) return false;
+  g_console_card = std::move(card);
+  g_console_boot = true;
+  return true;
+}
+
+int32_t console_practice_bridge(int32_t op, int32_t* args, int32_t count) {
+  if (yougame::console::console_active() && op != MU_PRACTICE_SCENE &&
+      op != MU_PRACTICE_GET_PLAYER && op != MU_PRACTICE_GET_STAGE &&
+      op != MU_PRACTICE_GET_ONLINE_MODE && op != MU_PRACTICE_UNLOCKED &&
+      !(op == MU_PRACTICE_PAGE_PAUSE && count >= 3 && args[0] == -1)) return -1;
+  return g_game.practice ? g_game.practice(op, args, count) : -1;
+}
 
 // --match <stage>:<p1>[:<p2>...], each player <kind>[/c<level>][/x<costume>], all numbers decimal
 // or 0x-hex. For example "0x14:9:12/c9" is Onett, one human, one level 9 CPU.
@@ -3937,7 +4207,7 @@ int run(void (*shutdown)(int)) {
       !g_game.state_exclusions || !g_game.snapshot_ranges || !g_game.practice)
     host::die("%s has game API version %u, expected %u: it is from another version of Melee Unlocked than %s. "
               "Close the game and the launcher, then extract the whole release zip over the folder again", g_dll.c_str(), g_game.version, MU_GAME_API_VERSION, MELEE_PORT_VERSION);
-  slippi::native_practice::set_native_bridge(g_game.practice);
+  slippi::native_practice::set_native_bridge(console_practice_bridge);
   slippi::native_practice::set_content_bridge(prepare_practice_content);
   slippi::online::set_plain_opponent_handler(plain_opponent);
   MuStateRegion game_regions[3]{};
@@ -3988,3 +4258,9 @@ int run(void (*shutdown)(int)) {
 }
 
 }  // namespace source_port
+
+namespace yougame::console {
+bool console_begin(std::unique_ptr<SessionLink> link, const SessionConfig& config) {
+  return source_port::begin_console(std::move(link), config);
+}
+} // namespace yougame::console

@@ -11,7 +11,6 @@
 
 namespace yougame::friends {
 using json = nlohmann::json;
-inline constexpr const char* kHint = "Leave empty to invite a YouGame friend";
 inline constexpr const char* kVersion = "Your friend is on a different version";
 inline constexpr const char* kJoined = "Joined";
 inline constexpr const char* kFailed = "Couldn't reach your friend";
@@ -25,8 +24,8 @@ struct InviteEdge {
   bool need_release = false;
   // connected = the pad is present AND the game has the keyboard/pads. After it was not (the page's
   // friend picker had focus, a hot-plug), an A or START still held must be let go before a press counts:
-  // otherwise a held button reopened the picker every time focus came back (quality, pc2 10-30).
-  bool poll(bool connected, uint16_t buttons, bool code, bool empty, bool entry) {
+  // Verified in native platform performance review.
+  bool poll_buttons(bool connected, uint16_t buttons, uint16_t mask) {
     if (!connected) { previous = 0; need_release = true; return false; }
     if (need_release) {
       if (!(buttons & 0x1100)) need_release = false;
@@ -35,8 +34,17 @@ struct InviteEdge {
     }
     const uint16_t pressed = buttons & ~previous;
     previous = buttons;
-    return (code && empty && (pressed & 0x1000)) || (entry && (pressed & 0x1100));
+    return (pressed & mask) != 0;
   }
+  bool poll(bool connected, uint16_t buttons, bool entry) {
+    return poll_buttons(connected, buttons, entry ? 0x1100 : 0);
+  }
+  // Compatibility for the protected console entry's START-only ready/lock-in edge.
+  // Direct code entry never calls this overload or owns an Events picker context.
+  bool poll(bool connected, uint16_t buttons, bool start_only, bool enabled, bool entry) {
+    return poll_buttons(connected, buttons, entry ? 0x1100 : start_only && enabled ? 0x1000 : 0);
+  }
+
 };
 inline constexpr const char* kWaiting = "Waiting for your friend...";
 inline constexpr const char* kTeamWaiting = "Waiting for your team...";
@@ -140,9 +148,6 @@ inline std::string room_code(const json& value, const char* key) {
 }
 inline std::string room(const json& value) { return room_code(value, "room"); }
 inline std::string picker_room(const json& value) { return room_code(value, "code"); }
-inline bool empty_code(bool yougame, int mode, const std::string& code) {
-  return yougame && mode == 2 && code.empty();
-}
 // The picker supplies the host code; invitees repeat it in the `room` field.
 inline json ticket(const std::string& compatibility, const std::string& code) {
   if (room(json{{"room", code}}).empty()) throw std::runtime_error("Invalid YouGame friends room");
@@ -150,8 +155,8 @@ inline json ticket(const std::string& compatibility, const std::string& code) {
           {"room", code}, {"ranked", false},
           {"lobby", {{"version", 1}, {"minPlayers", 2}, {"maxLocalPlayers", 1}, {"compatibility", compatibility}}}};
 }
-inline bool native_ready(bool yougame, int mode, const std::string& code, const std::string& invite) {
-  return !(yougame && (!invite.empty() || empty_code(true, mode, code)));
+inline bool native_ready(bool yougame, int, const std::string&, const std::string& invite) {
+  return !(yougame && !invite.empty());
 }
 // The ordinary Direct winner path locks in on START without another code/stage screen.
 // A random first stage is already supplied by native_start_match, as for other searches.
@@ -254,17 +259,17 @@ class Events {
   void online_menu(bool visible, bool selected = false) {
     std::lock_guard<std::mutex> lock(mutex_);
     online_menu_ = visible; friend_entry_ = visible && selected;
-    if (!visible) host_requested_ = false;
+    if (!friend_entry_) host_requested_ = false;
   }
   bool online_menu() const { std::lock_guard<std::mutex> lock(mutex_); return online_menu_; }
   bool friend_entry() const { std::lock_guard<std::mutex> lock(mutex_); return friend_entry_; }
-  bool picker_context() const { std::lock_guard<std::mutex> lock(mutex_); return code_screen_ || online_menu_; }
+  bool picker_context() const { std::lock_guard<std::mutex> lock(mutex_); return friend_entry_; }
   // What asked for the picker last ("pad N buttons XXXX" or the keyboard/overlay path), for the entry log line.
   std::string trigger() const { std::lock_guard<std::mutex> lock(mutex_); return trigger_; }
   bool poll_pad(int port, bool connected, uint16_t buttons) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (port < 0 || port >= 4) return false;
-    if (!edges_[port].poll(connected, buttons, code_screen_, code_empty_, friend_entry_)) return false;
+    if (!edges_[port].poll(connected, buttons, friend_entry_)) return false;
     char why[40];
     std::snprintf(why, sizeof why, "pad %d buttons %04x", port + 1, buttons);
     trigger_ = why;
@@ -272,7 +277,7 @@ class Events {
   }
   void request_host() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if ((code_screen_ && code_empty_) || online_menu_) {
+    if (friend_entry_) {
       trigger_ = "Enter or the overlay button";
       host_requested_ = true; picker_error_.clear(); version_notice_ = version_logged_ = false;
     }
@@ -281,20 +286,12 @@ class Events {
     std::lock_guard<std::mutex> lock(mutex_);
     return std::exchange(host_requested_, false);
   }
-  void code_empty(bool empty) { std::lock_guard<std::mutex> lock(mutex_); code_empty_ = empty; }
-  bool code_empty() const { std::lock_guard<std::mutex> lock(mutex_); return code_empty_; }
-  void code_screen(bool visible) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    code_screen_ = visible;
-    if (!visible) { host_requested_ = false; picker_error_.clear(); }
-  }
-  bool code_screen() const { std::lock_guard<std::mutex> lock(mutex_); return code_screen_; }
  private:
   mutable std::mutex mutex_;
   InviteEdge edges_[4];
   std::string trigger_;
   bool online_menu_ = false, friend_entry_ = false, version_notice_ = false, version_logged_ = false;
-  bool hello_seen_ = false, code_screen_ = false, code_empty_ = false, host_requested_ = false;
+  bool hello_seen_ = false, host_requested_ = false;
   std::string pending_, toast_, current_room_, picker_error_;
   uint64_t toast_until_ = 0;
 };

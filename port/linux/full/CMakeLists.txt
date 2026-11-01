@@ -89,8 +89,11 @@ target_include_directories(full_monocypher PUBLIC "${PORT}/third_party/monocyphe
 add_library(full_imgui STATIC
   "${PORT}/third_party/imgui/imgui.cpp" "${PORT}/third_party/imgui/imgui_draw.cpp"
   "${PORT}/third_party/imgui/imgui_tables.cpp" "${PORT}/third_party/imgui/imgui_widgets.cpp"
-  "${PORT}/third_party/imgui/backends/imgui_impl_sdl2.cpp" "${PORT}/third_party/imgui/backends/imgui_impl_opengl3.cpp")
-target_include_directories(full_imgui PUBLIC "${PORT}/third_party/imgui" "${PORT}/third_party/imgui/backends")
+  "${PORT}/third_party/imgui/backends/imgui_impl_sdl2.cpp" "${PORT}/third_party/imgui/backends/imgui_impl_opengl3.cpp"
+  "${PORT}/third_party/imgui/backends/imgui_impl_vulkan.cpp")
+# The Vulkan renderer (runtime/gx/gx_vulkan.cpp) opens libvulkan at run time: headers only.
+target_include_directories(full_imgui PUBLIC "${PORT}/third_party/imgui" "${PORT}/third_party/imgui/backends" "${PORT}/third_party/vulkan-headers/include")
+target_compile_definitions(full_imgui PUBLIC IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
 target_compile_features(full_imgui PUBLIC cxx_std_17)
 target_link_libraries(full_imgui PUBLIC SDL2::SDL2 ${CMAKE_DL_LIBS})
 
@@ -108,7 +111,7 @@ add_library(full_runtime STATIC ${FULL_RUNTIME_SOURCES} "${PORT}/third_party/sli
   "${COMPAT}/compat.cpp" "${COMPAT}/winhttp_ws.cpp" ../xinput_sdl.cpp ../hid_linux.cpp ../renderer_gl.cpp ../renderer_presenter.cpp
   gx_backend_linux.cpp pc_settings_gl.cpp audio_sdl.cpp linux_media.cpp gpu_features_linux.cpp)
 target_compile_definitions(full_runtime PUBLIC MELEE_LINUX GX_PC_SETTINGS MELEE_LINUX_X11_EMBED
-  PRIVATE MELEE_PORT_VERSION="${MELEE_PORT_VERSION}" MELEE_PLAYBACK_GCT_BASE=0u MELEE_PLAYBACK_GCT_SIZE=0u
+  PRIVATE YOUGAME_COMPAT_TAG="${YOUGAME_COMPAT_TAG}" MELEE_PORT_VERSION="${MELEE_PORT_VERSION}" MELEE_PLAYBACK_GCT_BASE=0u MELEE_PLAYBACK_GCT_SIZE=0u
   GX_SHADER_CACHE_VERSION="linux-gl-1")
 target_include_directories(full_runtime PUBLIC "${COMPAT}" "${PORT}/runtime/ppc" "${PORT}/runtime/host" "${PORT}/runtime/hle"
   "${PORT}/runtime/gx" "${PORT}/runtime/mu_net" "${PORT}/runtime/abi" "${MELEE_PORT_GEN}" "${PROJECT_SOURCE_DIR}/native"
@@ -143,6 +146,10 @@ set_target_properties(melee_source PROPERTIES OUTPUT_NAME ${MELEE_SOURCE_NAME})
 target_compile_options(melee_source PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${MELEE_LINUX_COMMON_FLAGS}>")
 target_compile_features(melee_source PRIVATE c_std_99)
 target_link_libraries(melee_source PRIVATE full_runtime full_mu_net)
+if(YOUGAME_RANKED_BRANCH)
+  target_compile_definitions(melee_source PRIVATE YOUGAME_RANKED_BRANCH=1)
+  target_compile_definitions(full_runtime PRIVATE YOUGAME_RANKED_BRANCH=1)
+endif()
 option(YOUGAME_AGENT_TEST_HOOK "Staging test builds: read agent-test.json in app-launched YouGame mode" OFF)
 if(YOUGAME_AGENT_TEST_HOOK)
   # Windows defines this privately on runtime and both game hosts. Linux has one full host;

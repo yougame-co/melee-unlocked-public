@@ -13,6 +13,7 @@
 #include <string.h>
 #include <dolphin/os.h>
 #include <dolphin/pad.h>
+#include <dolphin/vi.h>
 #include <melee/gm/forward.h>
 #include <melee/gm/gm_1601.h>
 #include <melee/gm/gm_1A36.h>
@@ -35,10 +36,14 @@
 #include <sysdolphin/baselib/gobj.h>
 #include <sysdolphin/baselib/random.h>
 #include <mu_native.h>
+#include <mu_online_menu.h>
+#include <mu_ranked.h>
+#include <mu_ranked_setup_online.h>
 
 int mu_online_abi_command(unsigned int command, const unsigned char* payload, unsigned int size,
                           unsigned char* response, unsigned int capacity, unsigned int* response_size);
 void mu_online_abi_log(const char* text);
+int snprintf(char* buffer, __SIZE_TYPE__ size, const char* format, ...);
 void mu_replay_apply_game_info(StartMeleeData* data, const unsigned char* info);
 extern MenuKindData mn_803EB6B0[];
 
@@ -86,8 +91,10 @@ static int installed;         /* the online major replaced GM_HANYU_CSS (main.as
 static int zelda_sheik;       /* between the online major's OnLoad and OnUnload */
 static unsigned online_loads;  /* OnLoad count: the chat shim's Sheik selector keeps its icon until the next one */
 static int boot_oneshot;      /* boot.asm's one-shot "first menu = online submenu" */
+static int ranked_supported;
 static int ranked_offered;
 static int friends_offered;   /* FA bit 1: YouGame Online > Friends is offered */
+static int slippi_submenu;
 static int first_boot = 1;    /* OnMenuLoad's DOFST_IS_FIRST_BOOT */
 /* A peer-to-peer session with menus (mu_online_p2p_menus): the first online submenu confirms Direct
  * by itself. Set in the boot menu entry and cleared by that menu's think a few frames later, both
@@ -139,35 +146,80 @@ int mu_slippi_fetch_app_state(void)
     return slp.app_state;
 }
 
-/* FA: flags, then the Ranked character select's header (61 bytes of game text). A host without
- * the command answers nothing: Ranked stays hidden and the header stays "Ranked Mode". */
-int mu_slippi_ranked_header(char* out, unsigned int cap)
+/* FA: flags, then six 128-byte presentation lines. Bit 0 offers the menu row; bit 2
+ * supports YouGame Ranked text and random-stage play while the row stays hidden. */
+int mu_slippi_ranked_line(unsigned int line, char* out, unsigned int cap)
 {
-    u8 r[64];
-    unsigned int got = 0, n;
+    u8 r[1 + 6 * 128];
+    unsigned int got = 0, n, offset = 1 + line * 128;
     memset(r, 0, sizeof r);
-    if (out != NULL && cap > 0) {
-        out[0] = 0;
-    }
-    if (mu_slippi_cmd(CMD_YOUGAME_RANKED, NULL, 0, r, sizeof r, &got) != 0 || got < 1) {
-        friends_offered = 0;
+    if (out != NULL && cap > 0) out[0] = 0;
+    if (line >= 6 || mu_slippi_cmd(CMD_YOUGAME_RANKED, NULL, 0, r, sizeof r, &got) != 0 || got < 1) {
+        friends_offered = ranked_supported = 0;
         return 0;
     }
     friends_offered = (r[0] & 2) != 0;
-    if (!(r[0] & 1)) return 0;
-    if (got > sizeof r) {
-        got = sizeof r;
+    ranked_supported = (r[0] & 4) != 0;
+    if (out == NULL) return (r[0] & 1) != 0; /* menu visibility stays independent */
+    if (!ranked_supported || got <= offset || cap == 0) return 0;
+    n = got - offset;
+    if (n > 127) n = 127;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, r + offset, n);
+    out[n] = 0;
+    return 1;
+}
+
+/* A CSS frame consumes all six lines from one bridge query. */
+int mu_slippi_ranked_lines(char lines[6][128])
+{
+    u8 r[1 + 6 * 128];
+    unsigned int got = 0, i, n, offset;
+    memset(lines, 0, 6 * 128);
+    memset(r, 0, sizeof r);
+    if (mu_slippi_cmd(CMD_YOUGAME_RANKED, NULL, 0, r, sizeof r, &got) != 0 || got < 1) {
+        friends_offered = ranked_supported = 0;
+        return 0;
     }
-    if (out != NULL && cap > 0) {
-        n = got - 1 < cap - 1 ? got - 1 : cap - 1;
-        memcpy(out, r + 1, n);
-        out[n] = 0;
+    friends_offered = (r[0] & 2) != 0;
+    ranked_supported = (r[0] & 4) != 0;
+    if (!ranked_supported) return 0;
+    for (i = 0; i < 6; i++) {
+        offset = 1 + i * 128;
+        if (got <= offset) break;
+        n = got - offset;
+        if (n > 127) n = 127;
+        memcpy(lines[i], r + offset, n);
     }
     return 1;
 }
 
-int mu_slippi_ranked_available(void) { return ranked_offered; }
+int mu_slippi_ranked_header(char* out, unsigned int cap)
+{
+    return mu_slippi_ranked_line(0, out, cap);
+}
+
+int mu_slippi_ranked_available(void) { return ranked_supported; }
 int mu_slippi_friends_available(void) { return friends_offered; }
+/* FA presentation capability identifies YouGame even when an optional row is disabled. */
+int mu_slippi_yougame_menu(void) { return ranked_supported; }
+int mu_slippi_title_active(void)
+{
+    return mu_slippi_menus_enabled() && ranked_supported && slippi_submenu &&
+           mn_804A04F0.cur_menu == MENU_KIND_8;
+}
+int mu_slippi_menu_count(void) { return mu_online_menu_count(ranked_supported, slippi_submenu); }
+int mu_slippi_menu_option(int row) { return mu_online_menu_option(ranked_supported, slippi_submenu, row); }
+int mu_slippi_menu_label_kind(int row)
+{
+    int option = mu_slippi_menu_option(row);
+    if (!ranked_supported) return 0;
+    return option == MU_SLP_OPT_FRIENDS ? 1 : option == MU_SLP_OPT_SLIPPI ? 2 :
+           option == MU_SLP_MODE_DIRECT ? 3 : option == MU_SLP_MODE_TEAMS ? 4 :
+           option == MU_SLP_MODE_PARTY ? 5 : option == MU_SLP_MODE_RANKED ? 6 :
+           option == MU_SLP_MODE_UNRANKED ? 7 : 0;
+}
+
 
 int mu_slippi_app_state(void) { return slp.app_state; }
 const char* mu_slippi_user_name(void) { return (const char*) user_name; }
@@ -223,7 +275,7 @@ const MuMatchState* mu_slippi_match_state(void)
 }
 
 /* Find Match Transfer Buffer: mode, 18 Shift-JIS bytes. FN_TX_FIND_MATCH first resets the game
- * prep data's game index (and tiebreak, which this build never sets). */
+ * prep data's game and tiebreak counters. */
 void mu_slippi_find_opponent(int mode, const unsigned char* code_sjis18)
 {
     u8 b[19];
@@ -343,12 +395,13 @@ unsigned char mu_slippi_team_costume(int team, int ckind)
     }
 }
 
-/* HandleOnlineLockedOptions (Melee Unlocked edit: Ranked hidden when logged in, unless the host
- * offers it: YouGame mode). Logged out (or an unknown state): only Log in. Logged in: Unranked,
- * Direct, Teams, Party (and Ranked under YouGame). Update required: only Update. */
+/* YouGame has four top-level rows or two focusable Slippi rows. The latter gate
+ * confirmation on the app's Slippi sign-in. Standalone keeps
+ * today's app-state locks: Unranked/Direct/Teams/Party, Log in, or Update. */
 int mu_slippi_option_unlocked(int sel)
 {
-    if (sel == MU_SLP_OPT_FRIENDS) return slp.app_state == MU_SLP_APP_LOGGED_IN && friends_offered;
+    if (ranked_supported) return sel >= 0 && sel < mu_slippi_menu_count();
+    if (sel == MU_SLP_OPT_FRIENDS || sel == MU_SLP_OPT_SLIPPI) return 0;
     switch (slp.app_state) {
     case MU_SLP_APP_LOGGED_IN:
         return (sel >= MU_SLP_MODE_UNRANKED && sel <= MU_SLP_MODE_PARTY) ||
@@ -364,11 +417,12 @@ int mu_slippi_option_unlocked(int sel)
     }
 }
 
-/* GetFirstUnlocked: scan from Unranked (never Ranked by default). */
+/* YouGame starts on Ranked; standalone scans from Unranked as before. */
 int mu_slippi_first_unlocked(void)
 {
     int i;
     int count = mn_803EB6B0[MENU_KIND_8].selection_count;
+    if (ranked_supported) return 0;
     for (i = MU_SLP_MODE_UNRANKED; i < count; i++) {
         if (mn_80229938(MENU_KIND_8, i)) {
             break;
@@ -399,6 +453,7 @@ void mu_slippi_menu_prep(void)
         return;
     }
     mu_slippi_fetch_app_state();
+    slippi_submenu = 0;
     mu_mnmain_install_online_menu();
 }
 
@@ -412,7 +467,14 @@ int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned c
     if (previous_mode == GM_HANYU_CSS) {
         mu_content_mode(-1);   /* back from online: the offline view again */
         *menu_kind = MENU_KIND_8;
-        *hovered = mn_80229938(MENU_KIND_8, slp.mode) ? slp.mode : (u8) mu_slippi_first_unlocked();
+        if (ranked_supported) {
+            slippi_submenu = slp.mode == MU_SLP_MODE_DIRECT || slp.mode == MU_SLP_MODE_TEAMS ||
+                             slp.mode == MU_SLP_MODE_PARTY;
+            mu_mnmain_install_online_menu();
+            *hovered = (u8) mu_online_menu_row(1, slippi_submenu, slp.mode);
+        } else {
+            *hovered = mn_80229938(MENU_KIND_8, slp.mode) ? slp.mode : (u8) mu_slippi_first_unlocked();
+        }
         return 1;
     }
     if (previous_mode == GM_BOOT && boot_oneshot) {
@@ -421,10 +483,15 @@ int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned c
         *menu_kind = MENU_KIND_8;
         *hovered = (u8) mu_slippi_first_unlocked();
         if (mu_online_p2p_menus()) {
+            mu_slippi_load_match_state(NULL);
             /* The session's players are already known: no choice of mode, straight to Direct's
              * character select. The row is only open when the host reports a signed-in state. */
-            if (mn_80229938(MENU_KIND_8, MU_SLP_MODE_DIRECT)) {
-                *hovered = MU_SLP_MODE_DIRECT;
+            if (ranked_supported) {
+                slippi_submenu = 1;
+                mu_mnmain_install_online_menu();
+            }
+            if (mn_80229938(MENU_KIND_8, mu_online_menu_row(ranked_supported, slippi_submenu, MU_SLP_MODE_DIRECT))) {
+                *hovered = (u8) mu_online_menu_row(ranked_supported, slippi_submenu, MU_SLP_MODE_DIRECT);
                 p2p_auto_direct = 1;
             } else {
                 OSReport("[p2p] menus: Direct is locked (app state %d); staying on the online menu\n",
@@ -478,6 +545,16 @@ int mu_slippi_menu_clear_check(int menus_differ)
     return 0;
 }
 
+/* E6 value 8 is a local grant query; rows stay focusable so a locked confirm can
+ * explain the sign-in requirement without leaving this menu. Standalone never asks. */
+static int upstream_slippi_available(void)
+{
+    u8 query = 8, available = 0;
+    unsigned int got = 0;
+    return mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &query, 1, &available, 1, &got) == 0 &&
+           got == 1 && available != 0;
+}
+
 static u8 confirm_port(void)
 {
     int i;
@@ -489,52 +566,111 @@ static u8 confirm_port(void)
     return 0;
 }
 
+/* These are the cached, mapped controller values used by mn_80229624, not PADRead.
+ * repeat2 includes the initial edge. Keep its full 64 bits (PAD_ANY_* is above bit 31)
+ * and list every port contributing the chosen direction, since slot 4 ORs all ports. */
+static void log_online_highlight(int row, u64 direction, u64 input[4][3])
+{
+    char ports[640] = "input none", line[1024];
+    unsigned used = 0;
+    int i;
+    for (i = 0; i < 4; ++i) {
+        if (input[i][2] & direction) {
+            used += snprintf(ports + used, sizeof ports - used,
+                "%sport %d held 0x%04llx edge 0x%04llx repeat 0x%04llx (%s)",
+                used ? "; " : "", i + 1, (unsigned long long) input[i][0],
+                (unsigned long long) input[i][1], (unsigned long long) input[i][2],
+                input[i][1] & direction ? "press" : "repeat");
+        }
+    }
+    /* OSReport has a 512-byte buffer; four contributing ports must retain the suffix too. */
+    snprintf(line, sizeof line,
+        "online menu: row %d (option %d) highlighted; frame %u, %s; yougame %d, submenu %d, ranked offered %d, friends offered %d, app state %d\n",
+        row, mu_slippi_menu_option(row), VIGetRetraceCount(), ports,
+        ranked_supported, slippi_submenu, ranked_offered, friends_offered, slp.app_state);
+    mu_online_abi_log(line);
+}
+
 /* OnMenuPrep FN_OnlineSubmenuThink (ported from the regular-match think). The logout dialog is
  * unreachable: Log out is locked in every app state of this build. */
 void mu_slippi_online_menu_think(HSD_GObj* gp)
 {
     u32 buttons;
+    u64 input[4][3], direction = 0;
+    int port;
     MenuExitData* data;
     int auto_direct = 0;
-    int friends_visible = friends_offered && slp.app_state == MU_SLP_APP_LOGGED_IN;
+    int selected_row, selected_option;
+    int friends_visible = ranked_supported && !slippi_submenu;
+    int online_visible = 1;
     /* The menu takes no input while its entry cooldown runs (mn_80229624 answers 0 and counts it
      * down), so the frame it reaches 0 is the first one a player's own press could confirm on. */
     int accepts_input = mn_804D6BC8.cooldown == 0;
     (void) gp;
 
+    /* The getters only read controller_map; mn_80229624 reads the OR of this same snapshot. */
+    for (port = 0; port < 4; ++port) {
+        input[port][0] = gm_GetButtonsPressed((u8) port);
+        input[port][1] = gm_GetButtonsTriggered((u8) port);
+        input[port][2] = gm_801A36C0((u8) port);
+    }
     buttons = mn_80229624(4);
     if (p2p_auto_direct && accepts_input) {
         /* Once per run: confirm Direct as a press on this frame would, whatever the pads hold. */
         p2p_auto_direct = 0;
         if (mu_online_p2p_menus() && mn_804A04F0.cur_menu == MENU_KIND_8 &&
-            mn_80229938(MENU_KIND_8, MU_SLP_MODE_DIRECT))
+            mn_80229938(MENU_KIND_8, mu_online_menu_row(ranked_supported, slippi_submenu, MU_SLP_MODE_DIRECT)))
         {
             auto_direct = 1;
-            mn_804A04F0.hovered_selection = MU_SLP_MODE_DIRECT;
+            if (ranked_supported && mu_ranked_setup_cpu()) {
+                slippi_submenu = 0;
+                mu_mnmain_install_online_menu();
+            }
+            mn_804A04F0.hovered_selection = (u8) mu_online_menu_row(ranked_supported, slippi_submenu,
+                mu_ranked_setup_cpu() ? MU_SLP_MODE_RANKED : MU_SLP_MODE_DIRECT);
             buttons = MenuInput_Confirm;
             OSReport("[p2p] menus: entering the Direct character select (pad port %d)\n",
                      mu_online_p2p_port());
         }
     }
+    /* Confirm may replace the menu and its row mapping below. Log the option
+     * actually pressed, before entering or leaving the Slippi submenu. */
+    selected_row = mn_804A04F0.hovered_selection;
+    selected_option = mu_slippi_menu_option(selected_row);
     mn_804A04F0.buttons = buttons;
     if ((buttons & MenuInput_Confirm) && friends_visible &&
-        mn_804A04F0.hovered_selection == MU_SLP_OPT_FRIENDS)
+        mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_FRIENDS)
     {
         /* A and START both confirm Friends. The host keeps the menu here until the
          * picker returns; still apply the ordinary confirm cooldown. */
         mn_804D6BC8.cooldown = 5;
+    } else if ((buttons & MenuInput_Confirm) && ranked_supported &&
+               mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_SLIPPI) {
+        slippi_submenu = 1;
+        friends_visible = 0;
+        mu_mnmain_install_online_menu();
+        mn_804D6BC8.cooldown = 5;
+        sfxForward();
+        mn_80229894(MENU_KIND_8, 0, 1);
+        slp.force_clear = 1;
+    } else if ((buttons & MenuInput_Confirm) && ranked_supported && slippi_submenu &&
+               !upstream_slippi_available()) {
+        mn_804D6BC8.cooldown = 5;
+        sfxBack();
+        mu_slippi_signin_notice(gp);
     } else if (buttons & MenuInput_Confirm) {
         mn_804D6BC8.cooldown = 5;
         mn_804A04F0.entering_menu = 1;
         friends_visible = 0;
+        online_visible = 0;
         gm_801677E8(auto_direct ? (s8) mu_online_p2p_port() : (s8) confirm_port());
-        switch (mn_804A04F0.hovered_selection) {
+        switch (mu_slippi_menu_option(mn_804A04F0.hovered_selection)) {
         case MU_SLP_MODE_RANKED:
         case MU_SLP_MODE_UNRANKED:
         case MU_SLP_MODE_DIRECT:
         case MU_SLP_MODE_TEAMS:
         case MU_SLP_MODE_PARTY:
-            slp.mode = (u8) mn_804A04F0.hovered_selection;
+            slp.mode = (u8) mu_slippi_menu_option(mn_804A04F0.hovered_selection);
             if (mu_online_p2p_menus()) {
                 /* No game was played yet: neither winner nor loser. The character select gives the
                  * first game's stage pick to one player once the two are connected and their
@@ -559,34 +695,60 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
             mu_slippi_cmd(CMD_UPDATE_APP, NULL, 0, NULL, 0, NULL);
             break;
         }
+    } else if ((buttons & MenuInput_Back) && ranked_supported && slippi_submenu) {
+        slippi_submenu = 0;
+        friends_visible = 1;
+        mu_mnmain_install_online_menu();
+        mn_804D6BC8.cooldown = 5;
+        sfxBack();
+        mn_80229894(MENU_KIND_8, MU_YG_ROW_SLIPPI, 3);
+        slp.force_clear = 1;
     } else if (buttons & MenuInput_Back) {
         friends_visible = 0;
+        online_visible = 0;
         sfxBack();
         mn_804A04F0.entering_menu = 0;
         mn_80229894(MENU_KIND_1P, SEL_1P_2, 3);
     } else if (buttons & MenuInput_Up) {
+        direction = PAD_ANY_UP;
         sfxMove();
         do {
             if (mn_804A04F0.hovered_selection == 0) {
-                mn_804A04F0.hovered_selection = MU_SLP_OPT_COUNT - 1;
+                mn_804A04F0.hovered_selection = mu_slippi_menu_count() - 1;
             } else {
                 mn_804A04F0.hovered_selection--;
             }
         } while (!mn_80229938(MENU_KIND_8, mn_804A04F0.hovered_selection));
     } else if (buttons & MenuInput_Down) {
+        direction = PAD_ANY_DOWN;
         sfxMove();
         do {
-            if (mn_804A04F0.hovered_selection == MU_SLP_OPT_COUNT - 1) {
+            if (mn_804A04F0.hovered_selection == mu_slippi_menu_count() - 1) {
                 mn_804A04F0.hovered_selection = 0;
             } else {
                 mn_804A04F0.hovered_selection++;
             }
         } while (!mn_80229938(MENU_KIND_8, mn_804A04F0.hovered_selection));
     }
+    /* One melee.log line per highlighted row and per select, so a menu walk is provable from the log. */
+    {
+        static int logged_row = -1, logged_submenu = -1;
+        int row = mn_804A04F0.hovered_selection;
+        if (!accepts_input) logged_row = -1;
+        else if (row != logged_row || slippi_submenu != logged_submenu) {
+            log_online_highlight(row, direction, input);
+            logged_row = row;
+            logged_submenu = slippi_submenu;
+        }
+        if (accepts_input && (buttons & MenuInput_Confirm))
+            OSReport("online menu: row %d (option %d) selected\n", selected_row, selected_option);
+    }
     /* Publish after Up/Down so the next PADRead sees the row now under the cursor. */
     {
         u8 friends_menu = !friends_visible ? 0 :
-            accepts_input && mn_804A04F0.hovered_selection == MU_SLP_OPT_FRIENDS ? 2 : 1;
+            accepts_input && mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_FRIENDS ? 2 : 1;
+        /* Track Online even with the Friends row hidden; bit 2 is status-area visibility. */
+        if (online_visible) friends_menu |= 4;
         mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &friends_menu, 1, NULL, 0, NULL);
     }
 }
@@ -594,8 +756,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
 /* ---- the online major (Slippi Online Scene/main.asm) ----
  * GM_HANYU_CSS (unused in retail) becomes the online mode: states 0 CSS, 1 SSS, 2 VS, 3 Results,
  * 4 Splash. Slippi writes the raw next-state byte (id + 1); gm_SetNextGameModeStateId(id) is the
- * same write. The Ranked-only GameSetup state is not ported: standalone Melee Unlocked hides Ranked,
- * and YouGame's Ranked v1 plays the Unranked states (CSS, random legal stage, splash, VS). */
+ * same write. State 5 reserves GameSetup callbacks for track A. Ranked stays hidden. */
 
 static CSSData online_css_data;   /* Slippi reuses the event CSS buffer; the choice is saved in vs.unk_530 */
 
@@ -609,6 +770,7 @@ void mu_slippi_splash_init(void)
 /* MajorSceneLoad. */
 static void online_on_load(void)
 {
+    mu_ranked_set_reset();
     gmMainLib_804D3EE0->vs.unk_530.x6 = gm_801677F0();   /* the 1P port for the event CSS slot */
     zelda_sheik = 1;                                       /* the Zelda icon picks Sheik */
     online_loads++;
@@ -617,6 +779,8 @@ static void online_on_load(void)
 /* MajorSceneUnload. */
 static void online_on_unload(void)
 {
+    mu_ranked_practice_control(MU_YG_PRACTICE_STOP);
+    mu_ranked_set_reset();
     zelda_sheik = 0;
 }
 
@@ -635,6 +799,11 @@ static void css_decide(GameModeState* state)
     struct EventData* ev = &gmMainLib_804D3EE0->vs.unk_530;
     CSSData* css = gm_GetGameModeStateExitData(state);
 
+    /* Record the guest's exit request before the main-menu load sends BA.
+     * A cleanup line after returning to the menu does not explain the CSS exit. */
+    OSReport("slippi CSS: exit mode %u request %u connection %u\n",
+             (unsigned) slp.mode, (unsigned) css->pending_scene_change,
+             (unsigned) last_match.connection_state);
     /* gmevent.c onExitCss */
     if (css->pending_scene_change == 2) {
         gm_ChangeGameModeAfterCurrentScene(GM_MENU);
@@ -646,6 +815,11 @@ static void css_decide(GameModeState* state)
     ev->xA = -1;
 
     switch (slp.mode) {
+    case MU_SLP_MODE_RANKED:
+        /* asm Online/Slippi Online Scene/main.asm:420-447. */
+        mu_ranked_set_reset();
+        gm_SetNextGameModeStateId(MU_SLP_STATE_GAME_SETUP);
+        return;
     case MU_SLP_MODE_DIRECT:
     case MU_SLP_MODE_TEAMS:
         /* The first match and the last winner go to the splash; the loser picks the stage unless
@@ -656,7 +830,7 @@ static void css_decide(GameModeState* state)
         }
         break;
     default:
-        /* Unranked, Party, and Ranked (YouGame only, on the Unranked flow) */
+        /* Unranked and Party. */
         break;
     }
     mu_slippi_splash_init();
@@ -691,7 +865,11 @@ static void sss_decide(GameModeState* state)
 static void vs_prep(GameModeState* state)
 {
     gmVsMelee_EnterVs(state, gmVsMelee_GetVsData(), NULL, NULL);
-    mu_online_arm(slp.mode, gm_801677F0());
+    if (!mu_ranked_setup_cpu()) mu_online_arm(slp.mode, gm_801677F0());
+    else if (mu_ranked_set()->tiebreak_num && mu_ranked_set()->last_end_mode != 7) {
+        gmVsMelee_StartData.rules.time_limit = 180;
+        gmVsMelee_StartData.players[0].stocks = gmVsMelee_StartData.players[1].stocks = 1;
+    }
 }
 
 /* CheckIfWonLastGame. */
@@ -752,6 +930,31 @@ static void vs_decide(GameModeState* state)
     if (slp.mode == MU_SLP_MODE_PARTY) {
         next = MU_SLP_STATE_RESULTS;
         mu_slippi_cleanup_connections();   /* always disconnect after Party */
+    }
+    if (slp.mode == MU_SLP_MODE_RANKED) {
+        int result;
+        /* CPU hook plays an ordinary local VS game; online results are captured
+         * by report_game while LGL/stocks/percent still exist. */
+        if (mu_ranked_setup_cpu()) {
+            int w0 = won_last_game(0), w1 = won_last_game(1);
+            mu_ranked_setup_game_result(w0 != w1 ? (w0 ? 0 : 1) : -1, me->outcome, 0);
+        }
+        result = mu_ranked_setup_finish_game(
+            last_match.connection_state == MU_SLP_MM_CONNECTION_SUCCESS,
+            mu_yg_get16(last_match.game_info + 0xE));
+        /* asm main.asm:617-741: only conclusive games score; a tie reuses cur_game. */
+        if (result == MU_SETUP_NEXT_GAME || result == MU_SETUP_TIEBREAK) {
+            next = MU_SLP_STATE_GAME_SETUP;
+        } else {
+            u8 end_mode = result == MU_SETUP_SET_OVER ? 0 : 1;
+            if (result == MU_SETUP_SET_OVER && mu_ranked_practice()) {
+                const MuRankedSet* set = mu_ranked_set();
+                mu_ranked_practice_control(set->score[0] > set->score[1] ?
+                                          MU_YG_PRACTICE_WIN : MU_YG_PRACTICE_LOSS);
+            }
+            mu_slippi_cmd(0xC2, &end_mode, 1, NULL, 0, NULL);
+            mu_slippi_cleanup_connections();
+        }
     }
     gm_SetNextGameModeStateId((u8) next);
 
@@ -925,6 +1128,27 @@ static void splash_decide(GameModeState* state)
 
 extern UNK_T gmClassic_804D68D0;
 
+/* asm main.asm:1360-1434: invalidate character preloads except on replay. */
+static void setup_prep(GameModeState* state)
+{
+    (void)state;
+    if (!mu_ranked_set()->tiebreak_num) lbDvd_SetupVsPreloadCache();
+}
+static void setup_decide(GameModeState* state)
+{
+    (void)state;
+    if (mu_slippi_load_match_state(NULL) ||
+        last_match.connection_state != MU_SLP_MM_CONNECTION_SUCCESS ||
+        mu_ranked_setup_model()->status != MU_SETUP_COMPLETE) {
+        u8 end_mode = 1;
+        mu_slippi_cmd(0xC2, &end_mode, 1, NULL, 0, NULL);
+        gm_SetNextGameModeStateId(MU_SLP_STATE_CSS);
+        return;
+    }
+    mu_slippi_splash_init();
+    gm_SetNextGameModeStateId(mu_ranked_set()->tiebreak_num ? MU_SLP_STATE_VS : MU_SLP_STATE_SPLASH);
+}
+
 static GameModeState online_states[] = {
     { MU_SLP_STATE_CSS, lbDvdPreload_3, 0, css_prep, css_decide,
       { GS_CSS, &online_css_data, &online_css_data } },
@@ -936,6 +1160,9 @@ static GameModeState online_states[] = {
       { GS_RESULTS, &gmVsMelee_ResultsEnterData, NULL } },
     { MU_SLP_STATE_SPLASH, lbDvdPreload_3, 0, splash_prep, splash_decide,
       { GS_INTRO_EASY, &gmClassicIntroDataBuffer, &gmClassic_804D68D0 } },
+    /* Ranked game prep: rules/transport, then A2 screen callbacks. */
+    { MU_SLP_STATE_GAME_SETUP, lbDvdPreload_3, 0, setup_prep, setup_decide,
+      { GS_SLIPPI_GAME_SETUP, NULL, NULL } },
     { GM_GAMEMODESTATE_TERMINATE },
 };
 

@@ -117,7 +117,11 @@ static void ranked_set(const json& participants, bool split) {
     const int winner = winners[i];
     const int placements[4] = {winner, 1-winner, 255, 255};
     for (auto& set : clients) {
-      set.start_game();
+      const auto key = yougame::ranked::game_key(0x100 + i, 31);
+      set.start_game(key);
+      auto start = set.due(i*100,true,7);
+      CHECK(start.size()==1 && start[0]["t"]=="game-start" && start[0]["id"]==key);
+      set.sent(start[0]);
       yougame::ranked::Game game;
       game.index = set.games_started();
       game.key = yougame::ranked::game_key(0x100 + i, 31);
@@ -126,6 +130,7 @@ static void ranked_set(const json& participants, bool split) {
       set.report_game(game);
       const auto report = set.due(i * 100 + 1, true, 7);
       CHECK(report.size() == 1 && report[0]["t"] == "game-report");
+      set.sent(report[0]);
       CHECK(report[0]["winner"] == (winner == 0 ? "ada" : "bo"));
       CHECK(set.awaiting_receipt() && !set.over());
       json receipt = {{"t","game-result"},{"matchId","duel-set"},{"id",game.key},

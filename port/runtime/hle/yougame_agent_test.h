@@ -1,6 +1,7 @@
 // Test-only startup defaults for app-launched native games. Read agent-test.json once, only
 // with an active YouGame bridge and nonempty YOUGAME_DATA. Missing files are silent. Optional
 // keys: mute:true, online:"unranked"|"ranked"|"direct"|"teams", character:0..25 (with online),
+// consoleRollback:true|false (Source only, MELEE_CONSOLE_ROLLBACK),
 // code:1..12 ASCII [A-Z0-9#], timer:5..600 seconds, quitAfter:1..3, padBack:10..900 seconds, fight:true. Invalid/unknown keys
 // are ignored together in one log line. Prepend defaults so the existing CLI parser handles
 // modes, character defaults and volume, and later explicit flags win. No file watching.
@@ -17,6 +18,7 @@
 // Output paths stay inside the data directory.
 // keys:"overlay@20,escape@30" emits stdio protocol taps after the first presented frame.
 // Hook-only, both online engines: dropRoomAfter:330..900 seconds (agent-only rooms, never ranked).
+// openMenu:"phob:<1-4>" opens Controls -> PhobGCC on the chosen socket at boot.
 // Source renderer hook: present_log:"<name>", present_frames:"<directory-name>:<1..600>".
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
@@ -25,6 +27,7 @@
 #include "yougame_agent_paths.h"
 #include "yougame_agent_pad_trace.h"
 #include "yougame_agent_keys.h"
+#include "yougame_agent_friends.h"
 #include "yougame_agent_present.h"
 #include "yougame_box_present.h"
 #include "yougame_net_test.h"
@@ -42,12 +45,16 @@
 
 namespace yougame::agent_test {
 enum class Engine { Source, Static };
+#ifdef YOUGAME_AGENT_TEST_HOOK
+inline std::atomic<int> phob_menu_socket{0};
+#endif
 
 struct Settings {
   std::vector<std::string> arguments;
   std::vector<std::pair<std::string, std::string>> environment;
   std::string log;
   std::string unsupported_online;
+  bool agent_file = false;  // a valid agent-test.json was read: an agent runs this copy
   bool static_online_test = false;
   int pad_back_seconds = 0;
   bool fight = false;
@@ -55,11 +62,14 @@ struct Settings {
   std::vector<ScriptedKey> key_script;
   std::string pad_trace;
   bool agent_script = false;
+  bool ranked_cpu = false;
   bool rumble_test = false;
   bool box_present_compositor = false;
   net_test::Config net;
   agent_present::Config present;
   int stop_at_frame = 0;
+  int phob_socket = 0;
+  nlohmann::json console_request;
 #endif
 
   std::vector<std::string> prepend(int argc, char* const* argv) const {
@@ -204,6 +214,26 @@ inline Settings map_keys(const nlohmann::json& object, Engine engine = Engine::S
     const auto& key = it.key();
     const auto& value = it.value();
 #ifdef YOUGAME_AGENT_TEST_HOOK
+    if (key == "console") {
+      if (engine == Engine::Source && !object.count("online") && !object.count("match") && console_key(value, out.console_request)) applied("console");
+      else ignored = true;
+      continue;
+    }
+    if (key == "openMenu") {
+      if (value.is_string()) {
+        const auto text = value.get<std::string>();
+        if (text.size() == 6 && text.compare(0, 5, "phob:") == 0 && text[5] >= '1' && text[5] <= '4') {
+          out.phob_socket = text[5] - '0'; applied("openMenu"); continue;
+        }
+      }
+      ignored = true; continue;
+    }
+    if (key == "rankedCpu") {
+      if (engine == Engine::Source && value.is_boolean()) {
+        out.ranked_cpu = value.get<bool>(); applied("rankedCpu");
+      } else ignored = true;
+      continue;
+    }
     if (key == "padTrace") {
       std::filesystem::path path;
       if (!value.is_string() || !source_output_path(value.get<std::string>(), data_dir, false, path, *capability))
@@ -377,7 +407,10 @@ inline Settings map_keys(const nlohmann::json& object, Engine engine = Engine::S
       continue;
     }
 #endif
-    if (key == "mute" && value.is_boolean() && value.get<bool>()) {
+    if (key == "consoleRollback" && engine == Engine::Source && value.is_boolean()) {
+      out.environment.emplace_back("MELEE_CONSOLE_ROLLBACK", value.get<bool>() ? "1" : "0");
+      applied("consoleRollback");
+    } else if (key == "mute" && value.is_boolean() && value.get<bool>()) {
       out.arguments.insert(out.arguments.end(), {"--volume", "0"});
       applied("mute");
     } else if (key == "online" && value.is_string() &&
@@ -440,6 +473,7 @@ inline Settings map_keys(const nlohmann::json& object, Engine engine = Engine::S
 inline Settings load(bool active, const char* data_dir, Engine engine = Engine::Source) {
   Settings out;
 #ifdef YOUGAME_AGENT_TEST_HOOK
+  phob_menu_socket.store(0);
   pad_trace.stop();
   agent_present::recorder().stop();
   agent_paths::policy = {};
@@ -492,9 +526,11 @@ inline Settings load(bool active, const char* data_dir, Engine engine = Engine::
       , &agent_paths::session
 #endif
       );
+  out.agent_file = true;
 #ifdef YOUGAME_AGENT_TEST_HOOK
-  const bool active_session = !out.arguments.empty() || !out.environment.empty() || !out.key_script.empty() ||
-      !out.pad_trace.empty() || out.rumble_test || out.box_present_compositor || out.static_online_test || out.pad_back_seconds > 0 || out.fight || out.net.delay_ms > 0 || out.present.enabled();
+  if (!out.console_request.is_null()) console::requests.push(out.console_request);
+  const bool active_session = !out.console_request.is_null() || !out.arguments.empty() || !out.environment.empty() || !out.key_script.empty() ||
+      out.phob_socket > 0 || !out.pad_trace.empty() || out.rumble_test || out.box_present_compositor || out.static_online_test || out.pad_back_seconds > 0 || out.fight || out.net.delay_ms > 0 || out.present.enabled();
   if (!active_session) return out;
   // Consumers must reopen through the capability, not through a checked pathname.
   agent_paths::policy = {};
@@ -518,6 +554,7 @@ inline Settings load(bool active, const char* data_dir, Engine engine = Engine::
     if (!out.log.empty()) out.log += '\n';
     out.log += "agent-test: padTrace output capability refused; ignored";
   }
+  phob_menu_socket.store(out.phob_socket);
   scope.active = true;
 #endif
   return out;

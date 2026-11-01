@@ -16,6 +16,14 @@ namespace gx {
 // should not). Header-inline: the D3D12 backend is also linked into tests without the solver.
 inline std::atomic<size_t>& solver_pair_counter() { static std::atomic<size_t> count{0}; return count; }
 
+// Published only after a renderer actually starts, including fallbacks on the render thread.
+inline std::atomic<const char*> started_backend_name{"none"};
+inline Backend* record_started_backend(Backend* backend, const char* name) {
+  if (backend) started_backend_name.store(name);
+  return backend;
+}
+inline const char* started_render_backend() { return started_backend_name.load(); }
+
 // Creates the requested backend; falls back to D3D12 if D3D11 cannot start.
 Backend* create_render_backend(void* hwnd, int client_w, int client_h, const RenderOptions& options);
 const RenderOptions& render_options(Backend* backend);

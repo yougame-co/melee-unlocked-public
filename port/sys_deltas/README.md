@@ -51,7 +51,7 @@ VCDIFF instructions, including paired opcodes; RUN and COPY bytes are excluded.
 `target_sha1`, `target_size`, ordered `sources` (`disc` path, `sha1`, `size`),
 `delta`, `delta_sha1`, and `delta_size`. No extracted retail bytes are stored.
 
-The engine applier is owned by melee-native. It must validate disc identity,
+The engine applier must validate disc identity,
 verify each source SHA-1 and size, concatenate sources **in manifest order**,
 verify the patch, apply plain VCDIFF without secondary compression, and check
 `target_sha1` and size before use. Patches use the default VCDIFF code table and

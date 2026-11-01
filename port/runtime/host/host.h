@@ -275,6 +275,9 @@ void input_poll(PadState out[4]);
 // them, with none of input_poll's side effects (no overlay snapshot, no settings chord, no script):
 // for the early-input sampler, which reads between the game's polls on its own thread.
 void input_read_devices(PadState out[4]);
+// Console sessions: same devices, with empty routes disconnected and keyboard fallback behind
+// every connected controller (including an adapter plugged into physical port 2-4).
+void input_read_console_devices(PadState out[4]);
 // Scripted runs (--script): true while a script is driving the pads, and the pads the script will
 // deliver at retrace `retrace` (no state is changed by asking).
 bool input_script_active();

@@ -23,6 +23,9 @@ def main():
     parser.add_argument('--headless-build', action='store_true')
     parser.add_argument('--agent-test-hook', action='store_true',
                         help='staging only: enable agent-test.json in the full Source Port')
+    # ON like CMakeLists.txt: the main staging build carries Ranked (Luis 10-31: Friends + Ranked on the main build).
+    parser.add_argument('--ranked-branch', action=argparse.BooleanOptionalAction, default=True,
+                        help='visible Ranked and Practice vs CPU (default on; --no-ranked-branch turns it off)')
     parser.add_argument('--host-only', action='store_true', help='use the existing game build')
     parser.add_argument('--test', action='store_true')
     parser.add_argument('--build-dir', type=Path, default=ROOT / 'build-linux')
@@ -49,7 +52,9 @@ def main():
         extra = ['-DMELEE_DECOMP_DIR=' + str(decomp)] if (decomp / 'src/melee').is_dir() else []
         run('cmake', '-S', ROOT / 'sourceport/game', '-B', game_build, '-G', 'Ninja',
             '-DCMAKE_C_COMPILER=gcc-14', '-DCMAKE_CXX_COMPILER=g++-14',
-            '-DCMAKE_BUILD_TYPE=Release', '-DMELEE_CPU_BASELINE=' + args.cpu, *extra)
+            '-DCMAKE_BUILD_TYPE=Release', '-DMELEE_CPU_BASELINE=' + args.cpu,
+            '-DYOUGAME_AGENT_TEST_HOOK=' + ('ON' if args.agent_test_hook else 'OFF'),
+            '-DYOUGAME_RANKED_BRANCH=' + ('ON' if args.ranked_branch else 'OFF'), *extra)
         run('cmake', '--build', game_build, '--target',
             'mu_game_tests' if args.test else 'melee_game', '-j', args.jobs)
         if args.test:
@@ -60,6 +65,7 @@ def main():
         '-DMELEE_LINUX_GAME_LIBRARY=' + str(game_build / 'melee_game.so'),
         '-DMELEE_LINUX_GRAPHICS=' + ('OFF' if args.headless_build else 'ON'),
         '-DYOUGAME_AGENT_TEST_HOOK=' + ('ON' if args.agent_test_hook else 'OFF'),
+        '-DYOUGAME_RANKED_BRANCH=' + ('ON' if args.ranked_branch else 'OFF'),
         '-DMELEE_PORT_GEN=' + (str(args.port_gen.resolve()) if (args.port_gen / 'hle_decls.h').exists() else ''))
     targets = ['melee_linux'] + (['melee_' 'source', 'melee_launcher'] if full else [])
     if full and args.cpu != 'AVX2':
@@ -71,12 +77,31 @@ def main():
                     'port_settings_profile_bindings_test', 'port_dolphin_profile_test',
                     'port_yougame_embed_view_test', 'port_yougame_embed_volume_test',
                     'port_yougame_embed_toplevel_test',
+                    'port_yougame_shortcuts_off_test', 'port_yougame_shortcuts_hook_test',
                     # Registered above the root CMakeLists' Linux return() (0b0028).
-                    'port_disc_image_reader_test', 'port_opponent_display_test', 'port_settings_log_test',
-                    'port_yougame_mode_policy_test', 'port_yougame_display_defaults_test', 'port_friends_input_test', 'port_friends_label_test', 'port_session_logs_test',
+                    'port_disc_image_reader_test', 'port_opponent_display_test', 'port_settings_log_test', 'port_pacing_diagnostics_test',
+                    'port_yougame_ranked_record_test', 'port_yougame_ranked_policy_test', 'port_yougame_ranked_switch_test',
+                    'port_yougame_ranked_reveal_test', 'port_yougame_rank_badges_test',
+                    'port_yougame_ranked_ui_off_test', 'port_yougame_ranked_ui_branch_test',
+                    'port_ranked_setup_motion_test',
+                    'port_yougame_ranked_opponent_test',
+                    'port_yougame_ranked_panel_test',
+                    'port_yougame_ranked_panel_branch_test',
+                    'port_yougame_ranked_optional_test', 'port_yougame_ranked_nosp_test',
+                    'port_yougame_ranked_branch_on_test', 'port_yougame_ranked_branch_off_test',
+                    'port_yougame_ranked_branch_configured_test',
+                    'port_ranked_setup_cpu_branch_test', 'port_ranked_setup_online_branch_test',
+                    'port_ranked_setup_model_test', 'port_ranked_setup_widgets_test', 'port_ranked_setup_screen_test', 'port_ranked_setup_cpu_hook_test', 'port_ranked_setup_cpu_off_test',
+                    'port_ranked_setup_online_hook_test', 'port_ranked_setup_online_off_test', 'port_yougame_ranked_r1_test', 'port_yougame_mode_policy_test', 'port_yougame_display_defaults_test', 'port_yougame_display_defaults_agent_test', 'port_settings_nav_test', 'port_friends_input_test', 'port_friends_label_test', 'port_session_logs_test',
+                    'port_yougame_blend_test', 'port_yougame_release_default_test', 'port_yougame_release_mixed_test',
+                    'port_yougame_search_test', 'port_yougame_http_cancel_test',
                     'port_practice_ghost_placeholders_test', 'port_yougame_pad_trace_hook_test',
                     'port_yougame_pad_trace_off_test',
+                    'port_yougame_console_integration_test', 'port_yougame_console_engine_test',
+                    'port_yougame_console_pad_test', 'port_yougame_unranked_test', 'port_yougame_release_test',
+                    'port_phob_mirror_test', 'port_phob_mirror_hook_test',
                     'port_net_diagnostics_test', 'port_yg_enet_socket_test', 'port_yg_enet_posix_ring_test',
+                    'port_yougame_udp_test', 'port_yougame_udp_enet_test',
                     'port_yougame_relay_output_hook_test', 'port_yougame_relay_output_off_test',
                     'port_controller_relay_test', 'port_yougame_controller_relay_test']
         if full:
@@ -87,6 +112,7 @@ def main():
     if args.test:
         run('ctest', '--test-dir', host_build, '--output-on-failure')
     print('Native executable: ' + str(host_build / 'port/linux/melee_linux'))
+    print('YOUGAME_RANKED_BRANCH=' + ('ON' if args.ranked_branch else 'OFF'))
     print('YOUGAME_AGENT_TEST_HOOK=' + ('ON (STAGING ONLY)' if args.agent_test_hook else 'OFF'))
 
 

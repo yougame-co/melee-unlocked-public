@@ -1,6 +1,7 @@
 // port-settings.ini is read back exactly: a setting whose value has several words (the Custom video
 // preset, a texture pack folder with a space) must not shift the settings after it.
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <cstdint>
 #include "gx/pc_settings.h"
 #include "gx/fullscreen_state.h"
 #include "host/window.h"

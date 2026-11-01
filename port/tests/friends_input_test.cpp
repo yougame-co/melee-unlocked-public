@@ -10,27 +10,26 @@ int main() {
   for (const char* source : {"relayed", "adapter", "keyboard mapped START"}) {
     (void)source;
     InviteEdge e;
-    CHECK(e.poll(true, 0x1000, true, true, false));
-    CHECK(!e.poll(true, 0x1000, true, true, false));
-    CHECK(!e.poll(true, 0, true, true, false));
-    CHECK(e.poll(true, 0x1000, true, true, false));
-    CHECK(!e.poll(true, 0x1000, false, true, false));
+    CHECK(!e.poll(true, 0x1000, false)); // Direct's empty code + START never invites.
+    CHECK(!e.poll(true, 0, false));
+    CHECK(!e.poll(true, 0x1000, false));
   }
+
   InviteEdge e;
-  CHECK(!e.poll(true, 0x100, true, true, false)); // A must still type on Direct
-  CHECK(!e.poll(true, 0, false, false, true));
-  CHECK(e.poll(true, 0x100, false, false, true));
-  CHECK(!e.poll(true, 0x100, false, false, true));
-  CHECK(!e.poll(false, 0x100, false, false, true));
-  CHECK(!e.poll(true, 0x100, false, false, true));   // still held after focus/connection came back: no press
-  CHECK(!e.poll(true, 0x100, false, false, true));
-  CHECK(!e.poll(true, 0, false, false, true));       // released
-  CHECK(e.poll(true, 0x100, false, false, true));    // a real press counts again
-  CHECK(!e.poll(true, 0, false, false, true));
-  CHECK(e.poll(true, 0x1000, false, false, true));
-  CHECK(!e.poll(true, 0x1000, false, false, true));
+  CHECK(!e.poll(true, 0x100, false)); // A must still type on Direct
+  CHECK(!e.poll(true, 0, true));
+  CHECK(e.poll(true, 0x100, true));
+  CHECK(!e.poll(true, 0x100, true));
+  CHECK(!e.poll(false, 0x100, true));
+  CHECK(!e.poll(true, 0x100, true));   // still held after focus/connection came back: no press
+  CHECK(!e.poll(true, 0x100, true));
+  CHECK(!e.poll(true, 0, true));       // released
+  CHECK(e.poll(true, 0x100, true));    // a real press counts again
+  CHECK(!e.poll(true, 0, true));
+  CHECK(e.poll(true, 0x1000, true));
+  CHECK(!e.poll(true, 0x1000, true));
   CHECK(!yougame::mode_policy::friends_offered(false));
-  CHECK(yougame::mode_policy::friends_offered(true) == (YOUGAME_FRIENDS_ROW != 0));   // off in the main build
+  CHECK(yougame::mode_policy::friends_offered(true));   // main build default, no -D flags
   CHECK(!yougame::mode_policy::yougame_ranked_offered);
   CHECK(version_reason({{"reason", "version"}}));
   for (const auto& j : {json(), json::array(), json{{"reason", 1}}, json{{"reason", "Version"}}, json{{"error", "version"}}})
@@ -56,13 +55,22 @@ int main() {
   CHECK(!events.poll_pad(0, true, 0x1100));
   CHECK(!events.take_host());
 
+  // Direct has no picker context, for empty and typed code alike.
+  Events direct;
+  CHECK(!direct.poll_pad(0, true, 0x1000));
+  direct.request_host();
+  CHECK(!direct.take_host() && !direct.picker_context());
+  direct.online_menu(true, false); // visible Online, another row hovered
+  direct.request_host();
+  CHECK(!direct.take_host());
+
   // Match window.cpp's ownership: OverlayPad claims its chord before Friends sees
   // the remaining buttons; settings capture and a settings-opening edge are skipped.
   for (bool entry : {false, true}) {
     Events input;
     yougame::parity::OverlayPad overlay;
     if (entry) input.online_menu(true, true);
-    else { input.code_screen(true); input.code_empty(true); }
+
     auto poll = [&](uint16_t buttons, bool opened = false, bool capture = false) {
       const auto event = overlay.poll(true, 0, true, buttons, 100);
       if (!opened && !capture) input.poll_pad(0, true, buttons);
@@ -74,7 +82,7 @@ int main() {
     CHECK(!input.take_host());
     CHECK(!poll(0));
     CHECK(!poll(0x1000));  // plain START still invites once
-    CHECK(input.take_host());
+    CHECK(input.take_host() == entry);
     CHECK(!poll(0x1000));
     CHECK(!input.take_host());
     for (uint16_t buttons : {0x1000, 0x0100}) {

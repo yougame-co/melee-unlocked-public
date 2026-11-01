@@ -4,11 +4,13 @@
  * device every frame, saves and loads its state around rollbacks, and re-simulates the frames a
  * late remote input changed, all inside the engine loop (gm_801A4D34). This file is the native
  * equivalent, called from the same sites; each function names the patch it stands for. Nothing
- * here runs unless an online match is active, so offline play and replay playback are unchanged.
+ * Slippi's original paths run only for its online matches. An explicit console-only backend reuses
+ * the predictor and runner, with its own lifecycle and input adapter (mu_console_rollback.inc).
  *
  * Frame numbers: the online pad frame N (the number sent with each pad) is consumed by the engine
  * body whose unpaused-frame counter (gm_80479D58.unk_8) is N at its start; savestates and
  * checksums are keyed by that counter. Measured on the console code: 4746 of 4746 samples.
+ * Console rollback instead keys each body by unk_0, including paused bodies.
  *
  * All of this bookkeeping is excluded from snapshots: a rollback load restores the game, never the
  * record of which frames were predicted or confirmed.
@@ -22,6 +24,7 @@ char* getenv(const char* name);
 #include <melee/ft/ftlib.h>
 #include <melee/ft/types.h>
 #include <melee/gm/gmvs.h>
+#include <melee/gm/gmscene.h>
 #include <melee/gm/types.h>
 #include <melee/it/forward.h>
 #include <melee/it/types.h>
@@ -35,6 +38,9 @@ char* getenv(const char* name);
 #include <sysdolphin/baselib/jobj.h>
 #include <sysdolphin/baselib/random.h>
 #include <mu_native.h>
+#ifndef MU_NO_SLIPPI
+#include <mu_ranked_setup_online.h>
+#endif
 #include <sysdolphin/baselib/sislib.h>
 
 int mu_online_abi_command(unsigned int command, const unsigned char* payload, unsigned int size,
@@ -53,6 +59,7 @@ void mu_replay_game_info_block(unsigned char* out, const StartMeleeData* data);
 u32 gm_801A4BA8(void);    /* MenuController_LoadTimer1: engine bodies run this match */
 u32 pl_80040AF0(int slot);   /* PlayerBlock_GetCliffhangerStat: ledge grabs */
 extern StaticPlayer player_slots[];
+extern struct GameSceneInfo* gm_804D6720;
 
 enum {
     ROLLBACK_MAX = 7,
@@ -224,9 +231,24 @@ typedef struct MuOnlineState {
     int loop_entered;         /* the scene's engine loop has reached its pad wait */
     int engine_started;       /* the engine body of frame 0 has begun */
     u8 match_state[RESPONSE_CAPACITY];
+    int console_setup, console_active, console_injecting;
+    unsigned int console_epoch;
 } MuOnlineState;
 
 static MuOnlineState mu_online;
+
+/* These operations are the version-26 host ABI, private to console sessions. */
+enum { CONSOLE_QUERY, CONSOLE_MATCH_BEGIN, CONSOLE_FORWARD, CONSOLE_INPUTS,
+       CONSOLE_REPLAY, CONSOLE_MATCH_END, CONSOLE_FAIL,
+       CONSOLE_BOUNDARY, CONSOLE_BODY_END, CONSOLE_CONFIRM, CONSOLE_COMMIT, CONSOLE_SERVICE,
+       CONSOLE_VALIDATED };
+int mu_console_abi(int operation, unsigned int body, u8* local, u8* rxb,
+                   unsigned int* epoch, int* local_port);
+static void console_frame_begin(void);
+static int console_frame_end(void);
+static int console_pad_renew(PADStatus* stat);
+static void console_match_exit(void);
+
 
 /* GPDO_CUR_GAME of Slippi's game prep data: the online games since the player last searched for an
  * opponent, 1 for the first. It outlives each match (arming clears mu_online) and only changes
@@ -274,12 +296,12 @@ unsigned int mu_online_codes(void)
 /* The patches' short-circuit: an online match is running and the scene is not being left. */
 static int hooks_on(void)
 {
-    return mu_online.active && mu_gm_engine_state()->unk_C == 0;
+    return (mu_online.active || mu_online.console_active) && mu_gm_engine_state()->unk_C == 0;
 }
 
 static int global_frame(void)
 {
-    return (int) mu_gm_engine_state()->unk_8;
+    return (int) (mu_online.console_active ? mu_gm_engine_state()->unk_0 : mu_gm_engine_state()->unk_8);
 }
 
 /* The whole bookkeeping block, for the snapshot exclusion list (mu_online_abi.c). */
@@ -413,13 +435,15 @@ static int command(unsigned int cmd, const u8* payload, unsigned int size, u8* r
     return command_into(cmd, payload, size, response, RESPONSE_CAPACITY, response_size);
 }
 
-static void capture_state(int frame)
+static int capture_state(int frame)
 {
     u8 payload[32];
     memset(payload, 0, sizeof payload);
     put32(payload, (u32) frame);
-    command(CMD_CAPTURE_SAVESTATE, payload, sizeof payload, mu_online.match_state, NULL);
+    int result;
+    result = command(CMD_CAPTURE_SAVESTATE, payload, sizeof payload, mu_online.match_state, NULL);
     mu_online.captures++;
+    return result == 0;
 }
 
 static void correction_capture(void)
@@ -471,15 +495,17 @@ static void correction_measure(void)
     }
 }
 
-static void load_state(int frame)
+static int load_state(int frame)
 {
     u8 payload[32];
     memset(payload, 0, sizeof payload);   /* no preserve blocks: the bookkeeping is excluded */
     put32(payload, (u32) frame);
+    int result;
     mu_alarms_hold();   /* timers are hardware: they keep their schedule through a load */
-    command(CMD_LOAD_SAVESTATE, payload, sizeof payload, mu_online.match_state, NULL);
+    result = command(CMD_LOAD_SAVESTATE, payload, sizeof payload, mu_online.match_state, NULL);
     mu_alarms_release();
     mu_online.loads++;
+    return result == 0;
 }
 
 /* ---- self-test attribution: what lives at each range the re-simulation changed ---- */
@@ -698,6 +724,7 @@ int mu_online_pad_alarm_gate(void)
     if (!hooks_on()) {
         return 0;
     }
+    if (mu_online.console_active) return 1; /* body hook owns console queue injection */
     mu_online.frame_advance = 0;
     if (mu_online.direct_renew != 0) {
         return 0;   /* the rollback logic asked for these pads */
@@ -727,6 +754,7 @@ void mu_online_after_pad_renew(void)
 /* SkipNewInputFetchOnRollback (80376A20): nonzero skips PADRead during a rollback. */
 int mu_online_skip_pad_read(void)
 {
+    if (mu_online.console_active) return mu_online.console_injecting;
     return hooks_on() && mu_online.rollback_active && !mu_online.rollback_should_load;
 }
 
@@ -772,330 +800,7 @@ static const u8* early_pad(int count, int frame, int latest)
     return NULL;
 }
 
-static int load_opponent_inputs(PADStatus* stat, int frame, int predicting_allowed)
-{
-    int count, remote_port = 0, have_all = 1;
-    u8* rxb = mu_online.rxb;
-    for (count = 0; count < REMOTES; count++, remote_port++) {
-        int latest;
-        const u8* slots = rxb + RXB_OPNT_INPUTS + count * RXB_INPUTS_COUNT * PAD_SIZE;
-        const u8* src = slots;   /* entry k is the pad of frame (latest - k) */
-        if (remote_port == mu_online.local_index) {
-            remote_port++;
-        }
-        latest = (int) be32(rxb + RXB_OPNT_FRAME_NUMS + 4 * count);
-        if (latest - frame >= 0) {
-            src = slots + (latest - frame) * PAD_SIZE;
-        } else if (predicting_allowed && frame >= START_SYNC_FRAME - mu_online.delay &&
-                   !mu_online.game_over)
-        {
-            /* Predicting: the newest confirmed pad, or an early pad the other player sent for a
-             * frame up to this one. Kept for comparison once the real input arrives. */
-            u8 w = mu_online.predicted_write[count];
-            const u8* early = early_pad(count, frame, latest);
-            have_all = 0;
-            if (early != NULL) {
-                src = early;
-                mu_online.early_used++;
-            }
-            memcpy(mu_online.predicted[count][w], src, PAD_SIZE);
-            mu_online.predicted_early[count][w] = (u8) (early != NULL);
-            mu_online.predicted_write[count] = (u8) ((w + 1) % PREDICTED_INPUTS_COUNT);
-            if (!mu_online.player_predicting[count]) {
-                mu_online.player_savestate_frame[count] = frame;
-                mu_online.player_predicting[count] = 1;
-                mu_online.predicted_read[count] = w;
-                if (!mu_online.savestate_predicting) {
-                    mu_online.savestate_frame = frame;
-                    mu_online.savestate_predicting = 1;
-                }
-            }
-        }
-        if (remote_port < 4) {
-            wire_to_pad(&stat[remote_port], src);
-        }
-    }
-    if (have_all) {
-        mu_online.finalized = frame;
-    }
-    return have_all;
-}
-
-static int used_slot(int frame)
-{
-    int slot = frame % USED_PADS_COUNT;
-    return slot < 0 ? slot + USED_PADS_COUNT : slot;
-}
-
-static void record_used_pads(const PADStatus* stat, int frame, int confirmed)
-{
-    int slot = used_slot(frame), p;
-    mu_online.used_frame[slot] = frame;
-    mu_online.used_confirmed[slot] = (u8) confirmed;
-    for (p = 0; p < 4; p++) {
-        pad_to_wire(mu_online.used_pads[slot][p], &stat[p]);
-    }
-}
-
-/* Whether two pads differ the way the game would act on (the comparison Slippi's prediction check
- * makes: the buttons it reads, both sticks, the triggers outside their dead zone). */
-static int pads_differ(const u8* a, const u8* b)
-{
-    int t;
-    if ((a[0] & 0x1F) != (b[0] & 0x1F) || (a[1] & 0x7F) != (b[1] & 0x7F) || memcmp(a + 2, b + 2, 4) != 0) {
-        return 1;
-    }
-    for (t = 6; t < 8; t++) {
-        if (a[t] <= 42 && b[t] <= 42) {
-            continue;
-        }
-        if (a[t] != b[t]) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/* Early inputs: a frame already run on a guess whose early pad, arrived since, says otherwise. The
- * game then rolls back now instead of when the confirmed pad comes, so the correction shows a few
- * milliseconds sooner and goes back fewer frames. The confirmed pad still decides: if it differs
- * from the early one, that is one more ordinary rollback. Returns 1 when such a frame exists. */
-/* MELEE_EARLY_TRACE=1 (tests): every wrong early guess is logged with both pads. */
-static int early_trace_on(void)
-{
-    static int value = -1;
-    if (value < 0) {
-        const char* v = getenv("MELEE_EARLY_TRACE");
-        value = v != NULL && v[0] == '1';
-    }
-    return value;
-}
-
-/* MELEE_EARLY_ROLLBACK=1 turns it on; off by default (it adds rollbacks of its own). */
-static int early_rollback_on(void)
-{
-    static int value = -1;
-    if (value < 0) {
-        const char* v = getenv("MELEE_EARLY_ROLLBACK");
-        value = v != NULL && v[0] == '1';
-    }
-    return value;
-}
-
-/* Zone-level difference between two pads: a button edge, a stick crossing one of the game's
- * action lines, a shield drop, or a trigger crossing the light-shield line. Mirrors the host's
- * early-input judge (early_input_rules.h, all edges). */
-static int side_of(int v, int line)
-{
-    return line < 0 ? v <= line : v >= line;
-}
-static int axis_crossed(int a, int b, const signed char* lines, int n)
-{
-    int i;
-    for (i = 0; i < n; i++) {
-        if (side_of(a, lines[i]) != side_of(b, lines[i])) {
-            return 1;
-        }
-    }
-    return 0;
-}
-static int pads_contradict_zone(const u8* a, const u8* b)
-{
-    static const signed char main_x[4] = {-64, -23, 23, 64}, main_y[4] = {-56, -23, 23, 53};
-    static const signed char c_x[4] = {-64, -23, 23, 64}, c_y[4] = {-53, -23, 23, 53};
-    const unsigned int ba = ((unsigned int) a[0] << 8) | a[1], bb = ((unsigned int) b[0] << 8) | b[1];
-    const int shielding_a = (ba & 0x0070) || a[6] >= 43 || a[7] >= 43;
-    const int shielding_b = (bb & 0x0070) || b[6] >= 43 || b[7] >= 43;
-    if ((ba ^ bb) & (0x1300 | 0x0C70)) {
-        return 1;
-    }
-    if (axis_crossed((s8) a[2], (s8) b[2], main_x, 4) || axis_crossed((s8) a[3], (s8) b[3], main_y, 4) ||
-        axis_crossed((s8) a[4], (s8) b[4], c_x, 4) || axis_crossed((s8) a[5], (s8) b[5], c_y, 4)) {
-        return 1;
-    }
-    if ((shielding_a || shielding_b) && side_of((s8) a[3], -53) != side_of((s8) b[3], -53)) {
-        return 1;
-    }
-    if ((a[6] >= 43) != (b[6] >= 43) || (a[7] >= 43) != (b[7] >= 43)) {
-        return 1;
-    }
-    return 0;
-}
-/* MELEE_EARLY_RB_ANY=1: the old byte compare (any difference starts the early rollback). */
-static int early_rb_any(void)
-{
-    static int value = -1;
-    if (value < 0) {
-        const char* v = getenv("MELEE_EARLY_RB_ANY");
-        value = v != NULL && v[0] == '1';
-    }
-    return value;
-}
-
-static int early_contradicts(int count)
-{
-    int latest = (int) be32(mu_online.rxb + RXB_OPNT_FRAME_NUMS + 4 * count);
-    int f = mu_online.player_savestate_frame[count];
-    u8 r = mu_online.predicted_read[count];
-    while (r != mu_online.predicted_write[count]) {
-        const u8* early = early_pad(count, f, latest);
-        if (early != NULL && (early_rb_any() ? pads_differ(early, mu_online.predicted[count][r])
-                                               : pads_contradict_zone(early, mu_online.predicted[count][r]))) {
-            return 1;
-        }
-        r = (u8) ((r + 1) % PREDICTED_INPUTS_COUNT);
-        f++;
-    }
-    return 0;
-}
-
-/* Section 9: compare earlier predictions with inputs that have now arrived. Returns 1 when a
- * rollback was triggered. */
-static int check_predictions(int frame)
-{
-    u8* rxb = mu_online.rxb;
-    int rollback_required = mu_online.rollback_active;
-    int count, savestate, values_set = 0;
-
-    if (!mu_online.savestate_predicting) {
-        mu_online.player_predicting[0] = mu_online.player_predicting[1] =
-            mu_online.player_predicting[2] = 0;
-        return 0;
-    }
-    for (count = 0; count < REMOTES; count++) {
-        while (mu_online.player_predicting[count]) {
-            int latest = (int) be32(rxb + RXB_OPNT_FRAME_NUMS + 4 * count);
-            int ss = mu_online.player_savestate_frame[count];
-            int offset = latest - ss;
-            const u8* actual;
-            const u8* predicted;
-            int t, differ = 0;
-            if (offset < 0) {
-                break;   /* the inputs for the savestate frame have not arrived yet */
-            }
-            if (ss <= mu_online.stable_finalized) {
-                if (latest > ss) {
-                    goto inputs_match;   /* already finalized: advance without comparing */
-                }
-                break;
-            }
-            actual = rxb + RXB_OPNT_INPUTS + count * RXB_INPUTS_COUNT * PAD_SIZE + offset * PAD_SIZE;
-            predicted = mu_online.predicted[count][mu_online.predicted_read[count]];
-            if ((actual[0] & 0x1F) != (predicted[0] & 0x1F) ||
-                (actual[1] & 0x7F) != (predicted[1] & 0x7F) ||
-                memcmp(actual + 2, predicted + 2, 4) != 0)
-            {
-                differ = 1;
-            }
-            for (t = 6; t < 8 && !differ; t++) {
-                if (actual[t] <= 42 && predicted[t] <= 42) {
-                    continue;   /* both in the trigger dead zone */
-                }
-                if (actual[t] != predicted[t]) {
-                    differ = 1;
-                }
-            }
-            mu_online.predictions++;
-            if (mu_online.predicted_early[count][mu_online.predicted_read[count]]) {
-                mu_online.early_scored[count]++;
-                if (differ) {
-                    mu_online.early_missed[count]++;
-                }
-                /* Honest play: at most 3.3% wrong in every run with 32 or more scored guesses (32 runs,
-                 * 10-23); a peer sending made-up pads is 100% wrong. 24 guesses, over half wrong. */
-                if (!mu_online.early_distrusted[count] && mu_online.early_scored[count] >= 24 &&
-                    mu_online.early_missed[count] * 2 > mu_online.early_scored[count]) {
-                    mu_online.early_distrusted[count] = 1;
-                    logf_("online: remote %d early pads ignored for this match (%u of %u early guesses wrong)",
-                          count, mu_online.early_missed[count], mu_online.early_scored[count]);
-                }
-                if (differ) {
-                    mu_online.early_wrong++;
-                    if (early_trace_on() && mu_online.early_wrong <= 300) {
-                        logf_("early wrong: remote %d frame %d latest %d game frame %d guess %02x%02x %d,%d %d,%d %d %d actual %02x%02x %d,%d %d,%d %d %d",
-                              count, ss, latest, frame,
-                              predicted[0], predicted[1], (s8) predicted[2], (s8) predicted[3], (s8) predicted[4], (s8) predicted[5], predicted[6], predicted[7],
-                              actual[0], actual[1], (s8) actual[2], (s8) actual[3], (s8) actual[4], (s8) actual[5], actual[6], actual[7]);
-                    }
-                } else {
-                    mu_online.early_right++;
-                }
-            }
-            if (differ) {
-                mu_online.mispredictions++;
-                rollback_required = 1;
-                break;
-            }
-        inputs_match:
-            mu_online.player_savestate_frame[count] = ss + 1;
-            mu_online.predicted_read[count] =
-                (u8) ((mu_online.predicted_read[count] + 1) % PREDICTED_INPUTS_COUNT);
-            if (mu_online.predicted_read[count] == mu_online.predicted_write[count]) {
-                break;   /* caught up with the prediction */
-            }
-        }
-    }
-    if (!rollback_required && early_rollback_on() && mu_online.rxb_size > RXB_SIZE) {
-        for (count = 0; count < REMOTES; count++) {
-            if (mu_online.player_predicting[count] == 1 && early_contradicts(count)) {
-                rollback_required = 1;
-                mu_online.early_rollbacks++;
-                break;
-            }
-        }
-    }
-    /* The savestate frame is the lowest frame any remote is still predicted from. */
-    savestate = mu_online.stable_finalized;
-    for (count = 0; count < REMOTES; count++) {
-        if (mu_online.player_predicting[count] != 1) {
-            continue;
-        }
-        if (!values_set || mu_online.player_savestate_frame[count] < savestate) {
-            savestate = mu_online.player_savestate_frame[count];
-        }
-        values_set = 1;
-    }
-    mu_online.savestate_frame = savestate;
-    mu_online.finalized = savestate;
-    if (savestate > (int) be32(rxb + RXB_SMALLEST_LATEST)) {
-        mu_online.finalized = (int) be32(rxb + RXB_SMALLEST_LATEST);
-    }
-    if (rollback_required) {
-        {
-            unsigned long long mu_ticks_since_start(void);
-            mu_online.rollback_start_ticks = mu_ticks_since_start();
-        }
-        if (trace_renew()) {
-            unsigned long long mu_ticks_since_start(void);
-            logf_("rollback trigger frame %d retrace %d tbms %d", frame,
-                  (int) mu_online_abi_retrace_count(), (int) (mu_ticks_since_start() / 40500));
-        }
-        mu_online.selftest_rollback = 0;
-        mu_online.rollback_active = 1;
-        mu_online.rollback_should_load = 1;
-        mu_online.rollback_end_frame = frame;
-        mu_online.frame = frame + 1;
-        mu_online.rollbacks++;
-        if ((unsigned int) (frame - savestate) > mu_online.max_depth) {
-            mu_online.max_depth = (unsigned int) (frame - savestate);
-        }
-        return 1;
-    }
-    for (count = 0; count < REMOTES; count++) {
-        if (mu_online.player_predicting[count] == 1 &&
-            mu_online.predicted_read[count] == mu_online.predicted_write[count])
-        {
-            mu_online.player_predicting[count] = 0;
-        }
-    }
-    for (count = 0; count < REMOTES; count++) {
-        if (mu_online.player_predicting[count] == 1) {
-            return 0;
-        }
-    }
-    mu_online.savestate_predicting = 0;
-    return 0;
-}
+#include "mu_online_prediction.inc"
 
 static void clamp_stick_at_rest(PADStatus* pad)
 {
@@ -1115,6 +820,7 @@ int mu_online_pad_renew(PADStatus* stat)
     unsigned int got = 0;
     PADStatus* source;
 
+    if (mu_online.console_active) return console_pad_renew(stat);
     if (!hooks_on()) {
         return 0;
     }
@@ -1338,6 +1044,12 @@ int mu_online_pad_renew(PADStatus* stat)
  * Nonzero: run the engine now (with *count samples). */
 int mu_online_engine_gate(int* count)
 {
+    int mu_console_engine_gate(int* count);
+    /* Match bodies own their stable rollback fields at frame_begin, before TE. */
+    if (mu_online.console_active) return mu_console_engine_gate(count);
+    if (mu_console_engine_gate(count)) {
+        return 1;
+    }
     if (!hooks_on()) {
         return *count != 0;
     }
@@ -1451,9 +1163,20 @@ static void report_game(void)
     b[RGB_ONLINE_MODE] = (u8) mu_online.mode;
     put32(b + RGB_FRAME_LENGTH, gm_801A4BA8());
     put32(b + RGB_GAME_INDEX, online_game_index);
-    /* GPDO_TIEBREAK_GAME_NUM: only Ranked's set logic (the GameSetup state, not ported) sets it. */
+#ifndef MU_NO_SLIPPI
+    /* asm Online/Core/InitOnlinePlay.asm:320-400. */
+    put32(b + RGB_TIEBREAKER_INDEX, mu_online.mode == ONLINE_MODE_RANKED ? mu_ranked_set()->tiebreak_num : 0);
+#else
     put32(b + RGB_TIEBREAKER_INDEX, 0);
+#endif
     winner = singles_winner(end_method);
+#ifndef MU_NO_SLIPPI
+    /* VSSceneDecide calls SinglesDetermineWinner independently of the report's
+     * special -2/-3 winner codes (asm main.asm:628-655). Desync exits replay;
+     * only a disconnect aborts the set. Preserve that result before encoding. */
+    if (mu_online.mode == ONLINE_MODE_RANKED)
+        mu_ranked_setup_game_result(winner, end_method, mu_online.disconnect_displayed);
+#endif
     if (mu_online.disconnect_displayed) {
         winner = -3;
     } else if (mu_online.desync_displayed) {
@@ -1489,6 +1212,10 @@ void mu_online_frame_begin(void)
     DesyncLocal* written;
     DesyncLocal* confirmed;
 
+    if (mu_online.console_setup || mu_online.console_active) {
+        console_frame_begin();
+        return;
+    }
     if (!hooks_on()) {
         return;
     }
@@ -1660,9 +1387,12 @@ static void camera_tasks(void)
     }
 }
 
+#include "mu_console_rollback.inc"
+
 int mu_online_frame_end(void)
 {
     int current;
+    if (mu_online.console_active) return console_frame_end();
     if (!hooks_on()) {
         return ENGINE_CONTINUE;
     }
@@ -1861,9 +1591,12 @@ void mu_online_start_melee(StartMeleeData* data)
     }
     mu_online.pending = 0;
     mu_online_rules_clear();
-    /* The game index counts up before every game. Slippi leaves Ranked's to its set logic (the
-     * GameSetup state), which is not ported, so Ranked counts here too: 1, 2, 3 from its search. */
-    online_game_index++;
+    /* asm InitOnlinePlay.asm:38-50: Ranked indices belong to the set. */
+#ifndef MU_NO_SLIPPI
+    if (mu_online.mode == ONLINE_MODE_RANKED) online_game_index = mu_ranked_set()->cur_game;
+    else
+#endif
+        online_game_index++;
     /* FN_LoadMatchState: the match as the host negotiated it. */
     if (fetch_match_state(&size) != 0 || size < MSRB_SIZE) {
         mu_online_abi_log("online: no match state at match start; playing offline");
@@ -1877,6 +1610,16 @@ void mu_online_start_melee(StartMeleeData* data)
     mu_online.remote_index = mu_online.match_state[MSRB_REMOTE_PLAYER_INDEX] & 3;
     mu_online.rng_offset = be32(mu_online.match_state + MSRB_RNG_OFFSET);
     *HSD_RandSeedPtr = mu_online.rng_offset;
+#ifndef MU_NO_SLIPPI
+    /* asm InitOnlinePlay.asm:148-189: ties are one stock / three minutes.
+     * Exit/desync replay retains the host's recovery values. */
+    if (mu_online.mode == ONLINE_MODE_RANKED && mu_ranked_set()->tiebreak_num &&
+        mu_ranked_set()->last_end_mode != END_LRAS) {
+        u8* info = mu_online.match_state + MSRB_GAME_INFO_BLOCK;
+        put32(info + 0x10, 180);
+        for (i = 0; i < 4; ++i) info[0x62 + 0x24*i] = 1;
+    }
+#endif
     mu_replay_apply_game_info(data, mu_online.match_state + MSRB_GAME_INFO_BLOCK);
     /* Teams: the costume follows the team. The match state carries the colour each player picked,
      * and when all four picked the same team the host deals the teams out itself, so the picked
@@ -1914,9 +1657,13 @@ void mu_online_start_melee(StartMeleeData* data)
     /* SendGameInfo (8016E74C, right after InitOnlinePlay): every online match is recorded. */
     mu_replay_online_start(data, mu_online.match_state);
     /* HANDLE_RANKED_MATCH_START: a Ranked game that is not a tiebreak tells the server it starts
-     * (message 20 is game 1). No game is a tiebreak here (see report_game). Sent last, since the
+     * (message 20 is game 1). Sent last, since the
      * reply buffer is the match state the lines above still read. */
-    if (mu_online.mode == ONLINE_MODE_RANKED) {
+    if (mu_online.mode == ONLINE_MODE_RANKED
+#ifndef MU_NO_SLIPPI
+        && !mu_ranked_set()->tiebreak_num
+#endif
+    ) {
         u8 status = (u8) (online_game_index + 19);
         command(CMD_REPORT_MATCH_STATUS, &status, 1, mu_online.match_state, NULL);
     }
@@ -1976,6 +1723,10 @@ void mu_online_match_exit(void)
  * here, as it would have on its last frame. */
 void mu_online_scene_loop_exit(void)
 {
+    if (mu_online.console_active || mu_online.console_setup) {
+        console_match_exit();
+        return;
+    }
     if (!mu_online.resim) {
         return;
     }

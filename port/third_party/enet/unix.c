@@ -475,18 +475,17 @@ enet_socket_receive (ENetSocket socket,
        return -1;
     }
 
-#ifdef HAS_MSGHDR_FLAGS
-    if (msgHdr.msg_flags & MSG_TRUNC)
-      return -1;
-#endif
-
     if (address != NULL)
     {
         address -> host = (enet_uint32) sin.sin_addr.s_addr;
         address -> port = ENET_NET_TO_HOST_16 (sin.sin_port);
     }
 
-    return recvLength;
+#ifdef HAS_MSGHDR_FLAGS
+    if (msgHdr.msg_flags & MSG_TRUNC)
+      return ENET_SOCKET_RECEIVE_TRUNCATED;
+#endif
+    return recvLength == 0 ? ENET_SOCKET_RECEIVE_EMPTY : recvLength;
 }
 
 int

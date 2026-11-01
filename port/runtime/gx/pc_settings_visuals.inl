@@ -2,7 +2,9 @@
 // Mockup provenance: ui_sources/mockups/ORIGIN.md. No game state is written here.
 static bool settings_hit_button(const char* id, ImVec2 size,
                                ImGuiButtonFlags flags = ImGuiButtonFlags_EnableNav) {
-  return ImGui::InvisibleButton(id, size, flags);
+  const bool pressed = ImGui::InvisibleButton(id, size, flags);
+  settings_page::label_item(id);
+  return pressed;
 }
 
 // Close (X) buttons are mouse-only. Keyboard/controller focus landing on one meant pressing A
@@ -87,7 +89,6 @@ static ImVec2 g_settings_gd_origin;
 static float g_settings_gd_scale = 1.0f;
 static std::string g_settings_gd_help;
 static float g_settings_gd_back_x = 0;
-static bool g_settings_focus_next_gd_row = false;
 // The GD list (the settings page's scrolling child) and where its rows are this frame, in screen
 // pixels: used to rest the scroll on a row boundary and to keep the focused row whole.
 static ImGuiWindow* g_settings_gd_list = nullptr;
@@ -213,6 +214,7 @@ static SettingsGdRow settings_gd_row(const char* label) {
   row.y = (ImGui::GetCursorScreenPos().y - g_settings_gd_origin.y) / g_settings_gd_scale;
   ImGui::SetCursorScreenPos(row.point(88.5f, row.y));
   row.activated = settings_shaped_hit_button("##kit_row", ImVec2(451.5f * g_settings_gd_scale, 30.0f * g_settings_gd_scale));
+  settings_page::label_item(label);
   const bool nav_frame = settings_nav_frame_on_item();
   if (ImGuiWindow* list = ImGui::GetCurrentWindow(); list == g_settings_gd_list) {
     const float top = ImGui::GetItemRectMin().y, bottom = ImGui::GetItemRectMax().y;
@@ -231,13 +233,6 @@ static SettingsGdRow settings_gd_row(const char* label) {
     }
   }
   row.selected = ImGui::IsItemHovered() || ImGui::IsItemFocused() || ImGui::IsItemActive();
-  if (g_settings_focus_next_gd_row) {
-    // SetKeyboardFocusHere(-1) here targets the item before this row (the category
-    // control that just disappeared), leaving the new page with a dead navigation ID.
-    ImGui::SetItemDefaultFocus();
-    g_settings_focus_next_gd_row = false;
-    row.selected = true;
-  }
   const bool disabled = (ImGui::GetItemFlags() & ImGuiItemFlags_Disabled) != 0;
   const ImGuiID id = ImGui::GetID("lift");
   row.lift = ImGui::GetStateStorage()->GetFloat(id, 0.0f);
@@ -568,7 +563,7 @@ static void settings_field_label(const char* label) {
 
 static bool settings_toggle(const char* label, bool* value) {
   if (g_settings_form_style == 2 && label[0] != '#') return settings_gd_toggle(label,value);
-  if (g_settings_form_style >= 6) return ImGui::Checkbox(label,value);
+  if (g_settings_form_style >= 6) return settings_widgets::Checkbox(label,value);
   if (ImGui::GetCurrentWindow()->DC.IsSameLine)
     ImGui::NewLine();
   ImGui::PushID(label);
@@ -580,6 +575,7 @@ static bool settings_toggle(const char* label, bool* value) {
   const bool slanted = g_settings_form_style == 0;
   const bool clicked = slanted ? settings_shaped_hit_button("##switch", ImVec2(width, height)) :
                                  settings_hit_button("##switch", ImVec2(width, height));
+  settings_page::label_item(label);
   const bool nav_frame = slanted && settings_nav_frame_on_item();
   if (clicked) *value = !*value;
   const bool focused = ImGui::IsItemHovered() || ImGui::IsItemFocused();
@@ -627,6 +623,7 @@ static bool settings_combo(const char* label, int* value, const char* const item
     if (stacked && label[0] != '#') ImGui::TextUnformatted(label);
     ImGui::SetNextItemWidth(stacked ? available : width);
     const bool result=ImGui::Combo("##value",value,items,count);
+    settings_page::label_item(label);
     if (!stacked && label[0] != '#') { ImGui::SameLine(0.0f,4.0f); ImGui::TextUnformatted(label); }
     ImGui::PopID();
     return result;
@@ -634,6 +631,7 @@ static bool settings_combo(const char* label, int* value, const char* const item
   ImGui::PushID(label);
   settings_field_label(label);
   const bool result = ImGui::Combo("##value", value, items, count);
+    settings_page::label_item(label);
   ImGui::PopID();
   return result;
 }
@@ -645,6 +643,7 @@ static bool settings_slider(const char* label, int* value, int low, int high,
     ImGui::PushID(label);
     ImGui::SetNextItemWidth(std::min(330.0f, std::max(120.0f, ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize(label).x - 12.0f)));
     const bool result=ImGui::SliderInt("##value",value,low,high,format,flags);
+    settings_page::label_item(label);
     if (label[0] != '#') { ImGui::SameLine(0.0f,4.0f); ImGui::TextUnformatted(label); }
     ImGui::PopID();
     return result;
@@ -652,6 +651,7 @@ static bool settings_slider(const char* label, int* value, int low, int high,
   ImGui::PushID(label);
   settings_field_label(label);
   const bool result = ImGui::SliderInt("##value", value, low, high, format, flags);
+    settings_page::label_item(label);
   ImGui::PopID();
   return result;
 }

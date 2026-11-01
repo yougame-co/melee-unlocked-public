@@ -8,8 +8,12 @@
 #include "slippi_report.h"
 #include "slippi_account.h"
 #include "yougame_link.h"
+#include "yougame_udp_enet.h"
 #include "yougame_mode_policy.h"
 #include "yougame_friends.h"
+#include "yougame_blend.h"
+#include "yougame_update.h"
+#include "yougame_search.h"
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include "yougame_agent_script.h"
 #include "yougame_net_test.h"
@@ -170,7 +174,7 @@ Packet& Packet::operator<<(uint8_t v) { buf_.push_back(v); return *this; }
 Packet& Packet::operator<<(uint16_t v) { buf_.push_back((uint8_t)(v >> 8)); buf_.push_back((uint8_t)v); return *this; }
 Packet& Packet::operator<<(uint32_t v) { for (int i = 3; i >= 0; --i) buf_.push_back((uint8_t)(v >> (8 * i))); return *this; }
 Packet& Packet::operator<<(const std::string& s) { *this << (uint32_t)s.size(); append(s.data(), s.size()); return *this; }
-bool Packet::check(size_t n) { if (!ok_ || pos_ + n > buf_.size()) { ok_ = false; return false; } return true; }
+bool Packet::check(size_t n) { if (!ok_ || n > buf_.size() - pos_) { ok_ = false; return false; } return true; }
 Packet& Packet::operator>>(uint8_t& v) { if (check(1)) v = buf_[pos_++]; return *this; }
 Packet& Packet::operator>>(bool& v) { uint8_t b = 0; *this >> b; v = b != 0; return *this; }
 Packet& Packet::operator>>(uint16_t& v) { if (check(2)) { v = (uint16_t)((buf_[pos_] << 8) | buf_[pos_ + 1]); pos_ += 2; } return *this; }
@@ -181,13 +185,18 @@ Packet& Packet::operator>>(uint32_t& v) {
 Packet& Packet::operator>>(int32_t& v) { uint32_t u = 0; *this >> u; v = (int32_t)u; return *this; }
 Packet& Packet::operator>>(std::string& s) {
   uint32_t n = 0; *this >> n;
-  if (check(n)) { s.assign((const char*)&buf_[pos_], n); pos_ += n; }
+  if (check(n)) { if (n) s.assign((const char*)buf_.data() + pos_, n); else s.clear(); pos_ += n; }
   return *this;
 }
 
 // ---------------------------------------------------------------- user
 User::User(std::string user_dir, bool slippi_only) : dir_(std::move(user_dir)), slippi_only_(slippi_only) {
   if (AttemptLogin()) RefreshFromServer();
+}
+std::unique_ptr<User> User::GrantedSlippiUser(const std::string& user_dir) {
+  if (account::app_sign_in().empty()) return nullptr;
+  auto user = std::make_unique<User>(user_dir, true);
+  return user->IsLoggedIn() ? std::move(user) : nullptr;
 }
 void User::RefreshFromServer() {
   if (refresh_.valid() && refresh_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
@@ -281,7 +290,7 @@ bool User::CheckOnlineCompatibility(std::string* error, VersionFetch fetch) {
 bool User::AttemptLogin(bool rediscover) {
   // Launched by YouGame: the signed-in YouGame player is the account, and the online menus always
   // show the online modes, never Slippi's "log in" (signing in is YouGame's job; a search without a
-  // YouGame player says so). An Unranked search can separately load the local Slippi login.
+  // YouGame player says so). Slippi searches separately load only the app's explicit grant.
   if (yougame::active() && !slippi_only_) {
     const yougame::Identity id = yougame::identity();
     std::lock_guard<std::mutex> lock(mutex_);
@@ -297,7 +306,12 @@ bool User::AttemptLogin(bool rediscover) {
     return true;
   }
   account::Profile profile;
-  if (rediscover || !account_discovered_) {
+  if (yougame::active()) {
+    // Even slippi_only callers must never discover an ambient account in an app launch.
+    // Recheck the grant on every login attempt; a cached standalone file is not consent.
+    const auto grant = account::app_sign_in();
+    if (!grant.empty()) profile = account::read(grant);
+  } else if (rediscover || !account_discovered_) {
     profile = account::resolve(dir_);
     account_file_ = profile ? profile.file.string() : std::string();
     account_discovered_ = true;
@@ -366,7 +380,7 @@ void DirectCodes::AddOrUpdateCode(const std::string& code) {
 
 // ---------------------------------------------------------------- netplay client
 NetplayClient::NetplayClient(std::vector<std::string> addrs, std::vector<uint16_t> ports, uint8_t remote_player_count, uint16_t local_port,
-                             bool is_decider, uint8_t player_idx) {
+                             bool is_decider, uint8_t player_idx, bool own_udp) {
   host::log("slippi: netplay client: decider %d, player index %u, %u remote players", is_decider, player_idx, remote_player_count);
   is_decider_ = is_decider;
   // Every per-remote array here has REMOTE_PLAYER_MAX entries and every per-player one
@@ -389,9 +403,35 @@ NetplayClient::NetplayClient(std::vector<std::string> addrs, std::vector<uint16_
   }
   ENetAddress local_addr;
   ENetAddress* local = nullptr;
+  const auto requested = yougame::udp::port(own_udp ? std::getenv("YOUGAME_UDP_PORT") : nullptr);
+  if (own_udp) {
+    own_udp_ingress_ = std::make_unique<yougame::udp::EnetIngress>(&yougame::udp::own_udp_drops);
+    own_udp_ingress_->clock = time_ms;
+    own_udp_ingress_->log = [](const char* message) { host::log("%s", message); };
+    for (int i = 0; i < remote_player_count; ++i) {
+      ENetAddress addr{};
+      // Room candidates are numeric IPv4, never DNS names supplied by the wire.
+      if (inet_pton(AF_INET, addrs[i].c_str(), &addr.host) != 1 || !ports[i]) {
+        status_.store(ConnectStatus::FAILED); return;
+      }
+      own_udp_ingress_->senders.allow({addr.host, ports[i]});
+    }
+  }
+  if (!requested.valid) {
+    host::log("%s", yougame::udp::port_error(requested, "invalid decimal port").c_str());
+    own_udp_port_unavailable_ = true; status_.store(ConnectStatus::FAILED); return;
+  }
+  if (requested.set) local_port = requested.value;
   if (local_port > 0) { local_addr.host = ENET_HOST_ANY; local_addr.port = local_port; local = &local_addr; }
   client_ = enet_host_create(local, 10, 3, 0, 0);
-  if (!client_) { host::log("slippi: cannot create ENet client"); status_.store(ConnectStatus::FAILED); return; }
+  if (!client_) {
+    if (requested.set) {
+      host::log("%s", yougame::udp::port_error(requested, "bind failed").c_str());
+      own_udp_port_unavailable_ = true;
+    }
+    host::log("slippi: cannot create ENet client"); status_.store(ConnectStatus::FAILED); return;
+  }
+  if (own_udp_ingress_) own_udp_ingress_->attach(client_);
   for (int i = 0; i < remote_player_count; ++i) {
     ENetAddress addr;
     enet_address_set_host(&addr, addrs[i].c_str());
@@ -448,7 +488,7 @@ void NetplayClient::OnData(Packet& packet, ENetPeer* peer) {
         FrameTiming timing = last_frame_timing_[pidx];
         if (!has_game_started_) { timing.frame = 0; timing.time_us = cur_time; }
         int64_t opponent_send_time_us = (int64_t)cur_time - (int64_t)(ping_us_[pidx] / 2);
-        int64_t frame_diff_offset_us = 16683 * (int64_t)(timing.frame - frame);
+        int64_t frame_diff_offset_us = 16683 * ((int64_t)timing.frame - frame);
         int64_t time_offset_us = opponent_send_time_us - (int64_t)timing.time_us + frame_diff_offset_us;
         auto& fod = frame_offset_data_[pidx];
         if ((int)fod.buf.size() < ONLINE_LOCKSTEP_INTERVAL) fod.buf.push_back((int32_t)time_offset_us);
@@ -838,7 +878,7 @@ void NetplayClient::ThreadFunc() {
     bool all = true;
     for (int i = 0; i < remote_player_count_; ++i) if (!connections[i]) all = false;
     if (all) {
-      client_->intercept = intercept_callback;
+      if (!own_udp_ingress_) client_->intercept = intercept_callback;
       host::log("slippi: online connection successful");
       connected_at_ms_.store(time_ms(), std::memory_order_release);
       status_.store(ConnectStatus::CONNECTED, std::memory_order_release);
@@ -1336,10 +1376,12 @@ static int mm_send(ENetPeer* server, const json& msg) {
   ENetPacket* p = enet_packet_create(s.c_str(), s.size(), ENET_PACKET_FLAG_RELIABLE);
   return enet_peer_send(server, 0, p);
 }
-static int mm_receive(ENetHost* client, json& msg, int timeout_ms) {
+// -1 also when `stop` turns true (the caller asks it why).
+static int mm_receive(ENetHost* client, json& msg, int timeout_ms, const std::function<bool()>& stop = nullptr) {
   const int step = 250;
   int attempts = std::max(timeout_ms, step) / step;
   for (int i = 0; i < attempts; ++i) {
+    if (stop && stop()) return -1;
     ENetEvent ev;
     int net = enet_host_service(client, &ev, step);
     if (net <= 0) continue;
@@ -1416,6 +1458,12 @@ void Matchmaking::startMatchmaking() {
       fail("Matchmaking is off in automated runs");
       return;
     }
+    // Automated Direct, Teams and Party must stop here too, never use YouGame as a fallback.
+    if (yougame::active() && yougame::mode_policy::slippi_menu_mode(
+            search_settings_.mode, !search_settings_.friend_room.empty())) {
+      fail("Matchmaking is off in automated runs");
+      return;
+    }
     startYouGameMatchmaking();
     return;
   }
@@ -1423,30 +1471,65 @@ void Matchmaking::startMatchmaking() {
   if (yougame::active() && !local_peer.enabled) {
     slippi_user_.reset();
     const bool unranked = search_settings_.mode == UNRANKED && search_settings_.friend_room.empty();
-    // A remix never reads the Slippi login: only the base listing (vanilla-only) can match Slippi.
+    // Mixed Unranked reads the app's granted Slippi login only on the base listing.
     const bool vanilla = host::gameplay::vanilla_only();
-    if (unranked && vanilla && user_) slippi_user_ = std::make_unique<User>(user_->dir(), true);
+    const bool slippi_mode = yougame::mode_policy::slippi_menu_mode(
+        search_settings_.mode, !search_settings_.friend_room.empty());
+    if ((slippi_mode || (unranked && vanilla)) && user_)
+      slippi_user_ = User::GrantedSlippiUser(user_->dir());
+    // Account I/O may finish after the player cancelled and began a replacement search.
+    // Do not announce, change state, or reserve a generation on behalf of that old worker.
+    if (is_mm_terminated_ || state_ != INITIALIZING) return;
     const bool login = slippi_user_ && slippi_user_->IsLoggedIn();
-    if (yougame::mode_policy::matchmaking_route(search_settings_.mode, true, login, false,
-                                               !search_settings_.friend_room.empty(), vanilla) ==
-        yougame::mode_policy::MatchmakingRoute::YouGame) {
+    if (unranked && vanilla && user_) {
+      // Diagnostics obey the same grant boundary as login, including when no grant exists.
+      const bool app_file = !account::app_sign_in().empty();
+      if (login) {
+        if (app_file) host::log("slippi: app login file found");
+      } else {
+        const char* why = account::unusable_text(account::why_unusable_grant());
+        if (app_file) host::log("slippi: app login file not found (%s)", why);
+        else host::log("slippi: no usable login (%s)", why);
+      }
+      // The app hears the link (only the player's own connect code); remixes send nothing.
+      yougame::slippi_link(login, login ? slippi_user_->GetUserInfo().connect_code : std::string());
+    }
+#ifdef YOUGAME_AGENT_TEST_HOOK
+    const bool agent = yougame::agent_test::agent_script;   // returned above; the policy refuses it too
+#else
+    const bool agent = false;
+#endif
+    const auto route = yougame::mode_policy::matchmaking_route(search_settings_.mode, true, login, agent,
+                                               !search_settings_.friend_room.empty(), vanilla);
+    if (route == yougame::mode_policy::MatchmakingRoute::Locked) {
+      fail("Sign in to Slippi to play Direct, Teams and Party");
+      return;
+    }
+    if (route == yougame::mode_policy::MatchmakingRoute::YouGame) {
       if (unranked) host::log(vanilla ? "yougame: unranked on YouGame (no Slippi login)"
                                       : "yougame: unranked on YouGame (not vanilla Melee Unlocked)");
       slippi_user_.reset();
-      startYouGameMatchmaking();
+      startYouGameMatchmaking(unranked && vanilla ? yougame::blend::kSearchYouGameOnly : nullptr);
       return;
     }
-    host::log("yougame: unranked via Slippi matchmaking (Slippi login present)");
+    if (route == yougame::mode_policy::MatchmakingRoute::Blend) {
+      host::log("yougame: unranked on YouGame and Slippi (Slippi login present)");
+      blendMatchmaking();
+      return;
+    }
+    host::log("yougame: %s via Slippi", search_settings_.mode == DIRECT ? "direct" : "doubles");
     std::string error;
     if (!slippi_user_->CheckOnlineCompatibility(&error)) {
       fail(error.empty() ? "Could not check Slippi version. Try again." : error);
       return;
     }
+    if (is_mm_terminated_ || state_ != INITIALIZING) return;
+    // Same transport handoff used when Slippi wins the blend, before opening any native socket.
     if (!yougame::prepare_slippi_match([this] { return is_mm_terminated_ || state_ != INITIALIZING; })) return;
+    display_provider_ = display::Provider::Slippi;
   }
 
   UserInfo me = (slippi_user_ ? slippi_user_.get() : user_)->GetUserInfo();
-  static std::mt19937 rng((uint32_t)time_ms());
 
   if (local_peer.enabled) {
     // 2-4 local instances peer directly. The match is the get-ticket-resp the server would send,
@@ -1460,33 +1543,57 @@ void Matchmaking::startMatchmaking() {
     return;
   }
 
-  // This is the real Slippi route, including the app's separate slippi_user_ login.
+  // This is the real Slippi route (standalone or the app's signed-in Direct, Teams and Party).
   // Local test peering returned above and keeps an unknown provider.
   display_provider_ = display::Provider::Slippi;
-  for (int retry = 0; !client_ && retry < 15; ++retry) {
-    host_port_ = forced_port ? forced_port : 41000 + (int)(rng() % 10000);
-    ENetAddress addr; addr.host = ENET_HOST_ANY; addr.port = (enet_uint16)host_port_;
-    client_ = enet_host_create(&addr, 1, 3, 0, 0);
-  }
-  if (!client_) { fail("Failed to create mm client"); return; }
-  ENetAddress addr;
-  enet_address_set_host(&addr, "mm.slippi.gg");
+  const std::string error = openSlippiTicket(me, {}, 0);
+  if (!error.empty()) { fail(error); return; }
+  state_ = MATCHMAKING;
+  host::log("slippi: matchmaking ticket created");
+}
+
+std::string Matchmaking::openSlippiTicket(const UserInfo& me, const std::function<bool()>& stop, int avoid) {
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  // The last door before Slippi's servers: an agent search never gets through it.
+  if (yougame::agent_test::agent_script) return "Matchmaking is off in automated runs";
+#endif
+  static std::mt19937 rng((uint32_t)time_ms());
+  // Launched by the app, YouGame's search may have put ENet on its own links: this client is native.
+  const auto native = [](const std::function<void()>& create) {
+    if (yougame::active()) yougame::with_native_udp(create);
+    else create();
+  };
+  ENetAddress addr{};
   addr.port = 43113;
+  bool resolved = false;
+  native([&] {
+    resolved = enet_address_set_host(&addr, "mm.slippi.gg") == 0;
+    if (!resolved) return;
+    for (int retry = 0; !client_ && retry < 15; ++retry) {
+      host_port_ = yougame::search_policy::native_port((uint16_t)forced_port, (uint16_t)avoid, rng());
+      ENetAddress addr; addr.host = ENET_HOST_ANY; addr.port = (enet_uint16)host_port_;
+      client_ = enet_host_create(&addr, 1, 3, 0, 0);
+    }
+  });
+  if (!resolved) return "could not resolve the Slippi server";
+  if (!client_) return "Failed to create mm client";
   server_ = enet_host_connect(client_, &addr, 3, 0);
-  if (!server_) { fail("Failed to start connection to mm server"); return; }
+  if (!server_) return "Failed to start connection to mm server";
   int attempts = 0;
   while (!is_mm_connected_) {
+    if (stop && stop()) return "Cancelled";
     ENetEvent ev;
     int net = enet_host_service(client_, &ev, 500);
     if (net <= 0 || ev.type != ENET_EVENT_TYPE_CONNECT) {
-      if (++attempts >= 20) { fail("Failed to connect to mm server"); host::log("slippi: cannot reach mm.slippi.gg"); return; }
+      if (++attempts >= 20) { host::log("slippi: cannot reach mm.slippi.gg"); return "Failed to connect to mm server"; }
       continue;
     }
     client_->intercept = intercept_callback;
     is_mm_connected_ = true;
     host::log("slippi: connected to matchmaking server");
   }
-  std::string lan = local_address_string(&addr);
+  std::string lan;
+  native([&] { lan = local_address_string(&addr); });
   std::string lan_addr = lan.empty() ? "" : lan + ":" + std::to_string(host_port_);
   std::vector<uint8_t> code_buf(search_settings_.connect_code.begin(), search_settings_.connect_code.end());
   json req;
@@ -1497,48 +1604,74 @@ void Matchmaking::startMatchmaking() {
   req["ipAddressLan"] = lan_addr;
   mm_send(server_, req);
   json resp;
-  if (mm_receive(client_, resp, 5000) != 0) { fail("Failed to join mm queue"); return; }
+  if (mm_receive(client_, resp, 5000, stop) != 0) return stop && stop() ? "Cancelled" : "Failed to join mm queue";
   if (str_or(resp, "type", "") != "create-ticket-resp") {
-    fail("Invalid response when joining mm queue");
     host::log("slippi: mm response: %s", resp.dump(-1, ' ', false, json::error_handler_t::replace).c_str());
-    return;
+    return "Invalid response when joining mm queue";
   }
   std::string err = str_or(resp, "error", "");
-  if (!err.empty()) { fail(err); host::log("slippi: mm error: %s", err.c_str()); return; }
-  state_ = MATCHMAKING;
-  host::log("slippi: matchmaking ticket created");
+  if (!err.empty()) { host::log("slippi: mm error: %s", err.c_str()); return err; }
+  return "";
+}
+
+// Ends the blend's matchmaking client without waiting three seconds for a disconnect acknowledgement.
+// Send a goodbye for a connected ticket; reset a connection that was still being made.
+void Matchmaking::dropSlippi() {
+  if (server_) {
+    if (is_mm_connected_) enet_peer_disconnect_now(server_, 0);
+    else enet_peer_reset(server_);
+    server_ = nullptr;
+  }
+  terminateMmConnection();
 }
 
 // Launched by YouGame: the search runs through YouGame (yougame_link.h), which hands back the same
 // facts a get-ticket-resp carries. They go through ingest_ticket like a Slippi ticket, so the
 // netplay client connects exactly as before; the address is the one that answered YouGame's punch.
-void Matchmaking::startYouGameMatchmaking() {
+void Matchmaking::startYouGameMatchmaking(const char* status) {
+  // Defense at the YouGame boundary, including scripted/retry callers.
+  if (yougame::active() && yougame::mode_policy::slippi_menu_mode(
+          search_settings_.mode, !search_settings_.friend_room.empty())) {
+    fail("Sign in to Slippi to play Direct, Teams and Party");
+    return;
+  }
   display_provider_ = display::Provider::YouGame;
   static std::mt19937 rng((uint32_t)time_ms());
   host_port_ = forced_port ? forced_port : 41000 + (int)(rng() % 10000);
   yougame::Search search;
-  search.mode = (int)search_settings_.mode;
+  if (!youGameSearch(&search)) return;
+  search.udp_port = (uint16_t)host_port_;
+  if (status) search.status = status;
+  state_ = MATCHMAKING;
+  yougame::Match match = yougame::find_match(search, [this] { return is_mm_terminated_ || state_ != MATCHMAKING; });
+  if (is_mm_terminated_ || state_ != MATCHMAKING) return;
+  takeYouGameMatch(match);
+}
+bool Matchmaking::youGameSearch(yougame::Search* search) {
+  search->mode = (int)search_settings_.mode;
   // Direct and Teams require a readable code; unused fields must still be valid UTF-8.
   std::string code;
-  if (!yougame::friends::search_code(search.mode, search_settings_.connect_code, &code)) {
-    if (search.mode == 2)
+  if (!yougame::friends::search_code(search->mode, search_settings_.connect_code, &code)) {
+    if (search->mode == 2)
       host::log("slippi: YouGame search refused a Direct code with characters outside A-Z, 0-9 and #");
     else
       host::log("slippi: YouGame search refused a Teams code with characters outside A-Z, 0-9 and #");
     fail("Enter a code like NAME#123");
-    return;
+    return false;
   }
-  search.direct_code = code;
-  search.friend_room = search_settings_.friend_room;
-  search.udp_port = (uint16_t)host_port_;
-  state_ = MATCHMAKING;
-  yougame::Match match = yougame::find_match(search, [this] { return is_mm_terminated_ || state_ != MATCHMAKING; });
-  if (is_mm_terminated_ || state_ != MATCHMAKING) return;
+  search->direct_code = code;
+  search->friend_room = search_settings_.friend_room;
+  return true;
+}
+// A finished YouGame search: its match goes in as a get-ticket-resp would (host_port_ is the port it
+// searched from), or the search fails or searches again as it says.
+void Matchmaking::takeYouGameMatch(const yougame::Match& match) {
   if (!match.ok) {
     if (match.retry) { host::log("slippi: YouGame match not reachable (%s), searching again", match.error.c_str()); state_ = INITIALIZING; return; }
     fail(match.error);
     return;
   }
+  if (match.udp_port) host_port_ = match.udp_port;
   json resp;
   resp["type"] = "get-ticket-resp";
   resp["matchId"] = match.match_id;
@@ -1552,6 +1685,7 @@ void Matchmaking::startYouGameMatchmaking() {
                        {"ipAddress", addr}, {"ipAddressLan", addr}});
   }
   resp["players"] = players;
+  display_provider_ = display::Provider::YouGame;
   ingest_ticket(Ticket{resp});
   state_ = OPPONENT_CONNECTING;
   host::log("slippi: YouGame opponent found (decider: %d)", is_host_);
@@ -1691,6 +1825,234 @@ bool Matchmaking::ingest_ticket(const Ticket& ticket) {
   return true;
 }
 
+void announce_slippi_link(const std::string& user_dir) {
+  static std::atomic<bool> asked{false};
+  if (!yougame::active() || !host::gameplay::vanilla_only() || asked.exchange(true)) return;
+  // Read the app's grant off the game thread. Each Unranked search rechecks that grant.
+  std::thread([user_dir] {
+    try {
+      auto user = User::GrantedSlippiUser(user_dir);
+      const bool linked = user && user->IsLoggedIn();
+      yougame::slippi_link(linked, linked ? user->GetUserInfo().connect_code : std::string());
+    } catch (...) {}   // nothing may leave a thread as an exception
+  }).detach();
+}
+
+// Blended Unranked, the one case matchmaking_route sends here (the app's plain Unranked on the base
+// listing with a usable Slippi login; yougame_blend.h decides). YouGame's search runs on a helper
+// thread from the start, Slippi's on this one once the coordinator starts it; the first side given
+// an opponent is the match and the other is cancelled. The CSS sees one search: MATCHMAKING until a
+// side commits, then that side's ticket and OPPONENT_CONNECTING. Every way out ends Slippi's client
+// and waits for the helper, so no thread, socket or late callback outlives the search into a newer
+// one. A committed side that then fails does what that side always did; the other is not resumed.
+void Matchmaking::blendMatchmaking() {
+  using yougame::blend::Side;
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  if (yougame::agent_test::agent_script) { fail("Matchmaking is off in automated runs"); return; }   // routed to YouGame above
+#endif
+  // In particular, do not resurrect MATCHMAKING and retire a replacement Ranked room after
+  // cancellation during account loading. This must precede state writes and begin_search().
+  if (is_mm_terminated_ || state_ != INITIALIZING) return;
+  std::mutex mutex;                                        // coord, between this thread and the helper
+  yougame::blend::Coordinator coord(time_ms());
+  const auto print = [&coord] { for (const auto& line : coord.take_log()) host::log("%s", line.c_str()); };   // under mutex
+  const auto live = [&](Side side) { std::lock_guard<std::mutex> lk(mutex); return coord.live(side); };
+  const auto searching = [this] { return !is_mm_terminated_ && state_ == MATCHMAKING; };
+  display_provider_ = display::Provider::Unknown;          // the label names the pool once one wins
+  state_ = MATCHMAKING;
+  yougame::Search search;
+  if (!youGameSearch(&search)) return;
+  static std::mt19937 rng((uint32_t)time_ms());
+  const int yg_port = yougame::search_policy::blend_port((uint16_t)forced_port, rng());
+  search.epoch = yougame::begin_search();
+  search.udp_port = (uint16_t)yg_port;
+  search.status = yougame::blend::kSearchBoth;
+  search.on_searching = [&](int waiting) {
+    std::lock_guard<std::mutex> lk(mutex);
+    coord.searching(waiting, time_ms());
+    print();
+  };
+  search.claim = [&] {
+    if (!searching()) return false;                        // the player left: nothing commits
+    std::lock_guard<std::mutex> lk(mutex);
+    const bool won = coord.matched(Side::YouGame, time_ms());
+    print();
+    return won;
+  };
+  // YouGame's side. Declared after everything it uses, so every way out joins it before they go.
+  struct Helper {
+    std::atomic<bool> quit{false};
+    std::atomic<bool> update_required{false};
+    std::future<yougame::Match> result;
+    ~Helper() { quit = true; if (result.valid()) result.wait(); }
+  } yg;
+  yg.result = std::async(std::launch::async, [&] {
+    try {
+      auto match = yougame::find_match(search, [&] { return yg.quit || !searching() || !live(Side::YouGame); });
+      if (match.update_required) {
+        // Serialize refusal with opponent assignment. A late reply from the cancelled side cannot
+        // cancel a Slippi match that already won; a live refusal stops both sides before any claim.
+        std::lock_guard<std::mutex> lk(mutex);
+        match.update_required = coord.live(Side::YouGame);
+        if (match.update_required) {
+          coord.stop();
+          yg.update_required = true;
+        }
+      }
+      return match;
+    } catch (...) {                                        // nothing may leave a thread as an exception
+      yougame::Match failed;
+      failed.error = "YouGame matchmaking failed";
+      return failed;
+    }
+  });
+
+  enum class Slippi { Off, Checking, Queued } slippi = Slippi::Off;   // this thread's side of Slippi
+  std::string last_error;
+  const auto slippi_stop = [&] { return yg.update_required || !searching() || !live(Side::Slippi); };
+  // Slippi's side ended on its own (not cancelled): YouGame's goes on.
+  const auto slippi_failed = [&](const std::string& error) {
+    dropSlippi();
+    slippi = Slippi::Off;
+    std::lock_guard<std::mutex> lk(mutex);
+    if (!coord.live(Side::Slippi)) return;
+    host::log("yougame: unranked blend: Slippi search stopped: %s", error.c_str());
+    last_error = error;
+    coord.failed(Side::Slippi, time_ms());
+    print();
+  };
+  for (;;) {
+    if (!searching()) {                                    // the player left, or the search was shut down
+      { std::lock_guard<std::mutex> lk(mutex); coord.stop(); }
+      dropSlippi();
+      return;                                              // yg's destructor waits for its side to see it
+    }
+    if (yg.update_required) {
+      { std::lock_guard<std::mutex> lk(mutex); coord.stop(); }
+      dropSlippi();
+      fail(yougame::update::kMessage);
+      return;
+    }
+    Side won = Side::YouGame;
+    bool committed = false, over = false;
+    {
+      std::lock_guard<std::mutex> lk(mutex);
+      coord.tick(time_ms());
+      if (coord.take_start_slippi()) slippi = Slippi::Checking;
+      committed = coord.committed(&won);
+      over = coord.over();
+      print();
+    }
+    if (committed && won == Side::YouGame) {
+      // YouGame's queue named a room: Slippi's search ends now while YouGame's goes on to connect.
+      dropSlippi();
+      // Ends with the match, or when the player leaves. (Its future is unread: a side that failed
+      // before can never commit.)
+      const yougame::Match match = yg.result.get();
+      if (!searching()) return;
+      // Not this match's login. Its version check may still be in flight (the User's future), so the
+      // record is let go on a thread of its own rather than holding up the match.
+      if (slippi_user_) std::thread([user = std::move(slippi_user_)]() mutable { user.reset(); }).detach();
+      host_port_ = yg_port;
+      takeYouGameMatch(match);
+      return;
+    }
+    if (over) {
+      dropSlippi();
+      fail(last_error.empty() ? "Matchmaking failed" : last_error);
+      return;
+    }
+    if (slippi != Slippi::Off && !live(Side::Slippi)) { dropSlippi(); slippi = Slippi::Off; }
+    // YouGame's side ended before anything committed (a claim always precedes its end): a failure of
+    // its own. Slippi's side goes on, or starts now.
+    if (yg.result.valid() && yg.result.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+      { std::lock_guard<std::mutex> lk(mutex); if (coord.committed()) continue; }   // the next pass takes it
+      const yougame::Match match = yg.result.get();
+      if (match.update_required) {
+        { std::lock_guard<std::mutex> lk(mutex); coord.stop(); }
+        dropSlippi();
+        fail(yougame::update::kMessage);
+        return;
+      }
+      std::lock_guard<std::mutex> lk(mutex);
+      if (coord.live(Side::YouGame)) {
+        host::log("yougame: unranked blend: YouGame search stopped: %s", match.error.c_str());
+        last_error = match.error;
+        coord.failed(Side::YouGame, time_ms());
+        if (coord.take_start_slippi()) slippi = Slippi::Checking;
+        print();
+      }
+      continue;
+    }
+    if (slippi == Slippi::Checking) {
+      // Slippi's version, fresh for each search, polled so YouGame's commit is never held up by it.
+      std::string error;
+      const int version = slippi_user_->PollOnlineCompatibility(&error);
+      if (version == 0) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); continue; }
+      if (version < 0) { slippi_failed(error.empty() ? "Could not check Slippi version. Try again." : error); continue; }
+      error = openSlippiTicket(slippi_user_->GetUserInfo(), slippi_stop, yg_port);
+      if (slippi_stop()) { dropSlippi(); slippi = Slippi::Off; continue; }
+      if (!error.empty()) { slippi_failed(error); continue; }
+      slippi = Slippi::Queued;
+      host::log("slippi: matchmaking ticket created");
+      continue;
+    }
+    if (slippi == Slippi::Queued) {
+      json resp;
+      const int r = mm_receive(client_, resp, 250, slippi_stop);
+      if (r == -1) continue;                               // nothing yet, or stopped (the next pass sees why)
+      if (r != 0) { slippi_failed("Lost connection to the mm server"); continue; }
+      if (str_or(resp, "type", "") != "get-ticket-resp") { slippi_failed("Invalid response when getting mm status"); continue; }
+      const std::string err = str_or(resp, "error", ""), latest = str_or(resp, "latestVersion", "");
+      if (!err.empty()) {
+        if (!latest.empty()) slippi_user_->OverwriteLatestVersion(latest);
+        host::log("slippi: mm error: %s", err.c_str());
+        slippi_failed(err);
+        continue;
+      }
+      // Read whole before anything is decided: a refused or blocked ticket is not an opponent.
+      const ParsedTicket ticket = parse_ticket(resp);
+      if (!ticket.ok) {
+        host::log("slippi: matchmaking ticket refused: %s", ticket.error.c_str());
+        slippi_failed("Invalid match details from the mm server");
+        continue;
+      }
+      if (IsBlockedMatch(search_settings_.mode, search_settings_.blocked_codes, ticket.players, ticket.local_player_index)) {
+        // As Slippi's own search: a new ticket keeps it going; the other client sees a failed connection.
+        host::log("slippi: matched a blocked connect code in Unranked; searching again");
+        dropSlippi();
+        slippi = Slippi::Checking;
+        continue;
+      }
+      bool won_slippi = false;
+      if (searching()) {
+        // Same lock order as helper effects: session mutex, then coordinator mutex. No helper
+        // effect that checked liveness can cross this commit and land afterwards.
+        yougame::guard_search(search.epoch, [&] {
+          std::lock_guard<std::mutex> lk(mutex);
+          won_slippi = coord.matched(Side::Slippi, time_ms());
+          print();
+        });
+      }
+      dropSlippi();
+      if (!won_slippi) { slippi = Slippi::Off; continue; }
+      // Cancel the helper's I/O, fence its global effects, and start the peer before joining it.
+      yg.quit = true;
+      if (!searching()) return;
+      if (!yougame::prepare_slippi_match([this] { return is_mm_terminated_ || state_ != MATCHMAKING; }, search.epoch)) {
+        if (searching()) state_ = INITIALIZING;
+        return;
+      }
+      display_provider_ = display::Provider::Slippi;
+      if (!ingest_ticket(Ticket{resp})) return;
+      state_ = OPPONENT_CONNECTING;
+      host::log("slippi: opponent found (decider: %d)", is_host_);
+      handleConnecting();  // starts the Slippi peer now; Helper joins before we return
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));   // YouGame alone for now
+  }
+}
 
 void Matchmaking::handleConnecting() {
   if ((!yougame::active() || slippi_user_) && !local_peer.enabled) {
@@ -1714,7 +2076,8 @@ void Matchmaking::handleConnecting() {
     ports.push_back((uint16_t)std::atoi(ip.substr(colon + 1).c_str()));
   }
   const uint8_t remote_count = (uint8_t)std::min<size_t>(remote_ips_.size(), (size_t)REMOTE_PLAYER_MAX);
-  auto client = std::make_unique<NetplayClient>(addrs, ports, remote_count, (uint16_t)host_port_, is_host_, (uint8_t)local_player_index_);
+  auto client = std::make_unique<NetplayClient>(addrs, ports, remote_count, (uint16_t)host_port_, is_host_, (uint8_t)local_player_index_,
+      display_provider_ == display::Provider::YouGame && !yg_enet_selected());
   bool handed_over = false;
   while (!handed_over) {
     auto st = client->GetSlippiConnectStatus();
@@ -1730,6 +2093,7 @@ void Matchmaking::handleConnecting() {
       break;
     }
     if (st != NetplayClient::ConnectStatus::CONNECTED) {
+      if (client->OwnUDPPortUnavailable()) { fail("The own UDP port is unavailable"); return; }
       if (local_peer.enabled) { fail("Could not connect to the local peer"); return; }
       if (search_settings_.mode == TEAMS) { fail("Timed out waiting for other players to connect"); return; }
       host::log("slippi: connection attempt failed, searching again");

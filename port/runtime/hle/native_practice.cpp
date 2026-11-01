@@ -6,6 +6,9 @@
 #include "practice_cpu.h"
 #include "slippi_online.h"
 #include "yougame_link.h"
+#include "yougame_console_engine.h"
+#include "yougame_console_entry.h"
+#include "yougame_unranked.h"
 #include "yougame_ux.h"
 #include "yougame_friends.h"
 #include "slippi_playback.h"
@@ -567,14 +570,18 @@ void publish_snapshot() {
 // The online session is over (the other player left, the connection dropped, the player left with
 // at least one match played): back into Training with the same character, and once its match runs,
 // "search again?" for the same mode (Direct and Teams: the same code).
-void enter_training_after_session(MatchMode mode, int test_character = -1) {
+void enter_training_after_session(MatchMode mode, int local_index = -1, int test_character = -1) {
   uint8_t character = 0, costume = 0;
   const PracticeConfig css = capture_practice();
   bool picked = slippi::online::local_css_selection(&character, &costume);
   if (!picked && test_character >= 0) { character = (uint8_t)test_character; picked = true; }
-  if (!picked && css.valid && css.players[css.local_slot].character < 26) {
-    character = (uint8_t)css.players[css.local_slot].character;
-    costume = css.players[css.local_slot].costume;
+  // The online match's own slot for this player: both slots of an online match are human, so the
+  // first human one is player 1, and a player 2 came back to Training as player 1's character.
+  // (The character select record is cleared when each match starts, so it is usually gone here.)
+  const int slot = local_index >= 0 && local_index < 4 && css.players[local_index].active ? local_index : css.local_slot;
+  if (!picked && css.valid && css.players[slot].character < 26) {
+    character = (uint8_t)css.players[slot].character;
+    costume = css.players[slot].costume;
     picked = true;
   }
   g_practice = {};
@@ -603,7 +610,8 @@ void enter_training_after_session(MatchMode mode, int test_character = -1) {
   g_enter_seen_select = false;
   g_origin_major = kTrainingMajor;
   g_restore_training = false;
-  host::log("native practice: online session over; into Training%s, then offer a %s search", picked ? "" : " (no character known)",
+  host::log("native practice: online session over; into Training%s (character %u from slot %d), then offer a %s search",
+            picked ? "" : " (no character known)", (unsigned)character, slot,
             g_offer_mode == MatchMode::None ? "no" : match_mode_name(g_offer_mode));
   run_decision(g_lifecycle.return_after_session());
 }
@@ -647,6 +655,7 @@ void submit_acknowledge_failure() {
 }
 
 void tick() {
+  if (yougame::console::console_active()) return;
   // This tick runs at retrace even while the scene is frozen. No game state is
   // accessed by the stdin reader; online sessions never touch these pause flags.
   if (yougame::stdio_bridge()) {
@@ -705,9 +714,8 @@ void tick() {
     else g_friend_menu_ticks = 0;
     const bool safe = yougame::friends::menu_safe(major, minor) &&
                       (major != 1 || g_friend_menu_ticks >= 120);
-    // A picker belongs to the main menu's Friends row or to an open, empty Direct code box (the CSS scene);
-    // anywhere else (a match, results, another menu) it is stopped.
-    const bool picker_scene = major == 1 || yougame::friends::events.code_screen();
+    // Only the Online Friends row owns the page picker.
+    const bool picker_scene = major == 1;
     if (g_friend_picker.valid() && (!picker_scene || !safe || !yougame::friends::events.picker_context())) {
       *g_friend_picker_stop = true;
       g_friend_picker = {};
@@ -715,9 +723,8 @@ void tick() {
     if (safe && yougame::identity().ok) {
       auto room = yougame::friends::events.take_join(true);
       const bool host_friend = yougame::friends::events.take_host();
-      // Keep code entry in place until the page has chosen a room. A picker error is
-      // shown there, with no matchmaking session or room to clean up.
-      if (picker_scene && host_friend && !g_friend_picker.valid() && room.empty()) {
+      // Keep Friends in place until the page has chosen a room.
+      if (picker_scene && host_friend && !g_friend_picker.valid() && room.empty() && !yougame::console::entry.active()) {
         host::log("friends: entry opened (%s)", yougame::friends::events.trigger().c_str());
         g_friend_picker_stop = std::make_shared<std::atomic<bool>>(false);
         std::packaged_task<std::string()> task([stop = g_friend_picker_stop] {
@@ -740,33 +747,38 @@ void tick() {
         slippi::online::native_cleanup_match();
         g_lifecycle = Lifecycle{};
         clear_search_metadata();
-        set_online_mode(2);
-        g_practice = {};
-        g_practice.valid = true;
-        g_practice.players[0].active = true;
-        g_practice.players[0].character = 0;
-        write_event_backup();
-        if (g_bridge) { int32_t a[1] = {yougame::friends::kFirstCssWinner}; g_bridge(OP_DIRECT_FIRST_MATCH, a, 1); }
-        else {
-          host::wr8(kDirectIsWinner, yougame::friends::kFirstCssWinner);
-          host::wr8(kDirectChoseStage, 0);
-          // Keep a menu's ordinary decide callback from replacing the accepted destination.
-          static bool hooks = false;
-          if (!hooks) {
-            hooks = true;
-            const auto redirect = [](ppc::Context& context) {
-              if (g_friend_handoff) context.r[3] = kOnlineMajor;
-            };
-            ppc::add_entry_hook(0x801A42E8u, redirect);
-            ppc::add_entry_hook(0x801A42F8u, redirect);
+        if (g_bridge) {
+          yougame::console::friends_entry(room);
+          room.clear();
+        } else {
+          set_online_mode(2);
+          g_practice = {};
+          g_practice.valid = true;
+          g_practice.players[0].active = true;
+          g_practice.players[0].character = 0;
+          write_event_backup();
+          if (g_bridge) { int32_t a[1] = {yougame::friends::kFirstCssWinner}; g_bridge(OP_DIRECT_FIRST_MATCH, a, 1); }
+          else {
+            host::wr8(kDirectIsWinner, yougame::friends::kFirstCssWinner);
+            host::wr8(kDirectChoseStage, 0);
+            // Keep a menu's ordinary decide callback from replacing the accepted destination.
+            static bool hooks = false;
+            if (!hooks) {
+              hooks = true;
+              const auto redirect = [](ppc::Context& context) {
+                if (g_friend_handoff) context.r[3] = kOnlineMajor;
+              };
+              ppc::add_entry_hook(0x801A42E8u, redirect);
+              ppc::add_entry_hook(0x801A42F8u, redirect);
+            }
           }
+          if (g_content_bridge) g_content_bridge(2, true);
+          std::string error;
+          const bool started = slippi::online::native_start_match(2, {}, 0, 0, &error, room);
+          g_friend_handoff = !g_bridge;
+          request_major(kOnlineMajor);  // the CSS also shows any policy/start error
+          if (!started) host::log("yougame: could not join friends: %s", error.c_str());
         }
-        if (g_content_bridge) g_content_bridge(2, true);
-        std::string error;
-        const bool started = slippi::online::native_start_match(2, {}, 0, 0, &error, room);
-        g_friend_handoff = !g_bridge;
-        request_major(kOnlineMajor);  // the CSS also shows any policy/start error
-        if (!started) host::log("yougame: could not join friends: %s", error.c_str());
       }
     }
   }
@@ -918,7 +930,7 @@ void tick() {
   {
     static const int test_at = [] { const char* v = host::test_env::getenv("MELEE_TEST_AFTER_SESSION"); return v ? std::atoi(v) : -1; }();
     static int ticks = 0;
-    if (test_at >= 0 && ++ticks == test_at && g_lifecycle.phase() == Phase::Idle) enter_training_after_session(MatchMode::Unranked, [] { const char* c = host::test_env::getenv("MELEE_TEST_P1_CHAR"); return c ? std::atoi(c) : 2; }());   // Fox, or MELEE_TEST_P1_CHAR
+    if (test_at >= 0 && ++ticks == test_at && g_lifecycle.phase() == Phase::Idle) enter_training_after_session(MatchMode::Unranked, -1, [] { const char* c = host::test_env::getenv("MELEE_TEST_P1_CHAR"); return c ? std::atoi(c) : 2; }());   // Fox, or MELEE_TEST_P1_CHAR
     // MELEE_TEST_TRAIN_AGAINST=<tick>,<character> (tests only): a ghost's character picked at that tick.
     static int against_at = -1, against = -1;
     static const bool parsed = [] { if (const char* v = host::test_env::getenv("MELEE_TEST_TRAIN_AGAINST")) std::sscanf(v, "%d,%d", &against_at, &against); return true; }();
@@ -953,19 +965,23 @@ void tick() {
   // the session is over, so nothing changes during a match or between a pair's games.
   {
     static bool session_seen = false, played = false;
-    static int session_mode_seen = -1;
+    static int session_mode_seen = -1, local_index_seen = -1;
     static std::string session_code;
     const bool session = slippi::online::session_mode() >= 0;
     if (session) {
       session_seen = true;
       session_mode_seen = slippi::online::session_mode();
-      if (slippi::online::is_online_match()) played = true;
+      if (slippi::online::is_online_match()) { played = true; local_index_seen = slippi::online::local_player_index(); }
     } else if (session_seen) {
       session_seen = false;
-      if (played && gx::RenderOptions::live_online_back_to_training() && g_lifecycle.phase() == Phase::Idle &&
+      // The guest mode also covers local Ranked practice, which has no real
+      // matchmaking session and must not inherit an earlier session's return.
+      const bool allow_training = yougame::unranked::allow_training_return(yougame::active(), session_mode_seen) &&
+                                  online_mode() != 0;
+      if (played && allow_training && gx::RenderOptions::live_online_back_to_training() && g_lifecycle.phase() == Phase::Idle &&
           is_online_scene() && !slippi::playback::enabled()) {
-        enter_training_after_session((MatchMode)session_mode_seen);
-      } else if (played && gx::RenderOptions::live_online_return_training() && g_lifecycle.phase() == Phase::Idle &&
+        enter_training_after_session((MatchMode)session_mode_seen, local_index_seen);
+      } else if (played && allow_training && gx::RenderOptions::live_online_return_training() && g_lifecycle.phase() == Phase::Idle &&
           is_online_scene()) {
         g_origin_major = kTrainingMajor;
         g_restore_training = false;

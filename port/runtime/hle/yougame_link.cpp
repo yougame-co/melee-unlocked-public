@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "test_env.h"
 #include "yougame_link.h"
+#include "yougame_udp.h"
 #include "yougame_embed_toplevel.h"
 #include "opponent_display.h"
 #include "yougame_parity.h"
+#include "yougame_shortcuts.h"
 #include "yougame_relay_pads.h"
 #include "yougame_relay_rumble.h"
 #include "yougame_agent_rumble.h"
@@ -15,6 +17,12 @@
 #include "yougame_exit_reason.h"
 #include "yougame_ranked.h"
 #include "yougame_room.h"
+#include "yougame_console_link.h"
+#include "yougame_console_entry.h"
+#include "yougame_update.h"
+#include "yougame_blend.h"
+#include "yougame_search.h"
+#include "gameplay_policy.h"
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include "yougame_agent_static.h"
 #endif
@@ -167,8 +175,16 @@ pad_mirror::Attachment g_pad_mirror_attachment;
 #endif
 transport::Events g_net_events;
 std::atomic<bool> g_broker{false}, g_direct{false};
+search_policy::Generation g_search_generation;
+thread_local std::function<bool()> g_search_stopped;
+thread_local search_policy::BusyRetry* g_ticket_retry = nullptr;
+update::Notice g_update_notice;
+bool search_stopped() { return g_search_stopped && g_search_stopped(); }
 std::mutex g_link_mutex;
 std::map<unsigned, int> g_link_events;
+std::map<unsigned, std::string> g_link_routes;
+std::map<unsigned, std::vector<uint64_t>> g_link_rtts;
+std::atomic<bool> g_relaunch{false};
 int direct_state(unsigned id) {
   const int state = yg_enet_link_state(id);
   if (state == 2 || state == 3) return state;
@@ -248,6 +264,7 @@ host::controller_relay::Snapshot relayed_controllers() {
 }
 
 void handle_app_line(const std::string& line) {
+  if (g_update_notice.command(line)) return;
   if (line.rfind("yg-pads ", 0) == 0) {
     // The provider goes in before the first line is accepted, so a reader that sees relay mode
     // already sees the families. A line that does not parse installs nothing: native pads stay.
@@ -261,6 +278,7 @@ void handle_app_line(const std::string& line) {
   if (line.rfind("yg ", 0) == 0) {
     json j = json::parse(line.substr(3), nullptr, false);
     if (j.is_discarded() || !j.is_object()) return;
+    if (j.count("caps")) g_relaunch = console::relaunch_cap(j);
     if (j.count("re") && j["re"].is_number_integer()) {
       // The id first: json's operator= takes its argument by value, so moving j into it would empty
       // j before an index read from j on the left is evaluated (C++17 sequences the right side first).
@@ -272,14 +290,21 @@ void handle_app_line(const std::string& line) {
     // Pushes from the app: the pad mirror's handle ({"push":{"type":"pads","handle":N}}).
     if (j.count("push") && j["push"].is_object()) {
       const json& push = j["push"];
+      if (console::launch_request(push)) parity::signals.console_boot_ready();
       if (g_stdio) ux::page_pause.push(push);
       if (friends::events.push(push, now_ms()) && friends::version_reason(push)) log_friend_version();
       if (push.value("type", "") == "net") g_net_events.push(push);
       if (push.value("type", "") == "direct") {
-        const unsigned link = push.value("link", 0u);
-        const auto event = ranked::str(push, "event");
+        const auto notice = console::direct_notice(push);
         std::lock_guard<std::mutex> lock(g_link_mutex);
-        if (link && link <= 65534) g_link_events[link] = event == "up" ? 2 : event == "close" ? 3 : 0;
+        if (notice.link) {
+          if (notice.state) g_link_events[notice.link] = notice.state;
+          if (!notice.path.empty()) g_link_routes[notice.link] = notice.path;
+          if (notice.rtt) {
+            auto& samples = g_link_rtts[notice.link];
+            if (samples.size() < 32) samples.push_back(*notice.rtt);
+          }
+        }
       }
       if (push.value("type", "") == "pads" && push.count("handle") && push["handle"].is_number_unsigned())
         g_pad_mirror = (uintptr_t)push["handle"].get<uint64_t>();
@@ -296,6 +321,7 @@ void handle_app_line(const std::string& line) {
     return;
   }
   if (line.rfind("embed ", 0) == 0) {
+    if (shortcuts::commands.dispatch(line.substr(6), [](const char* text) { host::log("%s", text); })) return;
 #ifdef MELEE_LINUX_X11_EMBED
     if (g_embedded) {
       // Keep command order, including during boot. Never run Xlib on this reader thread.
@@ -415,9 +441,45 @@ json bridge_stdio(const json& body, int timeout_ms, const std::function<bool()>&
   return answer;
 }
 
+// Native WinHTTP cancels synchronous requests by closing their handle. The POSIX shim polls its
+// callback from libcurl/upgrade waits instead (closing its raw request concurrently is unsafe).
+class PendingHttp {
+ public:
+  PendingHttp(HINTERNET request, const std::function<bool()>& cancelled) : request_(request) {
+#ifdef _WIN32
+    if (request && cancelled) watcher_ = std::thread([this, cancelled] {
+      std::unique_lock<std::mutex> lock(mutex_);
+      while (!done_) {
+        if (cancelled()) { close(); break; }
+        cv_.wait_for(lock, std::chrono::milliseconds(25), [&] { return done_; });
+      }
+    });
+#else
+    if (request) WinHttpSetCancelCallback(request, cancelled);
+#endif
+  }
+  ~PendingHttp() {
+#ifdef _WIN32
+    { std::lock_guard<std::mutex> lock(mutex_); done_ = true; }
+    cv_.notify_all();
+    if (watcher_.joinable()) watcher_.join();
+#endif
+    close();
+  }
+ private:
+  void close() { if (auto request = request_.exchange(nullptr)) WinHttpCloseHandle(request); }
+  std::atomic<HINTERNET> request_;
+#ifdef _WIN32
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool done_ = false;
+  std::thread watcher_;
+#endif
+};
+
 // POST <bridge>/sdk {type, ...} -> {ok, result | error}. Only the app's loopback address is
 // accepted: the token must never travel anywhere else.
-json bridge_http(const json& body, int timeout_ms) {
+json bridge_http(const json& body, int timeout_ms, const std::function<bool()>& cancelled = {}) {
   if (g_bridge_url.empty() || g_bridge_token.empty()) throw std::runtime_error("Start Melee from the YouGame app to play online");
   Url u;
   if (!parse_url(g_bridge_url + "/sdk", u) || u.secure || u.host != L"127.0.0.1") throw std::runtime_error("The YouGame app's address is invalid");
@@ -428,23 +490,26 @@ json bridge_http(const json& body, int timeout_ms) {
   HINTERNET req = WinHttpOpenRequest(conn, L"POST", u.path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
   std::string result;
   bool sent = false;
-  if (req) {
-    DWORD never = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-    WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &never, sizeof never);
-    WinHttpSetTimeouts(req, 5000, 5000, timeout_ms, timeout_ms);
-    std::wstring headers = wide("Authorization: Bearer " + g_bridge_token + "\r\nContent-Type: application/json\r\n");
-    std::string data = body.dump();
-    sent = WinHttpSendRequest(req, headers.c_str(), (DWORD)-1, data.data(), (DWORD)data.size(), (DWORD)data.size(), 0) &&
-           WinHttpReceiveResponse(req, nullptr);
-    char buf[4096];
-    DWORD got = 0;
-    while (sent && WinHttpReadData(req, buf, sizeof buf, &got) && got) {
-      result.append(buf, got);
-      if (result.size() > (1u << 20)) { sent = false; break; }
+  {
+    PendingHttp pending(req, cancelled);
+    if (req) {
+      DWORD never = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+      WinHttpSetOption(req, WINHTTP_OPTION_REDIRECT_POLICY, &never, sizeof never);
+      WinHttpSetTimeouts(req, 5000, 5000, timeout_ms, timeout_ms);
+      std::wstring headers = wide("Authorization: Bearer " + g_bridge_token + "\r\nContent-Type: application/json\r\n");
+      std::string data = body.dump();
+      sent = WinHttpSendRequest(req, headers.c_str(), (DWORD)-1, data.data(), (DWORD)data.size(), (DWORD)data.size(), 0) &&
+             WinHttpReceiveResponse(req, nullptr);
+      char buf[4096];
+      DWORD got = 0;
+      while (sent && WinHttpReadData(req, buf, sizeof buf, &got) && got) {
+        result.append(buf, got);
+        if (result.size() > (1u << 20)) { sent = false; break; }
+      }
     }
-    WinHttpCloseHandle(req);
   }
   WinHttpCloseHandle(conn);
+  if (!sent && cancelled && cancelled()) throw std::runtime_error("Cancelled");
   if (!sent) throw std::runtime_error("The YouGame app is not answering");
   json j = json::parse(result, nullptr, false);
   if (j.is_discarded() || !j.is_object()) throw std::runtime_error("The YouGame app sent an invalid answer");
@@ -452,7 +517,33 @@ json bridge_http(const json& body, int timeout_ms) {
 }
 
 json bridge(const json& body, int timeout_ms = 15000, const std::function<bool()>& cancelled = {}) {
-  json j = g_stdio ? bridge_stdio(body, timeout_ms, cancelled) : bridge_http(body, timeout_ms);
+  search_policy::BusyRetry local_retry;
+  auto& retry = g_ticket_retry ? *g_ticket_retry : local_retry;
+  json j;
+  for (;;) {
+    if (cancelled && cancelled()) throw std::runtime_error("Cancelled");
+    j = g_stdio ? bridge_stdio(body, timeout_ms, cancelled) : bridge_http(body, timeout_ms, cancelled);
+    // The app forwards the site's code, including HTTP 409. Text/status alone never gates a build.
+    const auto& refused = update::refusal(j);
+    if (update::required(refused)) {
+      if ((cancelled && cancelled()) || search_stopped()) throw std::runtime_error("Cancelled");
+      if (!search_stopped()) {
+        g_update_notice.refuse();
+        host::log("yougame: update required (current %s)", update::current(refused).c_str());
+      }
+      throw update::Required();
+    }
+    // Inspect busy metadata before bridge converts a failure into display text.
+    const int delay = body.value("type", "") == "mpTicket" ? retry.delay(j) : 0;
+    if (!delay) break;
+    host::log("yougame: site busy, retrying the ticket in %d s (try %d/3)", delay, retry.tries());
+    if (!search_policy::wait(uint64_t(delay) * 1000, now_ms, [](int ms) { Sleep(ms); },
+        [&] { return cancelled && cancelled(); })) throw std::runtime_error("Cancelled");
+  }
+  // A delivered assignment still needs its scoped join/leave cleanup if cancel won the race.
+  const bool assigned = body.value("type", "") == "mpTicket" && j.value("ok", false) &&
+      j.count("result") && j["result"].is_object() && !ranked::str(j["result"], "room").empty();
+  if (cancelled && cancelled() && !assigned) throw std::runtime_error("Cancelled");
   if (!j.value("ok", false)) {
     std::string error = j.count("error") && j["error"].is_string() ? j["error"].get<std::string>() : "YouGame request failed";
     throw std::runtime_error(friends::version_request(body) && friends::version_reason(j) ? friends::kVersion :
@@ -467,14 +558,25 @@ json bridge(const json& body, int timeout_ms = 15000, const std::function<bool()
 class Socket {
  public:
   ~Socket() { close(); }
-  bool open_session(const std::string& url, const std::string& ticket, const std::string& room, std::string* error, int timeout = 10000) {
-    if (!g_broker) return open(url + (room.empty() ? "/match" : "/room/" + url_encode(room)) + "?ticket=" + url_encode(ticket), error);
-    if (!broker_) broker_ = std::make_unique<transport::Stream>(g_net_events, [](const json& q, int ms) { return bridge(q, ms); });
+  bool open_session(const std::string& url, const std::string& ticket, const std::string& room, std::string* error, int timeout = 10000, const std::function<bool()>& cancelled = {}, const std::string& session = {}) {
+    if (cancelled && cancelled()) return false;
+    cancel_open_ = cancelled;
+    if (!g_broker) return open(url + (room.empty() ? "/match" : "/room/" + url_encode(room)) + "?ticket=" + url_encode(ticket), error, timeout, cancelled);
+    if (!broker_) broker_ = std::make_unique<transport::Stream>(g_net_events, [this](const json& q, int ms) { return bridge(q, ms, cancel_open_); });
     try {
-      if (broker_->open(ticket, room, timeout)) return true;
-    } catch (...) {}
+      const bool opened = cancelled ? broker_->open(ticket, room, timeout, session, cancelled)
+                                    : broker_->open(ticket, room, timeout, session);
+      cancel_open_ = {};
+      if (opened) return true;
+    } catch (const update::Required&) { cancel_open_ = {}; throw; }
+    catch (...) {}
+    cancel_open_ = {};
     *error = "Lost the connection to YouGame";
     return false;
+  }
+  bool open_session(const std::string& url, const std::string& ticket, const std::string& room,
+                    std::string* error, int timeout, const std::string& session) {
+    return open_session(url, ticket, room, error, timeout, {}, session);
   }
   int connection() const { return broker_ ? broker_->conn() : 0; }
   bool recoverable() const { return broker_ && broker_->close_code() == 1006; }
@@ -483,7 +585,7 @@ class Socket {
   uint64_t agent_test_first_open_at() const { return broker_ ? broker_->agent_test_first_open_at() : 0; }
   void agent_test_drop_room() { if (broker_) broker_->agent_test_drop_room(); }
 #endif
-  bool open(const std::string& address, std::string* error) {
+  bool open(const std::string& address, std::string* error, int timeout, const std::function<bool()>& cancelled) {
     Url u;
     if (!parse_url(address, u) || (!u.secure && u.host != L"127.0.0.1" && u.host != L"localhost")) {
       *error = "Invalid YouGame rooms address";
@@ -494,19 +596,20 @@ class Socket {
     HINTERNET req = WinHttpOpenRequest(conn, L"GET", u.path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                                        u.secure ? WINHTTP_FLAG_SECURE : 0);
     DWORD status = 0, size = sizeof status;
-    // A room can be quiet for minutes (a friend who has not joined yet, a long game): the socket
-    // must not time out on receive; it is kept alive by pings instead.
     DWORD forever = 0;
-    if (req) WinHttpSetOption(req, WINHTTP_OPTION_RECEIVE_TIMEOUT, &forever, sizeof forever);
-    bool ok = req && WinHttpSetOption(req, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0) &&
-              WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0) && WinHttpReceiveResponse(req, nullptr) &&
-              WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
-                                  WINHTTP_NO_HEADER_INDEX) &&
-              status == 101;
-    if (ok) ws_ = WinHttpWebSocketCompleteUpgrade(req, 0);
-    if (ws_) WinHttpSetOption(ws_, WINHTTP_OPTION_RECEIVE_TIMEOUT, &forever, sizeof forever);
-    if (req) WinHttpCloseHandle(req);
+    {
+      PendingHttp pending(req, cancelled);
+      if (req) WinHttpSetTimeouts(req, timeout, timeout, timeout, timeout);
+      bool ok = req && WinHttpSetOption(req, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0) &&
+                WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0) && WinHttpReceiveResponse(req, nullptr) &&
+                WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
+                                    WINHTTP_NO_HEADER_INDEX) &&
+                status == 101;
+      if (ok) ws_ = WinHttpWebSocketCompleteUpgrade(req, 0);
+      if (ws_) WinHttpSetOption(ws_, WINHTTP_OPTION_RECEIVE_TIMEOUT, &forever, sizeof forever);
+    }
     WinHttpCloseHandle(conn);
+    if (cancelled && cancelled()) { if (ws_) { WinHttpCloseHandle(ws_); ws_ = nullptr; } return false; }
     if (!ws_) {
       *error = status == 403 ? "YouGame refused the ticket" : status ? "YouGame refused the connection (HTTP " + std::to_string(status) + ")"
                                                                   : "Could not connect to YouGame";
@@ -533,8 +636,8 @@ class Socket {
     return true;
   }
   bool closed() const { return broker_ ? broker_->closed() : closed_.load(); }
-  void close() {
-    if (broker_) { broker_->close(1000, 4000); return; }
+  void close(int code = 4000) {
+    if (broker_) { broker_->close(1000, code); return; }
     HINTERNET ws = nullptr;
     {
       std::lock_guard<std::mutex> lock(send_mutex_);
@@ -551,6 +654,7 @@ class Socket {
   }
 
  private:
+  std::function<bool()> cancel_open_;
   void read_loop() {
     std::string data;
     std::vector<char> buf(16384);
@@ -597,9 +701,9 @@ bool parse_addr(const std::string& s, sockaddr_in& out) {
   if (colon == std::string::npos) return false;
   std::memset(&out, 0, sizeof out);
   out.sin_family = AF_INET;
-  int port = std::atoi(s.c_str() + colon + 1);
-  if (port <= 0 || port > 65535 || inet_pton(AF_INET, s.substr(0, colon).c_str(), &out.sin_addr) != 1) return false;
-  out.sin_port = htons((u_short)port);
+  const auto port = udp::port(s.c_str() + colon + 1);
+  if (!port.valid || inet_pton(AF_INET, s.substr(0, colon).c_str(), &out.sin_addr) != 1) return false;
+  out.sin_port = htons(port.value);
   return true;
 }
 bool same_addr(const sockaddr_in& a, const sockaddr_in& b) { return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port; }
@@ -639,6 +743,7 @@ bool wait_readable(SOCKET s, int timeout_ms) {
 // The external address of `s` as a STUN server sees it (RFC 5389 binding request,
 // XOR-MAPPED-ADDRESS). This is the address the opponent's packets must be sent to.
 bool stun(SOCKET s, std::string& out, const std::function<bool()>& cancelled) {
+  udp::StunIngress ingress(&udp::own_udp_drops);
   static const char* servers[][2] = {{"stun.cloudflare.com", "3478"}, {"stun.l.google.com", "19302"}};
   for (auto& server : servers) {
     if (cancelled()) return false;
@@ -653,33 +758,21 @@ bool stun(SOCKET s, std::string& out, const std::function<bool()>& cancelled) {
     std::memcpy(req + 8, &t1, 8);
     std::memcpy(req + 16, &t2, 4);
     for (int attempt = 0; attempt < 3; ++attempt) {
-      sendto(s, (const char*)req, sizeof req, 0, (sockaddr*)&to, sizeof to);
+      if (sendto(s, (const char*)req, sizeof req, 0, (sockaddr*)&to, sizeof to) != sizeof req) continue;
       uint64_t until = now_ms() + 500;
+      ingress.open({to.sin_addr.s_addr, ntohs(to.sin_port)}, req, until);
       while (now_ms() < until) {
         if (!wait_readable(s, (int)(until - now_ms()))) break;
         uint8_t buf[512];
         sockaddr_in from{};
         SocketLength fl = sizeof from;
         int n = recvfrom(s, (char*)buf, sizeof buf, 0, (sockaddr*)&from, &fl);
-        if (n < 20 || buf[0] != 0x01 || buf[1] != 0x01 || std::memcmp(buf + 4, req + 4, 16) != 0) continue;
-        for (int pos = 20; pos + 4 <= n;) {
-          int type = (buf[pos] << 8) | buf[pos + 1], len = (buf[pos + 2] << 8) | buf[pos + 3];
-          const uint8_t* v = buf + pos + 4;
-          if (pos + 4 + len > n) break;
-          if ((type == 0x0020 || type == 0x0001) && len >= 8 && v[1] == 0x01) {
-            uint16_t port = (uint16_t)((v[2] << 8) | v[3]);
-            uint8_t ip[4] = {v[4], v[5], v[6], v[7]};
-            if (type == 0x0020) {
-              port ^= 0x2112;
-              for (int i = 0; i < 4; ++i) ip[i] ^= req[4 + i];
-            }
-            out = std::to_string(ip[0]) + "." + std::to_string(ip[1]) + "." + std::to_string(ip[2]) + "." + std::to_string(ip[3]) + ":" +
-                  std::to_string(port);
-            return true;
-          }
-          pos += 4 + ((len + 3) & ~3);
-        }
+        if (n < 0) continue;
+        if (!ingress.accept({from.sin_addr.s_addr, ntohs(from.sin_port)}, buf, size_t(n), now_ms(),
+            [](const char* message) { host::log("%s", message); })) continue;
+        if (udp::stun_reply(buf, size_t(n), req, out)) { ingress.close(); return true; }
       }
+      ingress.close();
     }
   }
   return false;
@@ -716,8 +809,11 @@ const char* answered_via(const PunchPeer& p, const sockaddr_in& from) {
     if (same_addr(p.candidates[i], from)) return p.kinds[i];
   return "other";
 }
-bool punch(SOCKET s, int my_port, std::vector<PunchPeer>& peers, const std::function<bool()>& cancelled) {
+bool punch(SOCKET s, int my_port, std::vector<PunchPeer>& peers, udp::Ingress& ingress, const std::function<bool()>& cancelled) {
   const uint64_t start = now_ms(), deadline = start + 8000;
+  ingress.clear(); // STUN's solicited endpoint is never a gameplay/punch peer.
+  for (const auto& peer : peers) for (const auto& a : peer.candidates)
+    ingress.allow({a.sin_addr.s_addr, ntohs(a.sin_port)});
   uint64_t next_send = 0, done_at = 0;
   for (;;) {
     const uint64_t now = now_ms();
@@ -750,17 +846,21 @@ bool punch(SOCKET s, int my_port, std::vector<PunchPeer>& peers, const std::func
     sockaddr_in from{};
     SocketLength fl = sizeof from;
     int n = recvfrom(s, (char*)buf, sizeof buf, 0, (sockaddr*)&from, &fl);
-    if (n != 14 || std::memcmp(buf, "YGP2", 4) != 0) continue;
-    uint64_t token;
-    std::memcpy(&token, buf + 5, 8);
+    if (n < 0) continue;
+    // SECURITY: source allowlist precedes every read of the datagram payload.
+    if (!ingress.accept({from.sin_addr.s_addr, ntohs(from.sin_port)}, now,
+        [](const char* message) { host::log("%s", message); })) continue;
+    udp::Probe probe;
+    if (!udp::probe(buf, size_t(n), probe)) continue;
     for (auto& p : peers) {
-      if (p.port != buf[13] || token != p.theirs) continue;
+      if (p.port != probe.player || probe.token != p.theirs ||
+          std::none_of(p.candidates.begin(), p.candidates.end(), [&](const auto& a) { return same_addr(a, from); })) continue;
       if (!p.found) {
         p.found = true;
         p.chosen = from;
         host::log("yougame: player %d answered after %llu ms via %s", p.port, (unsigned long long)(now - start), answered_via(p, from));
       }
-      if (buf[4] == kProbe) send_probe(s, from, kAck, p.mine, my_port);
+      if (probe.type == kProbe) send_probe(s, from, kAck, p.mine, my_port);
       else p.acked = true;
     }
   }
@@ -773,13 +873,13 @@ bool g_identity_asked = false;
 uint64_t g_identity_at = 0;   // GetTickCount64 of the last answer
 std::string g_status = "offline";
 uint64_t g_status_since = 0;
+search_policy::LinkFailures g_direct_link_failures; // g_mutex; survives replacement searches
 
 // The room of the current online session. Stays open through the match for results.
 struct Room : transport::RoomState<Socket> {
   bool friends = false;
   ~Room() {
     // Also runs on cancelled/failed setup: no abandoned links occupy the three slots.
-    if (!links.ids.empty()) yg_enet_enable(0);
     transport::close_links(links, [](const json& q, int ms) { return bridge(q, ms); });
   }
 };
@@ -794,7 +894,6 @@ void select_match_transport(bool slippi) {
   yg_enet_select(!slippi && g_broker);
 #endif
 }
-uint64_t g_search_epoch = 0;
 #ifdef YOUGAME_AGENT_TEST_HOOK
 bool g_pending_input = false;
 struct PendingInputRoster {
@@ -807,18 +906,16 @@ struct PendingInputRoster {
 std::shared_future<void> g_retired; // a new search waits until the previous room has left
 int g_ranked_rooms = 0;             // ranked rooms this process has played in
 ranked::RankCache g_rank; // the newest ranked standing (ticket, mpRank or a set's result) for this process
-// The bridge's mpRank read (docs/MELEE_UNLOCKED.md): asked when the Ranked header has no rank yet,
-// and again a while after a ranked room closed without its result reaching this game.
-struct RankRead {
-  bool unsupported = false, in_flight = false;
-  uint64_t next_at = 0;    // no ask before this (a failure or an empty answer waits)
-  uint64_t stale_at = 0;   // ask again at this time (0: not stale)
-};
-RankRead g_rank_read;
+ranked::RankRead g_rank_read;
+ranked::ResultsPanel g_rank_results;
+bool g_rank_result_visible = false;
+std::string g_rank_opponent, g_rank_score;
+int g_rank_local = 0;
 constexpr uint64_t kDrainMs = 30000;   // a ranked room stays open this long at most for its result
 
 void set_status(const std::string& s) {
   std::lock_guard<std::mutex> lock(g_mutex);
+  if (search_stopped()) return;
   if (g_status != s) host::log("yougame: %s", s.c_str());
   g_status = s;
   g_status_since = now_ms();
@@ -828,11 +925,17 @@ using transport::read_roster;
 
 transport::RoomIO room_io(Room& r) {
   transport::RoomIO io;
-  io.request = [](const json& q, int ms) { return bridge(q, ms); };
+  io.request = [&r](const json& q, int ms) {
+    return bridge(q, ms, [&] { return q.value("type", "") == "mpTicket" && r.stop; });
+  };
   io.link_state = direct_state;
   io.disable_links = [] { yg_enet_enable(0); };
   io.log = [](const char* message) { host::log("%s", message); };
+  io.started = [](const std::string& id) { g_rank_results.pending(id); };
   io.result = [&r](const json& m) {
+    if (!g_rank_results.receive(m, r.set.local_participant())) g_rank_results.result_error();
+    g_rank_result_visible = true;
+    g_rank_read.recovery_at = 0;
     const bool won = m.count("ranking") && m["ranking"].is_array() && !m["ranking"].empty() &&
                      m["ranking"][0] == r.set.local_participant();
     const bool none = m.count("void") && m["void"].is_boolean() && m["void"].get<bool>();
@@ -865,7 +968,7 @@ uint64_t close_room(Leave why) {
   std::unique_ptr<Room> r;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
-    ++g_search_epoch;
+    g_search_generation.begin();
 #ifdef YOUGAME_AGENT_TEST_HOOK
     g_pending_input = false;
     g_pending_input_roster = {};
@@ -876,7 +979,7 @@ uint64_t close_room(Leave why) {
 #ifdef YOUGAME_AGENT_TEST_HOOK
       if (agent_test::static_quit_requested.load()) host::request_exit(0);
 #endif
-      return g_search_epoch;
+      return g_search_generation.value();
     }
 #ifdef YOUGAME_AGENT_TEST_HOOK
     const bool agent_test_quit = !r->ranked && agent_test::static_quit_requested.load();
@@ -890,13 +993,14 @@ uint64_t close_room(Leave why) {
       if (r->set.leaves_at_once()) host::log("yougame: ranked set concession: the opponent won");
       host::log("yougame: leaving the ranked room (%s)%s", why == Leave::Quit ? "quit" : why == Leave::Lost ? "connection lost" : "set over",
                 at_once ? "" : "; staying for its result");
-      // Its result may not reach this game (left at once, or the room went first): read the
-      // standing from the app again once the room has had time to record it.
-      if (!r->set.settled()) g_rank_read.stale_at = now_ms() + 20000;
+      // Keep the last set visible while its exact room drains its authoritative result.
+      g_rank_result_visible = r->set.started();
+      g_rank_score = r->set.score_text();
     }
     auto done = std::make_shared<std::promise<void>>();
     g_retired = done->get_future().share();
-    std::thread([r = std::move(r), done, at_once
+    const auto result_match = g_rank_results.match();
+    std::thread([r = std::move(r), done, at_once, result_match
 #ifdef YOUGAME_AGENT_TEST_HOOK
                  , agent_test_quit
 #endif
@@ -906,15 +1010,8 @@ uint64_t close_room(Leave why) {
       if (r->ranked && at_once) {
         transport::stop_and_flush(*r, g_mutex);
       } else if (r->ranked) {
-        const uint64_t until = now_ms() + kDrainMs;
-        for (;;) {
-          bool pending;
-          { std::lock_guard<std::mutex> lock(g_mutex); pending = r->set.needs_drain(); }
-          if (!pending || now_ms() >= until) break;
-          Sleep(50);
-        }
-        std::lock_guard<std::mutex> lock(g_mutex);
-        if (r->set.needs_drain()) host::log("yougame: ranked room left before its result");
+        if (!transport::drain_ranked_room(*r, g_mutex, room_io(*r), kDrainMs))
+          host::log("yougame: ranked room left before its result");
       }
 #ifdef YOUGAME_AGENT_TEST_HOOK
       if (agent_test_quit) {
@@ -926,13 +1023,21 @@ uint64_t close_room(Leave why) {
         if (!settled) host::log("agent test: quitAfter room left before its result");
       }
 #endif
+      const bool ranked_room = r->ranked;
       shutdown_room(std::move(r));
+      if (ranked_room) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (g_rank_results.match() == result_match && g_rank_results.state() == ranked::ResultsPanel::State::Pending) {
+          if (g_rank_read.unsupported) g_rank_results.recovered_standing(result_match, ranked::RankCache(), true);
+          else g_rank_read.recover(now_ms());
+        }
+      }
       done->set_value();
 #ifdef YOUGAME_AGENT_TEST_HOOK
       if (agent_test_quit) host::request_exit(0);
 #endif
     }).detach();
-    return g_search_epoch;
+    return g_search_generation.value();
   }
 }
 
@@ -951,10 +1056,20 @@ std::string compatibility(int mode) {
 
 thread_local bool g_friend_search = false;
 thread_local bool g_friend_failed = false;
-Match fail(const std::string& why, bool retry = false) {
+// Blended Unranked's YouGame side (yougame_blend.h): cancelled because Slippi's side was first, it
+// goes quiet ("offline"), not "error: Cancelled" under a Slippi match.
+thread_local bool g_blend_search = false;
+Match fail(const std::string& why, bool retry = false, bool update_required = false) {
   Match m;
   m.error = why;
-  m.retry = retry;
+  m.retry = retry && !update_required;
+  m.update_required = update_required;
+  if (search_stopped()) return m;
+  if (update_required) {
+    m.retry = false;
+    set_status(update::kMessage);
+    return m;
+  }
   if (g_friend_search) {
     if (!g_friend_failed) {
       if (why == friends::kVersion) log_friend_version();
@@ -962,23 +1077,32 @@ Match fail(const std::string& why, bool retry = false) {
       g_friend_failed = true;
     }
     set_status(why == friends::kVersion ? friends::kVersion : why == "Cancelled" ? "offline" : friends::kFailed);
-  } else set_status("error: " + why);
+  } else set_status(why == search_policy::kLinkRetry ? why :
+                    g_blend_search && why == "Cancelled" ? "offline" : "error: " + why);
   return m;
 }
 
 std::atomic<bool> g_identity_fetching{false};
 
-Identity fetch_identity() {
+Identity fetch_identity(const std::function<bool()>& cancelled = nullptr) {
   static std::once_flag said;
   std::call_once(said, [] { host::log("yougame: YouGame mode (%s%s)", g_stdio ? "stdio bridge" : "loopback bridge", g_embedded ? ", in the player box" : ""); });
   Identity id;
   try {
-    json hello = bridge({{"type", "hello"}});
-    friends::events.hello(hello);
+    json hello = bridge({{"type", "hello"}}, 15000, cancelled);
+    if ((cancelled && cancelled()) || search_stopped()) return id;
+    { std::lock_guard<std::mutex> lock(g_mutex);
+      if (search_stopped()) return id;
+      friends::events.hello(hello);
+      console::launch_hello(hello);
+      if (console::requests.pending()) parity::signals.console_boot_ready();
+      if (hello.count("caps")) g_relaunch = console::relaunch_cap(hello);
+    }
 #ifdef _WIN32
     const auto mode = transport::Mode::hello(hello);
     {
       std::lock_guard<std::mutex> lock(g_mutex);
+      if (search_stopped()) return id;
       g_broker = g_stdio && mode.broker;
       g_direct = g_stdio && mode.direct;
       select_match_transport(g_slippi_match);
@@ -988,6 +1112,7 @@ Identity fetch_identity() {
     const auto route = transport::posix_datagram_route(hello);
     {
       std::lock_guard<std::mutex> lock(g_mutex);
+      if (search_stopped()) return id;
       if (route != transport::DatagramRoute::Standalone) g_broker = true;
       g_direct = g_stdio && route == transport::DatagramRoute::Ring;
       select_match_transport(g_slippi_match); // refuse mode also prevents native sockets
@@ -998,7 +1123,8 @@ Identity fetch_identity() {
     id.player_id = p.value("id", "");
     id.name = p.value("name", "");
     try {
-      json code = bridge({{"type", "mpCode"}});
+      json code = bridge({{"type", "mpCode"}}, 15000, cancelled);
+      if ((cancelled && cancelled()) || search_stopped()) return id;
       id.code = code.value("code", "");
     } catch (const std::exception& e) {
       host::log("yougame: no connect code: %s", e.what());
@@ -1011,9 +1137,11 @@ Identity fetch_identity() {
   } catch (const std::exception& e) {
     id.error = e.what();
   }
+  if ((cancelled && cancelled()) || search_stopped()) return id;
   if (id.ok) host::log("yougame: signed in as %s (%s)", id.name.c_str(), id.code.empty() ? "no code" : id.code.c_str());
   else host::log("yougame: not signed in: %s", id.error.c_str());
   std::lock_guard<std::mutex> lock(g_mutex);
+  if (search_stopped()) return id;
   g_identity = id;
   g_identity_asked = true;
   g_identity_at = GetTickCount64();
@@ -1022,11 +1150,235 @@ Identity fetch_identity() {
 
 }  // namespace
 
+// The room worker owns Socket after open. SessionLink only queues sends and polls messages;
+// it never waits for a bridge answer from pump(wait_ms).
+namespace {
+struct ConsoleBackend {
+  std::unique_ptr<Socket> room;
+  std::thread worker;
+  std::atomic<bool> stop{false}, closed{false};
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<json> incoming, outgoing;
+  ENetSocket datagrams = ENET_SOCKET_NULL;
+  int conn = 0;
+  std::string session;
+  ~ConsoleBackend() { close(); }
+  bool open(const std::string& ticket, const std::string& code, int ms) {
+    room = std::make_unique<Socket>(); std::string error;
+    if (!room->open_session("",ticket,code,&error,ms,session)) return false;
+    conn = room->connection();
+    worker = std::thread([this] {
+      uint64_t ping = now_ms();
+      for (;;) {
+        json m;
+        if (!stop && room->next(m,10)) {
+          std::lock_guard<std::mutex> lock(mutex);
+          if (incoming.size() >= 1024) { closed = true; break; }
+          incoming.push_back(std::move(m)); cv.notify_all();
+        }
+        if (room->closed()) { closed = true; cv.notify_all(); break; }
+        std::deque<json> send;
+        { std::lock_guard<std::mutex> lock(mutex); send.swap(outgoing); }
+        if (now_ms()-ping >= 5000) { send.push_back({{"t","ping"},{"at",now_ms()}}); ping = now_ms(); }
+        for (const auto& value : send) if (!room->send(value)) { closed = true; cv.notify_all(); break; }
+        if (closed || stop) break; // flush queued session-end notices before closing the stream
+      }
+    });
+    return true;
+  }
+  bool next(json& m, int ms) {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (ms > 0) cv.wait_for(lock,std::chrono::milliseconds(ms),[&] { return !incoming.empty() || closed; });
+    if (incoming.empty()) return false;
+    m = std::move(incoming.front()); incoming.pop_front(); return true;
+  }
+  bool send(const json& m) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (closed || outgoing.size() >= 256) return false;
+    outgoing.push_back(m); return true;
+  }
+  bool attach(int ms) {
+    if (ms <= 0) return false;
+    if (!yg_enet_channel_ready()) {
+      // Like directOpen: a refused attach answers {ok:false, code} (no_direct when the links helper is
+      // missing or won't start). Log the code (letters and _ only) instead of throwing it away.
+      json raw = g_stdio ? bridge_stdio({{"type","directAttach"}},ms) : bridge_http({{"type","directAttach"}},ms);
+      if (!raw.value("ok",false)) {
+        std::string code = ranked::str(raw,"code");
+        if (code.empty() || code.size() > 24 || code.find_first_not_of("abcdefghijklmnopqrstuvwxyz_") != std::string::npos) code = "unknown";
+        host::log("console: link helper attach refused (%s)", code.c_str());
+        return false;
+      }
+      const auto h = raw.count("result") ? raw["result"] : json::object();
+#ifdef _WIN32
+      if (h.value("version",0) != 1 || yg_enet_attach_handles(h.value("section",uintptr_t(0)),
+          h.value("toApp",uintptr_t(0)),h.value("toGame",uintptr_t(0)))) return false;
+#else
+      transport::PosixAttachment p;
+      if (!transport::posix_attachment(h,p) || yg_enet_attach_posix(p.section,p.wake,p.wait,p.size)) return false;
+#endif
+    }
+    yg_enet_select(1); yg_enet_enable(1);
+    datagrams = yg_enet_create(); // explicitly virtual: never falls back to an OS UDP socket
+    return datagrams != ENET_SOCKET_NULL;
+  }
+  void close() {
+    stop = true;
+    if (worker.joinable()) worker.join();
+    // A clean close preserves Rooms' relaunch hold. Never send an explicit leave.
+    if (room) { room->close(1000); room.reset(); }
+    if (datagrams != ENET_SOCKET_NULL) { yg_enet_destroy(datagrams); datagrams = ENET_SOCKET_NULL; yg_enet_enable(0); }
+  }
+};
+}
+
+namespace console {
+namespace {
+std::string current_build() {
+  static const auto build = [] {
+    wchar_t exe[32768]{};
+    if (!GetModuleFileNameW(nullptr,exe,32768)) return std::string();
+    return build_fingerprint(std::filesystem::path(exe));
+  }();
+  return build;
+}
+int64_t epoch_now() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+SessionIO console_io(const std::shared_ptr<ConsoleBackend>& b) {
+  SessionIO io;
+  // Console boots before the ordinary mod/card scan. Use native Direct's canonical
+  // content key in both the waiting game and the fresh boot (no ranked rules).
+#ifdef MELEE_PORT_VERSION
+  io.compatibility = compatibility_key(MELEE_PORT_VERSION,false,"",false) + "-console1";
+#else
+  io.compatibility = compatibility_key("dev",false,"",false) + "-console1";
+#endif
+  io.exclusive = true;
+  io.background_service = true;
+  io.random = random64;
+  io.request = [](const json& q,int ms) {
+    // A refused directOpen answers {ok:false, code} (no_direct, not_room, not_peer, exists, rate_links, ended).
+    // bridge() would throw that away; hand the code (letters and _ only) to the link log instead.
+    if (ranked::str(q,"type") == "directOpen") {
+      json j = g_stdio ? bridge_stdio(q,ms) : bridge_http(q,ms);
+      if (j.value("ok",false)) return j.count("result") ? j["result"] : json::object();
+      std::string code = ranked::str(j,"code");
+      if (code.empty() || code.size() > 24 || code.find_first_not_of("abcdefghijklmnopqrstuvwxyz_") != std::string::npos) code = "unknown";
+      return json{{"link",0},{"refused",code}};
+    }
+    return bridge(q,ms);
+  };
+  io.open_room = [b](const std::string& ticket,const std::string& room,int ms) { return b->open(ticket,room,ms); };
+  io.next_room = [b](json& m,int ms) { return b->next(m,ms); };
+  io.send_room = [b](const json& m) { return b->send(m); };
+  io.room_closed = [b] { return b->closed.load(); };
+  io.connection = [b] { return b->conn; };
+  io.attach = [b](int ms) { return b->attach(ms); };
+  io.state = direct_state;
+  io.route = [](unsigned id) { std::lock_guard<std::mutex> lock(g_link_mutex); return g_link_routes[id]; };
+  io.rtt = [](unsigned id) {
+    std::lock_guard<std::mutex> lock(g_link_mutex);
+    return std::exchange(g_link_rtts[id],{});
+  };
+  io.send = [b](unsigned id,const Bytes& bytes) {
+    ENetAddress address; if (yg_enet_link_address(id,&address)) return;
+    ENetBuffer buffer; buffer.data = const_cast<uint8_t*>(bytes.data()); buffer.dataLength = bytes.size();
+    yg_enet_send(b->datagrams,&address,&buffer,1);
+  };
+  io.receive = [b](unsigned& id,Bytes& bytes) {
+    bytes.resize(1200); ENetAddress address{}; ENetBuffer buffer;
+    buffer.data = bytes.data(); buffer.dataLength = bytes.size();
+    const int n = yg_enet_receive(b->datagrams,&address,&buffer,1);
+    if (n <= 0) { if (n < 0) b->closed = true; return false; }
+    id = ENET_NET_TO_HOST_32(address.host) & 65535; bytes.resize(size_t(n)); return true;
+  };
+  io.wait = [b](int ms) { enet_uint32 condition = ENET_SOCKET_WAIT_RECEIVE; if (yg_enet_wait(b->datagrams,&condition,ms) < 0) b->closed = true; };
+  io.close = [b] { b->close(); };
+  io.log = [](const std::string& line) { host::log("%s",line.c_str()); };
+  return io;
+}
+} // namespace
+std::unique_ptr<SessionLink> start_session(const json& request, SessionConfig& config, std::string& error) {
+  bool busy;
+  { std::lock_guard<std::mutex> lock(g_mutex); busy = bool(g_room) || g_slippi_match; }
+  if (!active() || !wait_identity(10000).ok || !g_broker || !g_direct || busy) {
+    error = "console sessions need the YouGame link helper";
+    host::log("console: start failed: %s",error.c_str()); return nullptr;
+  }
+  auto b = std::make_shared<ConsoleBackend>();
+  b->session = friends::text(request,"sessionId",64);
+  auto io = console_io(b);
+  io.cancelled = [] { return host::exit_requested(); };
+  return start_session(request,config,error,std::move(io));
+}
+void take_pending_launch() {
+  const char* data = std::getenv("YOUGAME_DATA");
+  if (!data || !active()) return;
+  pending_take(std::filesystem::u8path(data),epoch_now(),current_build(),
+      [](const json& q,const auto& consume) { return requests.push(q,true,consume); },
+      [](const char* text) { host::log("%s",text); });
+}
+void friends_entry(const std::string& room) {
+  if (!entry.begin()) return;
+  friends::events.current_room(room);
+  host::log("console: Friends waiting in room %s",room.c_str());
+  std::thread([room] {
+    auto b = std::make_shared<ConsoleBackend>();
+    auto io = console_io(b);
+    io.cancelled = [] { return entry.cancelled() || host::exit_requested(); };
+    io.confirm_start = [] { return entry.start(); };
+    std::string last;
+    io.waiting = [&last](const std::string& text,bool ready) {
+      entry.status(text,ready);
+      if (last != text) { host::log("console: %s",text.c_str()); last = text; }
+    };
+    bool prepared = false; std::string prepared_session;
+    io.prepared = [&](const SessionConfig& c) {
+      prepared_session = c.session_id;
+      const char* data = std::getenv("YOUGAME_DATA");
+      prepared = handoff(c,g_stdio && g_relaunch,data ? std::filesystem::u8path(data) : std::filesystem::path(),
+          epoch_now(),current_build(), [](const json& q) { write_line("yg " + q.dump()); },
+          [](const std::string& line) { host::log("%s",line.c_str()); },
+          [](const char* text) { entry.status(text); });
+    };
+    // Keep the frozen room alive while the user closes/relaunches the game. Rooms owns the gap.
+    io.close = [] {};
+    SessionConfig c; std::string error;
+    try {
+      if (!g_broker || !g_direct) {
+        error = "console sessions need the YouGame link helper";
+        host::log("console: start failed: %s",error.c_str());
+      } else start_session({{"room",room},{"players",2}},c,error,std::move(io));
+      if (!prepared && !error.empty() && !entry.cancelled())
+        entry.status(session_notice(error) ? session_notice(error) : "Couldn't start playing together: " + error);
+      while (prepared && !entry.cancelled() && !host::exit_requested() && !b->closed) {
+        json m; b->next(m,50);
+        if (ranked::str(m,"t") == "sessionEnded" && ranked::str(m,"sessionId") == prepared_session) {
+          const auto reason = friends::text(m,"reason",160);
+          host::log("console: session ended: %s",reason.c_str());
+          entry.status(session_notice(reason) ? session_notice(reason) : "Lost connection to your friend."); break;
+        }
+      }
+    } catch (...) {
+      host::log("console: start failed: couldn't start playing together");
+      entry.status("Couldn't start playing together");
+    }
+    b->close();
+    friends::events.current_room({});
+    entry.finished();
+  }).detach();
+}
+} // namespace console
+
 namespace relay_pads {
 void logging_ready() {
   g_relay_pads.logging_ready();
   static std::once_flag once;
   std::call_once(once, [] {
+    if (yougame::active() && *compat_tag)
+      host::log("yougame: branch build \"%s\": matches only the same branch", compat_tag);
 #ifdef _WIN32
     if (g_embed_toplevel && g_toplevel_dpi_failed)
       host::log("embed: toplevel DPI awareness failed err=%lu", (unsigned long)g_toplevel_dpi_error);
@@ -1106,6 +1458,8 @@ bool stdio_bridge() { return g_stdio; }
 bool embedded() { return g_embedded; }
 bool embed_toplevel() { return g_embed_toplevel; }
 uint32_t app_pid() { return g_app_pid; }
+void console_boot_ready() { parity::signals.console_boot_ready(); }
+
 void embed_window_ready(uintptr_t hwnd) {
   if (g_embed_toplevel) {
     parity::signals.start(g_stdio, [](const char* line) { write_line(line); }, true);
@@ -1215,7 +1569,7 @@ void pause_event(bool pausable, bool paused, const char* reason) {
 std::string status_line() {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_status = friends::expire_joined(g_status, g_status_since, now_ms());
-  return g_status;
+  return g_update_notice.available() ? update::kMessage : g_status;
 }
 
 std::string pick_friend_room(const std::function<bool()>& cancelled) {
@@ -1233,42 +1587,104 @@ std::string pick_friend_room(const std::function<bool()>& cancelled) {
   }
 }
 
-bool prepare_slippi_match(const std::function<bool()>& cancelled) {
-  const uint64_t epoch = close_room(Leave::Quit);
-  std::shared_future<void> retired;
-  { std::lock_guard<std::mutex> lock(g_mutex); retired = g_retired; }
-  while (retired.valid() && retired.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready)
-    if (cancelled()) return false;
+void with_native_udp(const std::function<void()>& create) {
+  // g_mutex: no transport selection (a search starting, an identity refresh) lands in between.
   std::lock_guard<std::mutex> lock(g_mutex);
-  if (epoch != g_search_epoch || cancelled()) return false;
-  select_match_transport(true);
-  yg_enet_enable(0);
+  const int was = yg_enet_selected();
+  yg_enet_select(0);
+  try {
+    create();
+  } catch (...) {
+    yg_enet_select(was);
+    throw;
+  }
+  yg_enet_select(was);
+}
+
+void slippi_link(bool linked, const std::string& tag) {
+  const std::string line = blend::slippi_link_line(linked, tag);
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    static std::string sent;   // the last line the app has: only a change goes out again
+    if (line == sent) return;
+    sent = line;
+  }
+  host::log("yougame: Slippi %s", linked ? "linked" : "not linked");
+  if (g_stdio) write_line(line);
+}
+
+uint64_t begin_search() { return close_room(Leave::Quit); }
+
+bool guard_search(uint64_t epoch, const std::function<void()>& commit) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_search_generation.current(epoch)) return false;
+  commit();
   return true;
 }
 
-Match find_match(const Search& search, const std::function<bool()>& cancelled) {
+bool prepare_slippi_match(const std::function<bool()>& cancelled, uint64_t epoch) {
+  // A blend reserved/retired its room before launching the helper. Do not close a newer room.
+  const bool blend = epoch != 0;
+  if (!epoch) epoch = close_room(Leave::Quit);
+  std::shared_future<void> retired;
+  { std::lock_guard<std::mutex> lock(g_mutex); retired = g_retired; }
+  // A blend has no published YouGame room; older room teardown owns only its old links.
+  // Its completion must not consume the Slippi opponent's connection window either.
+  while (!blend && retired.valid() && retired.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready)
+    if (cancelled()) return false;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_search_generation.current(epoch) || cancelled()) return false;
+  select_match_transport(true);
+  yg_enet_enable(0);
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  g_pending_input = false;
+  g_pending_input_roster = {};
+#endif
+  return true;
+}
+
+Match find_match(const Search& search, const std::function<bool()>& cancel_requested) {
+  // Reserve before blocking, or use the generation reserved before the helper was launched.
+  if (cancel_requested()) { Match out; out.error = "Cancelled"; return out; }
+  const uint64_t epoch = search.epoch ? search.epoch : begin_search();
+  const auto cancelled = [&] { return !g_search_generation.current(epoch) || cancel_requested(); };
+  struct SearchScope {
+    search_policy::BusyRetry retry;
+    explicit SearchScope(const std::function<bool()>& stop) { g_search_stopped = stop; g_ticket_retry = &retry; }
+    ~SearchScope() { g_search_stopped = {}; g_ticket_retry = nullptr; }
+  } scope(cancelled);
+  if (cancelled()) return fail("Cancelled");
+  try {
   struct FriendSearch {
     explicit FriendSearch(bool active) {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      if (search_stopped()) return;
       friends::events.take_version();  // a notice from an earlier search cannot refuse this invite
       g_friend_search = active; g_friend_failed = false;
     }
     ~FriendSearch() { g_friend_search = false; }
-  } friend_search(!search.friend_room.empty() || friends::empty_code(true, search.mode, search.direct_code));
+  } friend_search(!search.friend_room.empty());
+  // Blended Unranked: the queue reports to the coordinator and asks it before taking a room.
+  const bool blend = static_cast<bool>(search.claim);
+  struct BlendSearch {
+    explicit BlendSearch(bool active) { g_blend_search = active; }
+    ~BlendSearch() { g_blend_search = false; }
+  } blend_search(blend);
   const std::string compat = compatibility(search.mode);
+  if (cancelled()) return fail("Cancelled");
   if (compat.empty()) return fail("Could not verify this mod's content. Restart the game before playing online.");
-  const uint64_t epoch = close_room(Leave::Quit);   // normally none is open: the cleanup closed it
 #ifdef YOUGAME_AGENT_TEST_HOOK
   struct PendingInput {
     uint64_t epoch;
     void clear() const {
       std::lock_guard<std::mutex> lock(g_mutex);
-      if (epoch != g_search_epoch) return;
+      if (!g_search_generation.current(epoch) || search_stopped()) return;
       g_pending_input = false;
       g_pending_input_roster = {};
     }
     void publish(const Room& room, const json& participants) const {
       std::lock_guard<std::mutex> lock(g_mutex);
-      if (epoch != g_search_epoch) return;
+      if (!g_search_generation.current(epoch) || search_stopped()) return;
       g_pending_input_roster = {room.mode, room.ranked, participants, room.me};
       g_pending_input = true;
     }
@@ -1279,22 +1695,46 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
   { std::lock_guard<std::mutex> lock(g_mutex); retired = g_retired; }
   while (retired.valid() && retired.wait_for(std::chrono::milliseconds(50)) != std::future_status::ready)
     if (cancelled()) return fail("Cancelled");
-  Identity me = identity();
-  if (!me.ok) me = fetch_identity();   // this is the matchmaking thread: it may wait for the app
+  if (cancelled()) return fail("Cancelled");
+  Identity me;
+  { std::lock_guard<std::mutex> lock(g_mutex); me = g_identity; }
+  if (!me.ok) me = fetch_identity(cancelled);
+  if (cancelled()) return fail("Cancelled");
   if (!me.ok) return fail(search.mode == 0 && me.error == "Sign in to YouGame to play online"
                             ? "Sign in to YouGame to play Ranked." : me.error);
-  { std::lock_guard<std::mutex> lock(g_mutex); select_match_transport(false); }
+  { std::lock_guard<std::mutex> lock(g_mutex);
+    if (cancelled()) { Match out; out.error = "Cancelled"; return out; }
+    select_match_transport(false);
+  }
 #ifndef _WIN32
   if (g_broker && !g_direct) return fail("YouGame broker requires direct links v1 (1200-byte datagrams)");
 #endif
   const bool team_code = search.mode == 3 && !search.direct_code.empty();
   std::string team_room;
   if (team_code && !friends::team_room_code(search.direct_code, &team_room)) return fail(friends::kTeamCodeError);
-  const bool friends_mode = !team_code && (!search.friend_room.empty() || friends::empty_code(true, search.mode, search.direct_code));
+  const bool friends_mode = !team_code && (!search.friend_room.empty());
   const bool direct = search.mode == 2;
   const int size = search.mode == 3 ? 4 : 2;
   const json lobby = {{"version", 1}, {"minPlayers", size}, {"maxLocalPlayers", 1}, {"compatibility", compat}};
   json request = {{"type", "mpTicket"}, {"players", size}, {"mode", size == 4 ? "teams" : "singles"}, {"lobby", lobby}, {"ranked", search.mode == 0}};
+  if (search.mode == 0) {
+    ranked::set_contract(request);
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      g_rank_opponent.clear(); g_rank_score.clear();
+      g_rank_results = {}; g_rank_result_visible = false;
+      g_rank_read.recovery_at = 0;
+      if (!g_rank_read.enabled) g_rank_read.enter(); // the agent harness bypasses the CSS
+    }
+    ranked_header();
+    // The CSS may already have the read in flight. The ticket must follow it, including when
+    // a hook enters Ranked without visiting the menu/CSS first.
+    for (;;) {
+      { std::lock_guard<std::mutex> lock(g_mutex); if (!g_rank_read.in_flight) break; }
+      if (cancelled()) return fail("Cancelled");
+      Sleep(20);
+    }
+  }
   // Unranked keeps its two players together for the next game, as Slippi's unranked does.
   if (search.mode == 1) request["afterMatch"] = "stay";
   if (!friends_mode && direct) request["direct"] = search.direct_code;
@@ -1307,16 +1747,21 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
     ~FriendsSetup() {
       if (keep) return;
       std::lock_guard<std::mutex> lock(g_mutex);
-      if (epoch == g_search_epoch) friends::events.current_room({});
+      if (g_search_generation.current(epoch) && !search_stopped()) friends::events.current_room({});
     }
   } friends_setup{epoch};
-  set_status(team_code ? friends::kTeamWaiting : friends_mode ? friends::kWaiting : "searching");
+  // The base listing's Unranked says which pools it searches (yougame_blend.h kSearch*).
+  const std::string searching = search.status.empty() ? std::string("searching") : search.status;
+  bool repeated_link_failure;
+  { std::lock_guard<std::mutex> lock(g_mutex); repeated_link_failure = g_direct_link_failures.repeated(); }
+  set_status(team_code ? friends::kTeamWaiting : friends_mode ? friends::kWaiting :
+             repeated_link_failure ? search_policy::kLinkRetry : searching);
   json ticket;
   try {
     if (team_code) {
       {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (epoch != g_search_epoch || cancelled()) throw std::runtime_error("Cancelled");
+        if (!g_search_generation.current(epoch) || cancelled()) throw std::runtime_error("Cancelled");
         friends::events.current_room(team_room);
       }
       ticket = bridge(request, 30000, cancelled);
@@ -1330,19 +1775,25 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
           }, cancelled,
           [&](const std::string& code) {
             std::lock_guard<std::mutex> lock(g_mutex);
-            if (epoch != g_search_epoch || cancelled()) throw std::runtime_error("Cancelled");
+            if (!g_search_generation.current(epoch) || cancelled()) throw std::runtime_error("Cancelled");
             friends::events.current_room(code);
           });
     } else {
-      ticket = bridge(request, 30000);
+      // The blend cancels this side when Slippi's is first: the ticket wait must not hold it up.
+      ticket = bridge(request, 30000, cancelled);
     }
+  } catch (const update::Required&) {
+    return fail(update::kMessage, false, true);
   } catch (const std::exception& e) {
     return fail(e.what());
   }
+  if (search.mode == 0 && !ranked::set_contract_matches(ticket))
+    return fail("YouGame did not return the Ranked best-of-three rules. Please try again later.");
   // A ranked ticket carries the player's standing on this game's ladder (the ticket route's
   // `rating` and ranks.ts `rank`): the Ranked header shows it from the first search on.
-  if (search.mode == 0 && ticket.is_object() && ticket.count("rank")) {
+  if (!cancelled() && search.mode == 0 && ticket.is_object() && ticket.count("rank")) {
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (cancelled()) { Match out; out.error = "Cancelled"; return out; }
     if (g_rank.standing(ticket["rank"], ticket.count("rating") ? ticket["rating"] : json()))
       host::log("yougame: ranked standing: %s", g_rank.header().c_str());
   }
@@ -1350,27 +1801,56 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
   std::string pass = ticket.value("ticket", "");
   std::string room_code = ticket.count("room") && ticket["room"].is_string() ? ticket["room"].get<std::string>() : "";
   if ((friends_mode || team_code) && room_code.empty()) room_code = friends::room(request);
+  std::string error;
+  const auto decline = [&] {
+    if (!g_search_generation.current(epoch)) return;
+    Socket late;
+    // A Slippi commit cancels normal I/O; this bounded cleanup owns only the assigned room.
+    const auto stale = [&] { return !g_search_generation.current(epoch); };
+    search_policy::decline_room(
+        [&] { return late.open_session(url, pass, room_code, &error, 1000, stale); },
+        [&] { late.send({{"t", "leave"}}); }); // Leave::Quit's casual protocol; no result
+  };
+
+  if (cancelled()) {
+    if (blend && !room_code.empty()) decline();
+    return fail("Cancelled");
+  }
   if ((!g_broker && url.empty()) || pass.empty()) return fail("YouGame did not return a ticket");
   if ((friends_mode || team_code) && (room_code != friends::room(request))) return fail("YouGame returned a different friends room");
-  if (cancelled()) return fail("Cancelled");
-  std::string error;
   // The reopen loop retries every 250 ms; renewals go to the site, so at most one per 1.5 s.
   uint64_t last_renew = 0;
+  bool update_refused = false;
   const auto renew_ticket = [&](uint64_t until) {
     const auto now = now_ms();
     if (now >= until || cancelled() || (last_renew && now - last_renew < 1500)) return false;
     last_renew = now;
     return transport::renew_room_ticket(pass, room_code, [&] {
-      return bridge(request, (int)std::min<uint64_t>(3000, until - now), cancelled);
+      try { return bridge(request, (int)std::min<uint64_t>(3000, until - now), cancelled); }
+      catch (const update::Required&) { update_refused = true; throw; }
     }, [](const char* message) { host::log("%s", message); });
   };
 
   // Unranked: wait in the queue until the matchmaker names a room.
-  if (room_code.empty()) {
+  const bool queued = room_code.empty();
+  if (queued) {
     Socket queue;
-    if (!queue.open_session(url, pass, "", &error)) return fail(error);
+    if (!queue.open_session(url, pass, "", &error, 10000, cancelled)) return fail(error);
     for (;;) {
-      if (cancelled()) return fail("Cancelled");
+      if (cancelled()) {
+        if (blend && g_search_generation.current(epoch)) {
+          queue.send({{"t", "cancel"}});
+          json late;
+          while (queue.next(late, 0)) {
+            if (late.value("t", "") == "matched" && late.count("room") && late["room"].is_string()) {
+              room_code = late["room"].get<std::string>();
+              decline();
+              break;
+            }
+          }
+        }
+        return fail("Cancelled");
+      }
       json m;
       if (!queue.next(m, 250)) {
         if (queue.closed()) {
@@ -1378,20 +1858,43 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
           const uint64_t until = now_ms() + 15000;
           bool reopened = false;
           transport::TicketRetry retry;
-          while (!cancelled() && now_ms() < until) {
-            if (retry.attempt([&] { return now_ms() < until && queue.open_session(url, pass, "", &error, (int)std::min<uint64_t>(3000, until - now_ms())); },
+          while (!cancelled() && !update_refused && now_ms() < until) {
+            if (retry.attempt([&] { return !update_refused && now_ms() < until && queue.open_session(url, pass, "", &error, (int)std::min<uint64_t>(3000, until - now_ms()), cancelled); },
                               [&] { if (queue.closed()) renew_ticket(until); })) { reopened = true; break; }
             Sleep(250);
           }
+          if (update_refused) return fail(update::kMessage, false, true);
           if (!reopened) return fail("Lost the connection to YouGame matchmaking");
         }
         continue;
       }
+      if (cancelled()) {
+        // next() may already have consumed the assignment when Slippi won. Release that
+        // room through the ordinary decline path before discarding the queue message.
+        if (blend && m.value("t", "") == "matched" && m.count("room") && m["room"].is_string()) {
+          room_code = m["room"].get<std::string>();
+          decline();
+        }
+        return fail("Cancelled");
+      }
+      const auto& refused = update::refusal(m);
+      if (update::required(refused)) {
+        g_update_notice.refuse();
+        host::log("yougame: update required (current %s)", update::current(refused).c_str());
+        return fail(update::kMessage, false, true);
+      }
       const std::string t = m.value("t", "");
-      if (t == "matched" && m.count("room") && m["room"].is_string()) { room_code = m["room"].get<std::string>(); break; }
+      if (!cancelled() && t == "searching" && search.on_searching && m.count("waiting") && m["waiting"].is_number_integer())
+        search.on_searching((int)std::clamp<int64_t>(m["waiting"].get<int64_t>(), 0, 1000000));
+      if (t == "matched" && m.count("room") && m["room"].is_string()) {
+        room_code = m["room"].get<std::string>();
+        if (blend && !search.claim()) { decline(); return fail("Cancelled"); }
+        break;
+      }
       if (t == "error") return fail(m.value("error", "Matchmaking failed"));
     }
   } else {
+    if (blend && !search.claim()) { decline(); return fail("Cancelled"); }   // ticket assignment
     if (friends_mode) host::log("friends: waiting");
     set_status(team_code ? friends::kTeamWaiting : friends_mode ? friends::kWaiting : "waiting for " + search.direct_code);
   }
@@ -1406,9 +1909,13 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
 #ifdef YOUGAME_AGENT_TEST_HOOK
   pending_input.publish(*room, json::array());
 #endif
-  if (!room->socket->open_session(url, pass, room_code, &error)) return fail(error, !direct);
+  if (!room->socket->open_session(url, pass, room_code, &error, 10000, cancelled)) return fail(error, !direct);
+  if (cancelled()) { room->socket->send({{"t", "leave"}}); return fail("Cancelled"); }
 
   const bool links_mode = g_direct;
+  const auto requested_port = udp::port(links_mode ? nullptr : std::getenv("YOUGAME_UDP_PORT"));
+  uint16_t bound_port = search.udp_port;
+  udp::Ingress ingress(&udp::own_udp_drops);
   SOCKET udp = INVALID_SOCKET;
   struct Closer { SOCKET& s; ~Closer() { if (s != INVALID_SOCKET) closesocket(s); } } closer{udp};
   std::string external, lan_addr;
@@ -1416,15 +1923,32 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
   if (g_broker && !links_mode) return fail("YouGame broker requires direct links v1 (1200-byte datagrams)");
 #endif
   if (!links_mode) {
+    if (!requested_port.valid) {
+      host::log("%s", udp::port_error(requested_port, "invalid decimal port").c_str());
+      return fail("The own UDP port is unavailable");
+    }
     udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (udp == INVALID_SOCKET) return fail("Could not open the network port");
+    if (udp == INVALID_SOCKET) {
+      if (requested_port.set) host::log("%s", udp::port_error(requested_port, "socket creation failed").c_str());
+      return fail("Could not open the network port");
+    }
     sockaddr_in bind_addr{};
     bind_addr.sin_family = AF_INET;
-    bind_addr.sin_port = htons(search.udp_port);
-    if (bind(udp, (sockaddr*)&bind_addr, sizeof bind_addr) != 0) return fail("The network port is in use");
+    if (!udp::bind_port(requested_port, search.udp_port, [&](uint16_t p) {
+      bind_addr.sin_port = htons(p); // zero-initialized INADDR_ANY: all interfaces
+      return bind(udp, (sockaddr*)&bind_addr, sizeof bind_addr) == 0;
+    }, [](const char* message) { host::log("%s", message); }))
+      return fail("The network port is in use");
+    SocketLength length = sizeof bind_addr;
+    if (getsockname(udp, (sockaddr*)&bind_addr, &length) != 0 ||
+        (requested_port.set && ntohs(bind_addr.sin_port) != requested_port.value)) {
+      if (requested_port.set) host::log("%s", udp::port_error(requested_port, "bound port check failed").c_str());
+      return fail("The own UDP port is unavailable");
+    }
+    bound_port = ntohs(bind_addr.sin_port);
     if (!stun(udp, external, cancelled)) host::log("yougame: STUN unavailable");
-    const std::string lan = lan_ip();
-    lan_addr = lan.empty() ? "" : lan + ":" + std::to_string(search.udp_port);
+    lan_addr = udp::lan_candidate(std::getenv("YOUGAME_HOST_LAN_IP"), bound_port, lan_ip,
+        [](const char* message) { host::log("%s", message); });
   }
   if (cancelled()) return fail("Cancelled");
   // Seat 0 names the match: Slippi's match id slot and replays get this, never the room's code.
@@ -1438,6 +1962,10 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
   std::map<std::string, uint64_t> tokens;     // connection id -> the token I gave it
   std::map<std::string, uint64_t> sent_at;    // connection id -> when I last sent it mine
   uint64_t last_ping = now_ms(), full_since = 0;
+  // Only base-listing plain Unranked can meet a blending client.
+  const uint64_t arrive_by = search_policy::no_show_deadline(host::gameplay::vanilla_only(), queued,
+      search.mode, friends_mode || team_code, now_ms());
+  bool arrived = false;
   int my_seat = -1;
   auto seat_of = [&](const std::string& conn) {
     return transport::connection_seat(participants, conn);
@@ -1446,7 +1974,15 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
     if (cancelled()) return fail("Cancelled");
     if (friends_mode && friends::events.take_version()) return fail(friends::kVersion);
     json m;
-    if (room->socket->next(m, 200)) {
+    const bool received = room->socket->next(m, 200);
+    if (cancelled()) return fail("Cancelled");
+    if (received) {
+      const auto& refused = update::refusal(m);
+      if (update::required(refused)) {
+        g_update_notice.refuse();
+        host::log("yougame: update required (current %s)", update::current(refused).c_str());
+        return fail(update::kMessage, false, true);
+      }
       const std::string t = m.value("t", "");
       if (t == "welcome") room->me = m.value("me", "");
       if (m.count("participants") && m["participants"].is_array()) participants = m["participants"];
@@ -1479,11 +2015,12 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
       const uint64_t until = now_ms() + 15000;
       bool reopened = false;
       transport::TicketRetry retry;
-      while (!cancelled() && now_ms() < until) {
-        if (retry.attempt([&] { return now_ms() < until && room->socket->open_session(url, pass, room_code, &error, (int)std::min<uint64_t>(3000, until - now_ms())); },
+      while (!cancelled() && !update_refused && now_ms() < until) {
+        if (retry.attempt([&] { return !update_refused && now_ms() < until && room->socket->open_session(url, pass, room_code, &error, (int)std::min<uint64_t>(3000, until - now_ms()), cancelled); },
                           [&] { if (room->socket->closed()) renew_ticket(until); })) { reopened = true; room->ticket = pass; break; }
         Sleep(250);
       }
+      if (update_refused) return fail(update::kMessage, false, true);
       if (!reopened) return fail("Lost the connection to the YouGame room", !direct);
       participants = json::array(); cands.clear(); sent_at.clear(); tokens.clear();
       room->me.clear(); room->participants = json::array(); full_since = 0;
@@ -1494,6 +2031,12 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
     }
     my_seat = seat_of(room->me);
     const bool full = (int)participants.size() == size && my_seat >= 0;
+    if (full) arrived = true;
+    else if (search_policy::no_show_expired(arrive_by, arrived, now_ms())) {
+      host::log("yougame: unranked: opponent never joined the room after 30 s; searching again");
+      room->socket->send({{"t", "leave"}});
+      return fail("Your opponent did not arrive", true);
+    }
     if (!full) full_since = 0;
     else if (!full_since) { full_since = now_ms(); set_status("connecting"); }
     // My addresses, point to point, each peer with a token of its own.
@@ -1549,7 +2092,9 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
     try {
       // Idempotent once per run. Mapping stays alive across matches; only the host owns ring I/O.
       if (!yg_enet_channel_ready()) {
-        json h = bridge({{"type", "directAttach"}}, 10000);
+        json h = bridge({{"type", "directAttach"}}, 10000, cancelled);
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (cancelled()) throw std::runtime_error("Cancelled");
 #ifdef _WIN32
         if (h.value("version", 0) != 1 || yg_enet_attach_handles(h.value("section", uintptr_t(0)),
             h.value("toApp", uintptr_t(0)), h.value("toGame", uintptr_t(0))))
@@ -1563,7 +2108,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
       std::vector<std::string> remotes;
       for (const auto& p : participants) if (p.value("connectionId", "") != room->me) remotes.push_back(p.value("connectionId", ""));
       if (!transport::open_links(room->links, room->socket->connection(), remotes,
-          [](const json& q, int ms) { return bridge(q, ms); }, direct_state, now_ms, [] { Sleep(10); }, cancelled))
+          [&](const json& q, int ms) { return bridge(q, ms, cancelled); }, direct_state, now_ms, [] { Sleep(10); }, cancelled))
         throw std::runtime_error("Direct link failed");
       size_t index = 0;
       for (const auto& p : participants) {
@@ -1579,25 +2124,54 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
         ENetAddress a;
         if (yg_enet_link_address(link, &a)) throw std::runtime_error("Invalid direct address");
       }
-      yg_enet_enable(1);
-    } catch (...) {
+      { std::lock_guard<std::mutex> lock(g_mutex);
+        if (cancelled()) throw std::runtime_error("Cancelled");
+        yg_enet_enable(1);
+      }
+    } catch (const update::Required&) { throw; }
+    catch (...) {
 #ifndef _WIN32
       try { throw; }
       catch (const std::exception& e) { host::log("yougame: direct links failed: %s", e.what()); }
       catch (...) { host::log("yougame: direct links failed"); }
 #endif
-      return fail(cancelled() ? "Cancelled" : "Could not connect to your opponent directly", transport::retry_link_failure(search.mode));
+      if (cancelled()) return fail("Cancelled");
+      // Count only peers whose link failed, never a teammate who connected.
+      // Even a partial successful link resets the previous failure history.
+      json failed_participants = json::array();
+      bool linked = false;
+      size_t peer_index = 0;
+      for (const auto& p : participants) {
+        if (p.value("connectionId", "") == room->me) continue;
+        const bool up = peer_index < room->links.ids.size() && direct_state(room->links.ids[peer_index]) == 2;
+        linked |= up;
+        if (!up) failed_participants.push_back(p);
+        ++peer_index;
+      }
+      bool repeated;
+      { std::lock_guard<std::mutex> lock(g_mutex);
+        if (cancelled()) { Match out; out.error = "Cancelled"; return out; }
+        if (linked) g_direct_link_failures.successful();
+        repeated = g_direct_link_failures.failed(failed_participants, room->me);
+      }
+      return fail(repeated ? search_policy::kLinkRetry : search_policy::kLinkFailed,
+                  transport::retry_link_failure(search.mode));
     }
-  } else if (!punch(udp, my_seat + 1, peers, cancelled)) {
+  } else if (!punch(udp, my_seat + 1, peers, ingress, cancelled)) {
     if (cancelled()) return fail("Cancelled");
     host::log("yougame: connect failed (own UDP): my STUN %s, my LAN %s", external.empty() ? "none" : "ok", lan_addr.empty() ? "none" : "ok");
     // Unranked searches again, as Slippi does when a found opponent cannot be reached.
     return fail("Could not connect to your opponent directly", !direct);
   }
 
+  if (cancelled()) return fail("Cancelled");
+  { std::lock_guard<std::mutex> lock(g_mutex);
+    if (!cancelled()) g_direct_link_failures.successful();
+  }
   host::log("yougame: transport %s", links_mode ? "YouGame direct links" : "own UDP");
   Match out;
   out.ok = true;
+  out.udp_port = links_mode ? 0 : bound_port;
   out.match_id = match_id.rfind("yg-", 0) == 0 && match_id.size() <= 32 ? match_id : my_match_id;
   out.local_index = my_seat;
   out.host = my_seat == 0;
@@ -1626,13 +2200,24 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
   else set_status("playing " + slippi::display::opponent_label(slippi::display::Provider::YouGame, names));
 
   std::lock_guard<std::mutex> lock(g_mutex);
-  if (epoch != g_search_epoch || g_room || cancelled()) {
+  if (!g_search_generation.current(epoch) || g_room || cancelled()) {
     out.ok = false;
     out.error = "Cancelled";
     return out;
   }
   Room* raw = room.get();
-  if (raw->ranked) ++g_ranked_rooms;
+  if (raw->ranked) {
+    ++g_ranked_rooms;
+    g_rank_local = my_seat;
+    const auto local = ranked::roster_rank(participants, my_seat);
+    if (local.known()) g_rank.update(local);
+    const auto opponent = ranked::roster_rank(participants, 1 - my_seat);
+    g_rank_opponent = opponent.known() ? opponent.header().substr(9) : "Unknown";
+    g_rank_score = raw->set.score_text();
+    g_rank_results = {};
+    g_rank_read.recovery_at = 0;
+    g_rank_result_visible = false;
+  }
   g_room = std::move(room);
 #ifdef YOUGAME_AGENT_TEST_HOOK
   g_pending_input = false;
@@ -1641,12 +2226,15 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled) {
   friends_setup.keep = true;
   raw->pump = std::thread(pump_room, raw);
   return out;
+  } catch (const update::Required&) {
+    return fail(update::kMessage, false, true);
+  }
 }
 
 #ifdef YOUGAME_AGENT_TEST_HOOK
 agent_test::InputState agent_test::live_input_state(int live_mode) {
   std::lock_guard<std::mutex> lock(g_mutex);
-  const uint64_t session = g_search_epoch + 1;
+  const uint64_t session = g_search_generation.value() + 1;
   if (!g_room) {
     if (!g_pending_input) return pre_room_input_state(session, live_mode);
     const int mode = live_mode == -1 ? g_pending_input_roster.mode : live_mode;
@@ -1666,7 +2254,7 @@ int seat_team(int player_idx) {
   return g_room ? g_room->seat_team(player_idx) : -1;
 }
 
-void game_started() {
+void game_started(int64_t rng, int stage) {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (!g_room) return;
   // Frame 1 is retried while waiting for peers; emit once per game, including later games of a set.
@@ -1674,7 +2262,7 @@ void game_started() {
     host::log("%s", lcancel::policy::ranked_start_log(lcancel::automatic_enabled()));
   g_room->in_game = true;
   // Called on every frame 1 the game sends while it waits for the opponent: the set counts a game once.
-  if (g_room->ranked) { g_room->set.start_game(); return; }
+  if (g_room->ranked) { g_room->set.start_game(ranked::game_key(rng, stage)); return; }
   if (g_room->socket->brokered()) { g_room->games.start_game(g_room->match_id); return; }
   // Only the room's host may start a match; everyone reports its result.
   g_room->pending_begin = g_room->me == g_room->host_connection;
@@ -1688,20 +2276,21 @@ void game_started() {
 void game_ended(const GameEnd& end) {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (!g_room || !g_room->in_game) return;   // one report per game, however many places say it ended
+  if (ranked::no_contest_waits_for_report(end.end_method, end.has_placements, g_room->ranked)) {
+    host::log("yougame: ranked No Contest: waiting for finalized desync/disconnect report");
+    return;
+  }
   if (ranked::time_out_waits_for_report(end.end_method, end.has_placements, g_room->size)) {
     host::log("yougame: time-out: the game's report names the winner");
     return;
   }
   g_room->in_game = false;
   if (g_room->ranked) {
-    // The game's own end record decides the game (yougame_ranked.h game_winner); a No Contest
-    // naming a player (they disconnected or the games desynced: Ranked has no LRA-Start) also
-    // ends the set for them.
-    ranked::Game game;
+    // Only the finalized report can distinguish a replay from a disconnect forfeit.
+    ranked::Game game = ranked::game_outcome(end.end_method, end.lras, end.winner,
+                                            end.has_placements ? end.placements : nullptr);
     game.key = ranked::game_key(end.rng, end.stage);   // an id both players' games share
     game.index = (uint32_t)g_room->set.games_started();
-    game.winner = ranked::game_winner(end.end_method, end.lras, end.winner, end.has_placements ? end.placements : nullptr);
-    game.forfeit = end.end_method == 7 && game.winner >= 0;
     game.detail = ranked::game_detail(end.end_method, end.lras, end.stage, end.characters, end.frames);
     g_room->set.report_game(game);
     host::log("yougame: ranked game %u (%s): %s%s", game.index, game.key.c_str(),
@@ -1751,7 +2340,7 @@ bool ranked_hold() {
 
 bool ranked_set_over() {
   std::lock_guard<std::mutex> lock(g_mutex);
-  return g_room && g_room->ranked && g_room->set.over();
+  return g_room && g_room->ranked && g_room->set.release_pair();
 }
 
 int ranked_games_received() {
@@ -1765,46 +2354,76 @@ bool ranked_room_retired() {
          (!g_retired.valid() || g_retired.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready);
 }
 
+void ranked_screen_enter() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_rank_read.enter(g_room && g_room->ranked && g_room->set.started());
+}
+
 std::string ranked_header() {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (g_slippi_match) return g_rank.header();
-  const uint64_t now = now_ms();
-  RankRead& read = g_rank_read;
-  const bool want = !g_rank.known() || (read.stale_at && now >= read.stale_at && !g_room);
-  if (want && !read.unsupported && !read.in_flight && now >= read.next_at && g_identity.ok) {
-    read.in_flight = true;
-    read.stale_at = 0;
+  const auto now = now_ms();
+  const bool live_set = g_room && g_room->ranked && g_room->set.started();
+  const bool recovery = !live_set && g_rank_results.state() == ranked::ResultsPanel::State::Pending && g_rank_read.recovery_due(now);
+  if (g_identity.ok && !live_set && (recovery || !g_rank_read.recovery_at) && g_rank_read.begin(now)) {
     const uint64_t asked = g_rank.version();
-    std::thread([asked] {
+    const auto match = g_rank_results.match();
+    std::thread([asked, recovery, match] {
       json result;
-      std::string error;
+      bool failed = false, unsupported = false;
       try {
         result = bridge({{"type", "mpRank"}, {"mode", "singles"}}, 10000);
       } catch (const std::exception& e) {
-        error = e.what();
+        failed = true;
+        unsupported = ranked::unknown_request(e.what());
+        // Bridge errors may contain untrusted text. The throttle applies to 429 and all failures.
+        host::log("yougame: mpRank unavailable; keeping cached standing and backing off");
       }
       std::lock_guard<std::mutex> lock(g_mutex);
-      g_rank_read.in_flight = false;
-      if (!error.empty()) {
-        if (ranked::unknown_request(error)) {
-          g_rank_read.unsupported = true;   // an app without mpRank: the rank shows after a ticket or a result
-          host::log("yougame: the app does not answer mpRank; the ranked standing comes with tickets and results");
-        } else {
-          g_rank_read.next_at = now_ms() + 60000;
-          host::log("yougame: mpRank failed: %s", error.c_str());
-        }
-        return;
+      const bool applied = g_rank_read.answer(g_rank, result, asked, now_ms(), failed, unsupported);
+      if (recovery) {
+        ranked::RankCache unknown;
+        g_rank_results.recovered_standing(match, applied ? g_rank : unknown, g_rank_read.recovery_tries >= 2 || unsupported);
+        if (g_rank_results.match() == match && g_rank_results.state() != ranked::ResultsPanel::State::Pending)
+          g_rank_read.recovery_at = 0;
       }
-      if (ranked::apply_rank_answer(g_rank, result, asked)) host::log("yougame: ranked standing: %s", g_rank.header().c_str());
-      else g_rank_read.next_at = now_ms() + 5 * 60000;   // no ranked result yet, or a newer one arrived meanwhile
     }).detach();
   }
   return g_rank.header();
 }
 
+std::array<std::string, 6> ranked_lines() {
+  const auto header = ranked_header();
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (g_room && g_room->ranked) {
+    g_rank_score = g_room->set.score_text();
+    if (g_room->set.over()) g_rank_result_visible = true;
+  }
+  return {header, g_rank_opponent.empty() ? "Opponent: Unknown" : "Opponent: " + g_rank_opponent,
+          // Line 3 stays empty: the splash that read it follows the setup screen, so "Stage
+          // striking comes next" was always wrong there (build 25, 11-01).
+          g_rank_score, "",
+          g_rank_result_visible ? g_rank_results.rating_text() : "",
+          g_rank_result_visible ? g_rank_results.change_text() : ""};
+}
+uint8_t opponent_rank() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  return g_room && g_room->ranked ? ranked::roster_rank_byte(g_room->participants, 1 - g_rank_local) : 0xFF;
+}
+
+std::vector<uint8_t> rank_record_response() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  const auto opponent = g_room && g_room->ranked ? ranked::roster_rank(g_room->participants, 1 - g_rank_local) : ranked::RankCache();
+  return ranked::rank_record_response(g_rank.record(), opponent.record(), g_rank_results.record());
+}
+
 std::vector<uint8_t> rank_response() {
   std::lock_guard<std::mutex> lock(g_mutex);
-  return g_rank.response();
+  auto reply = g_rank.response();
+  const auto status = g_rank_results.record().status;
+  if (status == MU_YG_RESULT_RECORDING) reply[1] = 0;
+  if (status == MU_YG_RESULT_ERROR) reply[1] = 2;
+  return reply;
 }
 uint8_t rank_visibility() {
   std::lock_guard<std::mutex> lock(g_mutex);

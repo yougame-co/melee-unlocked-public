@@ -3,6 +3,8 @@
 #include <melee/gm/gm_1A3F.h>
 #include <melee/gm/gmvs.h>
 #include <melee/gm/gmscene.h>
+#include <melee/mn/mnmain.h>
+#include <melee/mn/types.h>
 #include <melee/pl/player.h>
 #include <melee/ft/types.h>
 #include <melee/it/types.h>
@@ -150,8 +152,8 @@ void mu_state_snapshot_words(u32* out)
 {
     int slot;
     /* Layout must track MuStatePod in mu_host.h exactly: rng, scene, 6*12 player words,
-     * scene_major, match_frame. */
-    __builtin_memset(out, 0, (2 + 6 * 12 + 2) * sizeof *out);
+     * scene_major, match_frame, four menu words, then 23 console-only diagnostic words. */
+    __builtin_memset(out, 0, 103 * sizeof *out);
     out[0] = *HSD_RandSeedPtr;
     out[1] = gm_GetCurrentSceneIndex();
     for (slot = 0; slot < 6; ++slot) {
@@ -183,4 +185,28 @@ void mu_state_snapshot_words(u32* out)
     }
     out[2 + 6 * 12] = gm_GetCurrentGameMode();
     out[2 + 6 * 12 + 1] = gm_GetFrameCount();
+    out[76] = mn_804A04F0.cur_menu;
+    out[77] = mn_804A04F0.prev_menu;
+    out[78] = mn_804A04F0.hovered_selection;
+    out[79] = mn_804A04F0.entering_menu;
+    if (mu_console_rollback_active()) {
+        const VsSceneController* controller = gmVs_GetSceneController();
+        const VsSceneState* state = &controller->state;
+        const struct StartMeleeRules* rules = &controller->start;
+        out[80] = 1;
+        out[81] = state->match_result;
+        out[82] = (u32) (int) state->pauser;
+        out[83] = state->timer_seconds;
+        out[84] = state->unk_2C;
+        out[85] = rules->stkind;
+        out[86] = rules->is_teams;
+        out[87] = rules->time_limit;
+        out[88] = rules->timer_enabled;
+        out[89] = rules->timer_counts_up;
+        out[90] = (u32) (int) rules->item_freq;
+        for (slot = 0; slot < 6; ++slot) {
+            out[91 + slot] = Player_GetStocks(slot);
+            out[97 + slot] = Player_GetDamage(slot);
+        }
+    }
 }

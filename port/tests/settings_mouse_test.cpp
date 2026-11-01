@@ -1,12 +1,14 @@
 // Real ImGui input processing, no platform backend, renderer, adapter or game process.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "settings_imgui_input.h"
+#include "settings_page_navigation.h"
 #include "imgui_internal.h"
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
 
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
+static int checks;
+#define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
 
 namespace {
 struct Menu {
@@ -35,10 +37,11 @@ struct Menu {
     auto& io = ImGui::GetIO();
     // settings_frame's backend boundary and armed, routed GameCube pad mapping. The platform
     // backend has no gamepad producer now. Mouse events queued before this call are untouched.
-    io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+    gx::settings_input::navigation(io, nav_active);
+    CHECK(bool(io.ConfigFlags & ImGuiConfigFlags_NavEnableKeyboard) == nav_active);
+    CHECK(bool(io.ConfigFlags & ImGuiConfigFlags_NavEnableGamepad) == nav_active);
     io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
     if (nav_active) {
-      io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
       io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
       io.AddKeyEvent(ImGuiKey_GamepadStart, (buttons & 0x1000) != 0);
       io.AddKeyEvent(ImGuiKey_GamepadBack, (buttons & 0x10) != 0);
@@ -134,6 +137,100 @@ void held_stick_handoff() {
   menu.frame(0, 80);
   CHECK(menu.clicks[0] == 1);
 }
+
+// Real ImGui navigation across a flattened content child, including stale child focus/scroll.
+// This is a window-free regression, not a real-game player-flow certification.
+void page_entry(bool keyboard) {
+  ImGui::CreateContext();
+  auto& io = ImGui::GetIO();
+  io.IniFilename = io.LogFilename = nullptr;
+  io.DisplaySize = ImVec2(640, 480);
+  gx::settings_input::configure(io);
+  gx::settings_input::navigation(io, true);
+  io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+  io.Fonts->Build();
+  gx::settings_page::Navigation nav;
+  ImGuiID first = 0, second = 0, back = 0;
+  ImGuiID rows[24]{};
+  int music = 50;
+  ImGuiWindow* content = nullptr;
+  int activated = 0, focus_lines = 0;
+  const ImGuiKey down = keyboard ? ImGuiKey_DownArrow : ImGuiKey_GamepadDpadDown;
+  const ImGuiKey a = keyboard ? ImGuiKey_Enter : ImGuiKey_GamepadFaceDown;
+  auto frame = [&](int tab, int style, bool detail = true) {
+    io.DeltaTime = 1.f / 60.f;
+    ImGui::NewFrame();
+    ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(600, 400), ImGuiCond_Always);
+    ImGui::Begin("page", nullptr, ImGuiWindowFlags_NoSavedSettings);
+    ImGui::Button("< CATEGORIES"); back = ImGui::GetItemID();
+    if (detail) {
+      ImGui::BeginChild("##settings_content", ImVec2(0, 240), ImGuiChildFlags_NavFlattened);
+      content = ImGui::GetCurrentWindow();
+      ImGui::TextUnformatted("Section heading is not a focus stop");
+      nav.begin(tab, style);
+      gx::settings_page::observer = &nav;
+      for (int i = 0; i < 24; ++i) {
+        ImGui::PushID(i);
+        // Custom Clean/GD rows use hidden hit-box IDs with a separate public label.
+        if (i == 0 && tab == 1) {
+          ImGui::SetNextItemWidth(400);
+          gx::settings_widgets::SliderInt("Music", &music, 0, 100);
+        } else {
+          if (ImGui::InvisibleButton("##switch", ImVec2(400, 32), ImGuiButtonFlags_EnableNav)) ++activated;
+          gx::settings_page::label_item(i == 0 ? "First control##private-id" :
+                                       i == 19 ? "Auto L-cancel" : "Next control");
+        }
+        rows[i] = ImGui::GetItemID();
+        if (i == 0) first = ImGui::GetItemID();
+        if (i == 1) second = ImGui::GetItemID();
+        ImGui::PopID();
+      }
+      gx::settings_page::observer = nullptr;
+      if (const char* label = nav.changed_focus()) {
+        CHECK(std::string(label).find("##") == std::string::npos);
+        ++focus_lines;
+      }
+      ImGui::EndChild();
+    } else nav.leave();
+    ImGui::End(); ImGui::Render();
+  };
+  for (int style = 0; style < 8; ++style) {
+    for (int tab = 0; tab < 8; ++tab) {
+      for (int visit = 0; visit < 2; ++visit) {
+        frame(tab, style); frame(tab, style); frame(tab, style);
+        CHECK(ImGui::GetFocusID() == first && first != back);
+        CHECK(!ImGui::IsAnyItemActive());  // Music is focused, not in slider/text editing mode.
+        CHECK(content->Scroll.y < 1.0f);
+        if (tab == 1) CHECK(nav.labels.at(first) == "Music");
+        const int before = focus_lines;
+        frame(tab, style); frame(tab, style);
+        CHECK(focus_lines == before);  // Never a per-frame log.
+        io.AddKeyEvent(down, true); frame(tab, style);
+        io.AddKeyEvent(down, false); frame(tab, style); frame(tab, style);
+        CHECK(ImGui::GetFocusID() == second);
+        const int clicks = activated;
+        io.AddKeyEvent(a, true); frame(tab, style);
+        io.AddKeyEvent(a, false); frame(tab, style); frame(tab, style);
+        CHECK(activated == clicks + 1);
+        if (tab == 2) {
+          for (int n = 2; n <= 19; ++n) {
+            io.AddKeyEvent(down, true); frame(tab, style);
+            io.AddKeyEvent(down, false); frame(tab, style); frame(tab, style);
+            CHECK(ImGui::GetFocusID() == rows[n]);
+          }
+          CHECK(std::string(nav.labels.at(ImGui::GetFocusID())) == "Auto L-cancel");
+        }
+        // Leave from a stale, scrolled child, then open the same category again.
+        content->Scroll.y = content->ScrollMax.y;
+        content->ScrollTarget.y = content->ScrollMax.y;
+        frame(tab, style, false);
+      }
+    }
+  }
+  CHECK(focus_lines == 544);
+  ImGui::DestroyContext();
+}
 } // namespace
 
 int main() {
@@ -145,5 +242,7 @@ int main() {
         handoff(false, move, fast, dt, true);
       }
   held_stick_handoff();
-  std::puts("settings_mouse: old fast clicks lost; fixed move/click handoff, keyboard, stick and A pass");
+  page_entry(false);
+  page_entry(true);
+  std::printf("settings_mouse: %d checks; mouse handoff; 256 keyboard/pad page entries across 8 styles and 8 categories; first focus, Down, A, stale scroll and deduplicated labels\n", checks);
 }

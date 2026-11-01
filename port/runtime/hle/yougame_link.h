@@ -13,6 +13,7 @@
 // Unranked with a local Slippi login uses Slippi's matchmaking and native UDP instead.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -62,6 +63,7 @@ bool embedded();
 bool embed_toplevel();
 uint32_t app_pid();
 void embed_window_ready(uintptr_t hwnd = 0);
+void console_boot_ready();
 // The player box's commands ("rect x y w h", "hide", "show", "focus", "blur", "volume v", "quit"),
 // delivered on the bridge's reader thread. Lines that arrive before a handler is set are kept.
 void set_box_handler(std::function<void(const std::string&)> handler);
@@ -108,14 +110,35 @@ void pause_event(bool pausable, bool paused, const char* reason);
 std::string pick_friend_room(const std::function<bool()>& cancelled);
 
 // Retire any previous YouGame room before selecting plain UDP for a Slippi search.
-bool prepare_slippi_match(const std::function<bool()>& cancelled);
+bool prepare_slippi_match(const std::function<bool()>& cancelled, uint64_t epoch = 0);
+// Reserve a generation on the caller before launching a helper. Retires the previous room.
+uint64_t begin_search();
+// Serialize a blend commit with the helper's guarded global effects.
+bool guard_search(uint64_t epoch, const std::function<void()>& commit);
+
+// Runs `create` with ENet sockets on native UDP, then puts back the selection a YouGame search made.
+// ENet picks a socket's transport when it is created, so a host made here stays native: blended
+// Unranked makes Slippi's matchmaking client while YouGame's search (app-owned links) runs.
+void with_native_udp(const std::function<void()>& create);
+
+// Whether the base listing's Unranked can use a Slippi login, for the app: `yg {"slippi":...}` over the
+// stdio bridge the first time and whenever it changes (yougame_blend.h slippi_link_line). `tag` is the
+// player's own connect code; nothing else of the login ever goes out. Remixes never call it.
+void slippi_link(bool linked, const std::string& tag);
 
 // One matchmaking search: the game's online menu choice.
 struct Search {
+  uint64_t epoch = 0;        // reserved before launching a blend helper; 0: reserve on entry
   int mode = 1;               // Slippi's ids: 0 ranked, 1 unranked, 2 direct, 3 teams
   std::string direct_code;    // the opponent's connect code (Direct)
   std::string friend_room;    // internal invite; never an opponent connect code
   uint16_t udp_port = 0;      // the netplay port; STUN and the punch run from it so the NAT mapping is the one ENet uses
+  // Blended Unranked only (yougame_blend.h), called on the search's thread. on_searching: the queue's
+  // "searching" count (players searching there, this one included). claim: the queue named a room;
+  // false declines it (Slippi's side was first): briefly join and leave the assigned room.
+  std::function<void(int waiting)> on_searching;
+  std::function<bool()> claim;
+  std::string status;         // the status line while it searches (yougame_blend.h kSearch*); empty: "searching"
 };
 
 struct Player {
@@ -127,12 +150,14 @@ struct Player {
 
 struct Match {
   bool ok = false;
+  uint16_t udp_port = 0;      // actual own-UDP bound port, handed to the gameplay socket
   std::string error;          // shown in the game's error box
   bool retry = false;         // the connection failed after a match was found: search again
   std::string match_id;       // a fresh id per match (never the room's code, which stays private)
   bool host = false;          // seat 0: the decider
   int local_index = 0;        // 0-based local port
   std::vector<Player> players;
+  bool update_required = false; // Only an explicit update_required server code, never error text.
 };
 
 // Runs a whole search on the matchmaking thread: ticket, queue or direct room, compatibility
@@ -144,7 +169,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled);
 int seat_team(int player_idx);
 
 // The online game the room is recording started (the host asks the room to start a match).
-void game_started();
+void game_started(int64_t rng, int stage);
 // One game's end, from the game's Game End record (the Source Port) or Slippi's report (the Static
 // Recomp). A game is reported once, however many places say it ended.
 struct GameEnd {
@@ -162,7 +187,7 @@ void game_ended(const GameEnd& end);
 // Ranked: one best-of-3 set per room (yougame_ranked.h), decided from the games the room settles.
 void ranked_set_complete(uint8_t end_mode);   // C2 (a future GameSetup port)
 void ranked_match_status(uint8_t status);     // C4: 40 is Slippi's "abandoned"
-void ranked_game_setup();                     // the game sent a GameSetup step: its C2 decides
+void ranked_game_setup();                     // the game sent a GameSetup step: retain pair for C2 + result
 // Game thread, every online menu poll: a game's result is still on its way (no next game may start
 // yet), or the set is decided or its room is gone (break the pair, back to the search).
 bool ranked_hold();
@@ -172,10 +197,14 @@ bool ranked_room_retired();
 // This client's games with unique room receipts (the --online-test quit-after harness).
 int ranked_games_received();
 // The Ranked character select's header ("Ranked Mode", "Ranked - Placements 2/5",
-// "Ranked - Gold II - 1534"). The first ask without a known rank reads it from the app (mpRank).
+// "Ranked - Gold II - 1534"). Each CSS visit reads mpRank at most once, with failure back-off.
 std::string ranked_header();
+void ranked_screen_enter();
+std::array<std::string, 6> ranked_lines();
+uint8_t opponent_rank();
 // The last ranked standing is cached per process (E3/E5 and the match-state rank bytes).
 std::vector<uint8_t> rank_response();
+std::vector<uint8_t> rank_record_response(); // FE: self/opponent and the authoritative set result
 uint8_t rank_visibility();
 uint8_t local_rank();
 

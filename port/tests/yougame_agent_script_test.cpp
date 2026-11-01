@@ -1,5 +1,6 @@
 // Window-free parsing and routing/precedence checks for app-launched input scripts.
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <cstdint>
 #include "yougame_agent_script.h"
 #include "yougame_agent_fight.h"
 #ifdef YOUGAME_AGENT_TEST_HOOK

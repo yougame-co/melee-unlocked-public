@@ -3,7 +3,7 @@ from pathlib import Path
 import argparse, concurrent.futures, hashlib, json, os, shlex, shutil, subprocess, sys, time
 ROOT = Path(__file__).resolve().parents[2]
 BUILD = ROOT / 'build-mac-full'
-DEFAULT_GAME_LIBRARY = Path('<data-drive>/build-out/melee-ports/mu-0956-linux-game-nosp/melee_game.so')
+DEFAULT_GAME_LIBRARY = ROOT / 'build-mac-input' / 'melee_game.so'
 GAME_LIBRARY = Path(os.environ.get('MELEE_GAME_LIBRARY', str(DEFAULT_GAME_LIBRARY))).resolve()
 SDL = ROOT.parent / 'deps/sdl2'
 

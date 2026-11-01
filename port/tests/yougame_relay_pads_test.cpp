@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <cstdint>
 #include "yougame_link.h"
 #include "yougame_relay_pads.h"
 #ifdef _WIN32

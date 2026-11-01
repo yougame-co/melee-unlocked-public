@@ -51,7 +51,8 @@ APP_ROOTS = ('main.cpp', 'settings_window.cpp', 'source_host.cpp', 'source_host.
              'launcher.cpp', 'launcher_mod_catalog.cpp', 'launcher_replay_data.cpp', 'launcher_lobby.cpp',
              'launcher_lobby_p2p.cpp', 'launcher_process.cpp', 'launcher_theme.cpp', 'launcher_lang.cpp')
 BUILD_TOOLS = ('tools/generate_fobj_host.py', 'tools/native_major_fixture.py', 'tools/disc_offset_audit.py',
-               'tools/snapshot_audio_ranges.py', 'tools/tmce/link_module.py', 'tools/fma_exact/extract_funcs.py')
+               'tools/snapshot_audio_ranges.py', 'tools/tmce/link_module.py', 'tools/fma_exact/extract_funcs.py',
+               'tools/rank_badges.cmake', 'tools/rasterize_rank_badges.py', 'tools/rank_badges/checksums.json')
 RECOMP_FILES = ('recomp.py', 'analyze.py', 'dol.py', 'emit.py', 'gecko.py', 'gekko.py', 'symbols.py',
                 'GALE01_symbols.txt', 'hle_list.txt')
 ANIMATION_INPUTS = ('fobj.c', 'fobj.h', 'spline.c')

@@ -32,7 +32,9 @@ extern struct GamePrefs gmMainLib_DefaultGamePrefs;
 
 int mu_lag_test(void)
 {
+    int mu_console_active(void);
     static int state = -1;
+    if (mu_console_active()) return 0;
     if (state < 0) {
         state = getenv("MELEE_LAG_TEST") != NULL;
         if (state) {

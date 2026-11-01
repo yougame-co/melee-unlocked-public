@@ -201,6 +201,9 @@ void handle_event(const SDL_Event& e) {
   if (e.type == SDL_MOUSEMOTION) {
     g_pointer_moved = GetTickCount64();
     g_pointer_rested = false;
+#ifndef __APPLE__
+    show_cursor(true);
+#endif
   }
   if (e.type == SDL_QUIT || (e.type == SDL_WINDOWEVENT &&
       (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST || e.window.event == SDL_WINDOWEVENT_CLOSE)))
@@ -271,6 +274,9 @@ void handle_event(const SDL_Event& e) {
           g_activated.store(true);
 #endif
           g_cursor_reapply = true;
+#ifndef __APPLE__
+          g_pointer_moved = GetTickCount64();
+#endif
           linux_compat::set_window_focused(true);
           host::log("window: the game is in front again");
           return;
@@ -359,6 +365,9 @@ void apply_client_size(int w, int h) {
 }
 }  // namespace
 
+bool g_vulkan_window = false;
+void window_prefer_vulkan(bool on) { g_vulkan_window = on; }
+
 void* window_create(int w, int h, const wchar_t* title, bool visible) {
 #ifdef MELEE_LINUX_X11_EMBED
   const bool boxed = yougame::embedded();
@@ -387,7 +396,7 @@ void* window_create(int w, int h, const wchar_t* title, bool visible) {
 #ifdef MELEE_LINUX_X11_EMBED
   if (boxed) SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 0);  // Opaque child framebuffer.
 #endif
-  Uint32 flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+  Uint32 flags = (g_vulkan_window ? SDL_WINDOW_VULKAN : SDL_WINDOW_OPENGL) | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
 #ifdef MELEE_LINUX_X11_EMBED
   flags |= boxed ? SDL_WINDOW_HIDDEN : visible ? SDL_WINDOW_SHOWN : SDL_WINDOW_HIDDEN;
 #else
@@ -645,16 +654,17 @@ void window_pump() {
       [] { yougame::relay_key("escape"); },
       [](const std::string& line) { log("%s", line.c_str()); });
 #endif
-#ifdef MELEE_LINUX_X11_EMBED
-  if (g_x11_embed) return;  // The page owns the pointer and cursor.
-#endif
   if (!g_hwnd) return;
   const bool focused = (SDL_GetWindowFlags(sdl_window()) & SDL_WINDOW_INPUT_FOCUS) != 0;
+#ifdef __APPLE__
   // No pointer over the game while it has focus and no menu has input; and none after it has rested
   // for a while even then.
   bool visible = !focused || g_ui_capture.load();
   if (visible && !g_pointer_rested && g_pointer_moved && GetTickCount64() - g_pointer_moved >= kPointerRestMs) g_pointer_rested = true;
   if (g_pointer_rested) visible = false;
+#else
+  const bool visible = cursor_idle::visible(GetTickCount64(), g_pointer_moved, focused, g_ui_capture.load());
+#endif
   show_cursor(visible);
 }
 

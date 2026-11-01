@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -21,6 +22,8 @@
 
 struct _ENetHost;
 struct _ENetPeer;
+namespace yougame::udp { struct EnetIngress; }
+namespace yougame { struct Search; struct Match; }
 
 namespace slippi {
 
@@ -127,8 +130,12 @@ struct UserInfo {
 // The user record written by the Slippi Launcher (user.json in the Slippi user folder).
 class User {
  public:
-  // slippi_only loads MU's local Slippi login without replacing the menu's YouGame identity.
+  // slippi_only loads a Slippi login without replacing the menu's YouGame identity.
+  // Under YouGame this reads only its explicit grant; standalone keeps upstream discovery.
   explicit User(std::string user_dir, bool slippi_only = false);
+  // Every YouGame Slippi path uses only the account explicitly granted by its app.
+  // No ambient launcher discovery or server request when the grant is absent.
+  static std::unique_ptr<User> GrantedSlippiUser(const std::string& user_dir);
   bool AttemptLogin(bool rediscover = false);  // Log In rechecks shared launcher folders too.
   bool IsLoggedIn() const { return logged_in_; }
   UserInfo GetUserInfo() const { std::lock_guard<std::mutex> lock(mutex_); return info_; }
@@ -188,12 +195,13 @@ class NetplayClient {
   enum class DisconnectReason : uint32_t { UNSPECIFIED = 0, POOR_PERFORMANCE = 1 };
 
   NetplayClient(std::vector<std::string> addrs, std::vector<uint16_t> ports, uint8_t remote_player_count, uint16_t local_port,
-                bool is_decider, uint8_t player_idx);
+                bool is_decider, uint8_t player_idx, bool own_udp = false);
   ~NetplayClient();
 
   bool IsDecider() const { return is_decider_; }
   uint8_t LocalPlayerPort() const { return player_idx_; }
   ConnectStatus GetSlippiConnectStatus() const { return status_.load(std::memory_order_acquire); }
+  bool OwnUDPPortUnavailable() const { return own_udp_port_unavailable_; }
   std::vector<int> GetFailedConnections() const { return failed_connections_; }
   void StartSlippiGame();
   void SendSlippiPad(std::unique_ptr<Pad> pad);
@@ -275,6 +283,8 @@ class NetplayClient {
   std::deque<std::unique_ptr<Packet>> async_queue_;
 #endif
   _ENetHost* client_ = nullptr;
+  std::unique_ptr<yougame::udp::EnetIngress> own_udp_ingress_;
+  bool own_udp_port_unavailable_ = false;
   std::vector<_ENetPeer*> server_;
   std::thread thread_;
   uint8_t remote_player_count_ = 0;
@@ -386,7 +396,16 @@ class Matchmaking {
  private:
   void MatchmakeThread();
   void startMatchmaking();
-  void startYouGameMatchmaking();
+  // status: the Unranked status line while it searches (yougame_blend.h kSearch*); null for "searching".
+  void startYouGameMatchmaking(const char* status = nullptr);
+  bool youGameSearch(yougame::Search* search);     // false: the search has failed (an unreadable code)
+  void takeYouGameMatch(const yougame::Match& match);
+  // Blended Unranked (yougame_blend.h): YouGame's and Slippi's searches at once, first opponent wins.
+  void blendMatchmaking();
+  // Slippi's matchmaking client up to a queued ticket: "" once queued, else why not. `stop` ends it
+  // early; `avoid` is a port it must not take (the blend's YouGame port).
+  std::string openSlippiTicket(const UserInfo& me, const std::function<bool()>& stop, int avoid);
+  void dropSlippi();                       // ends Slippi's matchmaking client now
   void handleMatchmaking();
   void handleConnecting();
   void disconnectFromServer();
@@ -426,6 +445,10 @@ class Matchmaking {
   std::vector<std::string> remote_ips_;
   bool is_host_ = false;
 };
+
+// Launched by the app on the base listing: tells it whether Unranked can use a Slippi login when the
+// online menu first opens (yougame::slippi_link), read once off the game thread. Remixes send nothing.
+void announce_slippi_link(const std::string& user_dir);
 
 // Helpers shared with the EXI device.
 uint64_t time_us();

@@ -99,7 +99,7 @@ json graphql(const std::string& query, const json& variables) {
   json r = json::parse(response, nullptr, false);
   if (r.is_discarded()) { host::log("slippi report: bad response (HTTP %d): %s", status, response.substr(0, 200).c_str()); return nullptr; }
   const json* errors = json_member(r, "errors");
-  if (errors && errors->is_array() && !errors->empty()) { host::log("slippi report: server error: %s", errors->dump().substr(0, 300).c_str()); return nullptr; }
+  if (errors && errors->is_array() && !errors->empty()) { host::log("slippi report: server returned %zu errors", errors->size()); return nullptr; }
   const json* data = json_member(r, "data");
   if (!data) return nullptr;
   return *data;

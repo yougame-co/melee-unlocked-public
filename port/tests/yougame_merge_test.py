@@ -57,7 +57,7 @@ class YouGameMergeTest(unittest.TestCase):
         self.assertNotIn("g_config.delay", delay)
         self.assertIn("q.push_back((uint8_t)effective_delay());", online)
         for bridge in ("yougame::rank_response()", "yougame::rank_visibility()",
-                       "case CMD_YOUGAME_RANKED:", "yougame::ranked_header()",
+                       "case CMD_YOUGAME_RANKED:", "yougame::ranked_lines()",
                        "yougame::ranked_set_complete(payload[0])"):
             self.assertIn(bridge, online)
 

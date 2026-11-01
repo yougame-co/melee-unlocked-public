@@ -135,7 +135,7 @@ static void open_log_file() {
     MEMORYSTATUSEX memory{};
     memory.dwLength = sizeof memory;
     if (GlobalMemoryStatusEx(&memory))
-      std::fprintf(g_log_file, "memory: %.1f GB installed, %.1f GB free, %.1f GB more Windows can hand out\n",
+      std::fprintf(g_log_file, "memory: %.1f GB installed, %.1f GB free, %.1f GB more the system can hand out\n",
                    memory.ullTotalPhys / 1073741824.0, memory.ullAvailPhys / 1073741824.0, memory.ullAvailPageFile / 1073741824.0);
   }
 }
@@ -148,7 +148,7 @@ void log_memory() {
   memory.dwLength = sizeof memory;
   if (!K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&process, sizeof process) ||
       !GlobalMemoryStatusEx(&memory)) return;
-  log("memory: game %.2f GB, Windows %.1f GB free of %.1f, %.1f GB more it can hand out",
+  log("memory: game %.2f GB, system %.1f GB free of %.1f, %.1f GB more it can hand out",
       process.PrivateUsage / 1073741824.0, memory.ullAvailPhys / 1073741824.0, memory.ullTotalPhys / 1073741824.0,
       memory.ullAvailPageFile / 1073741824.0);
 }

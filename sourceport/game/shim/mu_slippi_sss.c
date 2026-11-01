@@ -18,6 +18,7 @@
 #include <melee/gm/types.h>
 #include <melee/mn/types.h>
 #include <mu_native.h>
+#include <mu_ranked.h>
 
 extern char mnNameNew_CurrentNameText[];
 
@@ -96,7 +97,7 @@ void mu_slippi_sss_lock_in(int stage_behavior)
 }
 
 /* FN_TX_FIND_MATCH: 2 of every 3 bytes of the typed name, 9 slots (the ninth reads past the eighth
- * letter, as on the console). The Ranked game-prep counters it also resets are not ported. */
+ * letter, as on the console). asm HandleInputsOnCSS.asm:334-343 resets prep. */
 void mu_slippi_sss_find_match(void)
 {
     unsigned char code[18];
@@ -105,6 +106,7 @@ void mu_slippi_sss_find_match(void)
         code[i * 2] = (unsigned char) mnNameNew_CurrentNameText[i * 3];
         code[i * 2 + 1] = (unsigned char) mnNameNew_CurrentNameText[i * 3 + 1];
     }
+    mu_ranked_set_reset();
     mu_slippi_find_opponent(mu_slippi_state()->mode, code);
 }
 

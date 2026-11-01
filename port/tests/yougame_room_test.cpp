@@ -78,6 +78,10 @@ struct FakeSocket {
   bool recoverable() const { return broker_mode && stream.close_code()==1006; }
   bool brokered() const { return broker_mode; }
   bool send(const json& m) { return stream.send(m); }
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  uint64_t agent_test_first_open_at() const { return stream.agent_test_first_open_at(); }
+  void agent_test_drop_room() { stream.agent_test_drop_room(); }
+#endif
 };
 struct Fixture {
   Broker b;
@@ -96,10 +100,15 @@ struct Fixture {
     io.disable_links=[this]{++b.disabled;};
     io.log=[this](const char* message){logs.emplace_back(message);};
   }
-  void ranked() {
+  void ranked(bool dispatch_start = true) {
     r.ranked=true; r.set.configure(0,{"a","b"}); r.set.start_game();
     r.match_id="set-1"; r.recovery.start(r.match_id);
     r.set.receive({{"t","start"},{"matchId","set-1"}});
+    if (dispatch_start) {
+      const auto start = r.set.due(b.now, true, 7);
+      CHECK(start.size() == 1 && start[0]["t"] == "game-start");
+      CHECK(r.socket->send(start[0])); r.set.sent(start[0]);
+    }
   }
   void report(int index=1) {
     yougame::ranked::Game g; g.index=index; g.winner=0; r.set.report_game(g);
@@ -116,17 +125,20 @@ static void failed_send_is_loss() {
       if (q["type"]=="netClose") ++closes;
       if (q["type"]=="netSend" && ++sends==1) throw std::runtime_error(error);
       return json::object();
-    });
+    }, [] { return uint64_t{1}; }); // queued open event: scheduling never consumes its budget
     CHECK(stream.open("ticket-old","abcdef",10));
     CHECK(!stream.send({{"t","begin"}}) && !stream.closed());
     CHECK(stream.open("ticket-old","abcdef",10) && closes==0); // no replacement of a live stream
     CHECK(stream.send({{"t","begin"}}) && sends==2);
   }
-  Fixture f; f.ranked(); f.report(); f.b.fail_send=true; f.tick();
-  f.b.at(101,[&]{f.b.fail_send=false; f.tick();});
-  f.b.at(2201,[&]{CHECK(f.b.messages("game-report")==1 && !f.r.set.closed());f.tick();});
-  f.stop_at(2301); f.run();
-  CHECK(f.b.count("netOpen")==1 && f.b.count("netClose")==0);
+  for (bool fail_start : {false,true}) {
+    Fixture f; f.ranked(!fail_start); f.report(); f.b.fail_send=true; f.tick();
+    f.b.at(101,[&]{CHECK(f.b.messages("game-report")==0); f.b.fail_send=false; f.tick();});
+    f.b.at(1901,[&]{CHECK(f.b.messages("game-report")==0); f.tick();});
+    f.b.at(2301,[&]{CHECK(f.b.messages("game-start")==1 && f.b.messages("game-report")==1 && f.r.set.awaiting_receipt() && !f.r.set.closed());f.tick();});
+    f.stop_at(2401); f.run();
+    CHECK(f.b.count("netOpen")==1 && f.b.count("netClose")==0);
+  }
 }
 static void timeout_and_late_open() {
   Broker b; b.on_open=[](int){};
@@ -206,18 +218,33 @@ static void departure_keeps_ranked_pump() {
   f.b.at(2,[&]{CHECK(f.b.disabled==0 && !f.r.recovery.pending());f.tick();});f.stop_at(3);f.run();
 }
 static void missed_receipts() {
-  for (const char* error : {"That game result is already recorded","That game result is already being recorded"}) {
-    Fixture f; f.ranked();f.report();
-    CHECK(f.r.set.due(f.b.now,true,7)[0]["t"]=="game-report"); // its receipt is lost
+  for (bool machine_ack : {false, true}) {
+    Fixture f; f.ranked(); f.report();
+    const auto report = f.r.set.due(f.b.now,true,7);
+    CHECK(report.size()==1 && report[0]["t"]=="game-report");
+    CHECK(f.r.socket->send(report[0])); f.r.set.sent(report[0]); // no answer before the drop
     f.r.set.lost(); f.b.closed();
     f.b.on_open=[&](int id){f.b.opened(id);f.b.push(welcome());};
-    f.b.at(2201,[&]{CHECK(f.b.messages("game-report")==1);f.b.push({{"t","command-error"},{"action","game-report"},{"id","g1-t0"},{"error",error}});});
-    f.b.at(2301,[&]{CHECK(!f.r.set.awaiting_receipt() && f.r.set.games_received()==1 && f.b.messages("finish")==1);f.b.push({{"t","result"},{"matchId","set-1"}});});
-    f.stop_at(2401);f.run();CHECK(f.r.set.settled());
-    // Internet/non-restored refusals still wait for their authoritative game-result.
-    yougame::ranked::Set legacy;legacy.configure(0,{"a","b"});legacy.start_game();legacy.receive({{"t","start"},{"matchId","set-1"}});
-    yougame::ranked::Game g;g.index=1;g.winner=0;legacy.report_game(g);legacy.due(1,true,7);
-    legacy.refused({{"action","game-report"},{"id","g1-t0"},{"error",error}});CHECK(legacy.awaiting_receipt());
+    // Respond only to a real replay, as a room whose prior receipt was missed would.
+    f.b.on_send=[&](const json& m) {
+      if (str(m,"t") != "game-start" && str(m,"t") != "game-report") return;
+      json answer={{"t","command-error"},{"action",m["t"]},{"id",m["id"]},
+                   {"error","That game result is already recorded"}};
+      if (machine_ack) answer["code"]="already_recorded";
+      f.b.push(answer);
+    };
+    f.b.at(2201,[&]{CHECK(f.b.messages("game-start")==2 && f.b.messages("game-report")==1);
+      CHECK(f.r.set.awaiting_receipt() && f.r.set.games_received()==0); f.tick();
+    });
+    f.b.at(17001,[&]{CHECK(f.r.set.awaiting_receipt());
+      CHECK(f.r.set.games_received()==0 && f.b.messages("finish")==0); f.tick();
+    });
+    f.b.at(33001,[&]{CHECK(f.r.set.release_pair() && !f.r.set.settled());
+      CHECK(f.r.set.games_received()==0 && f.b.messages("finish")>=1);
+      for (const auto& m : f.b.sent) if (str(m,"t")=="finish") CHECK(m["void"]==true);
+      f.b.push({{"t","result"},{"matchId","set-1"}});
+    });
+    f.stop_at(33201); f.run(); CHECK(f.r.set.settled());
   }
   for (bool refused : {false,true}) {
     Fixture f;f.r.games.start_game();f.r.games.started("old-game");f.r.games.report(0);
@@ -348,11 +375,49 @@ static void flush_joins_open() {
   while(!flushing) std::this_thread::yield();
   CHECK(flush.wait_for(std::chrono::milliseconds(10))==std::future_status::timeout);
   {std::lock_guard<std::mutex> lock(gate);release=true;cv.notify_all();}
-  flush.get();CHECK(!r.pump.joinable() && sent.size()==1 && sent[0]["t"]=="finish");
+  flush.get();CHECK(!r.pump.joinable() && sent.size()==2 && sent[0]["t"]=="game-start" && sent[1]["t"]=="finish");
+}
+static void quit_waiting_for_receipt_drains_concession() {
+  for (bool deciding_receipt : {false, true}) {
+    Fixture f; f.ranked();
+    std::string pending_id="g1-t0";
+    if (deciding_receipt) {
+      f.report();
+      const auto first=f.r.set.due(f.b.now,true,7);
+      CHECK(first.size()==1 && f.r.socket->send(first[0])); f.r.set.sent(first[0]);
+      f.r.set.receive({{"t","game-result"},{"matchId","set-1"},{"id","g1-t0"},{"ranking",{"a","b"}}});
+      f.r.set.start_game();
+      const auto start=f.r.set.due(f.b.now,true,7);
+      CHECK(start.size()==1 && f.r.socket->send(start[0])); f.r.set.sent(start[0]);
+      pending_id="g2-t0";
+    }
+    f.report();
+    const auto report = f.r.set.due(f.b.now,true,7);
+    CHECK(report.size()==1 && f.r.socket->send(report[0])); f.r.set.sent(report[0]);
+    // A 2-0 winner's pending deciding game must preserve its finish instead of conceding.
+    f.r.set.quit(); CHECK(!f.r.set.decided() && !f.r.set.leaves_at_once());
+    int waits=0;
+    f.io.pause=[&](int ms) {
+      f.b.now+=ms; ++waits;
+      CHECK(f.b.messages("finish")==0);
+      f.r.set.receive({{"t","game-result"},{"matchId","set-1"},{"id",pending_id},{"ranking",{"a","b"}}});
+      // Let the real pump send a winner's finish and receive the room's result.
+      if (deciding_receipt) {
+        f.b.on_send=[&](const json& m) { if (str(m,"t")=="finish") f.b.push({{"t","result"},{"matchId","set-1"}}); };
+        f.tick(); f.stop_at(f.b.now+10); f.run();
+      }
+    };
+    CHECK(drain_ranked_room(f.r,f.mutex,f.io,30000));
+    CHECK(waits==1 && f.b.messages("finish")==1);
+    const auto finish=std::find_if(f.b.sent.begin(),f.b.sent.end(),[](const json& m){return str(m,"t")=="finish";});
+    CHECK((*finish)["winner"]==(deciding_receipt?"a":"b"));
+    stop_and_flush(f.r,f.mutex); CHECK(f.b.messages("finish")==1);
+  }
 }
 int main() {
   failed_send_is_loss();timeout_and_late_open();recovery_closes_and_expiry();lobby_start_links();
   departure_keeps_ranked_pump();missed_receipts();ticket_allowance();internet_unchanged();flush_joins_open();
   ticket_renewal_recovers();ticket_renewal_deadline();ticket_renewal_validation();
+  quit_waiting_for_receipt_drains_concession();
   std::puts("yougame_room: real pump send loss, late open, recovery expiry, lobby links, ranked drain, missed receipts, ticket budgets, internet compatibility and flush serialization passed");
 }

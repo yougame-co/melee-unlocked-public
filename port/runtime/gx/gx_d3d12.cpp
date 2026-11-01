@@ -32,6 +32,7 @@
 #include "dxgi_paced_mode.h"
 #include "fullscreen_state.h"
 #include "vrr_detect.h"
+#include "pacing_diagnostics_win.h"
 #include "temporal_history.h"
 #include "vblank_clock.h"
 #include "gx_d3d12.h"
@@ -45,6 +46,7 @@
 #include "gx_shader.h"
 #include "yougame_parity.h"
 #include "crt_shader.h"
+#include "present_shader.h"
 #include "user_shader.h"
 #include "gx_dxr_scene.h"
 #include "gx_dxr_gpu_scene.h"
@@ -428,6 +430,7 @@ class D3D12Backend : public Backend {
   }
   VBlankClock vblank_;
   bool vblank_tracked_ = false;
+  pacing_diag::WindowsRecorder pacing_diagnostics_;
   void update_variable_refresh();
   vrr::Detector vrr_;
   bool tear_free_ = false, vrr_readable_ = false;
@@ -449,6 +452,7 @@ class D3D12Backend : public Backend {
   int scale() const { return scale_; }
   void set_skip_present(bool skip) override { skip_present_ = skip; }
   bool skip_present_ = false;
+  bool occluded_ = false;   // Present said DXGI_STATUS_OCCLUDED: minimized or alt-tabbed out of fullscreen
   uint32_t frames_presented() const { return frames_presented_; }
   uint32_t pipeline_count() const { return (uint32_t)psos_.size(); }
   uint32_t texture_count() const { return (uint32_t)textures_.size(); }
@@ -690,6 +694,20 @@ class D3D12Backend : public Backend {
   ComPtr<ID3D12DescriptorHeap> rtv_heap_, dsv_heap_, srv_heap_, sampler_heap_;
   ComPtr<ID3D12Resource> backbuffers_[3];
   ComPtr<ID3D12Resource> efb_color_, efb_depth_;
+  // MSAA (Anti-aliasing 2x/4x/8x MSAA): the draws go to these, resolved into efb_color_/efb_depth_
+  // (colour averaged, depth from sample 0) before anything reads the EFB. 1 = off.
+  ComPtr<ID3D12Resource> msaa_color_, msaa_depth_;
+  ComPtr<ID3D12PipelineState> depth_resolve_pso_, blit_msaa_pso_;
+  ComPtr<ID3DBlob> blit_vs_blob_, blit_ps_blob_;
+  uint32_t blit_msaa_samples_ = 0;
+  ID3D12PipelineState* efb_blit_pso();
+  uint32_t msaa_samples_ = 1;
+  int msaa_applied_ = 1;
+  void resolve_efb();
+  uint32_t msaa_wanted() const;
+  // MSAA draws only while nothing else reads the EFB itself: DLSS/XeSS and path tracing can be turned
+  // on while the game runs, and their pipelines expect the single-sample targets.
+  bool msaa_on() const { return msaa_samples_ > 1 && msaa_color_ && !dlss_active_ && !opts_.path_tracing; }
   // Frames in flight: each slot owns a command allocator, upload rings and the resources it
   // retired; a slot is reused only after the fence value recorded at its submission completes.
   // Two slots, not three: with three the CPU could run two whole GPU frames ahead, and when the GPU
@@ -884,7 +902,7 @@ void D3D12Backend::init() {
   create_swapchain(waitable_wanted() && !opts_.exclusive_fullscreen);
 
   D3D12_DESCRIPTOR_HEAP_DESC hd{};
-  hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 8;
+  hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 9;   // 8: the MSAA EFB
   check(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "rtv heap");
   hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV; hd.NumDescriptors = 2;
   check(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsv_heap_)), "dsv heap");
@@ -976,102 +994,7 @@ void D3D12Backend::init() {
   D3D12_ROOT_SIGNATURE_DESC brsd{2, bp, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_NONE};
   check(D3D12SerializeRootSignature(&brsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err), "blit root");
   check(device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&blit_root_)), "blit root sig");
-  const char* blit = R"(
-Texture2D src : register(t0); Texture2D efb : register(t1); Texture2D hudmask : register(t2); Texture2D<float> efb_depth : register(t3); SamplerState samp : register(s0);
-// box.z > 0: DLSS HUD composite. Pixels a flat 2D draw wrote this frame (HUD, text, player tags) come
-// from this frame's own render instead of DLSS, which rebuilds from history and ghosted the ticking
-// timer and moving tags; NVIDIA's guide puts UI after DLSS. hudr maps output uv to EFB uv.
-cbuffer C : register(b0) { float4 rect; float4 sharp; float4 box; float4 hudr; float4 color; float4 crt; float4 crt2; };  // rect: xy = uv scale, zw = uv offset; sharp: xy = texel size, z = amount; box: xy = taps per axis; color: x = brightness gain, y = contrast gain, z = vibrance gain
-struct O { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-O VS(uint id : SV_VertexID) { O o; float2 p = float2((id << 1) & 2, id & 2); o.pos = float4(p * float2(2,-2) + float2(-1,1), 0, 1); o.uv = p * rect.xy + rect.zw; return o; }
-// Border art (crt2.w > 0): the picture casts a soft shadow on the art beside it, darkest at the
-// picture's edge. crt = the picture's rectangle in window pixels, crt2.x = how far the shadow reaches.
-float3 art_frame(float2 px, float3 c) {
-  if (crt2.w <= 0.0) return c;
-  float2 d = max(max(crt.xy - px, px - crt.zw), 0.0);
-  float near = saturate(1.0 - length(d) / max(crt2.x, 1.0));
-  return c * (1.0 - 0.88 * near * near);
-}
-// Downsampling: average the whole footprint of one output pixel (a box of taps x taps bilinear
-// samples) instead of one bilinear sample, which at 3x or more would skip most of the rendered
-// pixels (shimmering, jagged edges). This is what makes a 4x or 6x internal resolution look
-// supersampled on a 1080p screen.
-float4 downsample(float2 uv) {
-  int nx = (int)box.x, ny = (int)box.y;
-  if (nx <= 1 && ny <= 1) return src.Sample(samp, uv);
-  float2 foot = sharp.xy * float2(nx, ny);   // footprint of one output pixel in uv
-  float4 acc = 0;
-  for (int y = 0; y < ny; ++y)
-    for (int x = 0; x < nx; ++x)
-      acc += src.Sample(samp, uv + (float2(x, y) + 0.5) / float2(nx, ny) * foot - 0.5 * foot);
-  return acc / (nx * ny);
-}
-float4 hud(float2 uv, float4 c) {
-  if (box.z <= 0.0) return c;
-  float2 e = uv * hudr.xy + hudr.zw;
-  if (box.w > 0.0) return float4(hudmask.Sample(samp, e).rrr, 1);   // MELEE_DEBUG_HUDMASK
-  float m = hudmask.Sample(samp, e).r;
-  return m > 0.0 ? lerp(c, efb.Sample(samp, e), saturate(m)) : c;
-}
-// Optional screen-space ambient occlusion approximation. Melee uses reversed depth (clear = 0),
-// so nearer samples have larger depth. It darkens contact edges only and leaves cleared pixels
-// alone. This is a lightweight display effect, not hardware ray tracing.
-float ao(float2 uv) {
-  if (color.w <= 0.0) return 1.0;
-  float d = efb_depth.Sample(samp, uv).r;
-  if (d <= 0.00001) return 1.0;
-  uint depth_w, depth_h;
-  efb_depth.GetDimensions(depth_w, depth_h);
-  float2 px = 2.0 / max(float2(depth_w, depth_h), 1.0);
-  float2 dirs[8] = {float2(-1,-1), float2(0,-1), float2(1,-1), float2(-1,0), float2(1,0), float2(-1,1), float2(0,1), float2(1,1)};
-  float occ = 0.0;
-  float bias = max(0.0015, d * 0.012);
-  [unroll] for (int k = 0; k < 8; ++k) {
-    float nd = efb_depth.Sample(samp, uv + dirs[k] * px).r;
-    occ += nd > d + bias ? 1.0 : 0.0;
-  }
-  return saturate(1.0 - (occ * 0.125) * color.w);
-}
-// Brightness/contrast/vibrance: a display adjustment over the finished picture, HUD included (a
-// brightness slider that left percentages at native brightness while dimming everything else would
-// read as a bug, not a feature). Neutral at (1,1,1), so this is a no-op when nobody has touched it.
-float3 grade(float3 c) {
-  if (color.x == 1.0 && color.y == 1.0 && color.z == 1.0) return c;
-  c *= color.x;
-  c = (c - 0.5) * color.y + 0.5;
-  float luma = dot(c, float3(0.2126, 0.7152, 0.0722));
-  c = lerp(luma.xxx, c, color.z);
-  return saturate(c);
-}
-float3 path_to_display(float3 c) {
-  c = saturate(c);
-  return lerp(12.92 * c, 1.055 * pow(c, 1.0 / 2.4) - 0.055, step(0.0031308, c));
-}
-float4 PS(O i) : SV_Target {
-  if (color.w < -1.5) {
-    uint z = min((uint)((1.0 - src.Sample(samp, i.uv).r) * 16777216.0), 0xFFFFFFu);
-    return float4(float3((z >> 16) & 255u, (z >> 8) & 255u, z & 255u) / 255.0, 1.0);
-  }
-  float2 depth_uv = i.uv * hudr.xy + hudr.zw;
-  float4 scene = downsample(i.uv);
-  scene.rgb *= ao(depth_uv);
-  float4 c = hud(i.uv, scene);
-  // color.w < 0: an EFB copy from a frame buffer without alpha, which reads as opaque on hardware.
-  if (color.w < 0.0) return float4(c.rgb, 1.0);
-  if (sharp.z <= 0.0) return float4(art_frame(i.pos.xy, grade(sharp.w > 0.5 ? path_to_display(c.rgb) : c.rgb)), c.a);
-  // Contrast-adaptive sharpening (AMD CAS style): sharpen where local contrast allows it,
-  // over neighbours one output pixel away.
-  float2 step = sharp.xy * max(box.xy, 1.0);
-  float3 n = src.Sample(samp, i.uv + float2(0, -step.y)).rgb, s = src.Sample(samp, i.uv + float2(0, step.y)).rgb;
-  float3 w = src.Sample(samp, i.uv + float2(-step.x, 0)).rgb, e = src.Sample(samp, i.uv + float2(step.x, 0)).rgb;
-  float3 mn = min(min(min(n, s), min(w, e)), c.rgb), mx = max(max(max(n, s), max(w, e)), c.rgb);
-  float3 amp = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, 1e-4)));
-  float peak = -1.0 / lerp(8.0, 5.0, saturate(sharp.z));
-  float3 wgt = amp * peak;
-  float3 r = (c.rgb + (n + s + w + e) * wgt) / (1.0 + 4.0 * wgt);
-  float4 sharpened = hud(i.uv, float4(saturate(r), c.a));
-  return float4(grade(sharp.w > 0.5 ? path_to_display(sharpened.rgb) : sharpened.rgb), sharpened.a);
-})";
+  const char* blit = kPresentShader;
   ComPtr<ID3DBlob> bvs, bps;
   check(D3DCompile(blit, strlen(blit), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &bvs, &err), "blit vs");
   check(D3DCompile(blit, strlen(blit), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &bps, &err), "blit ps");
@@ -1084,26 +1007,31 @@ float4 PS(O i) : SV_Target {
   pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM; pd.SampleDesc.Count = 1;
   check(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&blit_pso_)), "blit pso");
+  blit_vs_blob_ = bvs; blit_ps_blob_ = bps;
+  {
+    // MSAA depth resolve (resolve_efb): sample 0 of the multisampled depth into the EFB depth.
+    const char* dr = "Texture2DMS<float> msdepth : register(t0);\n"
+                     "float4 VS(uint id : SV_VertexID) : SV_Position { float2 p = float2((id << 1) & 2, id & 2); return float4(p * 2 - 1, 0, 1); }\n"
+                     "float PS(float4 pos : SV_Position) : SV_Depth { return msdepth.Load(int2(pos.xy), 0); }\n";
+    ComPtr<ID3DBlob> dvs, dps, derr;
+    if (SUCCEEDED(D3DCompile(dr, strlen(dr), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &dvs, &derr)) &&
+        SUCCEEDED(D3DCompile(dr, strlen(dr), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &dps, &derr))) {
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC dd{};
+      dd.pRootSignature = blit_root_.Get();
+      dd.VS = {dvs->GetBufferPointer(), dvs->GetBufferSize()}; dd.PS = {dps->GetBufferPointer(), dps->GetBufferSize()};
+      dd.SampleMask = UINT_MAX;
+      dd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; dd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; dd.RasterizerState.DepthClipEnable = FALSE;
+      dd.DepthStencilState.DepthEnable = TRUE; dd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+      dd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+      dd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      dd.NumRenderTargets = 0; dd.DSVFormat = DXGI_FORMAT_D32_FLOAT; dd.SampleDesc.Count = 1;
+      if (FAILED(device_->CreateGraphicsPipelineState(&dd, IID_PPV_ARGS(&depth_resolve_pso_)))) host::log("d3d12: MSAA depth resolve pipeline failed");
+    } else host::log("d3d12: MSAA depth resolve shader failed: %s", derr ? (const char*)derr->GetBufferPointer() : "?");
+  }
   // The CRT display model (crt_shader.h) as a second pixel shader over the same inputs: the picture
   // it reads is the one the plain present shows (HUD composite included), then occlusion and the
   // colour sliders apply to its result. Off costs nothing: the plain shader is unchanged.
-  const std::string crt_src = std::string(blit) + R"(
-float3 crt_tap(float2 uv) {
-  float4 c = src.SampleLevel(samp, uv, 0);
-  if (box.z > 0.0) {
-    float2 e = uv * hudr.xy + hudr.zw;
-    float m = hudmask.SampleLevel(samp, e, 0).r;
-    if (m > 0.0) c = lerp(c, efb.SampleLevel(samp, e, 0), saturate(m));
-  }
-  return sharp.w > 0.5 ? path_to_display(c.rgb) : c.rgb;
-}
-)" + kCrtShader + R"(
-float4 PS_CRT(O i) : SV_Target {
-  float2 picture_uv;
-  float3 c = crt_pixel(i.pos.xy, i.uv, picture_uv);
-  c *= ao(picture_uv * hudr.xy + hudr.zw);
-  return float4(grade(c), 1.0);
-})";
+  const std::string crt_src = std::string(blit) + kPresentCrtTap + kCrtShader + kPresentCrtMain;
   ComPtr<ID3DBlob> cps;
   check(D3DCompile(crt_src.data(), crt_src.size(), nullptr, nullptr, nullptr, "PS_CRT", "ps_5_0", 0, 0, &cps, &err), "crt ps");
   pd.PS = {cps->GetBufferPointer(), cps->GetBufferSize()};
@@ -1279,7 +1207,7 @@ void D3D12Backend::apply_fullscreen_mode() {
 int D3D12Backend::pick_scale(bool with_ssaa) const {
   constexpr int max_scale = 16384 / EFB_WIDTH;   // D3D12 texture limit
   if (forced_scale_ > 0) return std::clamp(forced_scale_, 1, max_scale);
-  const int ssaa = with_ssaa ? std::clamp(opts_.ssaa, 1, 2) : 1;
+  const int ssaa = with_ssaa ? std::clamp(opts_.ssaa, 1, 4) : 1;
   if (opts_.efb_scale > 0) return std::clamp(opts_.efb_scale * ssaa, 1, max_scale);
   float ww = (float)std::max(client_w_, 1), wh = (float)std::max(client_h_, 1);
   float aspect = output_aspect();
@@ -1322,8 +1250,89 @@ void D3D12Backend::create_efb() {
   check(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, &hv, IID_PPV_ARGS(&hud_mask_)), "hud mask");
   D3D12_CPU_DESCRIPTOR_HANDLE hrtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); hrtv.ptr += 6 * rtv_size_;
   device_->CreateRenderTargetView(hud_mask_.Get(), nullptr, hrtv);
+  msaa_samples_ = msaa_wanted();
+  msaa_applied_ = opts_.msaa;
+  msaa_color_.Reset(); msaa_depth_.Reset();
+  if (msaa_samples_ > 1) {
+    D3D12_RESOURCE_DESC md = rd;
+    md.SampleDesc.Count = msaa_samples_; md.Format = DXGI_FORMAT_R8G8B8A8_UNORM; md.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    check(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &md, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&msaa_color_)), "msaa color");
+    D3D12_CPU_DESCRIPTOR_HANDLE mrt = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); mrt.ptr += 8 * rtv_size_;
+    device_->CreateRenderTargetView(msaa_color_.Get(), nullptr, mrt);
+    md.Format = DXGI_FORMAT_R32_TYPELESS; md.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    check(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &md, D3D12_RESOURCE_STATE_DEPTH_WRITE, &dv, IID_PPV_ARGS(&msaa_depth_)), "msaa depth");
+    D3D12_DEPTH_STENCIL_VIEW_DESC mdv{}; mdv.Format = DXGI_FORMAT_D32_FLOAT; mdv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS;
+    D3D12_CPU_DESCRIPTOR_HANDLE mds = dsv_heap_->GetCPUDescriptorHandleForHeapStart(); mds.ptr += device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    device_->CreateDepthStencilView(msaa_depth_.Get(), &mdv, mds);
+    host::log("d3d12: %ux MSAA", msaa_samples_);
+  }
   last_poses_.clear(); dlss_reset_ = true;
   efb_is_rt_ = true;
+}
+
+// The MSAA the settings ask for, if this GPU has it for the EFB formats; 1 under DLSS/XeSS and path
+// tracing, which read the EFB themselves (as Anti-aliasing SSAA is set aside there).
+uint32_t D3D12Backend::msaa_wanted() const {
+  if (opts_.msaa <= 1 || opts_.dlss_mode || opts_.path_tracing) return 1;
+  for (uint32_t n = (uint32_t)std::min(opts_.msaa, 8); n > 1; n /= 2) {
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS c{DXGI_FORMAT_R8G8B8A8_UNORM, n}, d{DXGI_FORMAT_D32_FLOAT, n};
+    if (SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &c, sizeof c)) && c.NumQualityLevels &&
+        SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &d, sizeof d)) && d.NumQualityLevels) return n;
+  }
+  return 1;
+}
+
+// Colour by the hardware resolve, depth by a pass that copies sample 0 into the single-sample
+// depth (D3D12 resolves no depth formats). Leaves the MSAA targets bound again.
+// The blit pipeline for drawing into the EFB itself (video backgrounds): MSAA needs one with the
+// EFB's sample count.
+ID3D12PipelineState* D3D12Backend::efb_blit_pso() {
+  if (!msaa_on()) return blit_pso_.Get();
+  if (blit_msaa_samples_ != msaa_samples_) {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = blit_root_.Get();
+    pd.VS = {blit_vs_blob_->GetBufferPointer(), blit_vs_blob_->GetBufferSize()}; pd.PS = {blit_ps_blob_->GetBufferPointer(), blit_ps_blob_->GetBufferSize()};
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM; pd.SampleDesc.Count = msaa_samples_;
+    blit_msaa_pso_.Reset();
+    if (FAILED(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&blit_msaa_pso_)))) return nullptr;
+    blit_msaa_samples_ = msaa_samples_;
+  }
+  return blit_msaa_pso_.Get();
+}
+
+void D3D12Backend::resolve_efb() {
+  if (!msaa_on()) return;
+  D3D12_RESOURCE_BARRIER b[3]{};
+  for (auto& x : b) x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b[0].Transition = {msaa_color_.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE};
+  b[1].Transition = {efb_color_.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_DEST};
+  b[2].Transition = {msaa_depth_.Get(), 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+  list_->ResourceBarrier(3, b);
+  list_->ResolveSubresource(efb_color_.Get(), 0, msaa_color_.Get(), 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+  if (depth_resolve_pso_) {
+    const uint32_t slot = reserve_srvs(4);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = srv_heap_->GetCPUDescriptorHandleForHeapStart(); cpu.ptr += slot * srv_size_;
+    D3D12_SHADER_RESOURCE_VIEW_DESC v{}; v.Format = DXGI_FORMAT_R32_FLOAT; v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    for (int k = 0; k < 4; ++k) { D3D12_CPU_DESCRIPTOR_HANDLE h = cpu; h.ptr += k * srv_size_; device_->CreateShaderResourceView(msaa_depth_.Get(), &v, h); }
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = srv_heap_->GetGPUDescriptorHandleForHeapStart(); gpu.ptr += slot * srv_size_;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+    list_->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+    D3D12_VIEWPORT vp{0, 0, (float)efb_w_, (float)efb_h_, 0, 1}; D3D12_RECT sc{0, 0, (LONG)efb_w_, (LONG)efb_h_};
+    list_->RSSetViewports(1, &vp); list_->RSSetScissorRects(1, &sc);
+    list_->SetPipelineState(depth_resolve_pso_.Get());
+    list_->SetGraphicsRootSignature(blit_root_.Get());
+    list_->SetGraphicsRootDescriptorTable(0, gpu);
+    list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list_->DrawInstanced(3, 1, 0, 0);
+  }
+  for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+  list_->ResourceBarrier(3, b);
+  bind_efb_targets();
 }
 
 void D3D12Backend::bind_efb_targets() {
@@ -1332,6 +1341,12 @@ void D3D12Backend::bind_efb_targets() {
   rtvs[1] = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); rtvs[1].ptr += 5 * rtv_size_;
   rtvs[2] = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); rtvs[2].ptr += 6 * rtv_size_;
   D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+  if (msaa_on()) {
+    rtvs[0] = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); rtvs[0].ptr += 8 * rtv_size_;
+    dsv.ptr += device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    list_->OMSetRenderTargets(1, rtvs, FALSE, &dsv);
+    return;
+  }
   list_->OMSetRenderTargets(dlss_active_ ? 3 : 1, rtvs, FALSE, &dsv);
 }
 
@@ -1618,7 +1633,7 @@ void D3D12Backend::configure_dlss() {
   float bias_extra = -1.0f;
   if (const char* e = std::getenv("MELEE_DLSS_BIAS_EXTRA")) bias_extra = (float)std::atof(e);
   set_dlss_mip_bias((in_place ? 0.0f : std::log2((640.0f * scale) / (float)out_w)) + bias_extra);
-  if (in_place && std::clamp(opts_.ssaa, 1, 2) > 1)
+  if (in_place && opts_.ssaa > 1)
     host::log("dlss: supersampling is not applied under %s (it anti-aliases already)", upscaler_name());
   host::log("dlss: %s, render %dx%d (EFB x%d, optimal %ux%u) -> %s %dx%d%s", upscaler_name(),
             in_place ? out_w : 640 * scale, in_place ? out_h : 480 * scale, scale, rw, rh,
@@ -1713,8 +1728,8 @@ static void describe_pipeline(D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd, const PsoK
   pd.DepthStencilState.DepthWriteMask = (bits(zm, 0, 1) && bits(zm, 4, 1)) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
   pd.DepthStencilState.DepthFunc = bits(zm, 0, 1) ? cmp[bits(zm, 1, 3)] : D3D12_COMPARISON_FUNC_ALWAYS;
   pd.PrimitiveTopologyType = topo;
-  pd.NumRenderTargets = key.mvec ? 3 : 1; pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM; pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
-  if (key.mvec) {
+  pd.NumRenderTargets = (key.mvec & 1) ? 3 : 1; pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM; pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+  if (key.mvec & 1) {
     pd.RTVFormats[1] = DXGI_FORMAT_R16G16_FLOAT;
     pd.RTVFormats[2] = DXGI_FORMAT_R8_UNORM;
     pd.BlendState.IndependentBlendEnable = TRUE;
@@ -1729,7 +1744,7 @@ static void describe_pipeline(D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd, const PsoK
     pd.BlendState.RenderTarget[2] = D3D12_RENDER_TARGET_BLEND_DESC{};
     pd.BlendState.RenderTarget[2].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
   }
-  pd.SampleDesc.Count = 1;
+  pd.SampleDesc.Count = std::max(1u, key.mvec >> 4);   // MSAA sample count rides in mvec's high bits (0 when off)
 }
 
 ComPtr<ID3D12PipelineState> D3D12Backend::build_pso(const PsoKey& key, const VSUid& vsu, const PSUid& psu, D3D12_PRIMITIVE_TOPOLOGY_TYPE topo,
@@ -1801,7 +1816,9 @@ ComPtr<ID3D12PipelineState> D3D12Backend::build_pso(const PsoKey& key, const VSU
 // See Backend::variable_refresh and vrr_detect.h. Called every 32 presents; a window is a second.
 void D3D12Backend::update_variable_refresh() {
   DXGI_FRAME_STATISTICS st{};
-  vrr_readable_ = swapchain_ && SUCCEEDED(swapchain_->GetFrameStatistics(&st));
+  HRESULT diagnostic_statistics_result = E_FAIL;
+  vrr_readable_ = swapchain_ && SUCCEEDED(diagnostic_statistics_result = swapchain_->GetFrameStatistics(&st));
+  pacing_diagnostics_.statistics(diagnostic_statistics_result, st);
   if (!vrr_readable_) { vrr_.restart(); return; }
   static const double qpc_hz = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart > 0 ? (double)f.QuadPart : 1e7; }();
   if (!vrr_.add({st.PresentCount, st.SyncRefreshCount, (double)st.SyncQPCTime.QuadPart / qpc_hz}, vrr_nominal_hz_)) return;
@@ -1903,9 +1920,9 @@ void main(out float4 ocol0 : SV_Target0 MVEC_OUT, in float4 rawpos : SV_Position
   std::string vs = vs_src, ps = ps_src;
   vs.replace(vs.find("COLOR_EXPR"), 10, colored ? "color0" : "float4(1.0, 1.0, 1.0, 1.0)");
   ps.replace(ps.find("TEX_EXPR"), 8, textured ? "c *= Tex[0].Sample(samp[0], uv);" : "");
-  ps.replace(ps.find("MVEC_OUT"), 8, key.mvec ? ", out float2 omv : SV_Target1, out float ohud : SV_Target2" : "");
-  ps.replace(ps.find("MVEC_WRITE"), 10, key.mvec ? "omv = float2(0.0, 0.0); ohud = 0.0;" : "");
-  auto& blobs = fallback_blobs_[fk.variant | (key.mvec << 2)];
+  ps.replace(ps.find("MVEC_OUT"), 8, (key.mvec & 1) ? ", out float2 omv : SV_Target1, out float ohud : SV_Target2" : "");
+  ps.replace(ps.find("MVEC_WRITE"), 10, (key.mvec & 1) ? "omv = float2(0.0, 0.0); ohud = 0.0;" : "");
+  auto& blobs = fallback_blobs_[fk.variant | ((key.mvec & 1) << 2)];
   ComPtr<ID3DBlob>& vsb = blobs.first;
   ComPtr<ID3DBlob>& psb = blobs.second;
   ComPtr<ID3DBlob> err;
@@ -1972,7 +1989,7 @@ ID3D12PipelineState* D3D12Backend::get_pso(const DrawCall& dc, D3D12_PRIMITIVE_T
   PSUid psu = make_ps_uid(dc);
   vsu.motion_vectors = psu.motion_vectors = dlss_active_ ? 1u : 0u;
   uint64_t vh = vsu.hash(), ph = psu.hash();
-  PsoKey key{vh, ph, dc.bp.blendmode() & 0xFFFF, dc.bp.zmode() & 0x1F, dc.bp.cullmode() | wire, (uint32_t)topo, dc.bp.zcontrol() & 7, dlss_active_ ? 1u : 0u};
+  PsoKey key{vh, ph, dc.bp.blendmode() & 0xFFFF, dc.bp.zmode() & 0x1F, dc.bp.cullmode() | wire, (uint32_t)topo, dc.bp.zcontrol() & 7, (dlss_active_ ? 1u : 0u) | (msaa_on() ? msaa_samples_ << 4 : 0u)};
   g_prof[6] += sw.lap(); ++g_pso_lookups;   // uid build + hash
   auto it = psos_.find(key);
   g_prof[7] += sw.lap();                    // map lookup
@@ -2130,8 +2147,10 @@ void D3D12Backend::draw_video_background(
   D3D12_GPU_DESCRIPTOR_HANDLE gpu = srv_heap_->GetGPUDescriptorHandleForHeapStart();
   gpu.ptr += base * srv_size_;
 
+  ID3D12PipelineState* video_pso = efb_blit_pso();
+  if (!video_pso) return;
   D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
-  rtv.ptr += 3 * rtv_size_;
+  rtv.ptr += (msaa_on() ? 8 : 3) * rtv_size_;
   list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
   const float s = (float)scale_;
   D3D12_VIEWPORT vp{screen.src_x * s, screen.src_y * s,
@@ -2141,7 +2160,7 @@ void D3D12Backend::draw_video_background(
                 (LONG)((screen.src_y + screen.src_h) * scale_)};
   list_->RSSetViewports(1, &vp);
   list_->RSSetScissorRects(1, &sc);
-  list_->SetPipelineState(blit_pso_.Get());
+  list_->SetPipelineState(video_pso);
   list_->SetGraphicsRootSignature(blit_root_.Get());
   list_->SetGraphicsRootDescriptorTable(0, gpu);
   // Media Foundation's decoded rows are top-down while this EFB blit samples V in the opposite
@@ -2618,12 +2637,16 @@ void D3D12Backend::clear_efb(const EfbCopy& c) {
   D3D12_RECT r{(LONG)(c.src_x * s), (LONG)(c.src_y * s), (LONG)((c.src_x + c.src_w) * s), (LONG)((c.src_y + c.src_h) * s)};
   const uint32_t clear_colour = look_clear_colour(in_match_, c.clear_color);   // the look's background
   float color[4] = {((clear_colour >> 16) & 0xFF) / 255.0f, ((clear_colour >> 8) & 0xFF) / 255.0f, (clear_colour & 0xFF) / 255.0f, ((clear_colour >> 24) & 0xFF) / 255.0f};
-  D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += 3 * rtv_size_;
+  const bool msaa = msaa_on();
+  D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += (msaa ? 8 : 3) * rtv_size_;
   list_->ClearRenderTargetView(rtv, color, 1, &r);
-  list_->ClearDepthStencilView(dsv_heap_->GetCPUDescriptorHandleForHeapStart(), D3D12_CLEAR_FLAG_DEPTH, 1.0f - (float)c.clear_z / 16777215.0f, 0, 1, &r);
+  D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+  if (msaa) dsv.ptr += device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+  list_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f - (float)c.clear_z / 16777215.0f, 0, 1, &r);
 }
 
 void D3D12Backend::execute_copy(const EfbCopy& c) {
+  resolve_efb();
   // EFB -> texture at guest address: keep a GPU copy and register it for texture lookups.
   // Like Dolphin with "scaled EFB copies": the copy keeps the internal resolution (native size x scale_).
   // A half-scale copy (GX_TRUE mipmap flag on GXCopyTex) is a filtered 2:1 downscale, drawn with the
@@ -2715,6 +2738,7 @@ void D3D12Backend::execute_copy(const EfbCopy& c) {
 }
 
 void D3D12Backend::present_efb(const EfbCopy& c, const DxrScene* dxr_scene) {
+  resolve_efb();
   UINT bb = swapchain_->GetCurrentBackBufferIndex();
   ID3D12Resource* path_color = nullptr;
   if (opts_.path_tracing && dxr_scene && dxr_path_tracer_.ready()) {
@@ -3089,6 +3113,7 @@ void D3D12Backend::present_efb(const EfbCopy& c, const DxrScene* dxr_scene) {
 }
 
 void D3D12Backend::record_flicker_scan() {
+  resolve_efb();
   const D3D12_RESOURCE_DESC desc = efb_color_->GetDesc();
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
   UINT64 total = 0;
@@ -3351,7 +3376,7 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
   if (opts_.anisotropy != anisotropy_applied_) { anisotropy_applied_ = opts_.anisotropy; wait_gpu(); sampler_sets_.clear(); }
   if (opts_.ssaa != ssaa_applied_ || (!dlss_active_ && pick_scale() != scale_)) {
     ssaa_applied_ = opts_.ssaa;
-    if (pick_scale() != scale_) { wait_gpu(); host::log("d3d12: dropping %zu EFB copy textures, internal scale %d -> %d", efb_copies_.size(), scale_, pick_scale()); drop_efb_copies(); create_efb(); host::log("d3d12: internal resolution now EFB x%d", scale_); }
+    if (pick_scale() != scale_ || opts_.msaa != msaa_applied_) { wait_gpu(); host::log("d3d12: dropping %zu EFB copy textures, internal scale %d -> %d", efb_copies_.size(), scale_, pick_scale()); drop_efb_copies(); create_efb(); host::log("d3d12: internal resolution now EFB x%d", scale_); }
   }
   struct FloatEnvironment {
     unsigned saved = _mm_getcsr();
@@ -3366,7 +3391,7 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
   Stopwatch ui_sw;
   if (settings_ui_ && settings_ui_->begin(opts_)) {
     apply_fullscreen_mode();
-    if (pick_scale() != scale_) { wait_gpu(); host::log("d3d12: dropping %zu EFB copy textures, internal scale %d -> %d", efb_copies_.size(), scale_, pick_scale()); drop_efb_copies(); create_efb(); }
+    if (pick_scale() != scale_ || opts_.msaa != msaa_applied_) { wait_gpu(); host::log("d3d12: dropping %zu EFB copy textures, internal scale %d -> %d", efb_copies_.size(), scale_, pick_scale()); drop_efb_copies(); create_efb(); }
   }
   // Decided after the panel ran, because that is where the Lab view chose whether to cover this
   // frame; only a match is ever skipped, so menus draw as usual whatever the panel said.
@@ -3411,7 +3436,7 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
     if (opts_.exclusive_fullscreen) opts_.exclusive_fullscreen = false;
     else opts_.fullscreen = !host::window_is_fullscreen();
     apply_fullscreen_mode();
-    if (pick_scale() != scale_) { wait_gpu(); host::log("d3d12: dropping %zu EFB copy textures, internal scale %d -> %d", efb_copies_.size(), scale_, pick_scale()); drop_efb_copies(); create_efb(); }
+    if (pick_scale() != scale_ || opts_.msaa != msaa_applied_) { wait_gpu(); host::log("d3d12: dropping %zu EFB copy textures, internal scale %d -> %d", efb_copies_.size(), scale_, pick_scale()); drop_efb_copies(); create_efb(); }
   }
   configure_dlss();
   diag("frame setup");
@@ -3439,10 +3464,6 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
   const bool dxr_scene_diag_frame = dxr_device_ && dxr_list_ && dxr_scene_diag && in_match_ &&
                                     frame_counter_ % 120 == 0;
   if (!opts_.dump_path.empty() && frame_counter_ == opts_.dump_frame) dump_frame(frame, opts_.dump_path);
-  // A frame that will be shown waits for its place in the display queue first (see
-  // swapchain_waitable_); a backlog frame presents nothing and takes no place.
-  if (!skip_present_) wait_frame_latency();
-  diag("frame latency wait");
   // Submitted frames the GPU has not finished, sampled before this frame's slot wait: the GPU
   // queue depth the CPU found when it arrived, which is the latency the player feels.
   const uint64_t fence_completed = fence_->GetCompletedValue();
@@ -3667,6 +3688,13 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
   present_wait_ = 0;
   if (presented) {
     const double wait_start = Stopwatch::now();
+    // A shown frame waits for its place in the display queue (see swapchain_waitable_) here, after
+    // it is recorded and submitted, not before: the CPU records this frame while the GPU still runs
+    // the last one, as Direct3D 11 does with its device latency of 1. Waiting before recording made
+    // every frame take CPU plus GPU time under a heavy GPU load (16x SSAA ran 30% slower than D3D11).
+    // A backlog frame presents nothing and takes no place; a hidden window gets no presents to signal it.
+    if (!occluded_) wait_frame_latency();
+    diag("frame latency wait");
     { host::perf::Scope wait_cost(host::perf::Stage::Wait);
     for (;;) {
       double remaining = present_deadline_ - Stopwatch::now();
@@ -3698,11 +3726,21 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
           yougame::box_present::agent_override(), true, paced, !fullscreen_state_.exclusive_active, synced, yougame::embed_toplevel());
       if (const auto line = yougame::box_present::announcement(present)) host::log("%s", line);
       const double present_call = Stopwatch::now();
+      // Probe hidden standalone windows as DXGI asks, except during frame generation.
+      // Embedded launches keep drawing so the first-frame ready signal releases the app cover.
+      const bool test_only = occluded_ && fg_applied_ <= 0 && !yougame::embedded();
       const HRESULT present_result = [&] { host::perf::Scope wait_cost(host::perf::Stage::Wait);
-        return swapchain_->Present(present.interval, present.flags); }();
-      // Ready = the first real frame drawn, visible or not (see gx_d3d11.cpp: the page hides the window until ready).
-      yougame::parity::signals.presented(SUCCEEDED(present_result) && frame.test_fill < 0);
+          if (test_only) return swapchain_->Present(0, DXGI_PRESENT_TEST);
+          return swapchain_->Present(present.interval, present.flags); }();
+      const bool now_occluded = present_result == DXGI_STATUS_OCCLUDED;
+      if (now_occluded != occluded_) {
+        occluded_ = now_occluded;
+        host::log(occluded_ ? "d3d12: window hidden, presents paused" : "d3d12: window visible, presents resumed");
+      }
+      yougame::parity::signals.presented(!test_only && SUCCEEDED(present_result) && frame.test_fill < 0);
       present_wait_ += Stopwatch::now() - present_call;   // a synced Present waits for the display (see gx_d3d11.cpp)
+      if (!test_only) pacing_diagnostics_.present(present_call, opts_.vsync,
+          present.interval, present.flags, opts_.fps_cap, fullscreen_state_.exclusive_active);
     } catch (const std::system_error& error) {
       streamline::disable_after_resource_error(error.what());
       opts_.frame_generation_mode = 0;
@@ -3751,6 +3789,7 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
       opts_.capture_path = saved;
     }
   }
+  pacing_diagnostics_.poll(swapchain_.Get(), hwnd_);
 }
 
 }  // namespace

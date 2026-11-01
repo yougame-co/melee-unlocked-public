@@ -44,7 +44,8 @@
 
 int mu_replay_code(unsigned int code)
 {
-    return (mu_online_active() || mu_online_pending()) && (code & MU_ROLLBACK_CODES) != 0;
+    return ((mu_online_active() || mu_online_pending()) && (code & MU_ROLLBACK_CODES) != 0) ||
+           (mu_console_rollback_codes() & code) != 0;
 }
 
 /* Off-screen damage (fighter.c, under MU_RC_OFFSCREEN_DAMAGE): nonzero when the fighter is outside
@@ -163,6 +164,11 @@ static MuSlippiMenuState menu_state;   /* read by name entry and stage select; s
 
 int mu_slippi_menus_enabled(void) { return 0; }
 int mu_slippi_friends_available(void) { return 0; }
+int mu_slippi_yougame_menu(void) { return 0; }
+int mu_slippi_menu_count(void) { return 8; }
+int mu_slippi_menu_option(int row) { return row; }
+int mu_slippi_menu_label_kind(int row) { (void) row; return 0; }
+void mu_slippi_signin_notice(HSD_GObj* menu) { (void) menu; }
 MuSlippiMenuState* mu_slippi_state(void) { return &menu_state; }
 int mu_slippi_code_suggestion(const MuCodeSuggestionReq* in, MuCodeSuggestion* out)
 {
@@ -212,6 +218,13 @@ int mu_slippi_css_block_costume_change(void) { return 0; }
 int mu_slippi_css_local_ready(void) { return 0; }
 int mu_slippi_css_team_idx(void) { return 0; }
 void mu_slippi_css_set_team_idx(int team) { (void) team; }
+void mu_ranked_setup_load(void* data) { (void) data; }
+void mu_ranked_setup_think(void) {}
+void mu_ranked_setup_exit(void* data) { (void) data; }
+void mu_ranked_rank_enter(void) {}
+void mu_ranked_rank_frame(void) {}
+void mu_ranked_reveal_enter(void) {}
+void mu_ranked_reveal_frame(void) {}
 void mu_slippi_chat_enter(void) {}
 void mu_slippi_chat_frame(void) {}
 int mu_slippi_css_zelda_icon_reset(void) { return 1; }                /* 1: the retail icon kind */

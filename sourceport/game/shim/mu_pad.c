@@ -5,6 +5,26 @@
 #include "mu_shim.h"
 
 BOOL PADInit(void) { return 1; }
+int mu_console_active(void)
+{
+    uint32_t seed;
+    return mu_host->console_seed && mu_host->console_seed(&seed);
+}
+/* The host half of mu_console_frame_begin (shim/mu_console_pad.c): the agreed seed once, then the
+ * host composes this body's confirmed pads. Returns whether a console frame began. */
+int mu_console_host_frame_begin(void)
+{
+    static int seeded;
+    uint32_t seed;
+    void mu_apply_seed(uint32_t seed);
+    /* main may initialize the SDK RNG during boot; frame zero takes the agreed seed again,
+     * before the host snapshots it or any scene body consumes random values. */
+    if (!seeded && mu_host->console_seed && mu_host->console_seed(&seed)) {
+        mu_apply_seed(seed);
+        seeded = 1;
+    }
+    return mu_host->console_frame_begin && mu_host->console_frame_begin();
+}
 int PADReset(u32 mask) { (void) mask; return 1; }
 BOOL PADRecalibrate(u32 mask) { (void) mask; return 1; }
 void PADSetSamplingRate(u32 msec) { (void) msec; }

@@ -1,11 +1,20 @@
 #include "settings_nav.h"
 #include <cstdlib>
+#include <initializer_list>
+#include "cursor_idle.h"
 
 static void expect(bool value) { if (!value) std::abort(); }
 
 using host::settings_nav::Pad;
 
 int main() {
+  for (bool focused : {false, true}) for (bool menu : {false, true}) {
+    expect(host::cursor_idle::visible(1000, 1000, focused, menu));
+    expect(host::cursor_idle::visible(2999, 1000, focused, menu));
+    expect(host::cursor_idle::visible(3000, 1000, focused, menu) == (!focused || menu));
+    expect(host::cursor_idle::visible(9000, 1000, focused, menu) == (!focused || menu));
+    expect(host::cursor_idle::visible(9001, 9001, focused, menu));
+  }
   // Port 1 at rest, port 3 with a stick that never rests: the panel stays on port 1.
   Pad pads[4] = {{true, 0, 0, 0}, {}, {true, 0, 60, 0}, {}};
   bool rest[4] = {};

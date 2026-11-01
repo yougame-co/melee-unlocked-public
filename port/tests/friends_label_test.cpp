@@ -1,105 +1,100 @@
-// Compile the production label adapter with synthetic HSD objects and font pixels.
-// No disc files, renderer, host service, or game executable are involved.
+// Production native/baked texture adapter, with synthetic immutable HSD data.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include "mu_menu_label.h"
-
 static int checks;
-#define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::abort(); } } while (0)
-enum { MENU_KIND_8 = 8, MU_SLP_OPT_FRIENDS = 8, GX_TF_IA4 = 2 };
-struct HSD_ImageDesc { void* image_ptr; int width, height, format; };
+#define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr,"line %d: %s\n",__LINE__,#x); std::abort(); } } while (0)
+enum { MENU_KIND_8 = 8, GX_TF_IA4 = 2 };
+struct HSD_ImageDesc { const void* image_ptr; int width, height, format; };
 struct HSD_TObj { HSD_TObj* next; HSD_ImageDesc* imagedesc; HSD_ImageDesc** imagetbl; };
 struct HSD_MObj { HSD_TObj* tobj; unsigned color; };
 struct HSD_DObj { HSD_DObj* next; HSD_MObj* mobj; };
 struct HSD_JObj { union { HSD_DObj* dobj; } u; };
-static unsigned char HSD_SisLib_FontAtlas[287 * 512];
-static unsigned char HSD_SisLib_8040C680[288 * 2];
-static unsigned char HSD_SisLib_8040CB00[288 * 2];
-static int menus, offered;
+static int menus, offered, submenu;
 static int mu_slippi_menus_enabled() { return menus; }
-static int mu_slippi_friends_available() { return offered; }
+static int mu_slippi_yougame_menu() { return offered; }
+static int mu_slippi_menu_label_kind(int row) {
+    if (!offered) return 0;
+    if (submenu) return row >= 0 && row < 3 ? row + 3 : 0;
+    return row == 0 ? 6 : row == 1 ? 7 : row == 2 ? 1 : row == 3 ? 2 : 0;
+}
 #define DISC_SET(slot, value) ((slot) = (value))
 #include "friends_label_adapter.inc"
-
-static void font() {
-    // Distinct intensities identify each letter independently of the renderer.
-    const char* text = "Friends";
-    for (int i = 0; i < 7; ++i) {
-        int ascii = (text[i] - 0x20) * 2;
-        HSD_SisLib_8040C680[ascii] = 0x20;
-        HSD_SisLib_8040C680[ascii + 1] = static_cast<unsigned char>(i);
-        HSD_SisLib_8040CB00[i * 2] = 5;
-        HSD_SisLib_8040CB00[i * 2 + 1] = 13;
-        for (int y = 4; y < 28; ++y) for (int x = 4; x < 20; ++x) {
-            int p = ((y / 8) * 4 + x / 8) * 64 + y % 8 * 8 + x % 8;
-            HSD_SisLib_FontAtlas[i * 512 + p / 2] |= (i + 1) << (x % 2 ? 0 : 4);
-        }
-    }
-}
 static unsigned pixel(const unsigned char* p, int x, int y) {
-    return p[((y / 4) * 22 + x / 8) * 32 + y % 4 * 8 + x % 8];
+    return p[((y/4)*22+x/8)*32+y%4*8+x%8];
 }
-
 int main() {
-    font();
-    unsigned char storage[MU_LABEL_BYTES + 2];
-    std::memset(storage, 0xa5, sizeof storage);
-    auto render = [&] { return mu_friends_label_render(storage + 1, HSD_SisLib_FontAtlas,
-                                  HSD_SisLib_8040C680, HSD_SisLib_8040CB00); };
-    CHECK(render());
-    CHECK(storage[0] == 0xa5 && storage[sizeof storage - 1] == 0xa5);
-    // All seven glyphs, centering, italic offset, IA4 intensity/alpha order,
-    // and the full padded tile extent, checked against a separate pixel oracle.
-    for (int y = 0; y < 32; ++y) for (int x = 0; x < 176; ++x) {
-        unsigned expected = 0;
-        int letter = (x - 29 - (29 - y) / 5) / 16;
-        if (y >= 2 && y < 28 && x >= 29 + (29 - y) / 5 && letter >= 0 && letter < 7)
-            expected = ((letter + 1) << 4) | 15;
-        CHECK(pixel(storage + 1, x, y) == expected);
-    }
-    auto saved = HSD_SisLib_8040C680[('F' - 0x20) * 2];
-    HSD_SisLib_8040C680[('F' - 0x20) * 2] = 0x40;
-    CHECK(!render());
-    HSD_SisLib_8040C680[('F' - 0x20) * 2] = saved;
-    HSD_SisLib_8040CB00[0] = 40;
-    CHECK(!render());
-    HSD_SisLib_8040CB00[0] = 5;
-    CHECK(!mu_friends_label_render(nullptr, HSD_SisLib_FontAtlas, HSD_SisLib_8040C680, HSD_SisLib_8040CB00));
-
-    unsigned char update_pixels[] = {0xab, 0xcd};
-    HSD_ImageDesc update{update_pixels, 176, 30, GX_TF_IA4}, original = update;
-    HSD_ImageDesc border{nullptr, 64, 64, GX_TF_IA4};
-    HSD_ImageDesc other_format{nullptr, 176, 30, 6};
-    HSD_ImageDesc* table[] = {&update};
-    HSD_TObj format{nullptr, &other_format, table};
-    HSD_TObj edge{&format, &border, table};
-    HSD_TObj texture{&edge, &update, table};
-    HSD_MObj material{&texture, 0xffcc00};
-    HSD_DObj draw{nullptr, &material}, missing{&draw, nullptr};
-    HSD_JObj label{{&missing}};
-    for (menus = 0; menus <= 1; ++menus) for (offered = 0; offered <= 1; ++offered)
-        for (int kind : {0, 1, 8}) for (int selection = 0; selection < 9; ++selection) {
-            texture.imagedesc = &update;
-            mu_slippi_friends_label(&label, kind, selection);
-            bool friends = menus && offered && kind == MENU_KIND_8 && selection == MU_SLP_OPT_FRIENDS;
-            CHECK((texture.imagedesc != &update) == friends);
-            CHECK(texture.imagetbl == table && table[0] == &update);
-            CHECK(std::memcmp(&update, &original, sizeof update) == 0);
-            CHECK(update_pixels[0] == 0xab && update_pixels[1] == 0xcd);
-            CHECK(edge.imagedesc == &border && format.imagedesc == &other_format);
-            CHECK(material.color == 0xffcc00);
-            if (friends) CHECK(std::memcmp(texture.imagedesc->image_ptr, storage + 1, MU_LABEL_BYTES) == 0);
+    static_assert(sizeof mu_baked_friends == 5632 && sizeof mu_baked_slippi == 5632 &&
+                  sizeof mu_baked_slippi_title == 5632, "GX IA4 padded byte count");
+    for (auto* art : {mu_baked_friends, mu_baked_slippi, mu_baked_slippi_title}) {
+        int aa=0, fill=0, outline=0;
+        CHECK((reinterpret_cast<size_t>(art)&31)==0);
+        for(int y=0;y<32;++y)for(int x=0;x<176;++x) {
+            auto v=pixel(art,x,y);
+            if(y==0 || y>=29 || x<4 || x>=172) CHECK(v==0);
+            aa+=(v>>4)>0 && (v>>4)<15;
+            fill+=v==255; outline+=v==240;
         }
-    menus = offered = 1;
-    // Creation / hover / unhover reselect the animated image before the hook.
-    for (unsigned color : {0xffcc00u, 0u, 0xffcc00u}) {
-        material.color = color;
-        texture.imagedesc = &update;
-        mu_slippi_friends_label(&label, MENU_KIND_8, MU_SLP_OPT_FRIENDS);
-        CHECK(texture.imagedesc != &update && material.color == color);
+        CHECK(aa>50 && fill>100 && outline>5);
     }
-    mu_slippi_friends_label(nullptr, MENU_KIND_8, MU_SLP_OPT_FRIENDS);
-    std::printf("friends label: %d/%d checks passed (synthetic font and HSD objects)\n", checks, checks);
+    CHECK(std::memcmp(mu_baked_slippi,mu_baked_slippi_title,MU_LABEL_BYTES)!=0);
+    unsigned char pixels[8]{};
+    HSD_ImageDesc native[8];
+    HSD_ImageDesc border{nullptr,64,64,GX_TF_IA4},other{nullptr,176,30,6};
+    HSD_ImageDesc* table[]={&border};
+    HSD_TObj format{nullptr,&other,table},edge{&format,&border,table},texture{&edge,nullptr,table};
+    HSD_MObj material{&texture,0xffcc00};HSD_DObj draw{nullptr,&material},missing{&draw,nullptr};
+    HSD_JObj label{{&missing}};
+    menus=offered=1;
+    for(int slot=0;slot<8;++slot) {
+        native[slot]={pixels+slot,176,30,GX_TF_IA4};texture.imagedesc=&native[slot];
+        mu_slippi_friends_label(&label,MENU_KIND_8,slot,1);
+        CHECK(texture.imagedesc==&native[slot]);
+    }
+    auto originals=native[0];
+    for(menus=0;menus<=1;++menus)for(offered=0;offered<=1;++offered)
+      for(submenu=0;submenu<=1;++submenu)for(int menu:{0,1,8})for(int row=-1;row<9;++row) {
+        const int slot=row>=0&&row<8?row:0;
+        texture.imagedesc=&native[slot];
+        mu_slippi_friends_label(&label,menu,row,0);
+        int kind=mu_slippi_menu_label_kind(row);
+        bool replace=menus&&offered&&menu==8&&kind>=1&&kind<=5;
+        CHECK((texture.imagedesc!=&native[slot])==replace);
+        if(replace) {
+            if(submenu) CHECK(texture.imagedesc==&native[2+row]);
+            else CHECK(texture.imagedesc->image_ptr==(row==2?mu_baked_friends:mu_baked_slippi));
+            CHECK(texture.imagedesc->width==176&&texture.imagedesc->height==30&&texture.imagedesc->format==GX_TF_IA4);
+        }
+        CHECK(texture.imagetbl==table&&table[0]==&border);
+        CHECK(edge.imagedesc==&border&&format.imagedesc==&other&&material.color==0xffcc00);
+        CHECK(std::memcmp(&native[0],&originals,sizeof originals)==0);
+    }
+    menus=offered=1;
+    for(int sub : {0,1,0})for(int row=0;row<(sub?3:4);++row)
+      for(unsigned color:{0xffcc00u,0u,0xffcc00u}) {
+        submenu=sub;texture.imagedesc=&native[row];material.color=color;
+        mu_slippi_friends_label(&label,8,row,0);
+        if(sub) CHECK(texture.imagedesc==&native[2+row]);
+        else if(row<2) CHECK(texture.imagedesc==&native[row]);
+        else CHECK(texture.imagedesc->image_ptr==(row==2?mu_baked_friends:mu_baked_slippi));
+        CHECK(material.color==color);
+    }
+    submenu=1;
+    for(int row=0;row<2;++row) {
+        texture.imagedesc=&native[row];mu_slippi_friends_label(&label,8,row,0);
+        CHECK(texture.imagedesc==&native[row+2]);
+        submenu=0;mu_slippi_friends_label(&label,8,row,0);
+        CHECK(texture.imagedesc==&native[row]); // Back also restores a reused JObj
+        submenu=1;
+    }
+    for(int bad=0;bad<3;++bad) {
+        native[2]={pixels+2,176,30,GX_TF_IA4};
+        if(bad==0)native[2].width=168;if(bad==1)native[2].height=32;if(bad==2)native[2].format=0;
+        texture.imagedesc=&native[0];mu_slippi_friends_label(&label,8,0,0);
+        CHECK(texture.imagedesc==&native[0]);
+    }
+    mu_slippi_friends_label(nullptr,8,0,0);
+    std::printf("native/baked labels: %d checks passed (8 originals, every top/submenu row, restore, IA4 AA/padding/guards)\n",checks);
 }

@@ -59,9 +59,14 @@ void mu_post(MuEventFn fn, void* a, intptr_t b)
 
 static void mu_run_events(void)
 {
+    int console_clock;
     if (mu_delivering)
         return;
     mu_delivering = 1;
+    /* Deferred hardware callbacks retain their clock domain even when delivered after poll/VI
+     * returned to the game, or when a checkpoint is being replayed. OFF/Slippi does nothing. */
+    console_clock = mu_host->version >= 25 && mu_host->console_rollback &&
+                    mu_host->console_rollback(MU_CONSOLE_SERVICE, 1, NULL);
     while (mu_event_count) {
         MuEventFn fn = mu_events[mu_event_head].fn;
         void* a = mu_events[mu_event_head].a;
@@ -73,6 +78,7 @@ static void mu_run_events(void)
         fn(a, b);
         mu_interrupt_level = 1;
     }
+    if (console_clock) mu_host->console_rollback(MU_CONSOLE_SERVICE, 0, NULL);
     mu_delivering = 0;
 }
 
@@ -226,22 +232,39 @@ static void mu_alarm_insert(OSAlarm* alarm, OSTime fire, OSTime period, OSAlarmH
 
 void OSSetAlarm(OSAlarm* alarm, OSTime tick, OSAlarmHandler handler)
 {
+    uint64_t simulation, hardware;
+    if (mu_host->version >= 25 && mu_host->console_alarm_clock &&
+        mu_host->console_alarm_clock(&simulation, &hardware)) {
+        mu_alarm_insert(alarm, (OSTime) hardware + tick, 0, handler);
+        return;
+    }
     mu_alarm_insert(alarm, (OSTime) mu_host->ticks() + tick, 0, handler);
 }
 
 void OSSetAbsAlarm(struct OSAlarm* alarm, long long time, OSAlarmHandler handler)
 {
+    uint64_t simulation, hardware;
+    if (mu_host->version >= 25 && mu_host->console_alarm_clock &&
+        mu_host->console_alarm_clock(&simulation, &hardware)) {
+        mu_alarm_insert(alarm, (OSTime) (time - (long long) mu_host->boot_time()) +
+                                  (OSTime) hardware - (OSTime) simulation, 0, handler);
+        return;
+    }
     mu_alarm_insert(alarm, (OSTime) (time - (long long) mu_host->boot_time()), 0, handler);
 }
 
 void OSSetPeriodicAlarm(OSAlarm* alarm, OSTime start, OSTime period, OSAlarmHandler handler)
 {
-    OSTime now = (OSTime) mu_host->ticks();
+    uint64_t simulation, hardware;
+    int console = mu_host->version >= 25 && mu_host->console_alarm_clock &&
+                  mu_host->console_alarm_clock(&simulation, &hardware);
+    OSTime now = console ? (OSTime) hardware : (OSTime) mu_host->ticks();
     OSTime fire;
     /* SDK InsertAlarm anchors periodic deadlines to start, selecting the next
      * period when registration happens later. An expired start must not create
      * an extra controller sample immediately after a scene changes its rate. */
     start -= (OSTime) mu_host->boot_time();
+    if (console) start += (OSTime) hardware - (OSTime) simulation;
     fire = start;
     if (period > 0 && start < now)
         fire += period * ((now - start) / period + 1);

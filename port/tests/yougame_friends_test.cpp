@@ -58,9 +58,9 @@ int main() {
     CHECK(!direct_code_from_game("AB-C#1", &code));
   }
 #if defined(_WIN32) || defined(__linux__)
-  CHECK(std::string(yougame::parity::kCaps) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"view\",\"volume\"]}");
+  CHECK(std::string(yougame::parity::kCaps) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\"]}");
 #else
-  CHECK(std::string(yougame::parity::kCaps) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\"]}");
+  CHECK(std::string(yougame::parity::kCaps) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\"]}");
 #endif
 
   for (int mode : {0, 1, 2, 3, 4}) {
@@ -177,15 +177,11 @@ int main() {
   }
 
   CHECK(kFirstCssWinner == 1);
-  CHECK(!native_ready(true, 2, "", ""));
+  CHECK(native_ready(true, 2, "", ""));
   CHECK(!native_ready(true, 2, "", "abcd2345"));
   CHECK(native_ready(false, 2, "", ""));
   CHECK(native_ready(true, 2, "NAME#123", ""));
   for (int mode : {0, 1, 3}) CHECK(native_ready(true, mode, "", ""));
-  CHECK(empty_code(true, 2, ""));
-  CHECK(!empty_code(false, 2, ""));
-  CHECK(!empty_code(true, 2, "NAME#123"));
-  for (int mode : {0, 1, 3, 4, -1}) CHECK(!empty_code(true, mode, ""));
   CHECK(menu_safe(1, 0));
   CHECK(menu_safe(8, 0));
   CHECK(menu_safe(8, 1));
@@ -279,10 +275,9 @@ int main() {
     }
   }
   Events presentation;
-  presentation.code_screen(true);
-  presentation.code_empty(true);
+  presentation.online_menu(true, true);
   CHECK(!presentation.push({{"type", "hide"}}, 1));
-  CHECK(presentation.code_screen()); // embed hide/show never changes Friends state
+  CHECK(presentation.friend_entry()); // embed hide/show never changes Friends state
   presentation.picker_error("Picker cancelled");
   CHECK(presentation.picker_error() == "Picker cancelled");
   presentation.request_host();
@@ -291,16 +286,15 @@ int main() {
   Events host;
   host.request_host();
   CHECK(!host.take_host());
-  host.code_screen(true);
-  host.code_empty(false);
+  host.online_menu(true, false);
   host.request_host();
   CHECK(!host.take_host());
-  host.code_empty(true);
+  host.online_menu(true, true);
   host.request_host();
   CHECK(host.take_host());
   CHECK(!host.take_host());
   host.request_host();
-  host.code_screen(false); // Back/cancel must not host a room later
+  host.online_menu(false); // Back/cancel must not host a room later
   CHECK(!host.take_host());
   std::puts("YouGame friends passed");
 }

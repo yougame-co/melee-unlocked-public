@@ -27,7 +27,7 @@ inline bool gecko_synthetic_name(const char* name) {
 // code table in the heap, 2.6 MB away, so its translated cave looked like a stub; Beyond Melee's own
 // 803D709C was ignored and the game took Slippi's, which does not return the symbol in r4 as
 // Beyond Melee's callers expect. They read a function pointer through r4 = FFFFFFFF and jumped to
-// C7B6B105 (melee-native/bm-static-report.md).
+// C7B6B105 is reserved by the host stub policy.
 inline bool looks_like_host_stub(const char* name, uint32_t extent, size_t host_bytes) {
   if (extent < 0x20u || gecko_synthetic_name(name)) return false;
   return host_bytes < extent / 2;   // under two bytes per guest instruction

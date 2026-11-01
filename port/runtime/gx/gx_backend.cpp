@@ -3,6 +3,7 @@
 #include "gx_backend.h"
 #include "gx_d3d11.h"
 #include "gx_d3d12.h"
+#include "gx_vulkan.h"
 #include "host.h"
 #include <d3d11.h>
 
@@ -32,12 +33,24 @@ bool d3d11_available() {
 }
 
 Backend* create_render_backend(void* hwnd, int client_w, int client_h, const RenderOptions& options) {
-  if (options.api == RenderApi::D3D11) {
+  if (options.api == RenderApi::Vulkan) {
+    VulkanWindow window;
+    window.window = hwnd;
+    window.drawable_size = [hwnd](int* w, int* h) {
+      RECT r{}; GetClientRect((HWND)hwnd, &r);
+      *w = r.right - r.left; *h = r.bottom - r.top;
+    };
+    RenderOptions vulkan_options = options;
+    vulkan_options.dlss_mode = 0;   // DLSS, XeSS and frame generation are Direct3D 12 features
+    vulkan_options.frame_generation_mode = 0;
+    if (Backend* backend = create_vulkan_backend(window, client_w, client_h, vulkan_options)) return record_started_backend(backend, "Vulkan");
+    host::log("vulkan: falling back to Direct3D 12");
+  } else if (options.api == RenderApi::D3D11) {
     RenderOptions d3d11_options = options;
     if (d3d11_options.dlss_mode) host::log("d3d11: DLSS is a Direct3D 12 feature; rendering natively");
     d3d11_options.dlss_mode = 0;
     if (Backend* backend = create_d3d11_backend(hwnd, client_w, client_h, d3d11_options)) {
-      return backend;
+      return record_started_backend(backend, "D3D11");
     }
     host::log("d3d11: falling back to Direct3D 12");
   } else if (!d3d12_usable()) {
@@ -46,10 +59,10 @@ Backend* create_render_backend(void* hwnd, int client_w, int client_h, const Ren
     host::log("d3d12: cannot start on this system; starting on Direct3D 11");
     RenderOptions d3d11_options = options;
     d3d11_options.dlss_mode = 0;
-    if (Backend* backend = create_d3d11_backend(hwnd, client_w, client_h, d3d11_options)) return backend;
+    if (Backend* backend = create_d3d11_backend(hwnd, client_w, client_h, d3d11_options)) return record_started_backend(backend, "D3D11");
     host::log("d3d11: did not start either; trying Direct3D 12 anyway");
   }
-  return create_d3d12_backend(hwnd, client_w, client_h, options);
+  return record_started_backend(create_d3d12_backend(hwnd, client_w, client_h, options), "D3D12");
 }
 
 }  // namespace gx

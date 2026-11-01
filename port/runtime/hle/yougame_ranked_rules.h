@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include "native_online_policy.h"
+#include "yougame_ranked_policy.h"
 #include "../host/hackpack_ai.h" // existing portable, tested SHA-256
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -14,7 +15,9 @@
 namespace yougame::ranked_rules {
 constexpr size_t kMaxBytes = 16 * 1024;
 constexpr const char* kInvalid = "This remix's ranked rules are invalid";
+constexpr const char* kUnmapped = "This remix cannot use the Ranked selection policy";
 struct Rules {
+  MuRankedPolicy policy = ranked_policy::slippi_v1();
   std::vector<uint16_t> stages;
   std::vector<uint8_t> characters;
   bool all_characters = true;
@@ -23,6 +26,32 @@ struct Rules {
     return all_characters || std::binary_search(characters.begin(), characters.end(), id);
   }
 };
+
+inline void digest(Rules& rules) {
+  nlohmann::json canonical = {{"version", 1}, {"stages", rules.stages}, {"characters", "all"},
+                              {"selectionPolicy", ranked_policy::encode(rules.policy)}};
+  if (!rules.all_characters) canonical["characters"] = rules.characters;
+  rules.canonical = canonical.dump();
+  rules.digest = host::hackpack_ai::rules::sha256_hex(
+      reinterpret_cast<const uint8_t*>(rules.canonical.data()), rules.canonical.size());
+}
+// Test-branch Ranked shares the existing fingerprint/digest checks and room-key
+// path, with a separate rules identity. Other modes keep their original pools.
+inline std::string branch_digest(const std::string& digest) {
+#if defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH
+  const auto identity = std::string("yougame-ranked-test-branch-v1:") + digest;
+  return host::hackpack_ai::rules::sha256_hex(
+      reinterpret_cast<const uint8_t*>(identity.data()), identity.size());
+#else
+  return digest;
+#endif
+}
+inline const char* selection_error(const Rules& rules) {
+  return ranked_policy::maps_stages(rules.stages, rules.policy) ? nullptr : kUnmapped;
+}
+inline Rules vanilla() {
+  Rules rules; rules.stages = {2, 3, 8, 28, 31, 32}; digest(rules); return rules;
+}
 
 // Extended builds follow native_direct_selection_supported: the entire uint8/uint16 wire range.
 // Lists are sets: sorting also makes random draws use the same order on both peers.
@@ -57,11 +86,7 @@ inline bool parse(const std::string& text, bool extended_content, Rules& out) {
     if (!rules.all_characters && !ids(j["characters"], extended_content ? 255 : 25, rules.characters)) return false;
     // A list nobody can pick from would only fail at the character screen: refuse it with the file.
     if (!rules.all_characters && rules.characters.empty()) return false;
-    json canonical = {{"version", 1}, {"stages", rules.stages}, {"characters", "all"}};
-    if (!rules.all_characters) canonical["characters"] = rules.characters;
-    rules.canonical = canonical.dump();
-    rules.digest = host::hackpack_ai::rules::sha256_hex(
-        reinterpret_cast<const uint8_t*>(rules.canonical.data()), rules.canonical.size());
+    digest(rules);
     out = std::move(rules);
     return true;
   } catch (const std::exception&) { return false; }
