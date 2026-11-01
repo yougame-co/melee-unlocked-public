@@ -30,7 +30,7 @@ void mu_ranked_set_reset(void)
 {
     memset(&ranked_set, 0, sizeof ranked_set);
     /* Practice vs CPU plays the same best of three as Ranked (striking, game 1, then bans and
-     * counterpicks), so it teaches the real set (Luis 10-31: a one-game practice read as Ranked). */
+     * counterpicks), so it teaches the real set (a one-game practice read as Ranked). */
     ranked_set.max_games = 3;
     ranked_set.cur_game = 1;
     ranked_set.prev_winner = 0xFF;

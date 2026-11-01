@@ -22,6 +22,15 @@ static void mu_rank_text_label(char out[32], const MuYgRank* rank)
     }
 }
 
+/* A rating in tenths as the CSS panel and the end-of-set panel both show it: "1008", "1534.7",
+ * "-25". The tenth appears only when it is not zero. */
+static inline void mu_rank_number(char* out, long long tenths)
+{
+    unsigned long long v = tenths < 0 ? -tenths : tenths;
+    if (v % 10) sprintf(out, "%s%llu.%u", tenths < 0 ? "-" : "", v/10, (unsigned)(v%10));
+    else sprintf(out, "%s%llu", tenths < 0 ? "-" : "", v/10);
+}
+
 static HSD_Text* mu_rank_text_create(void)
 {
     sislib_UnkAlloc3* camera = HSD_SisLib_804D797C;

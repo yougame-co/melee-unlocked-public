@@ -486,7 +486,7 @@ bool window_is_fullscreen() {
 }
 // A YouGame full-screen start uses SDL's non-Spaces full screen (a borderless window over the display, no separate
 // macOS Space): AppKit's Space titlebar asks for remote-view services the app's sandbox denies on every frame
-// (pack-platform #15776). SDL reads the hint when the window is created, so call this before window_create.
+// SDL reads the hint when the window is created, so call this before window_create.
 void window_prefer_simple_fullscreen() { SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0"); }
 void window_defer_fullscreen_show() {
   if (!mac_embed::active()) g_deferred_fullscreen_show = true;

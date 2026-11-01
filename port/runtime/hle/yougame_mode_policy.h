@@ -26,7 +26,7 @@ constexpr MatchmakingRoute matchmaking_route(int mode, bool yougame_mode, bool s
 }
 
 // Whether the Online menu offers Ranked in YouGame mode. Off until Ranked plays like Slippi's
-// (rank shown, best of 3, stage striking, rating change): Luis, 2026-10-29. The site's ladder
+// (rank shown, best of 3, stage striking, rating change) (2026-10-29). The site's ladder
 // switch is off for these listings too, and the page turns a ranked request into a casual one.
 #if defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH
 constexpr bool yougame_ranked_offered = true;

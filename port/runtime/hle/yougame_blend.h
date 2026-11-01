@@ -1,4 +1,4 @@
-// Blended Unranked: one Unranked search over YouGame's pool and Slippi's (Luis, #33357 "smart
+// Blended Unranked: one Unranked search over YouGame's pool and Slippi's ("smart
 // Unranked"). Launched by the YouGame app on the base listing with a usable Slippi login, the search
 // goes to YouGame first when someone is already in its queue, otherwise to both at once; the first
 // side to be given an opponent is the match and the other is cancelled.

@@ -110,7 +110,7 @@ static bool intersects(const Box& a, const Box& b) {
   return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
 }
 static Box text_box(float x, float y, float sx, float sy, const std::string& value) {
-  // Measured on Luis's 2560x1440 CSS screenshot (10-31): "User" at scale .4 is ~8.2 units per
+  // Measured on 2560x1440 CSS screenshot (10-31): "User" at scale .4 is ~8.2 units per
   // character, so the game's font advances ~20.5 units per character at scale 1.
   return {x, y, x + value.size()*20.5f*sx, y + 20*sy};
 }
@@ -253,6 +253,9 @@ int main() {
   e3_status = 1; ranks.self = rank("Gold IV", 3, 4); tick();
   CHECK(std::string(panel.badges[0]->rank.label) == "Gold IV");
   CHECK(panel.text->rows[LOCAL_DETAIL] == "Rating 1534.7");
+  // A whole rating drops ".0", the same as the end-of-set panel ("Rating 1008", build 26).
+  ranks.self.rating = 10080; tick(); CHECK(panel.text->rows[LOCAL_DETAIL] == "Rating 1008");
+  ranks.self.rating = 15347;
   ranks.self.placed = 0; ranks.self.matches = 3; tick();
   CHECK(std::string(panel.badges[0]->rank.label) == "Placements 3 of 5");
   CHECK(panel.text->rows[LOCAL_LABEL] == "Placements 3 of 5");

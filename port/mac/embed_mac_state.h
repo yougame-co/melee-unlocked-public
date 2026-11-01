@@ -19,7 +19,7 @@ inline bool equal(Rect a, Rect b) { return a.x == b.x && a.y == b.y && a.w == b.
 // The app sends the player box in its window's backing pixels (the page's placeEmbed: CSS pixels times devicePixelRatio,
 // page zoom included, plus the title bar in backing pixels); AppKit places windows in points. Taking the pixels as points
 // made the panel twice the box on a 2x display: d0017/d0018 drew the picture low and off to the side, d0019 twice too
-// big (Luis 10-26). scale is the backing scale of the display the parent is on; anything not positive counts as 1.
+// big. scale is the backing scale of the display the parent is on; anything not positive counts as 1.
 inline Rect points_from_backing(Rect box, double scale) {
   if (!(scale > 0)) scale = 1;
   return {box.x / scale, box.y / scale, box.w / scale, box.h / scale};

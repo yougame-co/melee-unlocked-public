@@ -50,7 +50,7 @@ endif()
 set(SDK "${D}/libs/dolphin/src/dolphin")
 # ---- how game code is compiled: one definition, shared by the game and by the parity library ----
 add_library(game_flags INTERFACE)
-option(YOUGAME_RANKED_BRANCH "Ranked: visible Ranked and local CPU practice" ON)   # ON in the main staging build (Luis 10-31: Friends + Ranked on the main build)
+option(YOUGAME_RANKED_BRANCH "Ranked: visible Ranked and local CPU practice" ON)   # ON in the main staging build (Friends + Ranked on the main build)
 if(YOUGAME_RANKED_BRANCH)
   target_compile_definitions(game_flags INTERFACE YOUGAME_RANKED_BRANCH=1)
 endif()

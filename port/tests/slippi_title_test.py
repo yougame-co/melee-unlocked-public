@@ -105,6 +105,7 @@ int main() {
     slippi_submenu=0;mu_slippi_title_panel_update(&p,7);
     enabled=true;ranked_supported=1;mn_804A04F0.cur_menu=8;
     int records=logs;
+    u8 i4_reference[4096]{};
     for(int format : {GX_TF_I4,GX_TF_IA4}) {
         image.format=format;
         for(int cycle=0;cycle<2;++cycle) {
@@ -116,6 +117,19 @@ int main() {
             int bytes=format==GX_TF_I4?4096:8192, opaque=0;
             for(int i=0;i<bytes;++i)opaque+=pixels[i]!=0;
             CHECK(opaque>0);
+            if(format==GX_TF_I4) std::memcpy(i4_reference,pixels,4096);
+            else {
+                int fractional=0;
+                for(int y=0;y<32;++y)for(int x=0;x<256;++x) {
+                    unsigned v=pixels[((y/4)*32+x/8)*32+y%4*8+x%8];
+                    int pos=((y/8)*32+x/8)*64+y%8*8+x%8;
+                    unsigned got=(i4_reference[pos/2]>>(x%2?0:4))&15;
+                    unsigned a=v>>4,i=v&15;
+                    CHECK(got==(a*(15+2*i)+22)/45);
+                    if(a&&i&&i<15) {++fractional;CHECK(got<=a);}
+                }
+                CHECK(fractional>20);
+            }
             // Native animation reselects Online Play: update must reapply Slippi.
             texture.imagedesc=&image;title.mtx[0][3]=6;
             mu_slippi_title_panel_update(&p,7);CHECK(texture.imagedesc==&state->image);

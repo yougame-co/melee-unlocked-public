@@ -2275,7 +2275,7 @@ static int melee_main(int argc, char** argv) {
     host::window_prefer_vulkan(gfx.api == gx::RenderApi::Vulkan);
 #ifdef __APPLE__
     // An app older than 0.13.1048 asks for the player box (YOUGAME_EMBED=1) but passes no parent window: the game
-    // can't embed there, so it starts in full screen on its own, as before (native-experience-lead #15888).
+    // can't embed there, so it starts in full screen on its own, as before.
     const bool box_without_parent = yougame::embedded() && !std::getenv("YOUGAME_EMBED_PARENT");
     const bool defer_fullscreen = (gfx.fullscreen || box_without_parent) && !hidden;
     if (defer_fullscreen) host::window_prefer_simple_fullscreen();

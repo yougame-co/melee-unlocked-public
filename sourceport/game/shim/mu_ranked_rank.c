@@ -57,7 +57,7 @@ static void free_panel(void* unused)
 
 static void rank_panel(int player, const MuYgRank* rank, int status)
 {
-    char detail[64], label[32];
+    char detail[64], label[32], rating[24];
     MuYgRank display = *rank;
     int id = player ? OPP_DETAIL : LOCAL_DETAIL;
     if (!rank->known) {
@@ -66,12 +66,14 @@ static void rank_panel(int player, const MuYgRank* rank, int status)
     } else if (!rank->placed) {
         mu_rank_text_label(label, rank);
         strcpy(display.label, label);
-        sprintf(detail, mu_ranked_practice() ? "Practice rating %.1f" : "Rating %.1f", (double) rank->rating / 10.0);
+        mu_rank_number(rating, rank->rating);
+        sprintf(detail, mu_ranked_practice() ? "Practice rating %s" : "Rating %s", rating);
     } else {
         /* Preserve YouGame's label, including IV and Challenger. No E3 enum is
          * used for art or words: it compresses YouGame's four divisions. */
         display.label[sizeof display.label - 1] = 0;
-        sprintf(detail, mu_ranked_practice() ? "Practice rating %.1f" : "Rating %.1f", (double) rank->rating / 10.0);
+        mu_rank_number(rating, rank->rating);
+        sprintf(detail, mu_ranked_practice() ? "Practice rating %s" : "Rating %s", rating);
     }
     if (!player && status == 0 && rank->known) strcat(detail, " - Loading...");
     if (!player && status == 2) strcpy(detail, "Rank unavailable");

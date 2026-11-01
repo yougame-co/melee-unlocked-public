@@ -2,8 +2,8 @@
 # Compile one game source file the way the melee_game build does, into a scratch object, without
 # touching the ninja build (several people can run this at once). Prints only the compiler's errors.
 #   sourceport/tools/cc1.sh src/sysdolphin/baselib/jobj.c      (path relative to extern/melee)
-ROOT="/c/Users/user/NEW project/melee-sourceport"
-N=/c/Users/user/toolchains/winlibs-gcc-15.3/mingw64/bin/ninja.exe
+ROOT=${MELEE_SOURCEPORT_ROOT:-"$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"}
+N=${NINJA:-ninja}
 rel="$1"
 obj="CMakeFiles/melee_game.dir/C_/Users/user/NEW_project/melee-sourceport/sourceport/extern/melee/$rel.obj"
 cmd=$(cd "$ROOT" && $N -C build-sourceport-gcc -t commands "$obj" | tail -1)

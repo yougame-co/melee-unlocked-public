@@ -813,7 +813,7 @@ target_compile_definitions(melee_source PRIVATE MELEE_SOURCE_PORT NOMINMAX _CRT_
   MELEE_VERSION_COMMAS=${MELEE_VERSION_COMMAS})
 # Staging test builds only: read agent-test.json (runtime/hle/yougame_agent_test.h) in app-launched YouGame mode.
 # Off by default; never on for a build that goes to a production listing (tests/agent_test_hook_absent.sh checks it).
-option(YOUGAME_RANKED_BRANCH "Ranked: visible Ranked and local CPU practice" ON)   # ON in the main staging build (Luis 10-31: Friends + Ranked on the main build)
+option(YOUGAME_RANKED_BRANCH "Ranked: visible Ranked and local CPU practice" ON)   # ON in the main staging build (Friends + Ranked on the main build)
 if(YOUGAME_RANKED_BRANCH)
   target_compile_definitions(melee_source PRIVATE YOUGAME_RANKED_BRANCH=1)
   if(TARGET melee_port)

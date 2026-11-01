@@ -327,7 +327,9 @@ static int mu_slippi_title_image(MuSlippiTitlePanel* state, const MuTitleBounds*
             pixels[((y / 4) * (w / 8) + x / 8) * 32 + y % 4 * 8 + x % 8] = v;
         } else {
             int pos = ((y / 8) * (w / 8) + x / 8) * 64 + y % 8 * 8 + x % 8;
-            unsigned ink = (v & 15) ? v >> 4 : (v >> 4) / 3;
+            /* Preserve fractional fill intensity: treating every nonzero nibble
+             * as solid alpha thickens and stair-steps the antialiased edge. */
+            unsigned ink = ((v >> 4) * (15 + 2 * (v & 15)) + 22) / 45;
             pixels[pos / 2] |= ink << (x % 2 ? 0 : 4);
         }
     }

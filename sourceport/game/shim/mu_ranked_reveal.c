@@ -231,13 +231,6 @@ static void reveal_label(HSD_Text* t, const MuYgRank* rank, float offset, float 
     HSD_SisLib_803A74F0(t, 0, &color);
 }
 
-static void reveal_number(char* out, long long tenths)
-{
-    unsigned long long v = tenths < 0 ? -tenths : tenths;
-    if (v % 10) sprintf(out, "%s%llu.%u", tenths < 0 ? "-" : "", v/10, (unsigned)(v%10));
-    else sprintf(out, "%s%llu", tenths < 0 ? "-" : "", v/10);
-}
-
 static void reveal_draw(void)
 {
     MuReveal* s = &reveal.model;
@@ -292,8 +285,8 @@ static void reveal_draw(void)
     mu_rank_badge_pose(reveal.new_badge, p.new_y * .1f, p.scale, p.new_alpha, p.glow);
     reveal_label(reveal.old_label, &r->rank_before, p.old_y, 1, p.old_alpha);
     reveal_label(reveal.new_label, &r->rank_after, p.new_y, p.scale, p.new_alpha);
-    reveal_number(current, p.rating);
-    reveal_number(d, (long long)r->after-r->before);
+    mu_rank_number(current, p.rating);
+    mu_rank_number(d, (long long)r->after-r->before);
     if (r->after > r->before) chip = (GXColor){0x86,0xef,0xac,0xff};
     if (r->after < r->before) chip = (GXColor){0xfd,0xa4,0xaf,0xff};
     HSD_SisLib_803A70A0(reveal.panel, 1, "Rating %s  %s%s", current, r->after > r->before ? REVEAL_PLUS : "", d);

@@ -398,7 +398,7 @@ static void selector_draw(Selector* s, float x, float y, unsigned mat, unsigned 
 static HSD_Text* text_create(MuRankedWidgets* w, float x, float y, float scale)
 {
     /* Editable text (803A6754): the static constructor (803A5ACC) leaves alloc_data NULL, and the
-     * subtexts below wrote through it (Luis 10-31 5:27 PM, Ranked CSS Start -> setup crash). */
+     * subtexts below wrote through it (Ranked CSS Start -> setup crash). */
     HSD_Text* t;
     if (!HSD_SisLib_804D1124[0]) {
         OSReport("Ranked setup text_create failed: SIS slot 0 missing\n");

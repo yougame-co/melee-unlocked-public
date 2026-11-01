@@ -26,7 +26,7 @@ void math() {
     check(frame.w * c.backing_scale == c.box.w * c.backing_scale,
           "Retina backing size changes, placement stays in points");
   }
-  // The app's box is in backing pixels: Luis's 2x display, theater and the in-window full screen (10-26 melee.log).
+  // The app's box is in backing pixels: 2x display, theater and the in-window full screen (10-26 melee.log).
   check(equal(points_from_backing({142, 240, 2326, 1383}, 2), {71, 120, 1163, 691.5}), "theater box: pixels to points at 2x");
   check(equal(points_from_backing({142, 0, 3314, 2122}, 2), {71, 0, 1657, 1061}), "full-window box: pixels to points at 2x");
   check(equal(points_from_backing({10, 58, 640, 480}, 1), {10, 58, 640, 480}), "1x display: unchanged");

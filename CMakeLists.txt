@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 project(MeleeUnlocked LANGUAGES CXX)
-option(YOUGAME_RANKED_BRANCH "Ranked: visible Ranked and local CPU practice" ON)   # ON in the main staging build (Luis 10-31: Friends + Ranked on the main build)
+option(YOUGAME_RANKED_BRANCH "Ranked: visible Ranked and local CPU practice" ON)   # ON in the main staging build (Friends + Ranked on the main build)
 
 set(YOUGAME_COMPAT_TAG "" CACHE STRING "Isolate YouGame lobby compatibility to this branch tag")
 # Keep the tag literal, short enough for the Worker's 64-byte compatibility field, and log-safe.

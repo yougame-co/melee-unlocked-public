@@ -29,15 +29,23 @@ int main() {
     static_assert(sizeof mu_baked_friends == 5632 && sizeof mu_baked_slippi == 5632 &&
                   sizeof mu_baked_slippi_title == 5632, "GX IA4 padded byte count");
     for (auto* art : {mu_baked_friends, mu_baked_slippi, mu_baked_slippi_title}) {
-        int aa=0, fill=0, outline=0;
+        int aa=0, fill=0, outline=0, ring=0;
         CHECK((reinterpret_cast<size_t>(art)&31)==0);
         for(int y=0;y<32;++y)for(int x=0;x<176;++x) {
             auto v=pixel(art,x,y);
-            if(y==0 || y>=29 || x<4 || x>=172) CHECK(v==0);
+            if(y>=30 || x<4 || x>=172) CHECK(v==0);
+            if(art!=mu_baked_slippi_title && y==0) CHECK(v==0);
+            // Natural p descenders retain a faint AA tail in texel 29;
+            // both GX padding rows must still be entirely transparent.
+            if(art!=mu_baked_slippi_title && y==29) CHECK((v>>4)<=1);
             aa+=(v>>4)>0 && (v>>4)<15;
             fill+=v==255; outline+=v==240;
+            ring+=(v>>4)>0 && (v&15)<15;
         }
-        CHECK(aa>50 && fill>100 && outline>5);
+        CHECK(aa>50 && fill>100 && ring>50);
+        // The title's 1/4-texel ring has partial coverage, with no fully
+        // opaque black texel; rows retain a full dark ring.
+        if(art!=mu_baked_slippi_title) CHECK(outline>5);
     }
     CHECK(std::memcmp(mu_baked_slippi,mu_baked_slippi_title,MU_LABEL_BYTES)!=0);
     unsigned char pixels[8]{};

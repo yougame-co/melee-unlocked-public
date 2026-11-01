@@ -68,7 +68,7 @@ class YouGame0962MergeTest(unittest.TestCase):
 
     def test_exact_looks_run_as_upstream_in_yougame(self):
         main = source("port/app/main.cpp")
-        # Luis + Hero 10-28: YouGame runs exact looks with upstream's own validators and online eligibility.
+        # YouGame runs exact looks with upstream's own validators and online eligibility.
         self.assertNotIn("exact looks are off in YouGame", main)
         block = main.split("  // An exact look (Diet Classic, Diet 64, Crystal) serves its pack", 1)[1]
         block = block.split("if (host::gameplay::vanilla_only())", 1)[0]

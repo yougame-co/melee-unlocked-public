@@ -23,7 +23,7 @@ def main():
     parser.add_argument('--headless-build', action='store_true')
     parser.add_argument('--agent-test-hook', action='store_true',
                         help='staging only: enable agent-test.json in the full Source Port')
-    # ON like CMakeLists.txt: the main staging build carries Ranked (Luis 10-31: Friends + Ranked on the main build).
+    # ON like CMakeLists.txt: the main staging build carries Ranked (Friends + Ranked on the main build).
     parser.add_argument('--ranked-branch', action=argparse.BooleanOptionalAction, default=True,
                         help='visible Ranked and Practice vs CPU (default on; --no-ranked-branch turns it off)')
     parser.add_argument('--host-only', action='store_true', help='use the existing game build')

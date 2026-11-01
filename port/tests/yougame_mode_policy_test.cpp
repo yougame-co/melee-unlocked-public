@@ -42,7 +42,7 @@ int main() {
   }
   // A remix (not vanilla-only) never reaches Slippi, even signed in to Slippi on plain Unranked.
   CHECK(matchmaking_route(1, true, true, false, false, false) == MatchmakingRoute::YouGame);
-  // The base listing signed in to Slippi searches both pools (#33357); standalone stays on Slippi.
+  // The base listing signed in to Slippi searches both pools; standalone stays on Slippi.
   CHECK(matchmaking_route(1, true, true, false, false, true) == MatchmakingRoute::Blend);
   CHECK(matchmaking_route(1, false, true, false, false, true) == MatchmakingRoute::Slippi);
   // Only that one case blends: Ranked, Direct, Teams, Party, a friend room or an agent never do.
@@ -50,7 +50,7 @@ int main() {
   CHECK(matchmaking_route(1, true, true, false, true, true) == MatchmakingRoute::YouGame);
   CHECK(matchmaking_route(1, true, true, true, false, true) == MatchmakingRoute::YouGame);
   CHECK(matchmaking_route(1, false, true, true, false, true) == MatchmakingRoute::YouGame);
-  // Ranked stays off the YouGame Online menu until it plays like Slippi's (Luis, 2026-10-29).
+  // Ranked stays off the YouGame Online menu until it plays like Slippi's.
   CHECK(!yougame_ranked_offered);
   std::printf("yougame_mode_policy: %d matchmaking route cases passed\n", route_cases);
   CHECK(hle::card::file_filter == nullptr);  // Standalone card tests and mounts need no app filter.

@@ -260,13 +260,13 @@ SDL_Window* create(int w, int h, const char* title, bool allowed_visible) {
     // The panel's GL surface stays in points, as SDL_CreateWindowFrom left it: SDL 2.30 never marks a foreign window
     // high-DPI, so SDL_GL_GetDrawableSize, present()'s letterbox and ImGui's viewport all count in points. Asking for a
     // Retina surface here made it twice that size, and on a 2x display the picture drew half-size in its lower left in
-    // theater and black in full screen (d0017/d0018, Luis 10-26). present() logs the window and surface sizes.
+    // theater and black in full screen (d0017/d0018). present() logs the window and surface sizes.
     std::weak_ptr<Inbox> inbox = s.inbox;
     yougame::set_box_handler([inbox](const std::string& line) {
       const auto command = parse_command(line);
       if (!command) return;
       // One log line per command from the app (a rect only when it changes), so a page/host disagreement about the
-      // player box can be told apart (native-experience-lead #15940).
+      // player box can be told apart.
       static std::string last_rect;
       if (command->kind == Kind::Rect) {
         if (line != last_rect) { last_rect = line; host::log("embed: got %s", line.c_str()); }
@@ -327,7 +327,7 @@ bool pump() {
       s.tracker.refresh();
       if (command.kind == Kind::Focus) s.wants_key = true;
       // Blur never calls resignKeyWindow: it only posts the notification (Apple: never call it yourself) and leaves
-      // the panel key, so typing on the page died after a match (native-experience #33649). The app takes the key
+      // the panel key, so typing on the page died after a match. The app takes the key
       // back itself (win.focus() + webContents.focus()); hide() orders the panel out.
       if (command.kind == Kind::Blur) s.wants_key = false;
     }
