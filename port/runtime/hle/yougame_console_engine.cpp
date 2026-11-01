@@ -116,16 +116,21 @@ uint64_t Engine::liveness_clock() const {
   return link_->liveness_clock(hooks_.now_ms());
 }
 void Engine::relink_notice() {
-  const bool waiting = link_->reconnecting();
+  const bool recovering = link_->reconnecting();
+  const bool waiting = input_waiting_ || recovering;
+  const char* notice = recovering ? kReconnecting : kWaitingForFriend;
   const auto now = hooks_.now_ms();
-  if (waiting && (!relink_shown_ || now >= relink_notice_at_)) {
-    if (hooks_.notice) hooks_.notice(kReconnecting);
+  if (waiting) {
+    if (!relink_started_) relink_started_ = now;
+    if (!input_waiting_ && now-*relink_started_ < 1000) return;
+  } else relink_started_.reset();
+  if (waiting && (relink_shown_ != notice || now >= relink_notice_at_)) {
+    if (hooks_.notice) hooks_.notice(notice);
     relink_notice_at_ = now+1000;
   } else if (!waiting && relink_shown_ && hooks_.notice) hooks_.notice("");
-  relink_shown_ = waiting;
+  relink_shown_ = waiting ? notice : nullptr;
 }
 bool Engine::compare_digests() {
-  relink_notice();
   for (auto it = checks_.begin(); it != checks_.end();) {
     for (int p : config_.ports) {
       const unsigned bit = 1u << (p - 1);
@@ -209,6 +214,8 @@ bool Engine::advance(const Pads& hardware, const MuStatePod& state) {
         ready = false;
     }
     const auto waited = hooks_.now_ms() - began;
+    input_waiting_ = !ready && waited >= 1000;
+    relink_notice();
     if (ready) {
       if (!compose(frame_, match_)) { end("required input history missing"); return false; }
       admitted_through_ = std::max(admitted_through_, frame_);
@@ -329,6 +336,7 @@ bool Engine::publish(uint32_t corrected_boundary) {
     published_through_ = it->first;
     it = candidates_.erase(it);
   }
+  relink_notice();
   return compare_digests();
 }
 bool Engine::validated(uint32_t boundary) {
@@ -374,12 +382,15 @@ bool Engine::restore_clock(uint32_t body) {
 }
 bool Engine::confirm(uint32_t body) {
   if (!match_active() || frame_ != match_origin_ + body || body_clock_) return false;
+  const auto wall_began = hooks_.now_ms();
   const auto began = liveness_clock();
   for (;;) {
     link_->pump(0);
     if (auto lost = link_->lost()) { end(*lost); return false; }
     if (!compare_digests()) return false;
     receive(frame_);
+    input_waiting_ = confirmed_through() < frame_ && hooks_.now_ms()-wall_began >= 1000;
+    relink_notice();
     if (confirmed_through() >= frame_) return true;
     if (liveness_clock() - began >= 8000) { end("terminal input wait timed out"); return false; }
     if (hooks_.responsive) hooks_.responsive();

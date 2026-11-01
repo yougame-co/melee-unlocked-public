@@ -86,8 +86,10 @@ public:
 private:
   uint64_t liveness_clock() const;
   void relink_notice();
-  bool relink_shown_ = false;
+  const char* relink_shown_ = nullptr;
+  bool input_waiting_ = false;
   uint64_t relink_notice_at_ = 0;
+  std::optional<uint64_t> relink_started_;
   bool compare_digests();
   void candidate(uint32_t boundary, const MuStatePod&);
   bool publish(uint32_t corrected_boundary);

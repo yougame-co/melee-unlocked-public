@@ -89,7 +89,7 @@
   },
   {
     "before": "    if (nav_frame) {\n      // Lifted face and its shadow together, in the rows' own slant.\n      const ImVec2 frame[] = {point(x+dx, y+dy), point(x+444, y+dy),\n                              point(x+444, y+30), point(x+dx, y+30)};\n      settings_nav_frame(draw, frame);\n",
-    "after": "    if (nav_frame) {\n      // Follow all four corners of the lifted face.\n      const ImVec2 frame[] = {point(x+dx, y+dy), point(x+444+dx, y+dy),\n                              point(x+444+dx, y+30+dy), point(x+dx, y+30+dy)};\n      settings_nav_frame(draw, frame);\n"
+    "after": "    if (nav_frame) {\n      // Follow the lifted face, plus the gold plate under a selected row.\n      const ImVec2 frame[] = {point(x+dx, y+dy), point(x+444+dx, y+dy),\n                              point(x+444+dx, y+30+dy), point(x+dx, y+30+dy)};\n      const ImVec2 plate[] = {point(x, y), point(x+444, y), point(x+444, y+30), point(x, y+30)};\n      if (selected) settings_nav_frame_lifted(draw, frame, plate);\n      else settings_nav_frame(draw, frame);\n"
   },
   {
     "before": "  ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, dashboard ? 14.0f : 3.0f);\n  bool clicked = settings_widgets::Button(\"##category\", size);\n  if (selected) ImGui::SetItemDefaultFocus();\n",
@@ -97,7 +97,7 @@
   },
   {
     "before": "        (hovered ? IM_COL32(47, 85, 184, 255) : IM_COL32(30, 58, 140, 255)));\n  } else if (selected) {\n",
-    "after": "        (hovered ? IM_COL32(47, 85, 184, 255) : IM_COL32(30, 58, 140, 255)));\n    if (settings_nav_frame_on_item()) settings_nav_frame(draw, face);\n  } else if (selected) {\n"
+    "after": "        (hovered ? IM_COL32(47, 85, 184, 255) : IM_COL32(30, 58, 140, 255)));\n    if (settings_nav_frame_on_item()) {\n      if (selected) settings_nav_frame_lifted(draw, face, rest);\n      else settings_nav_frame(draw, face);\n    }\n  } else if (selected) {\n"
   },
   {
     "before": "      const bool pressed = ImGui::InvisibleButton(id, ImVec2(button_w, 58.0f), ImGuiButtonFlags_EnableNav);\n",
@@ -109,6 +109,18 @@
   },
   {
     "before": "      const ImVec2 text_size = ImGui::CalcTextSize(label);\n",
-    "after": "      if (settings_nav_frame_on_item())\n        draw->AddPolyline(face, 4, settings_mix_color(accent, IM_COL32_WHITE, .75f), ImDrawFlags_Closed, 2.0f);\n      const ImVec2 text_size = ImGui::CalcTextSize(label);\n"
+    "after": "      if (settings_nav_frame_on_item()) {\n        // Frame the whole button as players see it, face and the slab below it (report d6ad1693).\n        const ImVec2 outline[] = {face[0], face[1], shadow[1], shadow[2], shadow[3], face[3]};\n        draw->AddPolyline(outline, 6, settings_mix_color(accent, IM_COL32_WHITE, .75f), ImDrawFlags_Closed, 2.0f);\n      }\n      const ImVec2 text_size = ImGui::CalcTextSize(label);\n"
+  },
+  {
+    "before": "  ImVec2 nav_frame_quad[4];\n",
+    "after": "  ImVec2 nav_frame_outline[7];\n  int nav_frame_points = 0;\n"
+  },
+  {
+    "before": "      nav_frame_row = true;\n      std::copy(poly, poly + 4, nav_frame_quad);\n",
+    "after": "      // Frame the button as players see it (report d6ad1693): face and left fold, plus the\n      // slab on the last row; the next row covers the slab of every other row.\n      nav_frame_row = true;\n      const ImVec2 slab[] = {poly[0], poly[1], depth[1], depth[2], depth[3],\n                             left_fold[2], left_fold[1]};\n      const ImVec2 covered[] = {poly[0], poly[1], poly[2], poly[3], left_fold[2], left_fold[1]};\n      nav_frame_points = i == 7 ? 7 : 6;\n      std::copy_n(i == 7 ? slab : covered, nav_frame_points, nav_frame_outline);\n"
+  },
+  {
+    "before": "  if (nav_frame_row) settings_nav_frame(draw, nav_frame_quad);\n",
+    "after": "  if (nav_frame_row) settings_nav_frame_outline(draw, nav_frame_outline, nav_frame_points);\n"
   }
 ]

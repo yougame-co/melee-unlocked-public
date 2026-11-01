@@ -17,6 +17,7 @@ class Round38Wiring(unittest.TestCase):
         helpers = '\n'.join('static ' + signature + ' {' + body(visuals, name) + '}' for name, signature in (
             ('settings_shaped_hit_button', 'bool settings_shaped_hit_button(const char* id, ImVec2 size)'),
             ('settings_nav_frame_on_item', 'bool settings_nav_frame_on_item()'),
+            ('settings_nav_frame_outline', 'void settings_nav_frame_outline(ImDrawList* draw, const ImVec2* outline, int count)'),
             ('settings_nav_frame', 'void settings_nav_frame(ImDrawList* draw, const ImVec2 (&quad)[4])')))
         menu.OnlineMenuTest().compile_fixture('round38-focus', r'''
 #include <cstdio>
@@ -69,7 +70,9 @@ int main() {
         self.assertLess(action.index('PushStyleColor'), action.index('ImGui::InvisibleButton'))
         self.assertIn('ImGuiButtonFlags_EnableNav', action)
         self.assertIn('ImGui::PopStyleColor();', action)
-        self.assertIn('if (settings_nav_frame_on_item())\n        draw->AddPolyline(face, 4, settings_mix_color(accent, IM_COL32_WHITE, .75f), ImDrawFlags_Closed, 2.0f);', action)
+        self.assertIn('const ImVec2 outline[] = {face[0], face[1], shadow[1], shadow[2], shadow[3], face[3]};', action)
+        self.assertIn('if (settings_nav_frame_on_item()) {', action)
+        self.assertIn('draw->AddPolyline(outline, 6, settings_mix_color(accent, IM_COL32_WHITE, .75f), ImDrawFlags_Closed, 2.0f);', action)
         self.assertIn('p.y + y - (hot ? 4.0f : 0.0f)', action)
         for pin in ('ImGui::SetFocusID', 'ImGui::SetNavCursorVisible(true)', 'agent_menu_focus',
                     'agent_menu_label', 'state.menu_quit && enter', '!quit_button_focused'):
@@ -97,7 +100,13 @@ int main() {
         self.assertIn('ImGuiWindowFlags_NoInputs', ui)
         tile = body(ui, 'settings_nav_tile')
         self.assertIn('if (gd_kit) ImGui::PushStyleColor(ImGuiCol_NavCursor', tile)
-        self.assertIn('if (settings_nav_frame_on_item()) settings_nav_frame(draw, face);', tile)
+        self.assertIn('if (selected) settings_nav_frame_lifted(draw, face, rest);', tile)
+        self.assertIn('if (selected) settings_nav_frame_lifted(draw, frame, plate);', body(ui, 'settings_gd_home'))
+        self.assertIn('settings_nav_frame_lifted(ImGui::GetWindowDrawList(), frame, plate)', body(visuals, 'settings_gd_row'))
+        home = body(ui, 'settings_clean_home')
+        self.assertIn('left_fold[2], left_fold[1]};', home)
+        self.assertIn('nav_frame_points = i == 7 ? 7 : 6;', home)
+        self.assertIn('settings_nav_frame_outline(draw, nav_frame_outline, nav_frame_points);', home)
 
     def test_broker_close_flows_to_friends_notice_and_safe_log(self):
         link = read('port/runtime/hle/yougame_link.cpp')

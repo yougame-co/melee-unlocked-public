@@ -46,12 +46,14 @@ static int entry_failed;   /* ... and the match could not be made */
 
 /* gm_801A4510: the first game mode of this run. */
 int mu_console_active(void);
+void mu_console_load_save(void);
 
 void mu_replay_boot_mode(unsigned char* mode)
 {
     /* Frozen session state only: every seat takes retail VS on the same first
      * scene boundary, before any body or frame-zero digest. No local input. */
     if (mu_console_active()) {
+        mu_console_load_save();
         *mode = GM_VS;
         return;
     }

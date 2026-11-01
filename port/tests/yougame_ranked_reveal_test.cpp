@@ -119,5 +119,35 @@ int main() {
     CHECK(s.frame == REVEAL_HOLD_END && reveal_done(&s));
     reveal_accept(&s, &r); CHECK(s.frame == REVEAL_HOLD_END && reveal_done(&s));
     reveal_accept(&s, &empty); CHECK(!s.active && s.frame == 0);
+    // One plain log line per new rated result: ranks, ratings, change; no names or ids.
+    char line[160];
+    CHECK(!reveal_shown_line(&s, line));
+    auto bronze = rank(1, 2, "Bronze I");
+    r = result(bronze, bronze, 8720, 8680); reveal_accept(&s, &r);
+    CHECK(reveal_shown_line(&s, line));
+    CHECK(std::string(line) == "yougame: ranked reveal shown: Bronze I 872 -> Bronze I 868 (-4)\n");
+    CHECK(!reveal_shown_line(&s, line));
+    reveal_tick(&s); reveal_accept(&s, &r); CHECK(!reveal_shown_line(&s, line));
+    r = result(gold, platinum, 11285, 11320); reveal_accept(&s, &r);
+    CHECK(reveal_shown_line(&s, line));
+    CHECK(std::string(line) == "yougame: ranked reveal shown: Gold II 1128.5 -> Platinum IV 1132 (+3.5)\n");
+    r = result(gold, gold, 11400, 11400); reveal_accept(&s, &r);
+    CHECK(reveal_shown_line(&s, line) && std::string(line) == "yougame: ranked reveal shown: Gold II 1140 -> Gold II 1140 (0)\n");
+    r = result(gold, platinum, INT32_MIN, INT32_MAX); reveal_accept(&s, &r);
+    CHECK(reveal_shown_line(&s, line));
+    CHECK(std::string(line) == "yougame: ranked reveal shown: Gold II -214748364.8 -> Platinum IV 214748364.7 (+429496729.5)\n");
+    auto full = rank(2, 5, "Silver"); std::memset(full.label, 'S', sizeof full.label);
+    r = result(full, full, 9000, 8995); reveal_accept(&s, &r);
+    CHECK(reveal_shown_line(&s, line) && std::string(line).find(std::string(24, 'S') + " 900 -> ") != std::string::npos);
+    CHECK(std::string(line).find(std::string(25, 'S')) == std::string::npos);
+    r = result(gold, gold, 11400, 11395); reveal_accept(&s, &r);
+    CHECK(reveal_shown_line(&s, line) && std::string(line) == "yougame: ranked reveal shown: Gold II 1140 -> Gold II 1139.5 (-0.5)\n");
+    // Pending, unrated and error results carry no numbers and log nothing.
+    for (int status : {MU_YG_RESULT_RECORDING, MU_YG_RESULT_UNRATED, MU_YG_RESULT_ERROR}) {
+        r.status = status; reveal_accept(&s, &r); CHECK(!reveal_shown_line(&s, line));
+    }
+    // A result that comes back after a pending poll is new, so it logs again.
+    r = result(bronze, bronze, 8720, 8680); reveal_accept(&s, &r); CHECK(reveal_shown_line(&s, line));
+    reveal_accept(&s, &empty); CHECK(!reveal_shown_line(&s, line));
     std::cout << "rank reveal: " << checks << " checks passed\n";
 }

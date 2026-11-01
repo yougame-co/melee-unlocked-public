@@ -255,6 +255,30 @@ static void friends_handoff_chunks() {
   CHECK(mismatch.receive(d) && mismatch.complete() && !mismatch.finish());
 }
 
+// The pacer against Rooms' own token buckets (256 KiB/s with 2 s of burst, 120 messages/s with 5 s),
+// beside 60 input messages a second: the socket is never over either budget (11-02 c0057 run closed 1008).
+static void friends_handoff_pacer() {
+  using namespace handoff_join;
+  for (size_t total : {size_t(100*1024),size_t(1024*1024),stored_limit}) {
+    ++cases; RoomPacer pacer;
+    double bytes = 2*256*1024, messages = 5*120; uint64_t now = 1000, last = now, next_input = now;
+    auto spend = [&](double b) {
+      const double dt = double(now-last)/1000; last = now;
+      bytes = std::min(2*256*1024.0,bytes+dt*256*1024); messages = std::min(600.0,messages+dt*120);
+      bytes -= b; messages -= 1; CHECK(bytes >= 0 && messages >= 0);
+    };
+    for (size_t off = 0; off < total; off += kCardChunk) {
+      const size_t size = std::min(kCardChunk,total-off);
+      spend(double(card_encode(std::vector<uint8_t>(size).data(),size).size()+200));
+      const uint64_t due = pacer.after(now,size);
+      CHECK(due >= now+12);
+      for (; next_input < due; next_input += 17) { now = std::max(now,next_input); spend(120); }
+      now = due;
+    }
+    if (total == 1024*1024) CHECK(now-1000 < 7000);
+  }
+}
+
 // Real room/meet/direct-open/delay setup, followed by scripted main-thread publications.
 // No Engine starts and no mu-console-end is emitted when falling back to prepared().
 static void friends_handoff_live_transfer() {

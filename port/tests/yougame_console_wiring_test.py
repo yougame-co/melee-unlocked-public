@@ -85,7 +85,8 @@ class ConsoleWiring(unittest.TestCase):
         self.assertIn('link->open_peer(peer,budget())', transport)
         self.assertIn('reply = open_link(attempt->request,conn,peer,1000)', transport)
         engine = read('port/runtime/hle/yougame_console_engine.cpp')
-        self.assertIn('hooks_.notice(kReconnecting)', engine)
+        self.assertIn('recovering ? kReconnecting : kWaitingForFriend', engine)
+        self.assertIn('hooks_.notice(notice)', engine)
         self.assertIn('liveness_clock() - it->second.since >= 8000', engine)
 
     def test_links_are_serviced_during_boot_and_loading_and_relaunch_has_no_leave(self):

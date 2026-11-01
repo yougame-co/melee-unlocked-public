@@ -137,7 +137,9 @@ int main() {
     for(bool yg : {false,true})for(bool back : {false,true})for(bool ret : {false,true}) {
         active=yg;back_setting=back;return_setting=ret;guest_mode=1;
         session_mode_value=1;playing=true;tick();session_mode_value=-1;playing=false;
-        int before=training;tick();CHECK(training-before==int(!yg&&(back||ret)));
+        // Upstream v0.9.91: "back to Training" no longer leaves Unranked's character select after a game;
+        // only the plain "go back to Training mode" setting still does (outside YouGame).
+        int before=training;tick();CHECK(training-before==int(!yg&&ret));
     }
     // Local Ranked practice cannot inherit the previous Unranked session's destination.
     active=false;back_setting=return_setting=true;session_mode_value=1;guest_mode=1;playing=true;tick();

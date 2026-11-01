@@ -4,6 +4,7 @@
 #include "replay_hud.h"
 
 #include "practice_menu.h"
+#include "replay_bar.h"
 #include "replay_coach.h"
 #include "replay_control.h"
 #include "imgui.h"
@@ -21,7 +22,7 @@ namespace {
 
 // GameCube buttons as the pads report them.
 constexpr uint16_t kDLeft = 0x0001, kDRight = 0x0002, kDDown = 0x0004, kDUp = 0x0008, kZ = 0x0010, kA = 0x0100,
-                   kX = 0x0400, kY = 0x0800, kStart = 0x1000;
+                   kB = 0x0200, kX = 0x0400, kY = 0x0800, kStart = 0x1000;
 constexpr int32_t kLead = 60;            // a tip is jumped to a second before it happens
 constexpr int32_t kJump = 5 * 60;
 constexpr double kHoldBack = 0.6;        // Start held this long goes back to the replay
@@ -176,8 +177,10 @@ void capture_result(int port, int32_t from, int32_t to) {
 
 // Tests: MELEE_TEST_REPLAY_PRESS="<replay frame>:<button>,..." presses A, X, Y, Z, S (Start) or U D L R
 // (the D-pad) once each when playback reaches that frame (hidden runs have no controller here).
-uint16_t test_presses(int32_t frame) {
-  struct Press { int32_t frame; uint16_t button; bool fired; };
+// A frame written "h<n>" counts the viewer's own drawn frames instead (it runs while the replay is
+// paused, so the panel can be driven too).
+uint16_t test_presses(int32_t frame, uint32_t drawn) {
+  struct Press { int32_t frame; uint16_t button; bool fired; bool drawn; };
   static std::vector<Press> list;
   static bool parsed = false;
   if (!parsed) {
@@ -193,17 +196,18 @@ uint16_t test_presses(int32_t frame) {
         if (colon == std::string::npos || colon + 1 >= item.size()) continue;
         uint16_t b = 0;
         switch (item[colon + 1]) {
-          case 'A': b = kA; break; case 'X': b = kX; break; case 'Y': b = kY; break; case 'Z': b = kZ; break;
+          case 'A': b = kA; break; case 'X': b = kX; break; case 'Y': b = kY; break; case 'Z': b = kZ; break; case 'B': b = kB; break;
           case 'S': b = kStart; break; case 'U': b = kDUp; break; case 'D': b = kDDown; break;
           case 'L': b = kDLeft; break; case 'R': b = kDRight; break; default: break;
         }
-        if (b) list.push_back({(int32_t)std::strtol(item.c_str(), nullptr, 10), b, false});
+        const bool by_drawn = item[0] == 'h';
+        if (b) list.push_back({(int32_t)std::strtol(item.c_str() + (by_drawn ? 1 : 0), nullptr, 10), b, false, by_drawn});
       }
     }
   }
   uint16_t out = 0;
   for (Press& p : list)
-    if (!p.fired && frame >= p.frame) { p.fired = true; out |= p.button; }
+    if (!p.fired && (p.drawn ? (int64_t)drawn >= p.frame : frame >= p.frame)) { p.fired = true; out |= p.button; }
   return out;
 }
 
@@ -233,14 +237,17 @@ void frame(int style, const practice_menu::Frame& f) {
   }
   const practice_menu::ReplaySettings& rs = practice_menu::replay_settings();
   replay_control::set_defense(rs.defense);
+  static uint32_t drawn = 0;
+  const uint16_t test = test_presses(st.frame, ++drawn);
   const uint16_t held = f.buttons;
-  const uint16_t pressed = (uint16_t)((held & ~g.prev) | test_presses(st.frame));
+  const uint16_t pressed = (uint16_t)((held & ~g.prev) | test);
   g.prev = held;
   refresh_moments(now);
 
   // ---- the panel (Start while watching): take over, this player's tips, the settings ----
   if (g.panel) {
     practice_menu::Frame pf = f;
+    pf.buttons |= test;
     pf.open = true;
     pf.armed = true;
     practice_menu::ReplayPanelIn pin;
@@ -250,6 +257,7 @@ void frame(int style, const practice_menu::Frame& f) {
     const practice_menu::ReplayPanel out = practice_menu::replay_panel(style, pf, pin);
     if (out.player_step) g.port = next_port(ports, g.port, out.player_step);
     if (out.close) {
+      host::log("replay: panel closed (%s)", out.take_over ? "take over" : out.jump != INT32_MIN ? "tip" : "back to the replay");
       g.panel = false;
       g.prev = 0xFFFF;   // the closing press is not a press for the layer
       if (out.take_over) {
@@ -291,6 +299,7 @@ void frame(int style, const practice_menu::Frame& f) {
     if (pressed & kZ) replay_control::toggle_pause();
     if (pressed & kStart) {
       g.panel = true;
+      host::log("replay: panel opened");
       g.panel_paused = !st.paused;
       if (!st.paused) replay_control::toggle_pause();
       return;
@@ -332,6 +341,14 @@ void frame(int style, const practice_menu::Frame& f) {
       replay_control::retry_takeover();
     }
   }
+
+  // B while watching (in a takeover B is the fighter's): everything the viewer draws goes away for
+  // recording, and B brings it back. Hidden, the takeover's LIVE label and results stay away too.
+  if (live < 0 && (pressed & kB)) {
+    replay_bar::toggle_hidden();
+    host::log("replay: controls %s", replay_bar::all_hidden() ? "hidden" : "shown");
+  }
+  if (replay_bar::all_hidden()) return;
 
   // ---- drawing ----
   const float x0 = f.game_x0, x1 = f.game_x1, y0 = f.game_y0, y1 = f.game_y1;
@@ -425,8 +442,8 @@ void frame(int style, const practice_menu::Frame& f) {
   // Bottom: the buttons, with this player's tips on a thin timeline above them.
   {
     const char* spec = live >= 0 ? "S:Retry|S:Hold to go back to the replay"
-                       : st.paused ? "A:Take over|X:Last tip|Y:Next tip|D:Frame|Z:Play|S:Settings"
-                                   : "A:Take over|X:Last tip|Y:Next tip|D:5 s|Z:Pause|R:Fast|S:Settings";
+                       : st.paused ? "A:Take over|X:Last tip|Y:Next tip|D:Frame|Z:Play|B:Hide|S:Settings"
+                                   : "A:Take over|X:Last tip|Y:Next tip|D:5 s|Z:Pause|R:Fast|B:Hide|S:Settings";
     const float ls = u * 0.82f;
     const float lw = practice_menu::legend(dl, 0, 0, ls, spec, 1.0f, false);
     const bool timeline = live < 0 && rs.tips && st.last_frame > st.first_frame;

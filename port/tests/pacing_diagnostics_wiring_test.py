@@ -93,6 +93,10 @@ class PacingDiagnosticsWiringTest(unittest.TestCase):
       host::log("present: vsync %s (settings)", options.vsync ? "on" : "off");
 #endif'''
         self.assertIn(addition, s)
+        # Build 44 merges upstream v0.9.91: first reverse exactly its pc_settings.cpp hunks (vs v0.9.89).
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build44_0991_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
         # Build 42 merges upstream v0.9.89: first reverse exactly its pc_settings.cpp hunks (vs 0565f039).
         for approved in json.loads((ROOT / 'port/tests/fixtures/build42_0989_settings_ranges.json').read_text()):
             self.assertEqual(s.count(approved['after']), 1, approved['after'])

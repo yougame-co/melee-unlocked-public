@@ -125,3 +125,7 @@ static int mu_slippi_cmd(unsigned cmd, const void*, unsigned, void* out, unsigne
     static_cast<u8*>(out)[1]=1; *got=size; return 0;
 }
 static void lbAudioAx_80024030(int) {}
+static std::vector<std::string> os_reports;
+static void OSReport(const char* fmt, ...) {
+    va_list args; va_start(args,fmt); os_reports.push_back(format(fmt,args)); va_end(args);
+}

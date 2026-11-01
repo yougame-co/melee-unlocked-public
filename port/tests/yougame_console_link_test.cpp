@@ -711,6 +711,22 @@ static void relink_async_leave() {
   CHECK(cleaned.get_future().wait_for(std::chrono::seconds(1)) == std::future_status::ready);
   CHECK(responsive); // late successful open is closed by the abandoned attempt
 }
+static void room_carried_drop() {
+  ++cases; Fixture f; SessionConfig c; std::string error;
+  auto io=f.io(); bool rejoining=false; int opens=0;
+  io.room_rejoining=[&] {return rejoining;};
+  io.route=[](unsigned) {return "unknown";};
+  const auto request=io.request;
+  io.request=[&](const json& q,int ms) {if(str(q,"type")=="directOpen") ++opens;return request(q,ms);};
+  auto link=start_session(f.input(),c,error,std::move(io));CHECK(link && error.empty());
+  const auto before=opens; rejoining=true; const auto began=f.now;
+  link->pump(0); CHECK(link->reconnecting()); CHECK(opens==before);
+  f.now+=3370; link->pump(0);CHECK(link->liveness_clock(f.now)==began);
+  CHECK(!link->lost());
+  f.now=began+74999;link->pump(0);CHECK(!link->lost());
+  f.now=began+75000;link->pump(0);CHECK(link->lost()=="your friend disconnected");
+  std::printf("A: room-carried drop detected immediately, no opens during rejoin; give-up at 75000 ms\n");
+}
 static void relink_engines(int dropped_seat, bool match = false) {
   ++cases;
   Fixture a,b(2,1); std::array<Fixture*,2> f{&a,&b};
@@ -1812,8 +1828,12 @@ int main(int argc,char** argv) {
     friends_handoff_off_trace(); return 0;
   }
   if (argc > 1 && std::string(argv[1]) == "--handoff-join") {
-    friends_handoff_agreement(); friends_handoff_flow(); friends_handoff_chunks(); friends_handoff_live_transfer(); friends_handoff_guest_transfer();
+    friends_handoff_agreement(); friends_handoff_flow(); friends_handoff_chunks(); friends_handoff_pacer(); friends_handoff_live_transfer(); friends_handoff_guest_transfer();
     std::printf("Friends handoff agreement: %d cases, %d checks passed\n",cases,checks.load()); return 0;
+  }
+  if (argc > 1 && std::string(argv[1]) == "--drop-timing") {
+    room_carried_drop(); relink_async_leave();
+    std::printf("Friends drop timing: %d cases, %d checks passed\n",cases,checks.load()); return 0;
   }
   friends_guest_waits_for_next_start();
   friends_reenter_held_room();

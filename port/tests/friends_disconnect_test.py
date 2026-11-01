@@ -25,7 +25,7 @@ class FriendsDisconnectTest(unittest.TestCase):
 #include <cstdlib>
 int checks=0;
 #define CHECK(x) do { if(!(x)) {std::fprintf(stderr,"line %d: %s\n",__LINE__,#x);std::abort();} ++checks; } while(0)
-std::atomic<bool> quitting{false}, drop{false};
+std::atomic<bool> quitting{false}, drop{false}, throw_next{false};
 std::atomic<int> drop_code{1006};
 namespace host {bool exit_requested(){return quitting;}void log(const char*,...) {}}
 using ENetSocket=int;constexpr int ENET_SOCKET_NULL=-1;
@@ -67,6 +67,7 @@ class Socket {
  void close(int=1000) {gone=true;}
  bool send(const json& m) {std::lock_guard<std::mutex> l(mock_mutex);sent.push_back(m);return !gone;}
  bool next(json& m,int) {
+   if(throw_next.exchange(false))(void)json(nullptr).at("t"); // any throw inside the worker loop
    if(drop.exchange(false)){gone=true;code=drop_code;return false;}
    {std::lock_guard<std::mutex> l(mock_mutex);if(!wire.empty()) {m=std::move(wire.front());wire.pop_front();return true;}}
    std::this_thread::sleep_for(std::chrono::milliseconds(1));return false;
@@ -82,7 +83,7 @@ template<class F>void until(F ready) {
 void reset(const char* identity) {
  std::lock_guard<std::mutex> l(yougame::mock_mutex);
  yougame::wire.clear();yougame::sent.clear();yougame::sessions.clear();yougame::opens=0;
- yougame::me=identity;quitting=drop=false;drop_code=1006;yougame::has_console=true;
+ yougame::me=identity;quitting=drop=throw_next=false;drop_code=1006;yougame::has_console=true;
 }
 bool sent_leave() {
  std::lock_guard<std::mutex> l(yougame::mock_mutex);
@@ -138,6 +139,20 @@ int main() {
  {
    ConsoleBackend b;CHECK(b.open("fixture-ticket","room123",100));quitting=true;
    until([&]{return sent_leave();});b.close();CHECK(sent_leave());
+ }
+ reset("host");friends::lobby.begin(true);friends::lobby.opened("room123");
+ {
+   // A room message this build cannot use must fail the room, never leave the worker thread:
+   // an exception escaping it is std::terminate, which ends the whole game (exit 3).
+   ConsoleBackend b;CHECK(b.open("fixture-ticket","room123",100));
+   until([&]{std::lock_guard<std::mutex> l(b.mutex);return !b.last_roster.is_null();});
+   push({{"t","welcome"},{"me","host"},{"host","host"},{"players",roster()},{"participants",nullptr}});
+   push({{"t","leave"},{"player",{{"id","guest"}}},{"players",json::array({{{"id","host"}}})},{"host","host"}});
+   // That shape is read safely now: the room stays up and the guest's seat is gone.
+   until([&]{std::lock_guard<std::mutex> l(b.mutex);return b.last_roster.value("players",json()).size()==1;});
+   CHECK(!b.closed);
+   throw_next=true;until([&]{return b.closed.load();});
+   CHECK(!b.send({{"t","ping"}}) && !b.flush(0));b.close();
  }
  std::printf("production Friends worker: %d checks passed\n",checks);
 }

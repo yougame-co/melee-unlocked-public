@@ -2809,10 +2809,12 @@ static void settings_gd_home(SettingsState& state) {
     const float dx = selected ? -5.0f : 0.0f, dy = selected ? -5.0f : 0.0f;
     quad(x+dx, y+dy, 444, 30, selected ? settings_accent(2) : IM_COL32(46, 54, 64, 255));
     if (nav_frame) {
-      // Follow all four corners of the lifted face.
+      // Follow the lifted face, plus the gold plate under a selected row.
       const ImVec2 frame[] = {point(x+dx, y+dy), point(x+444+dx, y+dy),
                               point(x+444+dx, y+30+dy), point(x+dx, y+30+dy)};
-      settings_nav_frame(draw, frame);
+      const ImVec2 plate[] = {point(x, y), point(x+444, y), point(x+444, y+30), point(x, y+30)};
+      if (selected) settings_nav_frame_lifted(draw, frame, plate);
+      else settings_nav_frame(draw, frame);
     }
     gd_kit_text(draw, "row", origin, scale, x+16+dx, y+20.28f+dy,
                 names[i], selected ? IM_COL32(10, 14, 24, 255) : IM_COL32(242, 239, 228, 255));
@@ -3044,7 +3046,8 @@ static void settings_clean_home(SettingsState& state) {
   const float step = row_h - 1.0f;
   // The rows overlap, so the focus frame is drawn once they are all down or the next row hides it.
   bool nav_frame_row = false;
-  ImVec2 nav_frame_quad[4];
+  ImVec2 nav_frame_outline[7];
+  int nav_frame_points = 0;
   for (int i = 0; i < 8; ++i) {
     const float t = std::clamp((state.clean_home_frames - i * 1.25f) / 14.0f, 0.0f, 1.0f);
     const float eased = t * t * (3.0f - 2.0f * t);
@@ -3088,8 +3091,14 @@ static void settings_clean_home(SettingsState& state) {
                            ImVec2(x + width - 18.0f, y + row_h-tilt), ImVec2(x, y + row_h)};
     draw->AddConvexPolyFilled(poly, 4, face);
     if (nav_frame) {
+      // Frame the button as players see it (report d6ad1693): face and left fold, plus the
+      // slab on the last row; the next row covers the slab of every other row.
       nav_frame_row = true;
-      std::copy(poly, poly + 4, nav_frame_quad);
+      const ImVec2 slab[] = {poly[0], poly[1], depth[1], depth[2], depth[3],
+                             left_fold[2], left_fold[1]};
+      const ImVec2 covered[] = {poly[0], poly[1], poly[2], poly[3], left_fold[2], left_fold[1]};
+      nav_frame_points = i == 7 ? 7 : 6;
+      std::copy_n(i == 7 ? slab : covered, nav_frame_points, nav_frame_outline);
     }
     draw->AddLine(ImVec2(x + 18.0f, y + 1.0f), ImVec2(x + width - 1.0f, y + 1.0f-tilt),
                   selected ? IM_COL32(255, 223, 245, 255) :
@@ -3106,7 +3115,7 @@ static void settings_clean_home(SettingsState& state) {
       state.clean_detail_open = true;
     }
   }
-  if (nav_frame_row) settings_nav_frame(draw, nav_frame_quad);
+  if (nav_frame_row) settings_nav_frame_outline(draw, nav_frame_outline, nav_frame_points);
   // The A SELECT / B BACK chips drawn by settings_clean_chrome are real buttons: Select opens
   // the highlighted category, Back closes the panel. Hover lifts and lightens the chip.
   {
@@ -3274,7 +3283,10 @@ static bool settings_nav_tile(int index, bool selected, int overlay_style, ImVec
     draw->AddConvexPolyFilled(face, 4,
         selected ? settings_accent(2) :
         (hovered ? IM_COL32(47, 85, 184, 255) : IM_COL32(30, 58, 140, 255)));
-    if (settings_nav_frame_on_item()) settings_nav_frame(draw, face);
+    if (settings_nav_frame_on_item()) {
+      if (selected) settings_nav_frame_lifted(draw, face, rest);
+      else settings_nav_frame(draw, face);
+    }
   } else if (selected) {
     draw->AddRect(a, b, IM_COL32(244, 223, 255, 255), dashboard ? 14.0f : 5.0f, 0, 2.0f);
   }
@@ -3980,7 +3992,8 @@ static void draw_native_practice(SettingsState& state, RenderOptions& options,
     if (r.start_direct || r.start_teams) {
       std::string code, error;
       if (!practice.can_start) practice_menu::show_error("Search from Training or an event match.");
-      else if (slippi::native_practice::normalize_direct_code(r.direct_code, &code, &error)) {
+      else if (r.start_teams ? slippi::native_practice::normalize_teams_code(r.direct_code, &code, &error)
+                             : slippi::native_practice::normalize_direct_code(r.direct_code, &code, &error)) {
         if (r.start_teams) slippi::native_practice::submit_start_teams(code);
         else slippi::native_practice::submit_start_direct(code);
         close_menu();
@@ -6107,8 +6120,8 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       for (int port = 0; port < 4; ++port) shield_row(ports[port], &options.shield_color[port], port);
       ImGui::Separator();
       shield_row("Online (you)", &options.shield_color_online, 0);
-      settings_hint("Your shield and KO blast colours. Online, \"Online (you)\" is yours: players on Melee Unlocked see it,"
-                    " players on Slippi Dolphin see your port colour. Team matches keep team colours.");
+      settings_hint("Your shield and KO blast colours. Online, \"Online (you)\" is yours (left empty, your P1 colour): players"
+                    " on Melee Unlocked see it, players on Slippi Dolphin see your port colour. Team matches keep team colours.");
       ImGui::Unindent(8.0f);
     }
     // ---- Get mod looks ----
@@ -9127,7 +9140,8 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       }
       if (ImGui::IsItemHovered())
         ImGui::SetTooltip("When the other player leaves or the connection drops after a match, you land in a Training\n"
-                          "match with the same character. D-pad Up searches again (same mode, same Direct code), Down dismisses.");
+                          "match with the same character. D-pad Up searches again (same mode, same Direct code), Down dismisses.\n"
+                          "Direct and Teams only: after an Unranked game you stay on Unranked's character select.");
       if (!options.online_back_to_training && settings_toggle("After an online session ends, go back to Training mode", &options.online_return_training)) {
         RenderOptions::live_online_return_training() = options.online_return_training;
         changed = true;
@@ -10203,8 +10217,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                              ImVec2(q.x + button_w - 9, q.y + 54), ImVec2(q.x, q.y + 54)};
       draw->AddConvexPolyFilled(shadow, 4, hot ? accent_dark : IM_COL32(24, 13, 34, 245));
       draw->AddConvexPolyFilled(face, 4, hot ? accent : IM_COL32(31, 20, 42, 245));
-      if (settings_nav_frame_on_item())
-        draw->AddPolyline(face, 4, settings_mix_color(accent, IM_COL32_WHITE, .75f), ImDrawFlags_Closed, 2.0f);
+      if (settings_nav_frame_on_item()) {
+        // Frame the whole button as players see it, face and the slab below it (report d6ad1693).
+        const ImVec2 outline[] = {face[0], face[1], shadow[1], shadow[2], shadow[3], face[3]};
+        draw->AddPolyline(outline, 6, settings_mix_color(accent, IM_COL32_WHITE, .75f), ImDrawFlags_Closed, 2.0f);
+      }
       const ImVec2 text_size = ImGui::CalcTextSize(label);
       draw->AddText(ImVec2(q.x + (button_w - text_size.x) * .5f, q.y + (54.0f - text_size.y) * .5f),
                     IM_COL32(255, 250, 253, 255), label);

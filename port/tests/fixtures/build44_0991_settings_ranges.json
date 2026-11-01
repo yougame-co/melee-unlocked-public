@@ -1,0 +1,14 @@
+[
+  {
+    "before": "      else if (slippi::native_practice::normalize_direct_code(r.direct_code, &code, &error)) {\n",
+    "after": "      else if (r.start_teams ? slippi::native_practice::normalize_teams_code(r.direct_code, &code, &error)\n                             : slippi::native_practice::normalize_direct_code(r.direct_code, &code, &error)) {\n"
+  },
+  {
+    "before": "      settings_hint(\"Your shield and KO blast colours. Online, \\\"Online (you)\\\" is yours: players on Melee Unlocked see it,\"\n                    \" players on Slippi Dolphin see your port colour. Team matches keep team colours.\");\n",
+    "after": "      settings_hint(\"Your shield and KO blast colours. Online, \\\"Online (you)\\\" is yours (left empty, your P1 colour): players\"\n                    \" on Melee Unlocked see it, players on Slippi Dolphin see your port colour. Team matches keep team colours.\");\n"
+  },
+  {
+    "before": "                          \"match with the same character. D-pad Up searches again (same mode, same Direct code), Down dismisses.\");\n",
+    "after": "                          \"match with the same character. D-pad Up searches again (same mode, same Direct code), Down dismisses.\\n\"\n                          \"Direct and Teams only: after an Unranked game you stay on Unranked's character select.\");\n"
+  }
+]

@@ -48,3 +48,26 @@ if(NOT TARGET port_friends_handoff_join_test)
   target_link_libraries(port_friends_handoff_join_test PRIVATE Threads::Threads)
   add_test(NAME port_friends_handoff_join COMMAND port_friends_handoff_join_test --handoff-join)
 endif()
+
+if(NOT TARGET port_friends_timing_test)
+  add_executable(port_friends_timing_test "${CMAKE_CURRENT_LIST_DIR}/friends_timing_test.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../runtime/hle/handoff_state.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../runtime/hle/native_savestate.cpp")
+  target_include_directories(port_friends_timing_test PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/../runtime/hle" "${CMAKE_CURRENT_LIST_DIR}/../third_party")
+  target_compile_features(port_friends_timing_test PRIVATE cxx_std_17)
+  target_link_libraries(port_friends_timing_test PRIVATE Threads::Threads)
+  add_executable(port_friends_link_evidence_test "${CMAKE_CURRENT_LIST_DIR}/friends_link_evidence_test.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../runtime/hle/yougame_console_engine.cpp")
+  target_include_directories(port_friends_link_evidence_test PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/../runtime/hle" "${CMAKE_CURRENT_LIST_DIR}/../third_party")
+  target_compile_features(port_friends_link_evidence_test PRIVATE cxx_std_17)
+  target_link_libraries(port_friends_link_evidence_test PRIVATE Threads::Threads)
+  add_test(NAME port_friends_link_evidence COMMAND port_friends_link_evidence_test)
+  add_test(NAME port_friends_pause_guard COMMAND port_friends_timing_test --pause)
+  add_test(NAME port_friends_capture_timing COMMAND port_friends_timing_test --capture)
+  add_test(NAME port_friends_transfer_timing COMMAND port_friends_timing_test --transfer)
+  add_test(NAME port_friends_drop_timing COMMAND port_friends_handoff_join_test --drop-timing)
+  add_test(NAME port_friends_timing_mutants COMMAND "${Python3_EXECUTABLE}" -B
+    "${CMAKE_CURRENT_LIST_DIR}/friends_timing_mutant_test.py")
+endif()

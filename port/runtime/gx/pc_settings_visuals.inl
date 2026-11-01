@@ -32,11 +32,23 @@ static bool settings_nav_frame_on_item() {
 }
 
 // Two-pixel focus outline on the exact face, with a light tint of this panel's accent.
-static void settings_nav_frame(ImDrawList* draw, const ImVec2 (&quad)[4]) {
+static void settings_nav_frame_outline(ImDrawList* draw, const ImVec2* outline, int count) {
   const ImVec4 accent = ImGui::ColorConvertU32ToFloat4(ImGui::GetColorU32(ImGuiCol_NavCursor));
   const ImU32 light = ImGui::ColorConvertFloat4ToU32(
       ImVec4(.75f + accent.x * .25f, .75f + accent.y * .25f, .75f + accent.z * .25f, 1.0f));
-  draw->AddPolyline(quad, 4, light, ImDrawFlags_Closed, 2.0f);
+  draw->AddPolyline(outline, count, light, ImDrawFlags_Closed, 2.0f);
+}
+
+static void settings_nav_frame(ImDrawList* draw, const ImVec2 (&quad)[4]) {
+  settings_nav_frame_outline(draw, quad, 4);
+}
+
+// A face lifted up and left off its plate: frame the whole button as players
+// see it, face and the plate edge below it (report d6ad1693).
+static void settings_nav_frame_lifted(ImDrawList* draw, const ImVec2 (&face)[4],
+                                      const ImVec2 (&plate)[4]) {
+  const ImVec2 outline[] = {face[0], face[1], plate[1], plate[2], plate[3], face[3]};
+  settings_nav_frame_outline(draw, outline, 6);
 }
 
 // Hovering a category must not change the active page. Only an explicit
@@ -227,10 +239,13 @@ static SettingsGdRow settings_gd_row(const char* label) {
   row.quad(96+row.lift,row.y+row.lift,540+row.lift,row.y+30+row.lift,
            row.selected ? settings_accent(2) : IM_COL32(46,54,64,255));
   if (nav_frame) {
-    // Follow all four corners of the animated lifted face.
+    // Follow the animated lifted face, plus the gold plate while it shows.
     const ImVec2 frame[] = {row.point(96+row.lift,row.y+row.lift), row.point(540+row.lift,row.y+row.lift),
                             row.point(540+row.lift,row.y+30+row.lift), row.point(96+row.lift,row.y+30+row.lift)};
-    settings_nav_frame(ImGui::GetWindowDrawList(), frame);
+    const ImVec2 plate[] = {row.point(96,row.y), row.point(540,row.y),
+                            row.point(540,row.y+30), row.point(96,row.y+30)};
+    if (row.selected) settings_nav_frame_lifted(ImGui::GetWindowDrawList(), frame, plate);
+    else settings_nav_frame(ImGui::GetWindowDrawList(), frame);
   }
   const char* display_label=std::strcmp(label,"Exclusive fullscreen (experimental)")==0?
       "Exclusive fullscreen":label;

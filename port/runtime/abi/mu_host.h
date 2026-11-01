@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-#define MU_HOST_API_VERSION 27
+#define MU_HOST_API_VERSION 28
 #define MU_GAME_API_VERSION 9
 #define MU_SLIPPI_RESPONSE_CAPACITY 4096u
 
@@ -415,6 +415,9 @@ typedef struct MuHostApi {
      * by this, 1 the game's own. Read live offline; network sessions keep the game's own scale.
      * "Disable screen shake" still zeroes the offset. */
     float (*screen_shake_scale)(void);
+    /* Version 28. Frozen console boot choice: nonzero only when the agreed session
+     * card contains the host's save. Empty-digest sessions keep fresh-card boot. */
+    int32_t (*console_has_save)(void);
 } MuHostApi;
 
 /* Start each new sound in the sound frame being mixed now instead of the next one (5 ms sooner):

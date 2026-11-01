@@ -1317,6 +1317,9 @@ struct ConsoleBackend {
     }
     conn = room->connection();
     worker = std::thread([this,code] {
+      // Nothing may leave this thread as an exception: that is std::terminate, which ends the
+      // game (exit 3). A room message this build cannot use closes the room instead.
+      try {
       uint64_t ping = now_ms(), next_card = 0;
 #ifdef YOUGAME_AGENT_TEST_HOOK
       const bool drop_once = transport::agent_drop_room_once_enabled(std::getenv("MELEE_ONLINE_TEST_DROP_ROOM_ONCE"));
@@ -1364,7 +1367,7 @@ struct ConsoleBackend {
           else if (!last_roster.is_null()) {
             for (const auto* key : {"players","participants","host","revision"})
               if (m.count(key)) last_roster[key] = m[key];
-            if (type == "leave" && m.count("player") && last_roster.count("participants")) {
+            if (type == "leave" && m.count("player") && last_roster.count("participants") && last_roster["participants"].is_array()) {
               auto& seats = last_roster["participants"];
               const auto id = ranked::str(m["player"],"id");
               seats.erase(std::remove_if(seats.begin(),seats.end(),[&](const json& p) {
@@ -1453,6 +1456,13 @@ struct ConsoleBackend {
         }
         { std::lock_guard<std::mutex> lock(mutex); sending = 0; cv.notify_all(); }
         if (closed || stop) break; // flush queued session-end notices before closing the stream
+      }
+      } catch (const json::exception& e) {
+        host::log("console: room worker stopped on a room message it could not read (json %d)", e.id);
+        { std::lock_guard<std::mutex> lock(mutex); closed = true; sending = 0; } cv.notify_all();
+      } catch (...) { // never print exception text: bridge and ticket errors can carry secrets
+        host::log("console: room worker stopped on an internal error");
+        { std::lock_guard<std::mutex> lock(mutex); closed = true; sending = 0; } cv.notify_all();
       }
     });
     return true;

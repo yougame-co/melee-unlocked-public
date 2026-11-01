@@ -58,6 +58,17 @@ constexpr uint64_t max_raw_size = 128ull * 1024 * 1024;
 // Bound the file before allocating; validate everything before changing ANY live span or State.
 bool encode(const Identity&, const std::vector<native_savestate::Span>&, const State&,
             std::vector<uint8_t>& file, Sizes&, std::string& reason, bool compress = true);
+// Frame-boundary copy. Only owned bytes and numeric addresses cross to the worker.
+struct Capture {
+  Identity identity;
+  State state;
+  std::vector<Range> spans;
+  std::vector<uint8_t> bytes;
+};
+bool capture(const Identity&, const std::vector<native_savestate::Span>&, const State&,
+             Capture&, std::string& reason);
+bool encode_capture(const Capture&, std::vector<uint8_t>& file, Sizes&, std::string& reason,
+                    bool compress = true);
 // Decode and validate without touching any live memory. raw is the concatenated span payload.
 bool inspect(const std::vector<uint8_t>&, const Identity&,
              const std::vector<native_savestate::Span>&, State&, Sizes&,

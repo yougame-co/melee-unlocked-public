@@ -3,7 +3,7 @@ set(rank_ui_stubs "${CMAKE_CURRENT_BINARY_DIR}/ranked-ui-stubs")
 foreach(header mu_native.h sysdolphin/baselib/gobj.h
     sysdolphin/baselib/gobjuserdata.h sysdolphin/baselib/gobjproc.h
     sysdolphin/baselib/memory.h sysdolphin/baselib/sislib.h
-    dolphin/gx.h melee/lb/lbaudio_ax.h)
+    dolphin/gx.h dolphin/os.h melee/lb/lbaudio_ax.h)
   file(WRITE "${rank_ui_stubs}/${header}" "/* API facade: ranked_ui_renderer.h */\n")
 endforeach()
 

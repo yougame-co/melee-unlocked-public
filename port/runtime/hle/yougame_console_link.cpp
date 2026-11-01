@@ -101,6 +101,9 @@ struct Peer {
   bool bad_version = false, dirty = true, up_logged = false, sampled = false;
   int reopened = 0;
   std::string path;
+  // Sticky per link: the helper once reported lan/direct/relay, so a later "unknown" is a reporting gap.
+  // Received datagrams are NOT evidence: a room-carried link delivers them too.
+  bool direct_seen = false;
   uint64_t worst = 0;
   std::set<uint64_t> pings;
   PadRing pads;
@@ -262,7 +265,13 @@ class Link final : public SessionLink {
       for (auto& p : peers) {
         const bool closed = io.state(p.link) == 3;
         const auto silent = now >= p.heard ? now - p.heard : 0;
-        if (running_ && !p.relinking && p.room_connection != io.connection()) lose(p,now);
+        // A room-carried link can remain "up" in the helper during socket recovery.
+        // Direct/relay links keep running when the room alone is unavailable.
+        const auto route = io.route(p.link);
+        p.direct_seen = p.direct_seen || route == "lan" || route == "direct" || route == "relay";
+        const bool room_carried = !p.direct_seen;
+        if (running_ && !p.relinking && (p.room_connection != io.connection() ||
+            (room_carried && (io.room_rejoining() || p.away)))) lose(p,now);
         if (p.relinking) { relink(p,now); continue; }
         if (closed || (armed_ && silent >= 5000)) {
           if (running_) { lose(p,now); relink(p,now); continue; }
@@ -298,6 +307,7 @@ class Link final : public SessionLink {
       if (path != "lan" && path != "direct" && path != "relay") path = "unknown";
       if (p.up_logged && path != p.path && (path == "lan" || path == "direct"))
         io.log("console: link to port " + std::to_string(p.port) + " now " + path);
+      p.direct_seen = p.direct_seen || path != "unknown";
       p.path = path;
       if (io.rtt) for (auto sample : io.rtt(p.link)) if (sample <= 60000) {
         p.rtt = sample; p.worst = std::max(p.worst,sample); p.sampled = true;
@@ -453,7 +463,7 @@ class Link final : public SessionLink {
         for (auto& kv : p.outgoing) kv.second.sends = 0; // retry every unacknowledged frame immediately
         auto route = io.route(p.link);
         if (route != "lan" && route != "direct" && route != "relay") route = "unknown";
-        p.path = route;
+        p.path = route; p.direct_seen = route != "unknown"; // evidence belongs to the new link
         io.log("console: link to port " + std::to_string(p.port) + " reopened via " + route + " after " + std::to_string(now-p.lost_at) + " ms");
         return;
       } else if (io.state(p.link) == 3) { p.opening = false; p.reopen_at = now+1000; }

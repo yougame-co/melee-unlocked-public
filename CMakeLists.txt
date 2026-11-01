@@ -75,6 +75,8 @@ add_test(NAME port_console_input_wiring COMMAND "${Python3_EXECUTABLE}" -B
   "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/console_input_wiring_test.py")
 add_test(NAME port_console_friends_flow COMMAND "${Python3_EXECUTABLE}" -B
   "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/console_friends_flow_test.py")
+add_test(NAME port_console_save_boot COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/console_save_boot_test.py")
 add_executable(port_opponent_display_test port/tests/opponent_display_test.cpp)
 target_include_directories(port_opponent_display_test PRIVATE port/runtime/hle)
 target_compile_features(port_opponent_display_test PRIVATE cxx_std_17)

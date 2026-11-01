@@ -231,6 +231,25 @@ static void update_after_reveal() {
     reveal_close();
 }
 
+// The panel logs one plain line per rated result it shows: no names or ids, nothing in practice.
+static void reveal_shown_log() {
+    const auto bronze=standing("Bronze I",1,2);
+    ranks.result={};ranks.result.status=MU_YG_RESULT_RECORDED;ranks.result.before=8720;ranks.result.after=8680;
+    ranks.result.rank_before=ranks.result.rank_after=bronze;
+    menu.mode=MU_SLP_MODE_RANKED; os_reports.clear();
+    mu_ranked_reveal_enter();
+    for(int f=0;f<REVEAL_HOLD_END+600;++f) mu_ranked_reveal_frame();
+    CHECK(os_reports.size()==1 && os_reports[0]=="yougame: ranked reveal shown: Bronze I 872 -> Bronze I 868 (-4)\n");
+#if defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH
+    practice_mode=true; os_reports.clear();
+    mu_ranked_reveal_enter();
+    for(int f=0;f<REVEAL_HOLD_END;++f) mu_ranked_reveal_frame();
+    CHECK(os_reports.empty());
+    practice_mode=false;
+#endif
+    reveal_close();
+}
+
 // The winner's lines when the opponent left (CTO 11-01): only for a forfeit this seat won.
 static void forfeit_text() {
     char headline[64], line[80], rating[48];
@@ -285,7 +304,7 @@ static void setup_numerals() {
 }
 
 int main() {
-    setup_numerals();forfeit_text();unavailable_text_retries();placements_with_art();reveal_layout();update_after_reveal();
+    setup_numerals();forfeit_text();unavailable_text_retries();placements_with_art();reveal_layout();update_after_reveal();reveal_shown_log();
     CHECK(text_count==0 && !badges);
     std::cout<<"ranked UI with real badges: "<<checks<<" checks passed\n";
 }

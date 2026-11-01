@@ -110,6 +110,55 @@ bool encode(const Identity& id, const std::vector<Span>& spans, const State& sta
   return true;
 }
 
+bool capture(const Identity& id, const std::vector<Span>& spans, const State& state,
+             Capture& out, std::string& reason) {
+  reason.clear();
+  uint64_t raw = 0;
+  if (!layout(spans,raw,reason)) return false;
+  if (state.host.size() > max_host_size) return refuse(reason,"host state exceeds size limit");
+  out.identity = id; out.state = state; out.spans.clear(); out.spans.reserve(spans.size());
+  out.bytes.resize(state.host.size()+raw);
+  std::copy(state.host.begin(),state.host.end(),out.bytes.begin());
+  size_t at = state.host.size();
+  for (const auto& s : spans) {
+    out.spans.push_back({reinterpret_cast<uintptr_t>(s.address),s.size});
+    std::memcpy(out.bytes.data()+at,s.address,s.size); at += s.size;
+  }
+  return true;
+}
+bool encode_capture(const Capture& captured, std::vector<uint8_t>& file, Sizes& sizes,
+                    std::string& reason, bool compress) {
+  reason.clear(); file.clear(); sizes = {};
+  const auto& state = captured.state;
+  uint64_t raw = 0; uintptr_t end = 0;
+  if (captured.spans.empty() || captured.spans.size() > 65536 || state.host.size() > max_host_size)
+    return refuse(reason,"invalid capture");
+  for (const auto& s : captured.spans) {
+    if (!s.address || !s.size || s.address < end || s.size > UINTPTR_MAX-s.address)
+      return refuse(reason,"invalid capture spans");
+    end = s.address+s.size; raw += s.size;
+    if (raw > max_raw_size) return refuse(reason,"snapshot exceeds size limit");
+  }
+  if (captured.bytes.size() != state.host.size()+raw) return refuse(reason,"invalid capture size");
+  const auto hash = digest(captured.bytes.data(),captured.bytes.size());
+  const auto* payload = captured.bytes.data()+state.host.size();
+  int compressed_size = 0;
+  auto* compressed = compress ? stbi_zlib_compress(const_cast<unsigned char*>(payload),int(raw),&compressed_size,5) : nullptr;
+  if (compress && !compressed) return refuse(reason,"compression failed");
+  const bool zlib = compressed_size > 0 && uint64_t(compressed_size) < raw;
+  const uint64_t stored = zlib ? uint64_t(compressed_size) : raw;
+  file.insert(file.end(),{'M','U','H','S'}); put(file,1,4); put(file,captured.identity.size,8);
+  file.insert(file.end(),captured.identity.sha256.begin(),captured.identity.sha256.end());
+  put(file,captured.spans.size(),4); put(file,state.frame,8);
+  put(file,state.scene_major,4); put(file,state.scene_minor,4);
+  put(file,state.host.size(),4); put(file,zlib ? 1 : 0,4);
+  put(file,raw,8); put(file,stored,8); file.insert(file.end(),hash.begin(),hash.end());
+  for (const auto& s : captured.spans) { put(file,s.address,8); put(file,s.size,4); }
+  file.insert(file.end(),state.host.begin(),state.host.end());
+  file.insert(file.end(),zlib ? compressed : payload,(zlib ? compressed : payload)+stored);
+  STBIW_FREE(compressed); sizes = {raw,stored,file.size()}; return true;
+}
+
 bool inspect(const std::vector<uint8_t>& file, const Identity& id, const std::vector<Span>& spans,
              State& state, Sizes& sizes, std::vector<uint8_t>& bytes, std::string& reason) {
   reason.clear(); sizes = {};

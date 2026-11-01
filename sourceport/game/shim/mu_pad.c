@@ -11,6 +11,15 @@ int mu_console_active(void)
     uint32_t seed;
     return mu_host->console_seed && mu_host->console_seed(&seed);
 }
+int mu_console_has_save(void)
+{
+    return mu_host && mu_host->version >= 28 && mu_host->console_has_save &&
+           mu_host->console_has_save();
+}
+void mu_console_log(const char* text)
+{
+    if (mu_host && mu_host->log) mu_host->log(text);
+}
 /* The host half of mu_console_frame_begin (shim/mu_console_pad.c): the agreed seed once, then the
  * host composes this body's confirmed pads. Returns whether a console frame began. */
 int mu_console_host_frame_begin(void)

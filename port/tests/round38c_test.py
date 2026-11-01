@@ -26,9 +26,13 @@ class Round38cTest(unittest.TestCase):
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>
+#include <chrono>
+#include <thread>
+#include <vector>
+#include <algorithm>
 using json = nlohmann::json;
-std::string logged;
-namespace host { void log(const char* f,...) { char b[256]; va_list a;va_start(a,f);vsnprintf(b,sizeof b,f,a);va_end(a);logged=b; } }
+std::vector<std::string> logged;
+namespace host { void log(const char* f,...) { char b[256]; va_list a;va_start(a,f);vsnprintf(b,sizeof b,f,a);va_end(a);logged.push_back(b); } }
 namespace report {
 struct HttpFailure { const char* step; unsigned long code; };
 HttpFailure last_http_failure() { return {"send-request",12029}; }
@@ -48,17 +52,36 @@ bool check(std::string* error,VersionFetch fetch={}) {
 } };
 int main(){
  User u;std::string error;int checks=0;
- auto expect=[&](const char* step){if(logged!=std::string("slippi: version check failed: ")+step)std::abort();++checks;};
- if(u.check(&error))std::abort();expect("send-request 12029");
+ // Every failed try logs its step; three tries, then no known version blocks with one more line.
+ auto expect=[&](const char* step,int tries=3){
+  const std::string line=std::string("slippi: version check failed: ")+step;
+  if(std::count(logged.begin(),logged.end(),line)!=tries)std::abort();
+  for(const auto& l:logged) if(l.find("sensitive")!=std::string::npos)std::abort();
+  logged.clear();++checks;};
+ auto unknown=[&]{if(logged.empty() || logged.back().find("no known version")==std::string::npos)std::abort();logged.pop_back();};
+ if(u.check(&error))std::abort();unknown();expect("send-request 12029");
  auto fetch=[&](bool ok,int status,std::string text){return [=](const std::string&,std::string* out,int* code){*out=text;*code=status;return ok;};};
- if(u.check(&error,fetch(false,0,"sensitive-response")))std::abort();expect("http-get 0");
- if(u.check(&error,fetch(true,503,"sensitive-response")))std::abort();expect("http-status 503");
- if(u.check(&error,fetch(true,200,"broken")))std::abort();expect("json 0");
- if(u.check(&error,fetch(true,200,"{}")))std::abort();expect("latest-version 0");
- if(u.check(&error,fetch(true,200,R"({"latestVersion":"3.6.5"})")))std::abort();expect("update-required 0");
+ if(u.check(&error,fetch(false,0,"sensitive-response")))std::abort();unknown();expect("http-get 0");
+ if(u.check(&error,fetch(true,503,"sensitive-response")))std::abort();unknown();expect("http-status 503");
+ if(u.check(&error,fetch(true,200,"broken")))std::abort();unknown();expect("json 0");
+ if(u.check(&error,fetch(true,200,"{}")))std::abort();unknown();expect("latest-version 0");
+ // One failed try, then an answer: the retry plays online.
+ int calls=0;
+ auto flaky=[&](const std::string&,std::string* out,int* code){*out=R"({"latestVersion":"3.6.4"})";*code=calls++?200:503;return true;};
+ if(!u.check(&error,flaky) || !error.empty() || calls!=2)std::abort();expect("http-status 503",1);
+ // No answer at all: the account's last known version decides.
+ u.info_.latest_version="3.6.4";
+ if(!u.check(&error,fetch(true,503,"sensitive-response")) || !error.empty())std::abort();
+ if(logged.back().find("last known version 3.6.4")==std::string::npos)std::abort();logged.pop_back();expect("http-status 503");
+ u.info_.latest_version="3.6.5";
+ if(u.check(&error,fetch(true,503,"sensitive-response")) || error!="Slippi 3.6.5 is out. Update Melee Unlocked")std::abort();
+ logged.pop_back();expect("http-status 503");
+ u.info_.latest_version.clear();
+ if(u.check(&error,fetch(true,200,R"({"latestVersion":"3.6.5"})")))std::abort();expect("update-required 0",1);
  if(error!="Slippi 3.6.5 is out. Update Melee Unlocked")std::abort();++checks;
  if(!u.check(&error,fetch(true,200,R"({"latestVersion":"3.6.4"})")) || !error.empty())std::abort();++checks;
- u.info_.uid.clear();if(u.check(&error))std::abort();expect("signed-out 0");
+ if(!logged.empty())std::abort();
+ u.info_.uid.clear();if(u.check(&error))std::abort();expect("signed-out 0",1);
  printf("version diagnostics: %d checks passed\n",checks);
 }
 ''')

@@ -7,6 +7,7 @@ inline constexpr const char* kMixedBuilds = "Your friend is on a different versi
 inline constexpr const char* kBootTimeout = "your friend's game didn't start";
 // This seat pressed Leave: it ends quietly; only the friend sees "Your friend left."
 inline constexpr const char* kSelfLeft = "you left";
+inline constexpr const char* kWaitingForFriend = "Waiting for your friend...";
 inline constexpr const char* kReconnecting = "Reconnecting to your friend...";
 inline const char* session_notice(const std::string& reason) {
   if (reason == "left" || reason == "away" || reason == "kicked") return "Your friend left.";

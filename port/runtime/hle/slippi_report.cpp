@@ -58,6 +58,19 @@ bool http(const char* method, const std::string& url, const std::wstring& header
   if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) return failed("crack-url");
   HINTERNET session = WinHttpOpen(USER_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
   if (!session) return failed("open-session");
+  // TLS 1.2 and 1.3 asked for by name: on some Windows installs WinHTTP's default left them out,
+  // and Slippi's servers take nothing older, so every request failed there.
+#ifdef _WIN32   // Linux's HTTP layer (curl) negotiates TLS itself
+#ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3
+  DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+#else
+  DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+#endif
+  if (!WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof protocols)) {
+    protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;   // an older WinHTTP without TLS 1.3
+    WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof protocols);
+  }
+#endif
   bool ok = false;
   if (!WinHttpSetTimeouts(session, 5000, 5000, 15000, 15000)) {
     failed("set-timeouts"); WinHttpCloseHandle(session); return false;

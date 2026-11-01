@@ -19,6 +19,7 @@
 #include "yougame_console_card.h"
 #include "friends_handoff_join.h"
 #include "friends_handoff_transfer.h"
+#include "friends_handoff_capture.h"
 #include "handoff_state.h"
 #include <windows.h>
 #ifndef _WIN32
@@ -1154,6 +1155,10 @@ int32_t h_console_seed(uint32_t* seed) {
   *seed = static_cast<uint32_t>(yougame::console::console_engine().config().seed);
   return 1;
 }
+int32_t h_console_has_save() {
+  return g_console_boot && yougame::console::console_active() &&
+      !yougame::console::console_engine().config().card_digest.empty();
+}
 int32_t h_console_frame_begin() {
   if (yougame::console::friends_handoff_join_enabled()) {
     int32_t scene[2]{};
@@ -1499,6 +1504,7 @@ void publish_handoff_join_info(const MuStateRegion* regions, uint32_t count,
     }
     auto info = std::make_shared<handoff_join::Info>();
     info->library_size = identity.size;
+    for (const auto& span : spans) info->capture_bytes += span.size;
     constexpr char hex[] = "0123456789abcdef";
     for (const auto b : identity.sha256) {
       info->library_sha256 += hex[b >> 4]; info->library_sha256 += hex[b & 15];
@@ -1577,9 +1583,7 @@ void friends_handoff_tick() {
   const auto began = yougame::transport::now_ms();
   if (q->operation == Operation::Base) {
     try {
-      if (!handoff_state::encode(run.identity,run.spans,state,*bytes,sizes,why) || bytes->size() > stored_limit) {
-        result->reason = "base-capture-failed";
-      } else { result->bytes = bytes; result->raw = sizes.raw; result->ms = yougame::transport::now_ms()-began; }
+      if (!capture_base(run.identity,run.spans,state,*result,why,q->storage)) result->reason = "base-capture-failed";
     } catch (...) { result->reason = "base-capture-failed"; }
     publish(); return;
   }
@@ -1636,10 +1640,9 @@ void friends_handoff_tick() {
     if (result->reason.empty()) host::log("handoff-join: hash %s at frame %llu",result->hash.c_str(),(unsigned long long)result->frame);
     host::log("handoff-join: audio not reset"); // no imported body is run in this milestone
     result->ms = yougame::transport::now_ms()-began; publish();
-    while (result->reason.empty() && !channel->cancelled.load(std::memory_order_acquire) &&
-           !host::exit_requested() && yougame::transport::now_ms()-began < 20000) {
+    wait_paused(q->operation,*result,*channel,began,yougame::transport::now_ms,host::exit_requested,[] {
       host::window_pump(); std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    });
     if (q->operation == Operation::PauseDelta) host::log("handoff-join: paused %llu ms",
         (unsigned long long)(yougame::transport::now_ms()-began));
   } catch (...) {
@@ -1891,6 +1894,7 @@ constexpr uint8_t CMD_PRACTICE_CPU = 0xF6;   // the practice CPU's settings (por
 constexpr uint8_t CMD_FRAME_EVENT = 0xE8;   // replay frame data for the coach (shim/mu_framedata.c, host/replay_coach.h)
 constexpr uint8_t CMD_REPLAY_DEFENSE = 0xE9;   // a takeover's opponents once the game leaves the replay (shim/mu_replay_defend.c)
 constexpr uint8_t CMD_GHOST_AI = 0xEA;         // a pro AI's controller for this frame (hle/ghost_ai.h)
+constexpr uint8_t CMD_STAGE_SONGS = 0xEB;      // a stage's main and alternate songs (gr/ground.c, hle/jukebox.h)
 void apply_content_mode(int mode);
 constexpr int32_t kLabFrame = -1000000;
 // The replay viewer's controls (shim/mu_replay.c mu_replay_frame_begin, host/replay_control.h):
@@ -2361,6 +2365,11 @@ int32_t h_slippi_command(uint8_t command, const uint8_t* payload, uint32_t paylo
                         r.detail.c_str(), replay_coach::advice(e).c_str(), e.move);
             }
           }
+          return true;
+        }
+        if (c == CMD_STAGE_SONGS && n == 16) {
+          slippi::jukebox::note_stage_songs((int32_t)read_be32(p), (int32_t)read_be32(p + 4));
+          slippi::jukebox::note_stage_songs((int32_t)read_be32(p + 8), (int32_t)read_be32(p + 12));
           return true;
         }
         if (c == CMD_LAB_ADVANTAGE && n == 5) { training_overlay::set_advantage((int32_t)read_be32(p), p[4]); return true; }
@@ -3931,6 +3940,7 @@ MuHostApi make_host() {
   };
   h.console_frame_begin = h_console_frame_begin;
   h.console_seed = h_console_seed;
+  h.console_has_save = h_console_has_save;
   h.console_rollback = h_console_rollback;
   h.console_alarm_clock = h_console_alarm_clock;
   h.log = h_log; h.panic = h_panic; h.ticks = h_ticks; h.boot_time = h_boot_time; h.poll = h_poll;

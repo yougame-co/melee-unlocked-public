@@ -59,7 +59,8 @@ class YouGame0963MergeTest(unittest.TestCase):
                 self.assertNotIn('std::getenv("' + name + '")', load)
         self.assertIn("if (ms <= 0.0 || !g_budget_armed) return;", load)
         policy = source("port/runtime/host/test_env.h")
-        self.assertIn("yougame_session || gameplay::vanilla_only() ? nullptr", policy)
+        self.assertIn("return yougame_session ? nullptr : std::getenv(name);", policy)
+        self.assertNotIn("vanilla_only", policy)
 
     def test_upstream_deadline_signal_and_local_timing_report_coexist(self):
         host = source("port/runtime/host/host.cpp")

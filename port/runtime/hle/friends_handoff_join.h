@@ -23,6 +23,7 @@ using Json = nlohmann::json;
 struct Info {
   uint64_t library_size = 0;
   std::string library_sha256, spans_digest, os;
+  size_t capture_bytes = 0; // local allocation hint only; never serialized
   bool valid() const {
     return library_size && card_hash(library_sha256) && card_hash(spans_digest) &&
         (os == "windows" || os == "linux" || os == "macos");

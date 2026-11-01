@@ -3,7 +3,12 @@
  * matchmaking, scene changes, inputs or writes to the simulation/set state.
  * The portable model is also compiled directly by the host regression test. */
 #include <mu_ranked_wire.h>
+#include <stdio.h>
 #include <string.h>
+#ifndef MU_RANKED_REVEAL_TEST
+/* The game's MSL stdio.h has no snprintf; the host CRT does (as in mu_css_state.c). */
+int snprintf(char* dst, __SIZE_TYPE__ size, const char* format, ...);
+#endif
 
 enum {
     REVEAL_OLD_START = 48, REVEAL_OLD_END = 72, /* .8s + .4s */
@@ -17,7 +22,7 @@ enum {
 typedef struct MuReveal {
     MuYgResult result;
     unsigned frame;
-    int active, reduced;
+    int active, reduced, logged;
 } MuReveal;
 typedef struct MuRevealPose {
     float old_y, old_alpha, new_y, new_alpha, scale, glow;
@@ -90,9 +95,33 @@ static void reveal_accept(MuReveal* s, const MuYgResult* input)
         s->result.before != r.before || s->result.after != r.after ||
         !reveal_same_rank(&s->result.rank_before, &r.rank_before) ||
         !reveal_same_rank(&s->result.rank_after, &r.rank_after)) {
-        s->result = r; s->frame = 0;
+        s->result = r; s->frame = 0; s->logged = 0;
     }
     s->active = r.status != MU_YG_RESULT_NONE;
+}
+
+/* Tenths as the panel shows them: "872", "1534.7", "-25" (mu_rank_number, whose header needs the
+ * game's SIS headers). */
+static void reveal_tenths(char out[24], long long tenths)
+{
+    unsigned long long v = tenths < 0 ? 0ULL - (unsigned long long)tenths : (unsigned long long)tenths;
+    if (v % 10) snprintf(out, 24, "%s%llu.%u", tenths < 0 ? "-" : "", v/10, (unsigned)(v%10));
+    else snprintf(out, 24, "%s%llu", tenths < 0 ? "-" : "", v/10);
+}
+
+/* One plain log line the first time the panel shows a rated result: ranks, ratings and the
+ * change, never a name or id. Zero when there is nothing new to log. */
+static int reveal_shown_line(MuReveal* s, char out[160])
+{
+    const MuYgResult* r = &s->result;
+    char before[24], after[24], delta[24];
+    long long d = (long long)r->after - r->before;
+    if (!s->active || r->status != MU_YG_RESULT_RECORDED || s->logged) return 0;
+    s->logged = 1;
+    reveal_tenths(before, r->before); reveal_tenths(after, r->after); reveal_tenths(delta, d);
+    snprintf(out, 160, "yougame: ranked reveal shown: %.24s %s -> %.24s %s (%s%s)\n",
+             r->rank_before.label, before, r->rank_after.label, after, d > 0 ? "+" : "", delta);
+    return 1;
 }
 
 static MuRevealPose reveal_pose(const MuReveal* s)
@@ -153,6 +182,7 @@ static int reveal_done(const MuReveal* s)
 #include <mu_ranked.h>
 #include <mu_rank_badge.h>
 #include "mu_rank_text.h"
+#include <dolphin/os.h>
 #include <sysdolphin/baselib/gobj.h>
 #include <sysdolphin/baselib/sislib.h>
 #include <melee/lb/lbaudio_ax.h>
@@ -332,6 +362,10 @@ void mu_ranked_reveal_frame(void)
     if (!s->active || reveal_done(s)) { reveal_close(); return; }
     previous = s->frame;
     reveal_draw();
+    {
+        char line[160];
+        if (reveal.panel && !mu_ranked_practice() && reveal_shown_line(s, line)) OSReport("%s", line);
+    }
     reveal_tick(s);
     // Allow the result to finish drawing/animating before handing the game back.
     if (reveal.panel && previous >= REVEAL_GLOW_END) mu_ranked_update_result_shown();

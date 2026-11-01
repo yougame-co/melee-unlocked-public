@@ -122,6 +122,7 @@ int main() {
         reveal = literal_function(source('sourceport/game/shim/mu_ranked_reveal.c'), 'mu_ranked_reveal_frame')
         self.assertIn('reveal.panel && previous >= REVEAL_GLOW_END', reveal)
         self.assertLess(reveal.index('reveal_draw();'), reveal.index('mu_ranked_update_result_shown();'))
+        self.assertIn('reveal.panel && !mu_ranked_practice() && reveal_shown_line(s, line)', reveal)
         self.assertIn('mu_ranked_update_reset();', literal_function(
             source('sourceport/game/shim/mu_slippi_menu.c'), 'online_on_unload'))
 

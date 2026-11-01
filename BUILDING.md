@@ -1,7 +1,8 @@
-# Building Melee Unlocked 0.9.89 for YouGame
+# Building Melee Unlocked 0.9.92 for YouGame
 
-This source tree corresponds to build 43.1, row `0.9.89-online-test.43.1`.
-It is the Windows build on the main listing.
+This source tree corresponds to build 46, row `0.9.92-online-test.46`.
+It is the Windows and Linux build on the main listing
+(Linux row `0.9.92-linux-experimental.46`).
 Original project: https://github.com/Hero88go/melee-unlocked. Retain LICENSE,
 NOTICE and third-party attribution when redistributing this GPL-3.0-or-later
 project. The two pinned submodules are recorded as gitlinks; obtain their public
@@ -96,5 +97,5 @@ Supply your own uncompressed Melee NTSC 1.02 ISO using `--iso`, with the matchin
 game library and lawfully reconstructed runtime resources beside the host.
 The public source does not include a disc, DOL, extracted Nintendo assets or a
 complete runtime package. The YouGame app supplies its own launch arguments.
-Do not infer that build 43.1 is reproducible from this snapshot alone: resource
+Do not infer that build 46 is reproducible from this snapshot alone: resource
 provenance, missing inputs and platform builds still need verification.

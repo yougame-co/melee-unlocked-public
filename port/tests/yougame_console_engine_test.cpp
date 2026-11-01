@@ -169,6 +169,45 @@ void delay_and_reorder() {
   Pads out; a.read({}, out); CHECK(equal(out[1], hardware(0)[2]));
   CHECK(a.advance(hardware(1), {})); a.read({}, out); CHECK(equal(out[1], hardware(1)[2]));
 }
+void short_room_drop() {
+  ++cases;
+  for (int mine : {1,2}) {
+    Bus bus; Engine engine; std::vector<std::string> logs,notices;
+    auto h=hooks(bus,logs,notices); uint64_t first_notice=UINT64_MAX;
+    h.notice=[&](const char* text) {notices.emplace_back(text); if (*text && first_notice==UINT64_MAX) first_notice=bus.now;};
+    struct RoomDrop : Loopback {
+      using Loopback::Loopback;
+      bool reconnecting() const override { return bus.now < bus.release; }
+    };
+    std::unique_ptr<SessionLink> link = mine==1 ? std::make_unique<Loopback>(bus,mine) :
+                                               std::unique_ptr<SessionLink>(new RoomDrop(bus,mine));
+    CHECK(engine.begin(std::move(link),config(mine,0),h,false));
+    bus.echo_digest=true;bus.pads[2-mine][0]={};bus.release=3370;
+    CHECK(engine.advance(hardware(0),{}));
+    CHECK(first_notice>=1000 && first_notice<=1005);
+    const std::string expected = mine == 1 ? kWaitingForFriend : kReconnecting;
+    CHECK(notices == std::vector<std::string>({expected,expected,expected,""}));
+    CHECK(!notices.empty() && notices.back().empty());
+    CHECK(bus.now==3370 && bus.responsive==674 && engine.clock_ticks()==0 && engine.frame()==0);
+    std::cout << "A: seat " << mine << " late-input wait " << bus.now << " ms, first notice " << first_notice
+              << " ms, responsive callbacks " << bus.responsive << ", virtual ticks 0\n";
+  }
+  // Status changes during the same input stall update immediately, then clear once.
+  Bus bus; Engine engine; std::vector<std::string> logs,notices;
+  std::vector<std::pair<uint64_t,std::string>> shown;
+  struct ChangingLink : Loopback {
+    using Loopback::Loopback;
+    bool reconnecting() const override {return bus.now>=1500 && bus.now<2500;}
+  };
+  auto h=hooks(bus,logs,notices);
+  h.notice=[&](const char* text) {shown.emplace_back(bus.now,text);};
+  CHECK(engine.begin(std::make_unique<ChangingLink>(bus,1),config(1,0),h,false));
+  bus.echo_digest=true; bus.pads[1][0]={}; bus.release=3370;
+  CHECK(engine.advance(hardware(0),{}));
+  const std::vector<std::pair<uint64_t,std::string>> expected{
+    {1000,kWaitingForFriend},{1500,kReconnecting},{2500,kWaitingForFriend},{3370,""}};
+  CHECK(shown==expected);
+}
 void clocks_follow_calls() {
   ++cases;
   Bus bus; Engine a, b; std::vector<std::string> logs, notices;
@@ -201,8 +240,9 @@ void timeout_and_loss(bool immediate) {
   Pads out; a.read(hardware(9, 3), out);
   CHECK(equal(out[0], hardware(9, 3)[3]));
   for (int p = 1; p < 4; ++p) CHECK(out[p].err == -1 && out[p].button == 0);
-  CHECK(notices.size() == 1 && notices[0] == "Lost connection to your friend.");
-  a.end("again"); CHECK(notices.size() == 1);
+  CHECK(!notices.empty() && notices.back() == "Lost connection to your friend.");
+  CHECK(immediate ? notices.size()==1 : notices.front()==kWaitingForFriend);
+  const auto notice_count=notices.size(); a.end("again"); CHECK(notices.size()==notice_count);
   CHECK(logs.back() == (immediate ? "console: session ended: peer left" :
       "console: session ended: pad wait timed out at frame 0"));
   std::cout << logs.back() << '\n';
@@ -356,7 +396,8 @@ void terminal_wait_failure() {
     const auto clock = e.clock_ticks(); const auto frame = e.frame(); const auto sends = bus.sends[0];
     bus.lost = lost;
     CHECK(!e.confirm(1)); CHECK(!e.active()); CHECK(e.clock_ticks() == clock && e.frame() == frame);
-    CHECK(bus.sends[0] == sends); CHECK(notices.size() == 1);
+    CHECK(bus.sends[0] == sends); CHECK(!notices.empty());
+    CHECK(lost ? notices.size()==1 : notices.front()==kWaitingForFriend);
     CHECK(lost || bus.now == 8000);
   }
 }
@@ -488,7 +529,7 @@ int32_t mu_slippi_command(uint8_t command, const uint8_t* payload, uint32_t size
 }
 int main(int argc, char** argv) {
   try {
-    boot_barrier(); same_stream(); delay_and_reorder(); clocks_follow_calls();
+    short_room_drop(); boot_barrier(); same_stream(); delay_and_reorder(); clocks_follow_calls();
     timeout_and_loss(false); timeout_and_loss(true); desync(); inert();
     sparse_ports_and_delay(); four_players(); reentrant_close(); missing_digest();
     retained_inputs(); terminal_wait_failure(); rollback_switches(); legacy_digest_layout();

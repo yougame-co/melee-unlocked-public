@@ -40,7 +40,8 @@ static int native_ai_test(const std::string& mode) {
   MuHostApi api{}; api.version = MU_HOST_API_VERSION; api.test_getenv = host::test_env::getenv; mu_host = &api;
   set_env("MELEE_TEST_20XX_AI", "1");
   set_env("MELEE_TE_FAKE_ATTACK", "1");
-  const bool restricted = yougame_active || host::gameplay::vanilla_only();
+  // Only YouGame sessions blank the knobs; --vanilla-only reads them as upstream does.
+  const bool restricted = yougame_active;
   CHECK(bool(mu_20xx_ai_enabled()) == !restricted);
   CHECK(bool(mu_test_getenv("MELEE_TE_FAKE_ATTACK")) == !restricted);
   set_env("MELEE_TE_FAKE_ATTACK", nullptr);
@@ -74,7 +75,7 @@ static void environment_tests() {
   yougame_active = true;
   CHECK(!host::test_env::getenv("MELEE_TEST_20XX_AI")); CHECK(!host::test_env::getenv("MELEE_SNAPSHOT_EXCLUDE"));
   yougame_active = false; host::gameplay::vanilla_only_session = true;
-  CHECK(!host::test_env::getenv("MELEE_TEST_20XX_AI")); CHECK(!host::test_env::getenv("MELEE_SNAPSHOT_EXCLUDE"));
+  CHECK(host::test_env::getenv("MELEE_TEST_20XX_AI")); CHECK(host::test_env::getenv("MELEE_SNAPSHOT_EXCLUDE"));
   host::gameplay::vanilla_only_session = false;
   CHECK(host::test_env::getenv("MELEE_TEST_20XX_AI"));
   set_env("MELEE_TEST_20XX_AI", nullptr); set_env("MELEE_SNAPSHOT_EXCLUDE", nullptr);

@@ -1,7 +1,7 @@
 # Melee Unlocked: YouGame's version
 
-Source candidate for YouGame build 43.1, Melee Unlocked 0.9.89,
-row `0.9.89-online-test.43.1`. This is the Windows build on the main listing. Original project:
+Source candidate for YouGame build 46, Melee Unlocked 0.9.92,
+row `0.9.92-online-test.46` (Linux: `0.9.92-linux-experimental.46`). This is the Windows and Linux build on the main listing. Original project:
 https://github.com/Hero88go/melee-unlocked (GPL-3.0-or-later).
 Retain LICENSE, NOTICE and third-party notices.
 
