@@ -9,7 +9,10 @@ enum {
     REVEAL_OLD_START = 48, REVEAL_OLD_END = 72, /* .8s + .4s */
     REVEAL_NEW_START = 66, REVEAL_NEW_END = 102, /* 1.1s + .6s */
     REVEAL_POP_END = 114, REVEAL_GLOW_END = 126, /* .8s / 1s */
-    REVEAL_RATING_START = 15, REVEAL_RATING_END = 99 /* .25s + 1.4s */
+    REVEAL_RATING_START = 15, REVEAL_RATING_END = 99, /* .25s + 1.4s */
+    /* Build 29 (11-01): held for good, the panel hid the CSS's own rank panel and
+     * "Press START to search". A final result now gives the CSS back 3s after the glow. */
+    REVEAL_HOLD_END = REVEAL_GLOW_END + 180
 };
 typedef struct MuReveal {
     MuYgResult result;
@@ -135,7 +138,13 @@ static MuRevealPose reveal_pose(const MuReveal* s)
 static void reveal_tick(MuReveal* s)
 {
     /* No wrapping/replaying if the CSS stays open for hours. */
-    if (s->active && s->frame < REVEAL_GLOW_END) ++s->frame;
+    if (s->active && s->frame < REVEAL_HOLD_END) ++s->frame;
+}
+
+/* "Waiting for the room's result" stays until the room answers; the answer restarts the frame. */
+static int reveal_done(const MuReveal* s)
+{
+    return s->active && s->result.status != MU_YG_RESULT_RECORDING && s->frame >= REVEAL_HOLD_END;
 }
 
 #ifndef MU_RANKED_REVEAL_TEST
@@ -318,10 +327,12 @@ void mu_ranked_reveal_frame(void)
     else {
         memset(&error, 0, sizeof error); error.status = MU_YG_RESULT_ERROR;
         error.reason = MU_YG_REASON_UNAVAILABLE;
-        /* A failed poll cannot imply that a set exists on an idle CSS. */
-        if (s->active && s->result.status != MU_YG_RESULT_RECORDED) reveal_accept(s, &error);
+        /* A failed poll cannot imply that a set exists on an idle CSS, nor reopen a result
+         * that has already had its turn (the panel would flicker back over the CSS). */
+        if (s->active && s->result.status != MU_YG_RESULT_RECORDED && !reveal_done(s))
+            reveal_accept(s, &error);
     }
-    if (!s->active) { reveal_close(); return; }
+    if (!s->active || reveal_done(s)) { reveal_close(); return; }
     previous = s->frame;
     reveal_draw();
     reveal_tick(s);

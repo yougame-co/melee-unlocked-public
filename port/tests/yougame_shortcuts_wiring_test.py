@@ -24,6 +24,10 @@ class ShortcutsWiringTest(unittest.TestCase):
     def test_settings_uses_f1_atomic_and_consuming_path(self):
         window = source("port/runtime/host/window.cpp")
         self.assertIn('if (yougame::stdio_bridge() && yougame::shortcuts::commands.take_settings()) g_escape_press.store(true);', window)
+        # Linux and the Mac SDL host pump their own window (port/linux/window_sdl.inl): the page's button must work there too.
+        sdl = source("port/linux/window_sdl.inl")
+        pump = sdl[sdl.index('void window_pump() {'):]
+        self.assertIn('if (yougame::stdio_bridge() && yougame::shortcuts::commands.take_settings()) g_escape_press.store(true);', pump[:400])
         self.assertIn('if (w == VK_F1 && !(l & (1 << 30))) g_escape_press.store(true);', window)
         self.assertIn('bool window_take_escape() { return g_escape_press.exchange(false); }', window)
         header = source("port/runtime/hle/yougame_shortcuts.h")

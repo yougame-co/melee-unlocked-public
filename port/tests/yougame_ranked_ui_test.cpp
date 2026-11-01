@@ -213,6 +213,21 @@ static void update_after_reveal() {
         CHECK(update_result_shown==0);
     }
     mu_ranked_reveal_frame(); CHECK(update_result_shown==1);
+    // Then the CSS gets its own rank panel and "Press START to search" back, and stays so.
+    for(unsigned f=REVEAL_GLOW_END+1;f<REVEAL_HOLD_END;++f) { mu_ranked_reveal_frame(); CHECK(reveal.panel); }
+    mu_ranked_reveal_frame(); CHECK(!reveal.panel && !reveal.old_badge && !reveal.new_badge);
+    for(int f=0;f<600;++f) mu_ranked_reveal_frame();
+    CHECK(!reveal.panel && reveal.model.active && text_count==0);
+    // Failed polls and their recovery never bring a finished result back over the CSS.
+    fail_ranks=true;
+    for(int f=0;f<30;++f) { mu_ranked_reveal_frame(); CHECK(!reveal.panel); }
+    CHECK(reveal.model.result.status==MU_YG_RESULT_UNRATED);
+    fail_ranks=false;
+    for(int f=0;f<30;++f) { mu_ranked_reveal_frame(); CHECK(!reveal.panel); }
+    // A room still recording keeps its line up.
+    ranks.result.status=MU_YG_RESULT_RECORDING;
+    for(int f=0;f<600;++f) mu_ranked_reveal_frame();
+    CHECK(reveal.panel && reveal.panel->rows[1].value=="Waiting for the room's result");
     reveal_close();
 }
 

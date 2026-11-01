@@ -113,7 +113,8 @@ static int mu_slippi_css_scene_request() { return 0; }
 static int mu_slippi_ranked_available() { return 1; }
 void mu_ranked_reveal_frame();
 const MuRankedSet* mu_ranked_set() { return &set; }
-int mu_ranked_read_ranks(MuYgRanks* out) { *out=ranks; return 1; }
+static bool fail_ranks;
+int mu_ranked_read_ranks(MuYgRanks* out) { if (fail_ranks) return 0; *out=ranks; return 1; }
 #if defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH
 static bool practice_mode;
 int mu_ranked_practice() { return practice_mode; }

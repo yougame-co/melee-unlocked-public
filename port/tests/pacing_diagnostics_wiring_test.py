@@ -93,7 +93,7 @@ class PacingDiagnosticsWiringTest(unittest.TestCase):
       host::log("present: vsync %s (settings)", options.vsync ? "on" : "off");
 #endif'''
         self.assertIn(addition, s)
-        # Round 27 adds only the centered update notice and its unconditional draw call.
+        # Round 27 update notice and Round 30 menu safety fixes: reverse only exact reviewed ranges.
         for approved in json.loads((ROOT / 'port/tests/fixtures/round27_settings_ranges.json').read_text()):
             self.assertEqual(s.count(approved['after']), 1)
             s = s.replace(approved['after'], approved['before'], 1)

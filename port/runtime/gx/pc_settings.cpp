@@ -4945,6 +4945,13 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     state.clean_detail_open = state.dashboard_detail_open = false;
     state.gd_detail_open = state.radial_detail_open = state.wide_detail_open = false;
   };
+  bool menu_main_focus_pending = false;
+  const auto open_menu = [&state, &menu_main_focus_pending]() {
+    state.menu_open = true;
+    state.menu_quit = false;
+    state.menu_quit_focus_pending = false;
+    menu_main_focus_pending = true;
+  };
   if (g_guest_options_open_request.exchange(false, std::memory_order_acq_rel)) {
     state.open = true;
     state.practice_open = false;
@@ -4957,8 +4964,8 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     }
     if (yougame::stdio_bridge() && !state.open && !state.fill_window) {
       // Under the YouGame app the chord opens and closes the small menu, as F1 does there.
-      state.menu_open = !state.menu_open;
-      state.menu_quit = false;
+      if (state.menu_open) state.menu_open = false;
+      else open_menu();
     } else {
       state.open = !state.open;
       if (state.open) {
@@ -5168,28 +5175,20 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     else if (options.overlay_style == 4 && state.wide_detail_open) state.wide_detail_open = false;
     else state.open = false;
   }
-  // Esc: closes the panel if it is open; otherwise opens or closes the Esc menu. While a rebind is
-  // waiting for a button, Escape means "cancel that", which the capture itself watches for, so it
-  // does nothing here then (closing the panel on the same key left the capture running).
-  // Esc: opens settings on the category screen. On a settings page it goes back to the category
-  // screen; on the category screen it asks to quit (Quit / Cancel), so Esc, Esc, Enter still exits
-  // the game the way the old Esc menu did. Esc on that prompt cancels it. The legacy menus and the
-  // launcher's settings window keep Esc = close.
+  // The menu key (F1 under YouGame, Esc standalone) leaves Settings safely at the main menu.
+  // Only selecting its quit row may open the confirmation. Legacy/launcher settings keep close.
+  // While rebinding, Escape cancels the capture without also changing the panel.
   if (phob_native_open() && host::window_take_escape()) {
     phob_native_close();   // Esc leaves the PhobGCC menu for the Controls tab
   } else if (host::window_take_escape() && state.rebind_action < 0) {
     const int style = options.overlay_style;
-    const bool on_page = (style == 0 && state.clean_detail_open) || (style == 1 && state.dashboard_detail_open) ||
-                         (style == 2 && state.gd_detail_open) || (style == 3 && state.radial_detail_open) ||
-                         (style == 4 && state.wide_detail_open);
     if (state.open && (state.legacy_presentation || style >= 5 || launcher_window)) state.open = false;
-    else if (state.open && on_page) settings_back_page(state, style);
-    else if (state.open) { state.open = false; state.menu_open = true; state.menu_quit = true; state.menu_quit_focus_pending = true; }
+    else if (state.open) { state.open = false; open_menu(); }
     else if (state.practice_open) { state.practice_open = false; state.practice_release_capture = true; }
     else if (state.menu_open) { state.menu_open = false; state.menu_quit = false; }
     // Under the YouGame app the small menu comes first (Back to game / Settings / Back to YouGame), so
     // leaving for YouGame is one press away and Settings is its second button.
-    else if (!state.fill_window && yougame::stdio_bridge()) { state.menu_open = true; state.menu_quit = false; }
+    else if (!state.fill_window && yougame::stdio_bridge()) open_menu();
     else if (!state.fill_window) { state.open = true; reset_settings_home("Esc"); }
   }
   if (launcher_window && !state.open) {
@@ -5198,6 +5197,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   }
   if (state.open) { state.menu_open = false; state.practice_open = false; }
   if (state.menu_open) state.practice_open = false;
+  if (!state.menu_open) state.menu_quit = false;
   if (!state.menu_open || !state.menu_quit) state.menu_quit_focus_pending = false;
 #ifdef YOUGAME_AGENT_TEST_HOOK
   agent_menu_state();
@@ -10048,6 +10048,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     const float gap = 10.0f;
     const int count = state.menu_quit ? 2 : 3;
     const float button_w = (width - 40.0f - gap * (count - 1)) / count;
+    const bool enter = ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
+    const ImGuiID nav_id = ImGui::GetCurrentContext()->NavId;
+    const bool quit_button_focused = nav_id == ImGui::GetID("##confirm_quit") || nav_id == ImGui::GetID("##cancel_quit");
     auto action = [&](const char* id, const char* label, int index) {
       const float x = 20.0f + index * (button_w + gap), y = 66.0f;
       ImGui::SetCursorPos(ImVec2(x, y));
@@ -10060,17 +10063,24 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           ImGui::SetNavCursorVisible(true);
         state.menu_quit_focus_pending = false;
       }
+      if (!state.menu_quit && index == 0 && menu_main_focus_pending) {
+        ImGui::SetFocusID(ImGui::GetItemID(), ImGui::GetCurrentWindow());
+        ImGui::SetNavCursorVisible(true);
+        menu_main_focus_pending = false;
+      }
+      // Enter follows navigation focus, like pad A. Mouse-only Enter defaults to confirm only
+      // when neither quit button has navigation focus; it must never override CANCEL.
+      const bool activated = pressed || (state.menu_quit && enter &&
+          (ImGui::IsItemFocused() || (index == 0 && !quit_button_focused)));
 #ifdef YOUGAME_AGENT_TEST_HOOK
       if (ImGui::IsItemFocused()) {
         agent_menu_focus = ImGui::GetItemID();
         agent_menu_label = label;
       }
-      if (pressed || (state.menu_quit && index == 0 &&
-          (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))))
+      if (activated)
         host::log("[yougame] agent test: menu activated %s (%s)", label, id);
 #endif
-      if (pressed || (state.menu_quit && index == 0 &&
-          (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false))))
+      if (activated)
         host::log("menu: activated %s", label);
       const bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
       const ImVec2 q(p.x + x, p.y + y - (hot ? 4.0f : 0.0f));
@@ -10083,7 +10093,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       const ImVec2 text_size = ImGui::CalcTextSize(label);
       draw->AddText(ImVec2(q.x + (button_w - text_size.x) * .5f, q.y + (54.0f - text_size.y) * .5f),
                     IM_COL32(255, 250, 253, 255), label);
-      return pressed;
+      return activated;
     };
     if (!state.menu_quit) {
       if (action("##resume", "BACK TO GAME", 0)) state.menu_open = false;
@@ -10100,12 +10110,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       draw->AddText(ImVec2(p.x + 20, p.y + 144), IM_COL32(167, 162, 178, 255),
                     app ? yougame::parity::kMenuHint : "ESC  BACK TO GAME     F1  SETTINGS");
     } else {
-      const bool enter = ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
-      if (action("##confirm_quit", app ? "BACK TO YOUGAME" : "QUIT", 0) || enter) { state.menu_open = false; host::request_user_exit(); }
+      if (action("##confirm_quit", app ? "BACK TO YOUGAME" : "QUIT", 0)) { state.menu_open = false; state.menu_quit = false; host::request_user_exit(); }
       ImGui::SetItemDefaultFocus();
       if (action("##cancel_quit", "CANCEL", 1)) { state.menu_open = false; state.menu_quit = false; }
       draw->AddText(ImVec2(p.x + 20, p.y + 144), IM_COL32(167, 162, 178, 255),
-                    app ? yougame::parity::kMenuHint : "QUIT MELEE UNLOCKED?     ENTER  QUIT     ESC  CANCEL");
+                    app ? yougame::parity::kMenuHint : "ENTER  SELECT     ESC  CANCEL");
     }
     ImGui::End();
   }

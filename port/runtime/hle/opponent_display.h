@@ -13,7 +13,7 @@ enum class Provider { Unknown, Slippi, YouGame };
 // explicitly converted to the game's Shift-JIS hyphen glyph (0x817c).
 inline std::string opponent_label(Provider provider, std::string_view name,
                                   size_t width = std::string::npos) {
-  const std::string_view tag = provider == Provider::Slippi ? " - Slippi" : "";
+  const std::string_view tag = provider == Provider::Slippi ? " (Slippi)" : "";
   // An empty identity has no label; a width smaller than the tag cannot show it whole.
   if (name.empty() || width < tag.size()) return {};
   const size_t name_width = width - tag.size();

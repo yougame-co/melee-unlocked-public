@@ -630,6 +630,8 @@ void window_destroy() {
 }
 
 void window_pump() {
+  // The page's "Game settings" button arrives over the stdio bridge; it opens the menu the way F1 does (as window.cpp).
+  if (yougame::stdio_bridge() && yougame::shortcuts::commands.take_settings()) g_escape_press.store(true);
 #ifdef MELEE_LINUX_X11_EMBED
   pump_embed_commands();
   if (g_closed) return;

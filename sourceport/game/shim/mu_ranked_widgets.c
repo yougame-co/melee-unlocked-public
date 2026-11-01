@@ -463,7 +463,9 @@ static void header_score(MuRankedWidgets* w, const MuRankedSetupModel* m)
 {
     char line[64];
     if (!m->set) return;
-    sprintf(line,"Game %u - %u:%u",(unsigned)m->set->cur_game,
+    /* Practice (agent runs only) says so on this row: a fifth row under the stage panel
+     * touched the strip's top border (build 29). */
+    sprintf(line,"%sGame %u - %u:%u",mu_ranked_practice() ? "Practice  " : "",(unsigned)m->set->cur_game,
         (unsigned)m->set->score[m->local_player],(unsigned)m->set->score[!m->local_player]);
     text_set(w->text,5,line);
 }
@@ -663,7 +665,6 @@ void mu_ranked_widgets_draw(MuRankedWidgets* w, const MuRankedSetupModel* m, con
             "Arrows: move  A: select  B: clear  X/Y: costume");
         text_set(w->text,4,"GameSetup visuals unavailable");
     } else for (i=1; i<5; ++i) text_set(w->text,i,"");
-    if (mu_ranked_practice()) text_set(w->text,4,"Practice - not rated");
 }
 void mu_ranked_widgets_free(MuRankedWidgets* w)
 {

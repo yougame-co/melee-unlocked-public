@@ -50,7 +50,8 @@ struct MuRankedSetupModel {unsigned local_player=0;MuRankedSet* set;};
 struct MuMatchState {char names[2][31];char codes[2][10];};
 struct MuRankedWidgets {unsigned canvas=0;HSD_Text *text=nullptr,*names[2]={};};
 static unsigned allocated,loads,clears;
-static int failure;
+static int failure,practice;
+static int mu_ranked_practice() {return practice;}
 static std::vector<std::string> logs;
 static void destroy(void*) {}
 static void OSReport(const char* message) {logs.emplace_back(message);}
@@ -116,15 +117,21 @@ int main() {
         CHECK(w.names[1]->rows[1].value==ms.codes[!local]);
         CHECK(w.text->rows[5].value==(local?"Game 2 - 0:1":"Game 2 - 1:0"));
         text_set(w.text,0,"0:30");
-        std::vector<Box> boxes={bounds(w.text,0),bounds(w.text,5)};
-        for(auto* name:w.names)for(unsigned row:{0u,1u})boxes.push_back(bounds(name,row));
-        for(unsigned i=0;i<boxes.size();++i) {
-            auto box=boxes[i];CHECK(box.l>=0 && box.r<=640 && box.t>=0 && box.b<=110);
-            for(unsigned j=0;j<i;++j)CHECK(!collision(box,boxes[j]));
-            // Reserve 24px for each arrow and 18px for the best-of-nine pips.
-            for(auto reserved:{Box{248,49,272,73},Box{368,49,392,73},Box{223,16.5f,417,34.5f}})
-                CHECK(!collision(box,reserved));
+        // Agent practice runs say so on the score row, which must still clear everything.
+        for(int p:{1,0}) {
+            practice=p;header_score(&w,&model);
+            if(p)CHECK(w.text->rows[5].value==(local?"Practice  Game 2 - 0:1":"Practice  Game 2 - 1:0"));
+            std::vector<Box> boxes={bounds(w.text,0),bounds(w.text,5)};
+            for(auto* name:w.names)for(unsigned row:{0u,1u})boxes.push_back(bounds(name,row));
+            for(unsigned i=0;i<boxes.size();++i) {
+                auto box=boxes[i];CHECK(box.l>=0 && box.r<=640 && box.t>=0 && box.b<=110);
+                for(unsigned j=0;j<i;++j)CHECK(!collision(box,boxes[j]));
+                // Reserve 24px for each arrow and 18px for the best-of-nine pips.
+                for(auto reserved:{Box{248,49,272,73},Box{368,49,392,73},Box{223,16.5f,417,34.5f}})
+                    CHECK(!collision(box,reserved));
+            }
         }
+        CHECK(w.text->rows[5].value==(local?"Game 2 - 0:1":"Game 2 - 1:0"));
         CHECK(bounds(w.text,5).t==92 && w.text->rows[5].sx==.45f);
         for(auto* t:{w.text,w.names[0],w.names[1]})HSD_SisLib_803A5CC4(t);
         CHECK(allocated==0 && logs.empty());

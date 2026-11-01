@@ -1,7 +1,7 @@
 # Melee Unlocked: YouGame's version
 
-Source candidate for YouGame build 29, Melee Unlocked 0.9.86,
-row `0.9.86-online-test.29`. Original project:
+Source candidate for YouGame build 30, Melee Unlocked 0.9.86,
+row `0.9.86-online-test.30`. Original project:
 https://github.com/Hero88go/melee-unlocked (GPL-3.0-or-later).
 Retain LICENSE, NOTICE and third-party notices.
 

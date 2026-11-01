@@ -33,7 +33,7 @@ int main() {
     CHECK(!s.result.before && !s.result.after && !s.result.rank_before.known);
     CHECK(reveal_pose(&s).new_alpha == 0);
     for (int i = 0; i < 500; ++i) { reveal_tick(&s); reveal_accept(&s, &recording); }
-    CHECK(s.frame == REVEAL_GLOW_END);
+    CHECK(s.frame == REVEAL_HOLD_END && !reveal_done(&s));
     reveal_accept(&s, &r); CHECK(s.frame == 0);
     auto p = at(s, 0);
     CHECK(p.direction == 1 && p.tier_up && p.changed);
@@ -112,8 +112,12 @@ int main() {
     r = result(gold, platinum, INT32_MIN, INT32_MAX); reveal_accept(&s, &r); s.reduced = 0;
     CHECK(at(s, 0).rating == INT32_MIN && at(s, 99).rating == INT32_MAX);
     CHECK(at(s, 50).rating > INT32_MIN && at(s, 50).rating < INT32_MAX);
+    // A final result holds 3s after the glow, then gives the CSS back.
+    CHECK(REVEAL_HOLD_END == REVEAL_GLOW_END + 180);
+    s.frame = REVEAL_HOLD_END - 1; CHECK(!reveal_done(&s));
     for (int i = 0; i < 10000; ++i) reveal_tick(&s);
-    CHECK(s.frame == REVEAL_GLOW_END);
+    CHECK(s.frame == REVEAL_HOLD_END && reveal_done(&s));
+    reveal_accept(&s, &r); CHECK(s.frame == REVEAL_HOLD_END && reveal_done(&s));
     reveal_accept(&s, &empty); CHECK(!s.active && s.frame == 0);
     std::cout << "rank reveal: " << checks << " checks passed\n";
 }
