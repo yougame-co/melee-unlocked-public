@@ -17,6 +17,11 @@ include(port/tests/yougame_udp.cmake)
 
 enable_testing()
 find_package(Threads REQUIRED)
+add_executable(port_sdl_video_thread_test port/tests/sdl_video_thread_test.cpp)
+target_include_directories(port_sdl_video_thread_test PRIVATE port/runtime/host)
+target_compile_features(port_sdl_video_thread_test PRIVATE cxx_std_17)
+target_link_libraries(port_sdl_video_thread_test PRIVATE Threads::Threads)
+add_test(NAME port_sdl_video_thread COMMAND port_sdl_video_thread_test)
 add_executable(port_yougame_console_integration_test port/tests/yougame_console_integration_test.cpp)
 target_include_directories(port_yougame_console_integration_test PRIVATE port/runtime/hle port/third_party)
 target_compile_features(port_yougame_console_integration_test PRIVATE cxx_std_17)
@@ -46,6 +51,8 @@ add_test(NAME port_yougame_console_link COMMAND port_yougame_console_link_test)
 add_test(NAME port_yougame_console_latency COMMAND port_yougame_console_link_test --latency)
 add_test(NAME port_console_watchdog COMMAND port_yougame_console_link_test --watchdog)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME port_sdl_video_thread_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/sdl_video_thread_wiring_test.py")
 add_test(NAME port_yougame_console_wiring COMMAND "${Python3_EXECUTABLE}" -B
   "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_console_wiring_test.py")
 add_test(NAME port_console_input_wiring COMMAND "${Python3_EXECUTABLE}" -B

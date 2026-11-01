@@ -5,6 +5,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 namespace {
+SdlVideoThread g_sdl_video_thread;
+bool video_thread(SdlVideoThread::Call call) {
+  return g_sdl_video_thread.allow(call, [](const char* message) { host::log("%s", message); });
+}
 SDL_Window* sdl_window() { return static_cast<SDL_Window*>(g_hwnd); }
 #ifdef MELEE_LINUX_X11_EMBED
 // Owned exclusively by the SDL video/render thread. The bridge only queues strings.
@@ -32,6 +36,7 @@ void close_embed(const char* why) {
 }
 
 void pump_embed_commands() {
+  if (!video_thread(SdlVideoThread::Call::EmbedCommands)) return;
   if (!yougame::embedded()) return;
   if (exit_requested()) {  // Includes bridge EOF; preserve any existing nonzero exit code.
     clear_embed_keys(); g_closed = true; return;
@@ -177,6 +182,7 @@ void show_cursor(bool visible) {
 
 // One SDL event, with the same rules as wnd_proc on Windows.
 void handle_event(const SDL_Event& e) {
+  if (!video_thread(SdlVideoThread::Call::Event)) return;
 #ifdef MELEE_LINUX_X11_EMBED
   // Handle native parent events before any window-id filtering or UI callback.
   if (g_x11_embed && e.type == SDL_SYSWMEVENT && e.syswm.msg &&
@@ -375,6 +381,8 @@ bool g_vulkan_window = false;
 void window_prefer_vulkan(bool on) { g_vulkan_window = on; }
 
 void* window_create(int w, int h, const wchar_t* title, bool visible) {
+  // Claim before SDL initialization and the Mac/X11 adapters, including their startup pumps.
+  g_sdl_video_thread.claim();
 #ifdef MELEE_LINUX_X11_EMBED
   const bool boxed = yougame::embedded();
   // The app and game must both use X11 (including XWayland), before video initialization.
@@ -619,6 +627,7 @@ bool window_take_practice_toggle() { return g_practice_toggle.exchange(false); }
 bool window_take_escape() { return g_escape_press.exchange(false); }
 
 void window_destroy() {
+  if (!video_thread(SdlVideoThread::Call::Destroy)) return;
   yougame::parity::signals.emit(g_overlay_key.cancel());
 #ifdef __APPLE__
   g_deferred_fullscreen_show = false;
@@ -636,9 +645,14 @@ void window_destroy() {
 #ifdef __APPLE__
   mac_embed::destroy();
 #endif
+  g_sdl_video_thread.release();
 }
 
+// Do not even read window/embed state on another thread. exit_requested() is atomic in
+// host.cpp; console waiters read it after this returns. The render owner keeps pumping
+// even without frames (present_loop's empty-queue wait is bounded to 2 ms).
 void window_pump() {
+  if (!video_thread(SdlVideoThread::Call::Pump)) return;
   // The page's "Game settings" button arrives over the stdio bridge; it opens the menu the way F1 does (as window.cpp).
   if (yougame::stdio_bridge() && yougame::shortcuts::commands.take_settings()) g_escape_press.store(true);
 #ifdef MELEE_LINUX_X11_EMBED
@@ -680,6 +694,7 @@ void window_pump() {
 }
 
 void window_set_title(const wchar_t* title) {
+  if (!video_thread(SdlVideoThread::Call::Title)) return;
 #ifdef MELEE_LINUX_X11_EMBED
   // The loader can call from a worker. Keep all Xlib/SDL video calls on the window thread.
   if (window_embedded()) return;
@@ -691,6 +706,7 @@ void window_set_title(const wchar_t* title) {
 // shows while the first frame is held back (no second window to steal focus).
 namespace { std::wstring g_title_before_loading; bool g_loading_shown = false; }
 void loading_show(const wchar_t* what, size_t done, size_t total) {
+  if (!video_thread(SdlVideoThread::Call::LoadingShow)) return;
 #ifdef MELEE_LINUX_X11_EMBED
   if (yougame::embedded()) {
     window_pump();
@@ -712,6 +728,7 @@ void loading_show(const wchar_t* what, size_t done, size_t total) {
 #endif
 }
 void loading_close() {
+  if (!video_thread(SdlVideoThread::Call::LoadingClose)) return;
   if (!g_loading_shown) return;
   g_loading_shown = false;
   if (g_hwnd) SDL_SetWindowTitle(sdl_window(), utf8_title(g_title_before_loading.c_str()).c_str());

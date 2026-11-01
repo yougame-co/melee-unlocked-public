@@ -54,6 +54,7 @@
 #include "hid_pad.h"
 #include "playstation_pad.h"
 #ifndef _WIN32
+#include "sdl_video_thread.h"
 #include <SDL.h>
 #ifdef MELEE_LINUX_X11_EMBED
 #include <SDL_syswm.h>

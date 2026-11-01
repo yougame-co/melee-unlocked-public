@@ -73,6 +73,7 @@ def main():
 
     if args.test:
         targets += ['linux_gc_adapter_test', 'linux_input_script_test', 'port_yougame_sysgen_test',
+                    'port_sdl_video_thread_test',
                     'port_settings_mouse_test', 'port_keyboard_navigation_test', 'port_controller_profiles_test',
                     'port_settings_profile_bindings_test', 'port_dolphin_profile_test',
                     'port_yougame_embed_view_test', 'port_yougame_embed_volume_test',
