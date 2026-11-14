@@ -133,6 +133,16 @@ class PacingDiagnosticsWiringTest(unittest.TestCase):
       host::log("present: vsync %s (settings)", options.vsync ? "on" : "off");
 #endif'''
         self.assertIn(addition, s)
+        # Build 101 merges upstream v0.9.120 (Gecko function patches, Boot to CSS, Center 2P HUD): reverse exactly
+        # its pc_settings.cpp hunks (v0.9.119 -> v0.9.120) first.
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build101_0120_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
+        # Build 100 merges upstream v0.9.119 (Hide fighter shadows, render latency on Vulkan NVIDIA): reverse
+        # exactly its pc_settings.cpp hunks (v0.9.118 -> v0.9.119) first.
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build100_0119_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
         # Build 96.3 merges upstream v0.9.116 (snapback filter size and time as separate settings): reverse
         # exactly its pc_settings.cpp hunks (v0.9.115 -> v0.9.116) first.
         for approved in json.loads((ROOT / 'port/tests/fixtures/build963_0116_settings_ranges.json').read_text()):

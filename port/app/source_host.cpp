@@ -3292,6 +3292,7 @@ void h_pad_read(MuPadStatus out[4]) {
   // The player's data-only Gecko codes, once per frame. Offline only: the writer in the game
   // library also refuses during an online match, whichever kind.
   if (slippi::online::session_mode() < 0 && !g_replaying && !yougame::tournament_active()) user_gecko::apply();
+  else user_gecko::suspend_function_patches();   // a code's rewritten functions go back online, in replays and in YouGame tournaments
   // A pasted always-display hitbox code turns on the Arcade look switches its lines stand for.
   gx::set_arcade_display(gx::ArcadeSource::Codes, user_gecko::arcade_bits_of_codes());
   // Hidden test hook: MELEE_TEST_INSTALL_LOOK=<0 Diet, 1 Animelee, 2 Animelee x DBZ> starts that one-click install once.
@@ -4653,12 +4654,16 @@ std::vector<uint8_t> read_replay_event(const std::string& path, uint8_t wanted) 
 // Which of the replay's gameplay codes the native game knows, by injection address.
 uint32_t replay_codes(const Slippi::GameSettings& s, uint8_t* ps_frozen_toggle) {
   struct Known { uint32_t address; uint32_t code; const char* name; };
+  // UCF 0.8 (Slippi's list until it moved to 0.84, so replays from 2023 and before) patches the same
+  // three places as 0.84's dashback, shield drop and tumble, with different code. These say "a UCF"
+  // here; which one is settled after the loop, from the 0.84-only codes and the code sizes.
+  constexpr uint32_t kUcfShared = 0x80000000u;
   static const Known known[] = {
       {0x800D65EC, MU_REPLAY_CODE_UCF084, "UCF 0.84 DBOOC SquatRv fix"},
-      {0x800C9A44, MU_REPLAY_CODE_UCF084, "UCF dashback"}, {0x8006B460, MU_REPLAY_CODE_UCF084, "UCF pad buffer"},
+      {0x800C9A44, kUcfShared, "UCF dashback"}, {0x8006B460, MU_REPLAY_CODE_UCF084, "UCF pad buffer"},
       {0x8008E54C, MU_REPLAY_CODE_UCF084, "UCF SDI"}, {0x8009A0B8, MU_REPLAY_CODE_UCF084, "UCF shield drop extended"},
-      {0x800998A4, MU_REPLAY_CODE_UCF084, "UCF shield drop"}, {0x80093294, MU_REPLAY_CODE_UCF084, "UCF shield SDI"},
-      {0x800908F4, MU_REPLAY_CODE_UCF084, "UCF tumble"},
+      {0x800998A4, kUcfShared, "UCF shield drop"}, {0x80093294, MU_REPLAY_CODE_UCF084, "UCF shield SDI"},
+      {0x800908F4, kUcfShared, "UCF tumble"},
       {0x8016E510, MU_REPLAY_CODE_NEUTRAL_SPAWN, "NeutralSpawn"},
       {0x801239A8, MU_REPLAY_CODE_FREEZE_GLITCH, "FreezeGlitchFix"},
       {0x801C154C, MU_REPLAY_CODE_INIT_STAGE_DATA, "Init Stage Data"},
@@ -4671,6 +4676,17 @@ uint32_t replay_codes(const Slippi::GameSettings& s, uint8_t* ps_frozen_toggle) 
       {0x801C65C8, MU_REPLAY_CODE_PS_ZERO_BUFFER, "Stadium CustomZeroBuffer"},
       {0x801D4760, MU_REPLAY_CODE_PS_IS_VALID, "Stadium GrPsxIsValid"},
       {0x801D457C, MU_REPLAY_CODE_PS_FROZEN_CHECK, "Stadium IngameCheckIfFrozen"},
+      // The older online lists (netplay-old1, 2023): Stadium always frozen, a jump from the start of
+      // grStadium_801D4548 to its exit with no toggle of its own.
+      {0x801D4578, MU_REPLAY_CODE_PS_FROZEN_CHECK, "Stadium frozen (older online lists)"},
+      // Preload Stadium Transformations (Slippi's 2023 core list): the next transformation is rolled
+      // and loaded as the countdown starts, not when it ends (grpstadium.c, MU_RC_PS_PRELOAD).
+      {0x801D14C8, MU_REPLAY_CODE_PS_PRELOAD, "Stadium preload: init isLoaded"},
+      {0x801D45EC, MU_REPLAY_CODE_PS_PRELOAD, "Stadium preload: load transformation"},
+      {0x801D460C, MU_REPLAY_CODE_PS_PRELOAD, "Stadium preload: preloaded transition"},
+      {0x801D4610, MU_REPLAY_CODE_PS_PRELOAD, "Stadium preload: skip normal decision"},
+      {0x801D4724, MU_REPLAY_CODE_PS_PRELOAD, "Stadium preload: skip normal load"},
+      {0x801D4F14, MU_REPLAY_CODE_PS_PRELOAD, "Stadium preload: reset isLoaded"},
       {0x800165AC, MU_REPLAY_CODE_PS_FILE_LOAD, "Stadium StadiumFileLoad"},
       {0x8008653C, MU_REPLAY_CODE_WHISPY_FIX, "WhispyBlowDirFix"},
       {0x800AC5B8, MU_REPLAY_CODE_NANA_DETERMINISM, "NanaDeterminism"},
@@ -4691,6 +4707,7 @@ uint32_t replay_codes(const Slippi::GameSettings& s, uint8_t* ps_frozen_toggle) 
   auto kept = slippi::playback::gameplay_codes(s.geckoCodes, sys, &dropped);
   uint32_t codes = 0;
   size_t unknown = 0;
+  size_t ucf_dashback_bytes = 0, ucf_shield_drop_bytes = 0;
   for (const auto& c : kept) {
     const Known* k = nullptr;
     for (const auto& e : known) if (e.address == c.address) { k = &e; break; }
@@ -4698,12 +4715,32 @@ uint32_t replay_codes(const Slippi::GameSettings& s, uint8_t* ps_frozen_toggle) 
       ++unknown;
       host::log("replay: code %08X (type %02X, %zu bytes) is not implemented natively; this replay may diverge",
                 c.address, c.type, c.bytes.size());
-      if ((c.address == 0x800C9A44 || c.address == 0x800998A4) && !(codes & MU_REPLAY_CODE_UCF084)) codes |= MU_REPLAY_CODE_UCF_OTHER;
       continue;
     }
     codes |= k->code;
+    if (c.address == 0x800C9A44) ucf_dashback_bytes = c.bytes.size();
+    if (c.address == 0x800998A4) ucf_shield_drop_bytes = c.bytes.size();
     // IngameCheckIfFrozen keeps its toggle in its own code: b; blrl; .byte toggle.
     if (c.address == 0x801D457C && c.bytes.size() >= 8 + 12) *ps_frozen_toggle = c.bytes[8 + 8];
+    // That jump (32 bytes: fmr f31,f1; lis/ori r12,801D4FD8; mtctr; bctr): no toggle, always frozen.
+    if (c.address == 0x801D4578 && c.bytes.size() == 32 && c.bytes[0x18] == 0x4E && c.bytes[0x1B] == 0x20) *ps_frozen_toggle = 1;
+  }
+  // Which UCF the shared sites belong to. 0.84 brings codes of its own (pad buffer, SDI, ...); 0.8's
+  // dashback and shield drop are 352 and 312 bytes (External/UCF 0.8, Slippi's list_console_UCF).
+  // Anything else is a UCF the native game does not have: said, and the replay plays without one.
+  if (codes & kUcfShared) {
+    codes &= ~kUcfShared;
+    if (codes & MU_REPLAY_CODE_UCF084) {
+      // 0.84: the shared sites are its own.
+    } else if (ucf_dashback_bytes == 352 && ucf_shield_drop_bytes == 312) {
+      codes |= MU_REPLAY_CODE_UCF08;
+      host::log("replay: recorded with UCF 0.8 (dashback, shield drop, tumble); played with UCF 0.8");
+    } else {
+      codes |= MU_REPLAY_CODE_UCF_OTHER;
+      ++unknown;
+      host::log("replay: recorded with a UCF other than 0.84 or 0.8 (dashback %zu bytes, shield drop %zu bytes); "
+                "this replay may diverge", ucf_dashback_bytes, ucf_shield_drop_bytes);
+    }
   }
   host::log("replay: code list %zu bytes, %zu gameplay codes kept (%zu denylisted by %s), %zu not native; codes mask %08X",
             s.geckoCodes.size(), kept.size(), dropped, sys.c_str(), unknown, codes);
@@ -5906,6 +5943,14 @@ int run(void (*shutdown)(int)) {
   g_look_items = (void (*)(MuLookItems*))game_proc("mu_look_items_v1");
   user_gecko::set_native_writer((user_gecko::NativeWrite)game_proc("mu_user_gecko_write"));
   user_gecko::set_native_reader((user_gecko::NativeRead)game_proc("mu_user_gecko_read"));
+  {
+    // Functions a code may make return at once (shim/mu_gecko_functions.c); an older library has none.
+    using Functions = uint32_t (*)(const user_gecko::NativeFunction**);
+    const auto functions = (Functions)game_proc("mu_user_gecko_functions");
+    const user_gecko::NativeFunction* table = nullptr;
+    const uint32_t count = functions ? functions(&table) : 0;
+    user_gecko::set_native_functions(table, count, host::dol_data_read);
+  }
   if (!entry) host::die("%s has no mu_game_entry", g_dll.c_str());
   static MuHostApi api = make_host();
   // The game library and this program come from the same release and refuse each other otherwise.

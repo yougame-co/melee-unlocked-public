@@ -1,0 +1,18 @@
+[
+  {
+    "before": "  state.intervals[state.cursor++ % state.intervals.size()] = ImGui::GetIO().DeltaTime*1000.f;\n  if (streamline::reflex_available())\n    state.latencies[state.latency_cursor++ % state.latencies.size()] = streamline::reflex_latency_ms();\n",
+    "after": "  state.intervals[state.cursor++ % state.intervals.size()] = ImGui::GetIO().DeltaTime*1000.f;\n  if (streamline::reflex_available() || streamline::reflex_latency_ms() > 0.0f)   // Vulkan on NVIDIA too\n    state.latencies[state.latency_cursor++ % state.latencies.size()] = streamline::reflex_latency_ms();\n"
+  },
+  {
+    "before": "         \"The menu's confirm sound plays on a successful V-cancel.\"},\n        {MU_DISPLAY_OPTION_HITBOX_ID_COLORS, \"Hitbox colours by ID\",\n",
+    "after": "         \"The menu's confirm sound plays on a successful V-cancel.\"},\n        {MU_DISPLAY_OPTION_NO_FIGHTER_SHADOWS, \"Hide fighter shadows\",\n         \"Fighters cast no shadow on the stage (the No Character Shadows code).\"},\n        {MU_DISPLAY_OPTION_HITBOX_ID_COLORS, \"Hitbox colours by ID\",\n"
+  },
+  {
+    "before": "                          \"not NVIDIA Reflex Low Latency (Video tab) is On, so Off has a number too.\\n\"\n                          \"The full breakdown by stage is on the performance graph.\");\n",
+    "after": "                          \"not NVIDIA Reflex Low Latency (Video tab) is On, so Off has a number too.\\n\"\n                          \"Direct3D 12, and Vulkan on an NVIDIA card (its driver's frame report).\\n\"\n                          \"The full breakdown by stage is on the performance graph.\");\n"
+  },
+  {
+    "before": "      // total; osRenderQueue and driver overlap the other stages a little, per NVIDIA's own report.\n      if (streamline::reflex_available()) {\n        const float lat = streamline::reflex_latency_ms();\n        ImGui::Text(\"Render latency: %.2f ms%s\", lat, options.reflex_mode == 0 ? \" (Reflex off)\" : \"\");\n        ImGui::PlotLines(\"##latency\", state.latencies.data(), (int)state.latencies.size(),\n",
+    "after": "      // total; osRenderQueue and driver overlap the other stages a little, per NVIDIA's own report.\n      // Vulkan on NVIDIA publishes the same report (VK_NV_low_latency2) without Streamline.\n      const bool reflex_here = streamline::reflex_available();\n      if (reflex_here || streamline::reflex_latency_ms() > 0.0f) {\n        const float lat = streamline::reflex_latency_ms();\n        ImGui::Text(\"Render latency: %.2f ms%s\", lat, reflex_here && options.reflex_mode == 0 ? \" (Reflex off)\" : \"\");\n        ImGui::PlotLines(\"##latency\", state.latencies.data(), (int)state.latencies.size(),\n"
+  }
+]

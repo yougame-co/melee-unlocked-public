@@ -12,6 +12,15 @@
  * It never brings up YouGame's client window or a game page, and never brings a running YouGame
  * forward. What it does, in this order:
  *   1. YouGame is running for this user: nothing is shown. YG_START_RUNNING.
+ *   U. Windows: YouGame is not running and has just quit to install an update (its marker file
+ *      %APPDATA%\<profile>\updating.json, written by the app, is valid: see "The update marker"
+ *      below), and the marker file is under 20 seconds old or its version is not installed: nothing is started
+ *      and nothing is shown. YG_START_UPDATING, with the version it is installing in `update_to`
+ *      (when a buffer is given; with `update_to_magic` it is also cleared at entry). The game shows its own
+ *      "YouGame is updating" line and calls yg_start again about every 10 seconds, for at most
+ *      5 minutes. Also while it waits for a
+ *      YouGame it started (`open_wait_ms`): an old YouGame that finds an update quits to install it,
+ *      and the hook returns YG_START_UPDATING the moment the marker appears, not "didn't open".
  *   2. YouGame is installed but not running.
  *      Windows, when `no_open` is 0, `tray_from` is set, the registered program is the signed
  *      YouGame program at its install location (%LOCALAPPDATA%\Programs\<folder>\<exe>, its version
@@ -50,7 +59,22 @@
  *
  * Runs that must never show a window or start anything (tests, headless runs): set `quiet`, or the
  * environment variable YOUGAME_START_QUIET=1. Then it only looks (a pipe or socket, the registry or
- * the system's link handler) and reports what it found; it starts no program on any system.
+ * the system's link handler, the update marker and the installed version) and reports what it
+ * found; it starts no program on any system.
+ *
+ * The update marker (Windows): right before YouGame quits to install an update it writes one line of
+ * UTF-8 JSON, {"v":1,"from":"0.13.1412","to":"0.13.1415","at":1763106830000} (`at` = epoch ms when it
+ * quit), to updating.json in its profile folder (Electron's userData) under FOLDERID_RoamingAppData.
+ * Production: "yougame-desktop" (the packaged app's folder) first, then "YouGame" (should a later
+ * build add a productName); the first valid one wins (see yg__start_profiles). Staging: "YouGame
+ * Staging (agent build)" only. The hook only reads it, never writes or deletes it, and only on a
+ * fixed local drive: a Roaming folder redirected to a network share or a removable drive is never
+ * opened, so it cannot stall the game. It takes the marker only when it is a regular
+ * file under 1 KiB, `v` is 1, `at` is at most 5 minutes old and at most 60 s ahead of this
+ * computer's clock, and `to` is digits and dots (at most 32 characters). When the installed YouGame
+ * is already at `to` or newer (compared number by number), the marker is a leftover of a finished
+ * update and is ignored once the marker file is at least 20 seconds old (installer post-steps may
+ * still run). Anything else, malformed included, is no marker: today's behaviour. macOS and Linux have no marker yet, so YG_START_UPDATING never comes back there.
  *
  * MIT licence (see LICENSE beside this file).
  */
@@ -63,6 +87,8 @@
 #endif
 #ifndef YOUGAME_START_H
 #define YOUGAME_START_H
+
+#include <stddef.h> /* size_t */
 
 #ifdef __cplusplus
 extern "C" {
@@ -77,8 +103,15 @@ typedef enum yg_start_result {
                                it), or no window could be shown */
   YG_START_UNAVAILABLE = 4, /* nothing was done: unsupported system, bad options, or an error */
   YG_START_INSTALLED = 5,   /* quiet runs only: installed but not running; nothing was started */
-  YG_START_MISSING = 6      /* quiet runs only: not installed, and nothing was shown */
+  YG_START_MISSING = 6,     /* quiet runs only: not installed, and nothing was shown */
+  YG_START_UPDATING = 7     /* Windows: YouGame quit to install an update (its marker is valid):
+                               nothing was started or shown. Show the game's own "YouGame is
+                               updating" line and call yg_start again in about 10 s, for at most
+                               5 minutes. The version it installs is in update_to, when given. */
 } yg_start_result;
+
+/* "YGU1": with it, update_to is also cleared at entry (empty on every result but YG_START_UPDATING). */
+#define YG_START_UPDATE_TO_MAGIC 0x59475531u
 
 typedef struct yg_start_options {
   const char *game;      /* required: the game's slug, a-z 0-9 and '-', at most 80 characters */
@@ -92,6 +125,13 @@ typedef struct yg_start_options {
                             "0.13.1407". An installed YouGame older than this is never started (it
                             would show its whole window); the small window says it needs an update.
                             NULL (or not three dot-separated numbers) = never start it. */
+  /* Last, so a caller that zeroes the struct (= {0} or memset) keeps working.
+     Give a valid buffer and size, or leave both zero. On YG_START_UPDATING the version is written,
+     magic or not; with update_to_magic = YG_START_UPDATE_TO_MAGIC it is also cleared at entry. */
+  char *update_to;          /* optional: cleared at entry (with the magic); on YG_START_UPDATING, the version YouGame
+                               is installing (at most 32 characters), cut to fit, always NUL-terminated */
+  size_t update_to_cap;     /* buffer size including terminator (0 = not written) */
+  unsigned update_to_magic; /* YG_START_UPDATE_TO_MAGIC: also clear update_to at entry */
 } yg_start_options;
 
 /* Call once, on the thread that starts the game, before or after the game's own window exists. */
@@ -143,6 +183,9 @@ static const char *const yg__start_texts[4][2] = {
 #define YG__START_TRAY_OLD 1     /* its version is older than tray_from, or could not be read */
 #define YG__START_TRAY_REFUSED 2 /* no usable program, not the YouGame app, or not signed */
 #define YG__START_TRAY_FAILED 3  /* verified, but starting it failed */
+
+/* The update marker's `to`: at most 32 characters, plus the terminator. */
+#define YG__START_TO_CAP 33
 
 static int yg__start_slug_ok(const char *s) {
   size_t n = 0;
@@ -359,6 +402,259 @@ static int yg__start_env_drop(const wchar_t *entry) {
          (n == 12 && yg__start_wprefix(entry, L"NODE_OPTIONS") == 12) ||
          (n == 19 && yg__start_wprefix(entry, L"NODE_EXTRA_CA_CERTS") == 19);
 }
+
+/* THE UPDATE MARKER. Right before YouGame quits to install an update it writes updating.json in its
+   profile folder, app.getPath("userData"), under FOLDERID_RoamingAppData (the known folder Electron's
+   app.getPath("appData") is). The app side is desktop PR 1777 (desktop/src/updating-marker.ts).
+   [0] production: Electron names userData after app.name, which is package.json's productName, else
+   its name. desktop/package.json has name "yougame-desktop" and no productName ("YouGame" is set only
+   in electron-builder.yml, for the installer and program names), main.ts never calls setName or sets
+   userData for production, and desktop/WINDOWS_HANDOFF.md and the agent-test proof look under
+   %APPDATA%\yougame-desktop. So "yougame-desktop" is the folder, read first; "YouGame" is read too,
+   since a later build that sets productName would move it there and games already shipped must keep
+   working. The first valid marker wins. [1] staging: main.ts sets userData to "YouGame Staging (agent
+   build)" (STAGING.userDataName), and the installed signed staging app's folder really is that. */
+#define YG__START_PROFILES 2
+static const wchar_t *const yg__start_profiles[2][YG__START_PROFILES] = {
+  {L"yougame-desktop", L"YouGame"},
+  {L"YouGame Staging (agent build)", NULL}};
+#define YG__START_MARKER_MAX 1024        /* a marker is under 1 KiB */
+#define YG__START_MARKER_AGE_MS 300000.0 /* `at` at most 5 minutes before this computer's clock */
+#define YG__START_MARKER_SKEW_MS 60000.0 /* and at most 60 s after it */
+
+/* <root>\<profile>\updating.json into out (cap characters with the terminator); 0 when root or
+   profile is missing or empty, or the path does not fit. Trailing backslashes of root are dropped
+   ("C:\" gives "C:\YouGame\..."). */
+static int yg__start_marker_path(const wchar_t *root, const wchar_t *profile, wchar_t *out, size_t cap) {
+  const wchar_t *tail = L"\\updating.json";
+  size_t r, at, k;
+  if (!root || !profile || !profile[0] || !cap) return 0;
+  for (r = 0; root[r]; ++r) {}
+  while (r && root[r - 1] == L'\\') --r;
+  if (!r || r >= cap) return 0;
+  for (at = 0; at < r; ++at) out[at] = root[at];
+  if (at + 1 >= cap) return 0;
+  out[at++] = L'\\';
+  for (k = 0; profile[k]; ++k) {
+    if (at + 1 >= cap) return 0;
+    out[at++] = profile[k];
+  }
+  for (k = 0; tail[k]; ++k) {
+    if (at + 1 >= cap) return 0;
+    out[at++] = tail[k];
+  }
+  out[at] = 0;
+  return 1;
+}
+
+/* `to` looks like a version: 1 to 32 characters, digits and single dots, a digit first and last. */
+static int yg__start_marker_version_ok(const char *s, size_t n) {
+  size_t i;
+  if (n < 1 || n > YG__START_TO_CAP - 1) return 0;
+  for (i = 0; i < n; ++i) {
+    if (s[i] >= '0' && s[i] <= '9') continue;
+    if (s[i] != '.' || i == 0 || i + 1 == n || s[i - 1] == '.') return 0;
+  }
+  return 1;
+}
+
+static size_t yg__start_json_space(const char *s, size_t n, size_t i) {
+  while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n')) ++i;
+  return i;
+}
+
+/* A JSON string at s[*i] (its opening quote), moved past. 1: plain text (no escape), at most cap - 1
+   bytes, copied into out (NUL-terminated) with its length in *len. 2: well formed but with an escape
+   or longer than that: skipped, out empty and *len 0 (usable only as a field the hook ignores). 0: a
+   control character, or unclosed within n. */
+static int yg__start_json_string(const char *s, size_t n, size_t *i, char *out, size_t cap, size_t *len) {
+  size_t k = 0;
+  int plain = 1;
+  if (*i >= n || s[*i] != '"') return 0;
+  for (++*i; *i < n; ++*i) {
+    unsigned char c = (unsigned char)s[*i];
+    if (c == '"') {
+      ++*i;
+      if (!plain) k = 0;
+      out[k] = 0;
+      *len = k;
+      return plain ? 1 : 2;
+    }
+    if (c < 0x20) return 0;
+    if (c == '\\') {
+      plain = 0;
+      if (++*i >= n || (unsigned char)s[*i] < 0x20) return 0; /* the escaped byte, never a closing quote */
+    } else if (plain && k + 1 < cap) {
+      out[k++] = (char)c;
+    } else {
+      plain = 0;
+    }
+  }
+  return 0;
+}
+
+/* A JSON whole number at s[*i]: 1 to 15 digits (so it is exact in a double; no `long long`, which
+   C89 builds lack), no sign, no leading zero, no fraction or exponent. */
+static int yg__start_json_whole(const char *s, size_t n, size_t *i, double *out) {
+  size_t start = *i;
+  double v = 0;
+  while (*i < n && s[*i] >= '0' && s[*i] <= '9') {
+    if (*i - start >= 15) return 0;
+    v = v * 10 + (double)(s[*i] - '0');
+    ++*i;
+  }
+  if (*i == start || (s[start] == '0' && *i - start > 1)) return 0;
+  if (*i < n && (s[*i] == '.' || s[*i] == 'e' || s[*i] == 'E')) return 0;
+  *out = v;
+  return 1;
+}
+
+/* true, false or null at s[*i]. */
+static int yg__start_json_word(const char *s, size_t n, size_t *i) {
+  static const char *const words[3] = {"true", "false", "null"};
+  size_t w, k;
+  for (w = 0; w < 3; ++w) {
+    for (k = 0; words[w][k] && *i + k < n && s[*i + k] == words[w][k]; ++k) {}
+    if (!words[w][k]) {
+      *i += k;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* The marker's body (n bytes, not NUL-terminated) is a valid marker at now_ms (epoch milliseconds):
+   one JSON object with "v": 1, "to": a version (yg__start_marker_version_ok), "at": whole epoch
+   milliseconds at most 5 minutes before now_ms and at most 60 s after it, and optionally "from": a
+   string. Other keys (any string, escapes included) with a string, whole number, true, false or null
+   value are skipped, so the app can add fields later. Strict and bounded: a UTF-8 byte order mark and
+   whitespace between tokens are allowed; anything else (an escape in a known key or in "to", a nested
+   object or array, a negative or fractional number, a known key twice, text after the object, n of
+   1024 or more) is no marker. On 1, to holds the version. */
+static int yg__start_marker_parse(const char *s, size_t n, double now_ms, char to[YG__START_TO_CAP]) {
+  char key[32], value[64], version[YG__START_TO_CAP];
+  size_t i = 0, len = 0;
+  int have_v = 0, have_to = 0, have_at = 0, have_from = 0;
+  double at = 0, num = 0;
+  if (!s || n >= YG__START_MARKER_MAX) return 0;
+  if (n >= 3 && (unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF)
+    i = 3;
+  i = yg__start_json_space(s, n, i);
+  if (i >= n || s[i] != '{') return 0;
+  i = yg__start_json_space(s, n, i + 1);
+  for (;;) {
+    int kind; /* 0 true/false/null, 1 plain string, 2 whole number, 3 other string */
+    int r = yg__start_json_string(s, n, &i, key, sizeof key, &len);
+    if (!r) return 0; /* r == 2: a key no field of the hook's has, so key is "" and matches none */
+    i = yg__start_json_space(s, n, i);
+    if (i >= n || s[i] != ':') return 0;
+    i = yg__start_json_space(s, n, i + 1);
+    if (i >= n) return 0;
+    if (s[i] == '"') {
+      r = yg__start_json_string(s, n, &i, value, sizeof value, &len);
+      if (!r) return 0;
+      kind = r == 1 ? 1 : 3;
+    } else if (s[i] >= '0' && s[i] <= '9') {
+      if (!yg__start_json_whole(s, n, &i, &num)) return 0;
+      kind = 2;
+    } else if (yg__start_json_word(s, n, &i)) {
+      kind = 0;
+    } else {
+      return 0;
+    }
+    if (!strcmp(key, "v")) {
+      if (have_v++ || kind != 2 || num != 1) return 0;
+    } else if (!strcmp(key, "at")) {
+      if (have_at++ || kind != 2) return 0;
+      at = num;
+    } else if (!strcmp(key, "to")) {
+      if (have_to++ || kind != 1 || !yg__start_marker_version_ok(value, len)) return 0;
+      memcpy(version, value, len + 1);
+    } else if (!strcmp(key, "from")) {
+      if (have_from++ || (kind != 1 && kind != 3)) return 0;
+    }
+    i = yg__start_json_space(s, n, i);
+    if (i >= n) return 0;
+    if (s[i] == '}') break;
+    if (s[i] != ',') return 0;
+    i = yg__start_json_space(s, n, i + 1);
+  }
+  if (yg__start_json_space(s, n, i + 1) != n) return 0;
+  if (!have_v || !have_to || !have_at) return 0;
+  if (at > now_ms + YG__START_MARKER_SKEW_MS || now_ms - at > YG__START_MARKER_AGE_MS) return 0;
+  memcpy(to, version, strlen(version) + 1);
+  return 1;
+}
+
+/* GetDriveTypeW's DRIVE_FIXED, and the file attributes the marker must not have (FILE_ATTRIBUTE_
+   DIRECTORY, _DEVICE, _REPARSE_POINT), written out so the Mac test runs the same checks. */
+#define YG__START_DRIVE_FIXED 3u
+#define YG__START_ATTR_REFUSED (0x10UL | 0x40UL | 0x400UL)
+
+/* "X:\..." with a drive letter: not a UNC path (\\server\share), not a \\?\ or \\.\ device path, not
+   relative. */
+static int yg__start_drive_path(const wchar_t *path) {
+  return path && ((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z')) &&
+         path[1] == L':' && path[2] == L'\\';
+}
+
+/* The marker may be opened at all: its path is on a drive letter (yg__start_drive_path) whose type,
+   GetDriveTypeW of "X:\", is a fixed local drive. A network drive (a Roaming folder redirected to a
+   share, mapped or UNC), a removable, CD or RAM drive, or an unknown type is no marker, decided before
+   anything is opened, so a slow or gone server cannot hold up the game (a folder on the way that is
+   itself a link to a share is not detected). */
+static int yg__start_marker_local(const wchar_t *path, unsigned drive_type) {
+  return yg__start_drive_path(path) && drive_type == YG__START_DRIVE_FIXED;
+}
+
+/* The opened marker is a plain file the hook takes: on disk (GetFileType is FILE_TYPE_DISK), not a
+   folder, device or reparse point (it is opened as itself, so a link is seen, never followed), and
+   under 1 KiB (the size's high half 0, its low half below YG__START_MARKER_MAX). */
+static int yg__start_marker_file_ok(int on_disk, unsigned long attrs, unsigned long size_high,
+                                    unsigned long size_low) {
+  return on_disk && !(attrs & YG__START_ATTR_REFUSED) && !size_high && size_low < YG__START_MARKER_MAX;
+}
+
+/* A FILETIME (100 ns steps since 1601-01-01 UTC, in its 32-bit halves) as epoch milliseconds in *ms;
+   0 for a time before 1970. The Unix epoch is FILETIME 116444736000000000 (0x019DB1DE D53E8000);
+   the halves are subtracted exactly (no 64-bit integer type, which C89 lacks), and only the
+   difference goes into a double: within a microsecond for the next few hundred years. */
+#define YG__START_EPOCH_HIGH 0x019DB1DEUL
+#define YG__START_EPOCH_LOW 0xD53E8000UL
+static int yg__start_filetime_ms(unsigned long high, unsigned long low, double *ms) {
+  unsigned long dh, dl;
+  high &= 0xFFFFFFFFUL;
+  low &= 0xFFFFFFFFUL;
+  if (high < YG__START_EPOCH_HIGH || (high == YG__START_EPOCH_HIGH && low < YG__START_EPOCH_LOW))
+    return 0;
+  dh = high - YG__START_EPOCH_HIGH;
+  dl = (low - YG__START_EPOCH_LOW) & 0xFFFFFFFFUL;
+  if (low < YG__START_EPOCH_LOW) --dh;
+  *ms = ((double)dh * 4294967296.0 + (double)dl) / 10000.0;
+  return 1;
+}
+
+/* The installed program's version (its file version's first three parts) is already the marker's
+   `to` or newer, so the marker is a leftover of an update that has finished. Number by number from
+   the left; parts `to` lacks count as 0, and so do have's parts past the third (a file version's fourth part,
+   which the hook does not read). Leading zeros do not count; a part of more than 9 digits is larger
+   than any have. `to` is digits and dots (yg__start_marker_version_ok). */
+static int yg__start_version_reached(const unsigned have[3], const char *to) {
+  size_t i = 0;
+  unsigned part;
+  for (part = 0;; ++part) {
+    unsigned long v = 0, h = part < 3 ? have[part] : 0;
+    int digits = 0;
+    for (; to[i] >= '0' && to[i] <= '9'; ++i) {
+      if (!v && to[i] == '0') continue;
+      if (++digits > 9) return 0;
+      v = v * 10 + (unsigned long)(to[i] - '0');
+    }
+    if (v != h) return h > v;
+    if (to[i] != '.') return 1;
+    ++i;
+  }
+}
 #endif
 
 #ifdef YOUGAME_START_TESTING
@@ -378,6 +674,10 @@ static int yg__start_shell_open(const char *url);
 static int yg__start_offer(int text);
 static int yg__start_quiet_env(void);
 static void yg__start_sleep(unsigned ms);
+static unsigned long yg__start_ms(void);
+static int yg__start_installed_version(int staging, unsigned have[3]);
+typedef struct yg__start_mark { int looked; double age_ms; } yg__start_mark;
+static int yg__start_marker(int staging, yg__start_mark *mark, char to[YG__START_TO_CAP]);
 #elif defined(_WIN32)
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -421,6 +721,11 @@ typedef struct yg__start_app {
 } yg__start_app;
 
 static void yg__start_sleep(unsigned ms) { Sleep(ms); }
+
+/* A monotonic millisecond clock for the tray wait: GetTickCount (kernel32, every Windows; time since
+   boot, not the wall clock the user can set). It wraps every 49.7 days; the wait takes differences
+   modulo 2^32, so a wrap inside a wait of at most 60 s is harmless. */
+static unsigned long yg__start_ms(void) { return (unsigned long)GetTickCount(); }
 
 static int yg__start_quiet_env(void) {
   wchar_t v[8];
@@ -601,6 +906,92 @@ static int yg__start_install_folder_ok(const wchar_t *path, int staging) {
   return ok;
 }
 
+/* The update marker (see THE UPDATE MARKER), only read: never written or deleted. Its folder is
+   FOLDERID_RoamingAppData from SHGetKnownFolderPath (loaded from the system directory, as above),
+   never %APPDATA% from the game's environment, looked up once per yg_start call (mark), with the
+   drive type of its root: only paths on a fixed local drive are kept (yg__start_marker_local), so a
+   Roaming folder redirected to a network share is never opened (a folder on the way that is itself
+   a link to a share is not detected: FILE_FLAG_OPEN_REPARSE_POINT covers the file alone). Each kept path, in yg__start_profiles' order, is read
+   by yg__start_marker_read; the first valid marker wins. Any failure is no marker. */
+typedef struct yg__start_mark {
+  double age_ms; /* marker file age, for the installer post-step grace period */
+  int looked, count; /* the folder was looked up; count paths kept in path */
+  wchar_t path[YG__START_PROFILES][YG__START_PATH_CAP];
+} yg__start_mark;
+
+/* One marker file: opened as itself, not through a link, shared for reading, writing and deleting
+   so the app is never held up; a plain file under 1 KiB (yg__start_marker_file_ok) whose body is
+   valid against the system clock now (yg__start_filetime_ms, yg__start_marker_parse). */
+static int yg__start_marker_read(const wchar_t *path, char to[YG__START_TO_CAP], double *age_ms) {
+  char body[YG__START_MARKER_MAX];
+  BY_HANDLE_FILE_INFORMATION info;
+  FILETIME ft;
+  DWORD got = 0;
+  double now, written;
+  HANDLE f;
+  int ok = 0;
+  f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                  OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+  if (f == INVALID_HANDLE_VALUE) return 0;
+  if (GetFileInformationByHandle(f, &info) &&
+      yg__start_marker_file_ok(GetFileType(f) == FILE_TYPE_DISK, info.dwFileAttributes,
+                               info.nFileSizeHigh, info.nFileSizeLow) &&
+      ReadFile(f, body, (DWORD)sizeof body, &got, NULL) && got < YG__START_MARKER_MAX) {
+    GetSystemTimeAsFileTime(&ft);
+    if (yg__start_filetime_ms(ft.dwHighDateTime, ft.dwLowDateTime, &now) &&
+        yg__start_filetime_ms(info.ftLastWriteTime.dwHighDateTime, info.ftLastWriteTime.dwLowDateTime, &written)) {
+      ok = yg__start_marker_parse(body, got, now, to);
+      if (ok) *age_ms = now - written;
+    }
+  }
+  CloseHandle(f);
+  return ok;
+}
+
+static int yg__start_marker(int staging, yg__start_mark *mark, char to[YG__START_TO_CAP]) {
+  typedef HRESULT (WINAPI *known_fn)(const GUID *, DWORD, HANDLE, PWSTR *);
+  typedef void (WINAPI *free_fn)(LPVOID);
+  static const GUID roaming = /* FOLDERID_RoamingAppData */
+    {0x3eb685db, 0x65f9, 0x4cf6, {0xa0, 0x3a, 0xe3, 0xef, 0x65, 0x72, 0x9f, 0x3d}};
+  int i;
+  if (!mark->looked) {
+    HMODULE shell = yg__start_system_dll(L"shell32.dll");
+    HMODULE ole = yg__start_system_dll(L"ole32.dll");
+    known_fn known = NULL;
+    free_fn release = NULL;
+    PWSTR root = NULL;
+    mark->looked = 1;
+    mark->count = 0;
+    if (shell && ole) {
+      YG__START_PROC(known, shell, "SHGetKnownFolderPath");
+      YG__START_PROC(release, ole, "CoTaskMemFree");
+    }
+    if (known && release) {
+      if (known(&roaming, 0, NULL, &root) == S_OK && root && yg__start_drive_path(root)) {
+        wchar_t drive[4];
+        unsigned type;
+        drive[0] = root[0];
+        drive[1] = L':';
+        drive[2] = L'\\';
+        drive[3] = 0;
+        type = (unsigned)GetDriveTypeW(drive);
+        for (i = 0; i < YG__START_PROFILES; ++i) {
+          wchar_t *out = mark->path[mark->count];
+          if (yg__start_marker_path(root, yg__start_profiles[staging ? 1 : 0][i], out, YG__START_PATH_CAP) &&
+              yg__start_marker_local(out, type))
+            ++mark->count;
+        }
+      }
+      if (root) release(root);
+    }
+    if (ole) FreeLibrary(ole);
+    if (shell) FreeLibrary(shell);
+  }
+  for (i = 0; i < mark->count; ++i)
+    if (yg__start_marker_read(mark->path[i], to, &mark->age_ms)) return 1;
+  return 0;
+}
+
 /* One text of the version resource, \StringFileInfo\<lang><codepage>\<name>, copied into out (at most
    cap - 1 characters): 1. Missing: 0 (out empty). Too long to be ours: -1. */
 typedef BOOL (WINAPI *yg__start_query_fn)(LPCVOID, LPCWSTR, LPVOID *, PUINT);
@@ -725,6 +1116,54 @@ static int yg__start_app_find(int staging, yg__start_app *app) {
 static void yg__start_app_close(yg__start_app *app) {
   if (app->file != INVALID_HANDLE_VALUE) CloseHandle(app->file);
   app->file = INVALID_HANDLE_VALUE;
+}
+
+/* The installed program's file version (first three parts), for the leftover-marker check only
+   (yg__start_update_done). A valid marker usually means an installer is replacing the program right
+   now, so the hook holds no handle of its own on it (yg__start_app_find's read-only sharing would
+   block the installer's writes and deletes): version.dll reads it by path, for the moment of the
+   read. The path is the open command's program (yg__start_exe_from_command: absolute, no UNC or
+   device path) and its drive must be a fixed local one, checked before the read. Nothing else is
+   checked: this only decides to skip "updating", and the tray start that follows checks it all. */
+static int yg__start_installed_version(int staging, unsigned have[3]) {
+  typedef DWORD (WINAPI *size_fn)(DWORD, LPCWSTR, LPDWORD);
+  typedef BOOL (WINAPI *info_fn)(DWORD, LPCWSTR, DWORD, DWORD, LPVOID);
+  wchar_t command[2048], path[YG__START_PATH_CAP], drive[4];
+  HMODULE dll;
+  size_fn get_size = NULL;
+  info_fn get_info = NULL;
+  yg__start_query_fn query = NULL;
+  DWORD handle = 0, size = 0;
+  void *buf = NULL;
+  VS_FIXEDFILEINFO *fixed = NULL;
+  UINT len = 0;
+  int ok = 0;
+  if (!yg__start_command(staging, command, 2048) ||
+      !yg__start_exe_from_command(command, path, YG__START_PATH_CAP) || !yg__start_drive_path(path))
+    return 0;
+  drive[0] = path[0];
+  drive[1] = L':';
+  drive[2] = L'\\';
+  drive[3] = 0;
+  if (!yg__start_marker_local(path, (unsigned)GetDriveTypeW(drive))) return 0;
+  dll = yg__start_system_dll(L"version.dll");
+  if (!dll) return 0;
+  YG__START_PROC(get_size, dll, "GetFileVersionInfoSizeExW");
+  YG__START_PROC(get_info, dll, "GetFileVersionInfoExW");
+  YG__START_PROC(query, dll, "VerQueryValueW");
+  if (get_size && get_info && query) size = get_size(YG__START_VER_NEUTRAL, path, &handle);
+  if (size && size <= (1u << 20)) buf = HeapAlloc(GetProcessHeap(), 0, size);
+  if (buf && get_info(YG__START_VER_NEUTRAL, path, 0, size, buf) &&
+      query(buf, L"\\", (LPVOID *)&fixed, &len) && fixed && len >= sizeof *fixed &&
+      fixed->dwSignature == 0xFEEF04BDu) {
+    have[0] = HIWORD(fixed->dwFileVersionMS);
+    have[1] = LOWORD(fixed->dwFileVersionMS);
+    have[2] = HIWORD(fixed->dwFileVersionLS);
+    ok = 1;
+  }
+  if (buf) HeapFree(GetProcessHeap(), 0, buf);
+  FreeLibrary(dll);
+  return ok;
 }
 
 static int yg__start_app_named(yg__start_app *app, int staging) {
@@ -1393,9 +1832,8 @@ static int yg__start_offer(int which) {
 /* Windows' tray start, in the order that keeps one file from check to start: find and hold the
    program, check it is the YouGame app (name and version texts), its version, its signature, then
    start it (bound to the held file). */
-static int yg__start_tray(int staging, const unsigned want[3]) {
+static int yg__start_tray(int staging, const unsigned want[3], unsigned have[3]) {
   yg__start_app app;
-  unsigned have[3];
   int r;
   if (!yg__start_app_find(staging, &app)) return YG__START_TRAY_REFUSED;
   if (!yg__start_app_named(&app, staging))
@@ -1409,33 +1847,82 @@ static int yg__start_tray(int staging, const unsigned want[3]) {
   yg__start_app_close(&app);
   return r;
 }
+
+/* The marker's `to` is already installed: the registered program's file version
+   (yg__start_installed_version, which never blocks an installer) reaches `to`
+   (yg__start_version_reached). A program that cannot be read (an installer may be replacing it
+   right now) is not done. */
+static int yg__start_update_done(int staging, const char *to) {
+  unsigned have[3];
+  return yg__start_installed_version(staging, have) && yg__start_version_reached(have, to);
+}
+
+/* YG_START_UPDATING, with the marker's version copied to the game's update_to (cut to fit). */
+static yg_start_result yg__start_updating(const yg_start_options *o, const char *to) {
+  if (o->update_to && o->update_to_cap) {
+    size_t n = strlen(to);
+    if (n >= o->update_to_cap) n = o->update_to_cap - 1;
+    memcpy(o->update_to, to, n);
+    o->update_to[n] = 0;
+  }
+  return YG_START_UPDATING;
+}
 #endif
 
 #if defined(_WIN32) || defined(__APPLE__) || defined(__linux__) || defined(YOUGAME_START_TESTING)
 yg_start_result yg_start(const yg_start_options *o) {
   int staging, quiet, installed, text;
+#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
+  char to[YG__START_TO_CAP];
+  yg__start_mark mark;
+#endif
+  /* Cleared at entry only for a caller that set the magic: a struct that was never zeroed never
+     has its update_to written before a real YG_START_UPDATING. */
+  if (o && o->update_to_magic == YG_START_UPDATE_TO_MAGIC && o->update_to && o->update_to_cap) o->update_to[0] = 0;
   if (!o || !yg__start_slug_ok(o->game)) return YG_START_UNAVAILABLE;
   staging = o->staging ? 1 : 0;
   quiet = o->quiet || yg__start_quiet_env();
   if (yg__start_running(staging)) return YG_START_RUNNING;
   installed = yg__start_installed(staging);
+#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
+  /* YouGame quit to install an update: a fact, so quiet runs report it too, and nothing is started
+     or shown. Taken whether or not the link type is registered right now, since an installer may
+     drop and rewrite it while it runs, unless the installed YouGame already has the marker's version
+     and the marker file is at least 20 s old (a finished update, including installer post-steps). Windows only (YG__START_TRAY_SYSTEM): macOS and
+     Linux have no marker, so it is not even looked for there. */
+  mark.looked = 0;
+  if (YG__START_TRAY_SYSTEM && yg__start_marker(staging, &mark, to) &&
+      (mark.age_ms < 20000 || !yg__start_update_done(staging, to)))
+    return yg__start_updating(o, to);
+#endif
   if (quiet) return installed ? YG_START_INSTALLED : YG_START_MISSING;
   text = installed ? YG__START_TEXT_NOT_RUNNING : YG__START_TEXT_MISSING;
 #if defined(_WIN32) || defined(YOUGAME_START_TESTING)
   if (installed && YG__START_TRAY_SYSTEM && !o->no_open) {
-    unsigned want[3];
+    unsigned want[3], have[3] = {0, 0, 0};
     if (yg__start_version_parse(o->tray_from, want)) {
-      int tray = yg__start_tray(staging, want);
+      int tray = yg__start_tray(staging, want, have);
       if (tray == YG__START_TRAY_OLD) text = YG__START_TEXT_UPDATE;
       else if (tray == YG__START_TRAY_FAILED) text = YG__START_TEXT_DIDNT_OPEN;
       else if (tray == YG__START_TRAY_STARTED) {
+        /* Polled every 500 ms: the channel first, then the update marker. The wait is bounded by
+           the clock as well as by the sleeps it adds up, so slow checks never stretch it. */
         unsigned wait = o->open_wait_ms > 60000 ? 60000 : o->open_wait_ms, waited = 0;
+        unsigned long start, elapsed;
         if (wait == 0) return YG_START_OPENED;
+        start = yg__start_ms();
         while (waited < wait) {
           unsigned step = wait - waited < 500 ? wait - waited : 500;
           yg__start_sleep(step);
           waited += step;
+          elapsed = (yg__start_ms() - start) & 0xFFFFFFFFUL;
+          if (elapsed > waited) waited = elapsed < wait ? (unsigned)elapsed : wait;
           if (yg__start_running(staging)) return YG_START_OPENED;
+          /* An older YouGame that finds an update quits to install it: say so, not "didn't open".
+             The version it was started at (have) tells a leftover marker from a new one. */
+          if (yg__start_marker(staging, &mark, to) &&
+              (mark.age_ms < 20000 || !yg__start_version_reached(have, to)))
+            return yg__start_updating(o, to);
         }
         text = YG__START_TEXT_DIDNT_OPEN;
       }
@@ -1455,7 +1942,8 @@ yg_start_result yg_start(const yg_start_options *o) {
 #else
 
 yg_start_result yg_start(const yg_start_options *options) {
-  (void)options;
+  if (options && options->update_to_magic == YG_START_UPDATE_TO_MAGIC && options->update_to && options->update_to_cap)
+    options->update_to[0] = 0;
   (void)yg__start_slug_ok;
   (void)yg__start_version_parse;
   (void)yg__start_version_at_least;

@@ -82,7 +82,7 @@ extern char** environ;
 
 using json = nlohmann::json;
 
-// YouGame's start hook (MIT, YouGame's engines/native, claude/v2 bda1b5152). Built on Windows only for now:
+// YouGame's start hook (MIT, YouGame's engines/native, claude/v2 8dfb30680). Built on Windows only for now:
 // elsewhere yg_start answers UNAVAILABLE, as in build 98, until the macOS and Linux paths are checked.
 #ifdef _WIN32
 #define YOUGAME_START_IMPLEMENTATION
@@ -2765,6 +2765,7 @@ const char* start_result_name(int r) {
     case YG_START_UNAVAILABLE: return "unavailable";
     case YG_START_INSTALLED: return "installed, not running";
     case YG_START_MISSING: return "not on this computer";
+    case YG_START_UPDATING: return "YouGame is updating (treated as unavailable; it restarts by itself)";
     default: return "?";
   }
 }

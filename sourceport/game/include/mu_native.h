@@ -160,14 +160,18 @@ int mu_hud_emblems_hidden(void);
 #define MU_DISPLAY_HITBOX_ANGLES      0x00080000u   /* shown hitboxes carry a line along their knockback angle */
 #define MU_DISPLAY_HQ_FOD_REFLECTIONS 0x00100000u   /* Fountain of Dreams reflections at full resolution with full models */
 #define MU_DISPLAY_VCANCEL_SOUND      0x00200000u   /* the menu's confirm sound on a successful V-cancel */
-#define MU_DISPLAY_CODES_ALL         0x003FF000u
+#define MU_DISPLAY_NO_FIGHTER_SHADOWS 0x01000000u   /* No Character Shadows: fighters cast no shadow (ftlib.c ftLib_800872BC) */
+#define MU_DISPLAY_CENTER_2P_HUD      0x04000000u   /* Center Align 2P HUD: players 1 and 2 only, the HUD laid out for two (gmvs.c) */
+#define MU_DISPLAY_CODES_ALL         0x053FF000u
 /* shim/mu_code_features.c: nonzero while the player has that community code on. */
 int mu_code_feature(unsigned int bit);
 /* Offline community codes (HUD tab): they change menu timing and the pause, so the host sends them
  * only outside network play (source_host.cpp h_display_options). */
 #define MU_DISPLAY_INSTANT_MELEE      0x00400000u   /* Instant Melee: faster stage, stage select and character select loads; pause during the countdown */
 #define MU_DISPLAY_FREE_PAUSE_CAMERA  0x00800000u   /* Unrestricted pause camera: no angle limits, zoom 2.5 to 32768 */
+#define MU_DISPLAY_BOOT_TO_CSS        0x02000000u   /* Boot to CSS: the game starts at the character select (gmboot.c) */
 int mu_instant_melee(void);
+int mu_boot_to_css(void);
 int mu_free_pause_camera(void);
 /* shim/mu_code_features.c: the knockback angle line of a hitbox bubble just drawn (ftdrawcommon.c). */
 struct HitCapsule;
@@ -514,7 +518,7 @@ int mu_ucf_shield_sdi(struct Fighter* fp);
 int mu_ucf_shield_drop(struct Fighter* fp);
 int mu_ucf_shield_drop_extended(struct Fighter* fp);
 int mu_ucf_tumble_wiggle(struct Fighter* fp);
-int mu_ucf_enabled(void);   /* General Codes on, and the replay (if any) carries UCF 0.84 */
+int mu_ucf_enabled(void);   /* General Codes on, and the replay (if any) carries UCF 0.84 or 0.8 */
 
 /* Slippi replay playback (--replay), shim/mu_replay.c: the native form of Slippi's playback codes,
  * called from the sites those codes patch. Codes are MU_REPLAY_CODE_* in mu_host.h. */
@@ -534,6 +538,8 @@ int mu_ucf_enabled(void);   /* General Codes on, and the replay (if any) carries
 #define MU_RC_NANA_DETERMINISM 0x00002000u
 #define MU_RC_PS_MONITOR 0x00004000u
 #define MU_RC_PREVENT_WOBBLING 0x00008000u
+#define MU_RC_UCF08 0x00020000u
+#define MU_RC_PS_PRELOAD 0x00040000u
 struct StartMeleeData;
 int mu_replay_on(void);
 int mu_replay_code(unsigned int code);     /* playback and the replay carries the code */

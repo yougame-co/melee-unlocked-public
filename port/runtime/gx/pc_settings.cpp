@@ -2856,6 +2856,9 @@ static void draw_settings_icon(int index, ImVec2 p, ImU32 color) {
 // standalone settings window has no game behind it, so it shows none.
 static bool g_settings_standalone = false;
 static bool g_settings_restart_asked = false;
+// The restart asked is a switch to the Static Recomp (a Gecko code the Source Port cannot run):
+// host::request_engine_switch instead of host::request_restart.
+static bool g_settings_engine_switch = false;
 static void restart_now_button(const char* id) {
   if (g_settings_standalone) return;
   char label[96];
@@ -4608,8 +4611,10 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
     if (std::getenv("MELEE_LAG_TEST")) {   // the lag test's codes are not the player's: keep theirs
       for (const std::string& name : g_gecko_saved_on) file << "\ngeckocode " << name;
     } else {
+      // A code this engine cannot run keeps the switch it was saved with (on for the Static Recomp
+      // stays on when the Source Port writes this file); one that runs here is saved as it runs.
       for (const user_gecko::Code& c : user_gecko::codes())
-        if (c.enabled) file << "\ngeckocode " << c.name;
+        if (c.enabled || (!c.supported && c.wanted)) file << "\ngeckocode " << c.name;
     }
   }
   for (int i = 0; i < (int)host::BindAction::Count; ++i)
@@ -5607,7 +5612,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                                 state.practice_release_capture;
   host::window_input_capture(state.open || state.menu_open || practice_capture || replay_bar::wants_cursor());
   state.intervals[state.cursor++ % state.intervals.size()] = ImGui::GetIO().DeltaTime*1000.f;
-  if (streamline::reflex_available())
+  if (streamline::reflex_available() || streamline::reflex_latency_ms() > 0.0f)   // Vulkan on NVIDIA too
     state.latencies[state.latency_cursor++ % state.latencies.size()] = streamline::reflex_latency_ms();
   bool changed = false;
   if (panel_visible) {
@@ -9734,6 +9739,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
          "No GO! graphic when a match starts. Its sound and timing are unchanged."},
         {MU_DISPLAY_OPTION_VCANCEL_SOUND, "V-cancel sound",
          "The menu's confirm sound plays on a successful V-cancel."},
+        {MU_DISPLAY_OPTION_NO_FIGHTER_SHADOWS, "Hide fighter shadows",
+         "Fighters cast no shadow on the stage (the No Character Shadows code)."},
+        {MU_DISPLAY_OPTION_CENTER_2P_HUD, "Center the HUD for two players",
+         "With only players 1 and 2 in a match, their percents sit in the middle of the screen\n"
+         "(the Center Align 2P HUD code)."},
         {MU_DISPLAY_OPTION_HITBOX_ID_COLORS, "Hitbox colours by ID",
          "Shown hitboxes: ID 0 red, 1 green, 2 cyan, 3 purple."},
         {MU_DISPLAY_OPTION_HITBOX_ID_ORDER, "Highest-priority hitbox on top",
@@ -9762,6 +9772,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
          "match countdown."},
         {MU_DISPLAY_OPTION_FREE_PAUSE_CAMERA, "Unrestricted pause camera",
          "The pause camera turns all the way down, left and right and zooms much further."},
+        {MU_DISPLAY_OPTION_BOOT_TO_CSS, "Boot to character select",
+         "The game starts at the character select, past the title screen and menus\n"
+         "(the Boot to CSS code)."},
       };
       for (const Code& c : kOffline) {
         bool on = (options.community_codes & c.bit) != 0;
@@ -10631,6 +10644,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Shows the measured render latency under the FPS counter. Works whether or\n"
                           "not NVIDIA Reflex Low Latency (Video tab) is On, so Off has a number too.\n"
+                          "Direct3D 12, and Vulkan on an NVIDIA card (its driver's frame report).\n"
                           "The full breakdown by stage is on the performance graph.");
 #ifndef MELEE_NO_SLIPPI   // as for the Lab view switch above
       if (kLabViewAvailable) {
@@ -10682,7 +10696,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         const bool arcade_code = built_in == user_gecko::kArcadeHitboxCodeLabel;
         const bool runs_here = (c.supported && !built_in) || arcade_code;
         ImGui::BeginDisabled(!runs_here);
-        if (settings_toggle(c.name.c_str(), &c.enabled) && runs_here) { changed = true; g_gecko_chosen = true; }
+        if (settings_toggle(c.name.c_str(), &c.enabled) && runs_here) { c.wanted = c.enabled; changed = true; g_gecko_chosen = true; }
         ImGui::EndDisabled();
         if (arcade_code) {
           if (ImGui::IsItemHovered())
@@ -10693,7 +10707,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         else if (!runs_here)
           engine_only_reason("Cannot run in this build: this code %s.", c.reason.c_str());
         else if (ImGui::IsItemHovered())
-          ImGui::SetTooltip("Writes game variables only, so it runs here.\nNever applied online.");
+          ImGui::SetTooltip("%s\nNever applied online.",
+                            c.fn_bytes.empty() ? "Writes game variables only, so it runs here."
+                                               : "Only makes a game function give a fixed answer, which this build does too.");
         ImGui::PopID();
       }
     }
@@ -10717,7 +10733,8 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         const bool arcade_code = built_in == user_gecko::kArcadeHitboxCodeLabel;
         const bool runs_here = (c.supported && !built_in) || arcade_code;
         ImGui::BeginDisabled(!runs_here);
-        if (settings_toggle(c.name.c_str(), &c.enabled) && runs_here) { changed = true; g_gecko_chosen = true; }
+        // A code that cannot run here shows the switch it keeps for the Static Recomp.
+        if (settings_toggle(c.name.c_str(), runs_here ? &c.enabled : &c.wanted) && runs_here) { c.wanted = c.enabled; changed = true; g_gecko_chosen = true; }
         ImGui::EndDisabled();
         if (arcade_code) {
           if (ImGui::IsItemHovered())
@@ -10726,11 +10743,30 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         } else if (built_in)
           engine_only_reason("Built into the Source Port: \"%s\" is the switch that applies here.\n"
                              "This one is your setting for the Static Recomp.", built_in);
-        else if (!runs_here)
+        else if (!runs_here) {
           engine_only_reason("Cannot run on the Source Port: this code %s.\n"
                              "It keeps its setting for the Static Recomp.", c.reason.c_str());
+          // The way to play with it: the Static Recomp runs every Gecko code. One click turns the code
+          // on, picks that engine in the launcher and starts the game again on it.
+          if (!g_settings_standalone && host::engine_switch_available()) {
+            // Its own line: the switch above fills the row.
+            ImGui::Indent(12.0f);
+            const bool clicked = ImGui::SmallButton("Play on the Static Recomp");
+            ImGui::Unindent(12.0f);
+            if (clicked) {
+              c.wanted = true; g_gecko_chosen = true; changed = true;
+              g_settings_engine_switch = true; g_settings_restart_asked = true;
+            }
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip("Turns this code on and restarts the game on the Static Recomp engine, which runs\n"
+                                "every Gecko code. The launcher keeps that engine for your next Play; pick the\n"
+                                "Source Port there to come back.");
+          }
+        }
         else if (ImGui::IsItemHovered())
-          ImGui::SetTooltip("Writes game variables only, so it runs on the Source Port too.\nNever applied online or in replays.");
+          ImGui::SetTooltip("%s\nNever applied online or in replays.",
+                            c.fn_bytes.empty() ? "Writes game variables only, so it runs on the Source Port too."
+                                               : "Only makes a game function give a fixed answer, which the Source Port does too.");
         ImGui::PopID();
       }
     }
@@ -10764,7 +10800,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Remove this code.");
         ImGui::SameLine();
         ImGui::BeginDisabled(!c.supported);
-        if (settings_toggle(c.name.c_str(), &c.enabled)) { changed = true; g_gecko_chosen = true; }
+        if (settings_toggle(c.name.c_str(), &c.enabled)) { c.wanted = c.enabled; changed = true; g_gecko_chosen = true; }
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
           std::string tip;
@@ -10856,21 +10892,28 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, screen.y * 0.5f), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
       if (ImGui::BeginPopupModal(restart ? "Restart game?" : "Quit game?", nullptr,
                                  ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
-        ImGui::TextUnformatted(restart ? "Restart now? The current match will end."
-                                       : "Quit now? The current match will end.");
-        if (!state.saved) ImGui::TextDisabled("Unsaved changes in this panel will be lost.");
+        const bool engine_switch = restart && g_settings_engine_switch;
+        ImGui::TextUnformatted(engine_switch ? "Restart on the Static Recomp? The current match will end."
+                               : restart     ? "Restart now? The current match will end."
+                                             : "Quit now? The current match will end.");
+        if (!state.saved && !engine_switch) ImGui::TextDisabled("Unsaved changes in this panel will be lost.");
         ImGui::Separator();
         if (settings_widgets::Button(restart ? "Restart" : "Quit", ImVec2(110, 0))) {
           state.confirm = SettingsState::Confirm::None;
           ImGui::CloseCurrentPopup();
           // The new process reads its settings from the file: an unsaved choice (the look or audio
-          // driver this restart is for) is written first.
-          if (restart && state.dirty) { state.dirty = false; state.saved = write_settings_file(state, options); }
-          if (restart) host::request_restart(); else host::request_exit(0);
+          // driver this restart is for, the code switched on for the Static Recomp) is written first.
+          if (restart && (state.dirty || engine_switch)) { state.dirty = false; state.saved = write_settings_file(state, options); }
+          g_settings_engine_switch = false;
+          if (engine_switch) {
+            if (!host::request_engine_switch()) g_settings_save_error = "Could not ask the launcher to switch engines. Pick the Static Recomp there and press Play.";
+          } else if (restart) host::request_restart();
+          else host::request_exit(0);
         }
         ImGui::SameLine();
         if (settings_widgets::Button("Cancel", ImVec2(110, 0))) {
           state.confirm = SettingsState::Confirm::None;
+          g_settings_engine_switch = false;
           ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
@@ -11187,9 +11230,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       // Render latency: works whether or not Reflex's low-latency mode is on, so Native has a number
       // to show too (and something to compare "On" against). The breakdown adds up to roughly the
       // total; osRenderQueue and driver overlap the other stages a little, per NVIDIA's own report.
-      if (streamline::reflex_available()) {
+      // Vulkan on NVIDIA publishes the same report (VK_NV_low_latency2) without Streamline.
+      const bool reflex_here = streamline::reflex_available();
+      if (reflex_here || streamline::reflex_latency_ms() > 0.0f) {
         const float lat = streamline::reflex_latency_ms();
-        ImGui::Text("Render latency: %.2f ms%s", lat, options.reflex_mode == 0 ? " (Reflex off)" : "");
+        ImGui::Text("Render latency: %.2f ms%s", lat, reflex_here && options.reflex_mode == 0 ? " (Reflex off)" : "");
         ImGui::PlotLines("##latency", state.latencies.data(), (int)state.latencies.size(),
                          state.latency_cursor % state.latencies.size(), nullptr, 0, std::max(8.0f, lat * 2.0f), ImVec2(plot_w, 60));
         const streamline::ReflexBreakdown b = streamline::reflex_breakdown();
