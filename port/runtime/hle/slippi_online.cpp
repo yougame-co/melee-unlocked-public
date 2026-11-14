@@ -3184,9 +3184,9 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
       // The plain query is the Online menu opening: a game started on its own looks for YouGame again.
       if (payload_len == 0) yougame::online_menu_opened();
       // 0x20: the first row picked while YouGame is Coming soon: open the installed app, else the download page.
+      // 0x10: older menus' Coming soon stickers; none are drawn since build 98.2 (the rows look the same
+      // connected or not).
       if (payload_len == 1 && (payload[0] & 0xF0) == 0x10) {
-        coming_soon_overlay::first_row_text(yougame::first_row_text());
-        coming_soon_overlay::showing();
       } else if (payload_len == 1 && payload[0] == 0x20) {
         if (yougame::coming_soon()) yougame::first_row_picked();
       } else if (payload_len == 1 && payload[0] == 3) {

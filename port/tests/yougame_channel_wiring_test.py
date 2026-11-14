@@ -80,9 +80,9 @@ closed = re.search(r"void channel_closed\(.*?\n\}", link, re.S)
 need(closed is not None and re.search(r"if \(g_channel != conn\) return;.*?std::lock_guard<std::mutex> io\(g_io.mutex\);\s*g_io.eof = true;\s*\}",
                                        closed.group(0), re.S) is not None,
      "channel_closed checks the connection and sets eof in one critical section")
-# The menu file: both copies from the run's rule, one copy per load.
+# The menu file: since build 98.2 the rows are never greyed (one copy, the same connected or not).
 host = read("port/app/source_host.cpp")
-need("yougame::coming_soon_build()" in host and "if (at == 0 || !f.serving)" in host, "menu copies built once, picked per load")
+need("const bool soon = false;" in host and "if (at == 0 || !f.serving)" in host, "menu rows never greyed")
 
 # Logs: one line per probe result, never a token.
 for line in ("yougame channel: none", "yougame channel: connected ", "yougame channel: refused ",

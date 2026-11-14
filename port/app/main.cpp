@@ -1623,8 +1623,13 @@ static int guarded_main(int argc, char** argv) {
   }
 }
 #ifdef _WIN32
+#include "standalone_launch_win.h"
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   attach_parent_console();
+#ifdef MELEE_SOURCE_PORT
+  // A plain double-click (no arguments at all): find the player's disc and start like MeleeUnlocked.bat.
+  if (__argc == 1) return standalone_launch::run();
+#endif
   return guarded_main(__argc, __argv);
 }
 #endif
@@ -1925,6 +1930,8 @@ static int melee_main(int argc, char** argv) {
   // Started on its own: look for a running YouGame app on a background thread (yougame_channel.h). The
   // settings window's standby process never does: only the game holds a connection.
   if (!settings_window_only) yougame::start_channel(automated);
+  // YouGame's start hook, before the game window exists (its window must never sit behind ours).
+  if (!settings_window_only) yougame::start_hook_at_boot(automated);
   gfx.pc_settings = !automated;
   // In YouGame's player box the app reports a stop from the exit code; a dialog there only kept the
   // process alive behind the frozen picture (yougame_mode_policy.h). The report files are still written.

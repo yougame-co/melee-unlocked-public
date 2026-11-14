@@ -131,6 +131,11 @@ enum { YG_APP_RANKED = 1, YG_SPLIT = 2, YG_ROWS_OPEN = 4, YG_HEADER = 8, YG_OPEN
 /* Started for a YouGame mode (--online-mode): the boot menu confirms that row by itself, like the
  * P2P session's Direct (set at the boot entry, cleared by the menu's think before any match). */
 static int auto_slot = -1;
+/* A YouGame row picked while YouGame is not connected yet (YG_COMING_SOON): the host runs YouGame's
+ * start hook (CMD_YOUGAME_MENU 0x20) and the menu confirms this row by itself once the rows open.
+ * Menu-only, like auto_slot. -1: none. */
+static int yg_wait_slot = -1;
+static unsigned yg_wait_frames;
 static int yg_open;           /* YG_OPEN_* from the first answer that carried it (the host answers it once) */
 enum { SPLIT_SLIPPI = 3, SPLIT_FIRST_SLIPPI = 4 };
 /* The split layout's rows as Slippi mode ids; rows 0-2 are YouGame's, row 3 opens Slippi's page. */
@@ -144,20 +149,15 @@ static int split_layout(void) { return !ranked_supported && (yg_flags & YG_SPLIT
 static int split_start_page(void)
 {
     if (yg_flags & YG_COMING_SOON) {
-        return 0;   /* everyone sees YouGame's rows marked Coming soon; the cursor starts on Slippi */
+        return 0;   /* YouGame's rows, the same as when it is connected */
     }
     return !(yg_flags & YG_ROWS_OPEN) && slp.app_state == MU_SLP_APP_LOGGED_IN ? 1 : 0;
 }
-/* YouGame is not open yet: its rows stay on the menu (a locked row would vanish from it), their
- * labels greyed out with a Coming soon sticker over them, and the cursor never stops on them. */
+/* YouGame is not connected yet: its rows look and move exactly as when it is (same labels, never
+ * greyed, no stickers). Picking one asks the host to start YouGame, then continues into that row. */
 static int yougame_soon(void) { return split_layout() && (yg_flags & YG_COMING_SOON) != 0; }
 static int cursor_stops(int sel)
 {
-    /* Row 0 reads "Get YouGame" while the app is not found: the cursor stops there and A opens the
-     * YouGame download page (the host, CMD_YOUGAME_MENU 0x20). Rows 1 and 2 stay Coming soon. */
-    if (yougame_soon() && split_page == 0 && sel < SPLIT_SLIPPI && sel != 0) {
-        return 0;
-    }
     return mn_80229938(MENU_KIND_8, sel);
 }
 /* Direct's row: the P2P session menu confirms it by itself (Slippi Direct in the split layout). */
@@ -680,7 +680,7 @@ int mu_slippi_option_unlocked(int sel)
     if (split_layout()) {
         if (split_page == 0) {
             if (sel < SPLIT_SLIPPI) {
-                /* YouGame: the launcher's account, or shown greyed out as Coming soon */
+                /* YouGame: the launcher's account, or not connected yet (picking starts YouGame) */
                 return (yg_flags & (YG_ROWS_OPEN | YG_COMING_SOON)) != 0;
             }
             return sel == SPLIT_SLIPPI;   /* Slippi: its page, or its log in / update */
@@ -709,10 +709,6 @@ int mu_slippi_first_unlocked(void)
     int i;
     int count = mn_803EB6B0[MENU_KIND_8].selection_count;
     if (ranked_supported) return !slippi_submenu && !ranked_offered ? MU_YG_ROW_UNRANKED : 0;
-    /* Coming soon: the cursor starts on Slippi, the first row that does something. */
-    if (yougame_soon() && split_page == 0) {
-        return SPLIT_SLIPPI;
-    }
     /* The split layout: the first open row of the page shown. */
     for (i = split_layout() ? 0 : MU_SLP_MODE_UNRANKED; i < count; i++) {
         if (mn_80229938(MENU_KIND_8, i)) {
@@ -1025,6 +1021,22 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         input[port][2] = gm_801A36C0((u8) port);
     }
     buttons = mn_80229624(4);
+    if (yg_wait_slot >= 0) {
+        /* A YouGame row was picked before YouGame was connected: look again about once a second and
+         * confirm that row by itself once the rows open. Moving off it or leaving the menu cancels. */
+        if (mn_804A04F0.cur_menu != MENU_KIND_8 || split_page != 0 ||
+            mn_804A04F0.hovered_selection != yg_wait_slot || ++yg_wait_frames > 60u * 180u) {
+            yg_wait_slot = -1;
+        } else if (yg_wait_frames % 60u == 0) {
+            int flags = yougame_query(-1, NULL, 0);
+            if (flags & YG_ROWS_OPEN) {
+                yg_flags = flags;
+                auto_slot = yg_wait_slot;
+                yg_wait_slot = -1;
+                OSReport("online menu: YouGame is connected; continuing into row %d\n", auto_slot);
+            }
+        }
+    }
     if (auto_slot >= 0 && accepts_input) {
         /* Once: confirm the YouGame row the launcher started this game for. */
         mn_804A04F0.hovered_selection = (u8) auto_slot;
@@ -1150,10 +1162,6 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
     selected_row = mn_804A04F0.hovered_selection;
     selected_option = mu_slippi_menu_option(selected_row);
     mn_804A04F0.buttons = buttons;
-    if (yougame_soon() && split_page == 0 && mn_804A04F0.cur_menu == MENU_KIND_8) {
-        /* The host draws the Coming soon stickers while this page is on screen. */
-        yougame_query(0x10 | (mn_804A04F0.hovered_selection & 3), NULL, 0);
-    }
     if ((buttons & MenuInput_Confirm) && ranked_supported && tournament_offered &&
         selected_option == MU_SLP_OPT_TOURNAMENT) {
         tournament_query(MU_TOURNEY_JOIN);
@@ -1193,12 +1201,16 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         slippi_link_notice = 1;
         mu_slippi_signin_notice(gp);
     } else if ((buttons & MenuInput_Confirm) && yougame_soon() && split_page == 0 &&
-               mn_804A04F0.hovered_selection == 0) {
-        /* Get YouGame: the host opens the download page in the browser; the menu stays. Coming back
-         * to the Online menu looks for the app again (the plain query), and the rows open once found. */
+               mn_804A04F0.hovered_selection < SPLIT_SLIPPI) {
+        /* Ranked, Unranked or Friends while YouGame is not connected: the host runs YouGame's start
+         * hook (YouGame's own small window when it is not on this computer); the menu stays on the row
+         * and continues into it once YouGame is connected and the rows open. */
+        yg_wait_slot = mn_804A04F0.hovered_selection;
+        yg_wait_frames = 0;
         yougame_query(0x20, NULL, 0);
         mn_804D6BC8.cooldown = 30;
         sfxForward();
+        OSReport("online menu: row %d picked before YouGame was connected; starting YouGame\n", yg_wait_slot);
     } else if (buttons & MenuInput_Confirm) {
         mn_804D6BC8.cooldown = 5;
         mn_804A04F0.entering_menu = 1;

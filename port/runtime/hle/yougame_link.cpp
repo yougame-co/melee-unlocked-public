@@ -82,6 +82,10 @@ extern char** environ;
 
 using json = nlohmann::json;
 
+// YouGame's start hook (MIT, YouGame's engines/native): Windows only; elsewhere yg_start answers UNAVAILABLE.
+#define YOUGAME_START_IMPLEMENTATION
+#include "../../third_party/yougame_start/yougame_start.h"
+
 namespace yougame {
 namespace {
 std::timed_mutex g_tourney_mutex;
@@ -2738,10 +2742,61 @@ bool open_app(const char* why) {
 }
 }  // namespace
 
+namespace {
+// Agent, hidden and test runs never show YouGame's window or open anything (YOUGAME_START_QUIET=1 too).
+// MELEE_TEST_YOUGAME_START=1: a test that wants the real window.
+bool start_hook_quiet(bool automated) {
+  if (host::test_env::getenv("MELEE_TEST_YOUGAME_START")) return false;
+  return automated || g_automated_run.load() || host::test_env::agent_copy() || !g_channel_allowed ||
+         host::test_env::getenv("MELEE_NO_GC_ADAPTER") != nullptr;
+}
+const char* start_result_name(int r) {
+  switch (r) {
+    case YG_START_RUNNING: return "running";
+    case YG_START_OPENED: return "opened";
+    case YG_START_OFFERED: return "offered, Get YouGame pressed";
+    case YG_START_DECLINED: return "offered, Not now";
+    case YG_START_UNAVAILABLE: return "unavailable";
+    case YG_START_INSTALLED: return "installed, not running";
+    case YG_START_MISSING: return "not on this computer";
+    default: return "?";
+  }
+}
+// YouGame's start hook (yougame_start.h): YouGame running, nothing; not on this computer, YouGame's own
+// small window (Get YouGame / Not now). Installed but not running: the same window with its "YouGame
+// didn't open" words, and nothing is opened (a standalone game never brings up YouGame's
+// client window; it opens a hidden tray YouGame once the app has one). Blocks while YouGame's window is
+// up, so it never runs on the game's frame.
+int run_start_hook(const char* why, bool automated) {
+  yg_start_options o{};
+  o.game = "melee-unlocked";
+  o.staging = 1;
+  o.quiet = 1;   // first only look
+  o.no_open = 1; // installed but not running: the offer window, never the client window
+  int r = yg_start(&o);
+  const bool quiet = start_hook_quiet(automated);
+  if ((r == YG_START_MISSING || r == YG_START_INSTALLED) && !quiet) {
+    o.quiet = 0;
+    r = yg_start(&o);
+  }
+  host::log("yougame: start hook (%s): %s%s", why, start_result_name(r), quiet ? " (quiet run)" : "");
+  return r;
+}
+}  // namespace
+
+void start_hook_at_boot(bool automated) {
+  // The app started this game (its rows are open from the start), or a build without the hook.
+  if (active() || g_launcher || !coming_soon_build()) return;
+  run_start_hook("game start", automated);
+}
+
 void online_menu_opened() {
   // Never waits: this runs on the game's frame. A host found now opens the rows on the next visit.
   start_channel_probe(false);
   if (!coming_soon()) return;
+#ifdef _WIN32
+  return;   // the start hook ran at game start; the client window is never opened from here
+#endif
   // YouGame installed but not running: open it once per run by itself (the first row offers it again).
   std::thread([] {
     if (!app_installed_now() || g_app_auto_opened.load()) return;
@@ -2763,6 +2818,23 @@ void open_get_page() {
   host::log(ok ? "yougame: Get YouGame picked: download page opened" : "yougame: Get YouGame picked: download page could not be opened");
 }
 void first_row_picked() {
+#ifdef _WIN32
+  // Ranked, Unranked or Friends before YouGame was connected: YouGame's start hook, off the game's
+  // frame, then look for YouGame's channel every second for a minute (the Online menu keeps looking
+  // after that and continues into the row once the rows open).
+  std::thread([] {
+    bool idle = false;
+    if (!g_app_opening.compare_exchange_strong(idle, true)) return;   // one at a time
+    run_start_hook("online row picked", false);
+    for (int i = 0; i < 60 && !g_channel_up.load(); ++i) {
+      start_channel_probe(true);
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    if (g_channel_up.load()) host::log("yougame: YouGame answered");
+    g_app_opening = false;
+  }).detach();
+  return;
+#endif
   // Off the game's frame: an installed app is opened, otherwise the download page.
   std::thread([] {
     if (app_installed_now()) {

@@ -340,7 +340,8 @@ def main():
     for package in sorted(packages):
         copyright_file = Path('/usr/share/doc') / package / 'copyright'
         if copyright_file.is_file():
-            shutil.copy2(copyright_file, licenses / f'lib-{package}.txt')
+            shutil.copyfile(copyright_file, licenses / f'lib-{package}.txt')
+            os.chmod(licenses / f'lib-{package}.txt', 0o644)   # a build host's doc files can be 0777 (GitHub Actions runner)
     # librashader (shader presets), loaded at run time with dlopen, so ldd does not list it. Built from
     # its source tag (port/third_party/librashader/README.txt); without it the presets are off.
     rashader = ROOT / 'port/third_party/librashader/bin/librashader.so'
@@ -456,6 +457,11 @@ def main():
     tools.mkdir()
     for wanted, names in (('7zr', ('7zz', '7zr', '7za', '7z')), ('xdelta3', ('xdelta3',))):
         found = next((shutil.which(n) for n in names if shutil.which(n)), None)
+        if found and open(found, 'rb').read(2) == b'#!':
+            # Debian's 7zip installs 7zr as a two-line sh wrapper around /usr/lib/7zip/7zr: it only works where that
+            # path exists, so a wrapper is never shipped (build 98 on Actions carried one).
+            print(f'warning: {found} is a script wrapper, not a program; {wanted} not bundled')
+            found = None
         if found:
             shutil.copy2(found, tools / wanted)
             for soname, path in ldd(found).items():

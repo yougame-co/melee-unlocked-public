@@ -80,6 +80,10 @@ void online_menu_opened();
 // MELEE_TEST_YOUGAME_GET_PAGE=1. Never waits on the game's frame.
 void open_get_page();
 void first_row_picked();
+// Game start (main, after start_channel): YouGame's start hook (yougame_start.h) for a game nothing
+// started. YouGame running: nothing. Not on this computer: YouGame's own small window, before the game
+// window. Installed but not running: that window too, never the client window. Quiet in agent, hidden and test runs.
+void start_hook_at_boot(bool automated);
 const char* first_row_text();
 bool channel_connected();
 // The current search or match is a YouGame one: always in the app, and under the launcher from the

@@ -1144,7 +1144,8 @@ void load_system_files(const char* forced_off_by) {
     if (!yougame::active() && (std::strcmp(name, "MnMaAll.usd") == 0 || std::strcmp(name, "MnMaAll.dat") == 0)) {
       std::string why;
       // Both copies from the run's rule, never from the channel's state at this moment.
-      const bool soon = yougame::coming_soon_build();
+      // Since build 98.2 the rows are never greyed: one copy, the same connected or not.
+      const bool soon = false;
       if (soon) {
         open = data;
         if (!online_rows::apply(open, nullptr, false)) open.clear();
