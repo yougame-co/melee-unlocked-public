@@ -82,9 +82,15 @@ extern char** environ;
 
 using json = nlohmann::json;
 
-// YouGame's start hook (MIT, YouGame's engines/native): Windows only; elsewhere yg_start answers UNAVAILABLE.
+// YouGame's start hook (MIT, YouGame's engines/native, claude/v2 bda1b5152). Built on Windows only for now:
+// elsewhere yg_start answers UNAVAILABLE, as in build 98, until the macOS and Linux paths are checked.
+#ifdef _WIN32
 #define YOUGAME_START_IMPLEMENTATION
+#endif
 #include "../../third_party/yougame_start/yougame_start.h"
+#ifndef _WIN32
+extern "C" yg_start_result yg_start(const yg_start_options*) { return YG_START_UNAVAILABLE; }
+#endif
 
 namespace yougame {
 namespace {
@@ -2763,16 +2769,17 @@ const char* start_result_name(int r) {
   }
 }
 // YouGame's start hook (yougame_start.h): YouGame running, nothing; not on this computer, YouGame's own
-// small window (Get YouGame / Not now). Installed but not running: the same window with its "YouGame
-// didn't open" words, and nothing is opened (a standalone game never brings up YouGame's
-// client window; it opens a hidden tray YouGame once the app has one). Blocks while YouGame's window is
-// up, so it never runs on the game's frame.
+// small window (Get YouGame / Not now). Installed but not running: YouGame 0.13.1407 or newer is started
+// hidden in the tray (signed program at its install folder, never when the game runs as administrator);
+// an older one gets the small window saying it needs an update (a standalone game never
+// brings up YouGame's client window). Blocks while YouGame's window is up, so it never runs on the
+// game's frame.
 int run_start_hook(const char* why, bool automated) {
   yg_start_options o{};
   o.game = "melee-unlocked";
   o.staging = 1;
   o.quiet = 1;   // first only look
-  o.no_open = 1; // installed but not running: the offer window, never the client window
+  o.tray_from = "0.13.1407"; // the first YouGame that starts hidden in the tray
   int r = yg_start(&o);
   const bool quiet = start_hook_quiet(automated);
   if ((r == YG_START_MISSING || r == YG_START_INSTALLED) && !quiet) {
