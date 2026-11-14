@@ -1,4 +1,4 @@
-# Melee Unlocked: YouGame's version
+# YouGame's Melee Unlocked
 
 This is YouGame's build of **Melee Unlocked**, Hero's native PC version of Super Smash Bros. Melee (NTSC 1.02).
 Melee Unlocked is Hero's work, together with its contributors: <https://github.com/Hero88go/melee-unlocked>.
