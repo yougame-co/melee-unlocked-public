@@ -1,10 +1,14 @@
 // Slippi Online networking (see slippi_net.h). Wire-compatible port of Dolphin's
 // SlippiNetplayClient, SlippiMatchmaking and the user record.
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "slippi_agent_lock.h"
 #include "test_env.h"
 #include "slippi_net.h"
 #include "slippi_address.h"
 #include "slippi_netplay_receive.h"
+#include "slippi_gone_port.h"
+#include "slippi_port_inputs.h"
+#include "yougame_lobby_setup.h"
 #include "slippi_online.h"
 #include "slippi_report.h"
 #include "slippi_account.h"
@@ -197,12 +201,13 @@ User::User(std::string user_dir, bool slippi_only) : dir_(std::move(user_dir)), 
   if (AttemptLogin() && !host::test_env::agent_copy()) RefreshFromServer();
 }
 std::unique_ptr<User> User::GrantedSlippiUser(const std::string& user_dir) {
+  if (agent_lock::blocked(agent_lock::Operation::Login)) return nullptr;
   if (account::app_sign_in().empty()) return nullptr;
   auto user = std::make_unique<User>(user_dir, true);
   return user->IsLoggedIn() ? std::move(user) : nullptr;
 }
 void User::RefreshFromServer() {
-  if (host::test_env::agent_copy()) return;
+  if (agent_lock::blocked(agent_lock::Operation::Refresh)) return;
   if (refresh_.valid() && refresh_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
   UserInfo me = GetUserInfo();
   if (me.uid.empty()) return;
@@ -243,13 +248,32 @@ void User::RefreshFromServer() {
     }
   });
 }
+bool User::CheckSessionCompatibilityAt(uint64_t generation, std::string* error, VersionFetch fetch) {
+  // Matchmaking and the render thread's asynchronous poll can request the same check. Keep the
+  // network request off the render thread and share its result instead of repeating HTTP at
+  // queue entry, "connecting to player", and the first game's ready screen.
+  std::lock_guard<std::mutex> lock(compatibility_request_mutex_);
+  if (verified_generation_ != generation) {
+    const uint64_t start = time_ms();
+    verified_ok_ = CheckOnlineCompatibility(&verified_error_, fetch);
+    verified_generation_ = generation;
+    host::log("slippi: version verification %s in %llu ms", verified_ok_ ? "passed" : "refused",
+              (unsigned long long)(time_ms() - start));
+  }
+  *error = verified_error_;
+  return verified_ok_;
+}
+bool User::CheckSessionCompatibility(std::string* error, VersionFetch fetch) {
+  return CheckSessionCompatibilityAt(compatibility_generation_.load(), error, fetch);
+}
 int User::PollOnlineCompatibility(std::string* error, VersionFetch fetch) {
+  if (agent_lock::blocked(agent_lock::Operation::Version)) { *error = agent_lock::refusal; return -1; }
   if (!compatibility_done_) {
     if (!compatibility_.valid()) {
-      const uint64_t generation = compatibility_generation_;
+      const uint64_t generation = compatibility_generation_.load();
       compatibility_ = std::async(std::launch::async, [this, fetch, generation] {
         std::string reason;
-        const bool ok = CheckOnlineCompatibility(&reason, fetch);
+        const bool ok = CheckSessionCompatibilityAt(generation, &reason, fetch);
         return VersionResult{ok, std::move(reason), generation};
       });
     }
@@ -264,6 +288,7 @@ int User::PollOnlineCompatibility(std::string* error, VersionFetch fetch) {
   return compatibility_ok_ ? 1 : -1;
 }
 bool User::CheckOnlineCompatibility(std::string* error, VersionFetch fetch) {
+  if (agent_lock::blocked(agent_lock::Operation::Version)) { *error = agent_lock::refusal; return false; }
   *error = "Could not check Slippi version. Try again.";
   const auto failed = [](const char* step, unsigned long code) {
     host::log("slippi: version check failed: %s %lu", step, code);
@@ -276,9 +301,13 @@ bool User::CheckOnlineCompatibility(std::string* error, VersionFetch fetch) {
     // Launcher keeps current, or the profile refresh). One failed request used to block online
     // play outright for a player whose network or Windows refused this request. No known
     // version at all still blocks. Each failed try logs its step.
+    // A server that failed all three tries once this session gets one try after that: every search
+    // waited out three timeouts (up to a minute) before it could start.
+    static std::atomic<bool> unreachable{false};
     std::string latest;
     int status = 0;
-    for (int attempt = 0; attempt < 3 && latest.empty(); ++attempt) {
+    const int tries = unreachable.load() ? 1 : 3;
+    for (int attempt = 0; attempt < tries && latest.empty(); ++attempt) {
       if (attempt) std::this_thread::sleep_for(std::chrono::milliseconds(700));
       std::string response;
       status = 0;
@@ -294,8 +323,25 @@ bool User::CheckOnlineCompatibility(std::string* error, VersionFetch fetch) {
       if (release_version_valid(v)) latest = v;
       else failed("latest-version", 0);
     }
+    unreachable.store(latest.empty() && !fetch);   // tests pass their own transport: always three tries
+    const std::filesystem::path cache = std::filesystem::u8path(dir_) / "version-check.json";
     if (latest.empty()) {
-      const std::string known = me.latest_version;
+      // The last answer the server gave this game (kept below, three days at most) and the
+      // account's own, whichever is newer.
+      std::string known = me.latest_version;
+      {
+        std::ifstream in(cache, std::ios::binary);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const json saved = json::parse(text, nullptr, false);
+        const std::string v = saved.is_object() ? str_or(saved, "latestVersion", "") : std::string();
+        const json* checked = json_member(saved, "checkedAt");
+        const int64_t at = checked && checked->is_number_integer() ? checked->get<int64_t>() : 0;
+        const int64_t now = (int64_t)std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count();
+        if (release_version_valid(v) && now - at >= 0 && now - at < 3 * 24 * 3600 &&
+            (!release_version_valid(known) || version_newer(v, known)))
+          known = v;
+      }
       if (!release_version_valid(known)) {
         host::log("slippi: the version check did not answer (HTTP %d) and the account has no known version", status);
         return false;
@@ -314,6 +360,14 @@ bool User::CheckOnlineCompatibility(std::string* error, VersionFetch fetch) {
       if (info_.uid != me.uid) return failed("account-changed", 0);
       info_.latest_version = latest;
     }
+    {
+      std::error_code ec;
+      std::filesystem::create_directories(cache.parent_path(), ec);
+      std::ofstream out(cache, std::ios::trunc);
+      out << json{{"latestVersion", latest},
+                  {"checkedAt", (int64_t)std::chrono::duration_cast<std::chrono::seconds>(
+                                    std::chrono::system_clock::now().time_since_epoch()).count()}}.dump();
+    }
     if (version_newer(latest, SLIPPI_SEMVER)) {
       *error = "Slippi " + latest + " is out. Update Melee Unlocked";
       return failed("update-required", 0);
@@ -321,6 +375,22 @@ bool User::CheckOnlineCompatibility(std::string* error, VersionFetch fetch) {
     error->clear();
     return true;
   } catch (...) { return failed("exception", 0); }
+}
+
+// An agent copy never signs in, but its check still needs to see the app's hand-off: say whether
+// the granted file is there, without opening or following it, once per change.
+static void note_agent_grant() {
+  static std::mutex grant_mutex;
+  static std::string grant_seen = "unset";
+  const auto grant = account::app_sign_in();
+  std::error_code ec;
+  const char* state = grant.empty() ? "unset"
+      : std::filesystem::is_regular_file(std::filesystem::symlink_status(grant, ec)) ? "present" : "missing";
+  std::lock_guard<std::mutex> lock(grant_mutex);
+  if (grant_seen != state) {
+    grant_seen = state;
+    if (grant_seen != "unset") host::log("slippi: app sign-in file %s (agent copy, not used)", state);
+  }
 }
 
 bool User::AttemptLogin(bool rediscover) {
@@ -331,6 +401,7 @@ bool User::AttemptLogin(bool rediscover) {
     const yougame::Identity id = yougame::identity();
     std::lock_guard<std::mutex> lock(mutex_);
     const bool had = !info_.uid.empty();
+    if (info_.uid != id.player_id) ResetOnlineCompatibility();
     info_ = UserInfo();
     info_.uid = id.player_id;
     info_.play_key = "yougame";
@@ -341,7 +412,8 @@ bool User::AttemptLogin(bool rediscover) {
     if (id.ok && !had) host::log("slippi: YouGame player %s (%s)", info_.display_name.c_str(), info_.connect_code.c_str());
     return true;
   }
-  if (host::test_env::agent_copy()) return false;
+  if (yougame::active() && agent_lock::blocked(agent_lock::Operation::Login)) note_agent_grant();
+  if (agent_lock::blocked(agent_lock::Operation::Login)) return false;
   account::Profile profile;
   if (yougame::active()) {
     // Even slippi_only callers must never discover an ambient account in an app launch.
@@ -356,6 +428,7 @@ bool User::AttemptLogin(bool rediscover) {
     profile = account::read(account_file_);
   }
   std::lock_guard<std::mutex> lock(mutex_);
+  const std::string previous_uid = info_.uid, previous_key = info_.play_key;
   if (profile) {
     const json& j = profile.data;
     info_.uid = str_or(j, "uid", "");
@@ -374,9 +447,10 @@ bool User::AttemptLogin(bool rediscover) {
     info_ = UserInfo();
     logged_in_ = false;
   }
+  if (info_.uid != previous_uid || info_.play_key != previous_key) ResetOnlineCompatibility();
   return logged_in_;
 }
-void User::LogOut() { std::lock_guard<std::mutex> lock(mutex_); logged_in_ = false; info_ = UserInfo(); host::log("slippi: logged out (user.json left in place)"); }
+void User::LogOut() { std::lock_guard<std::mutex> lock(mutex_); ResetOnlineCompatibility(); logged_in_ = false; info_ = UserInfo(); host::log("slippi: logged out (user.json left in place)"); }
 std::vector<std::string> User::GetUserChatMessages() const { UserInfo me = GetUserInfo(); return me.chat_messages.size() == 16 ? me.chat_messages : GetDefaultChatMessages(); }
 std::vector<std::string> User::GetDefaultChatMessages() {
   return {"ggs", "one more", "brb", "good luck", "well played", "that was fun", "thanks", "too good",
@@ -417,7 +491,20 @@ void DirectCodes::AddOrUpdateCode(const std::string& code) {
 
 // ---------------------------------------------------------------- netplay client
 NetplayClient::NetplayClient(std::vector<std::string> addrs, std::vector<uint16_t> ports, uint8_t remote_player_count, uint16_t local_port,
-                             bool is_decider, uint8_t player_idx, bool own_udp, std::vector<std::string> public_fallbacks) {
+                             bool is_decider, uint8_t player_idx, bool own_udp, std::vector<std::string> public_fallbacks
+#if MU_SQUAD
+                             // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+                             , bool squad_search, MuSquadSide squad_side, bool squad_friend_room
+#endif
+                             , const yougame::lobby::Plan* lobby_plan) {
+#if MU_SQUAD
+  // MU_BUILD advertises exactly the chosen search. Only a friend room may turn squads on later,
+  // when the friend's build says they picked Squad Strike (NP_MSG_MU_BUILD below).
+  squad_search_ = squad_search && remote_player_count == 1 && player_idx < 2;
+  squad_friend_room_ = squad_friend_room && remote_player_count == 1 && player_idx < 2;
+  squad_local_ = squad_side;
+  if (squad_search_ && squad_friend_room_) host::log("squad: friend room squad mode (picked on the Squad Strike row)");
+#endif
   public_fallbacks_ = std::move(public_fallbacks);
   host::log("slippi: netplay client: decider %d, player index %u, %u remote players", is_decider, player_idx, remote_player_count);
   is_decider_ = is_decider;
@@ -438,6 +525,23 @@ NetplayClient::NetplayClient(std::vector<std::string> addrs, std::vector<uint16_
     match_info_.remote[i] = PlayerSelections();
     match_info_.remote[i].player_idx = (uint8_t)j;
     last_frame_acked_[i] = 0;
+  }
+  port_inputs_ = std::make_unique<PortInputs>();
+  port_inputs_->main = player_idx;
+  port_inputs_->humans = remote_player_count + 1;
+  if (lobby_plan && lobby_plan->ok) {
+    port_inputs_->humans = lobby_plan->humans;
+    machine_pad_format_ = lobby_plan->humans != lobby_plan->machines;
+    int remote = 0;
+    for (int port = 0; port < lobby_plan->humans; ++port) {
+      const auto& seat = lobby_plan->port[port];
+      port_inputs_->owner[port] = seat.local_index == 1 ? port - 1 : port;
+      if (seat.local_index == 0 && port != player_idx)
+        match_info_.remote[remote++].player_idx = uint8_t(port);
+    }
+    if (lobby_plan->machines != remote_player_count + 1 || lobby_plan->local_port != player_idx) {
+      status_.store(ConnectStatus::FAILED); return;
+    }
   }
   ENetAddress local_addr;
   ENetAddress* local = nullptr;
@@ -493,6 +597,16 @@ NetplayClient::NetplayClient(std::vector<std::string> addrs, std::vector<uint16_
   thread_ = std::thread(&NetplayClient::ThreadFunc, this);
 }
 
+int NetplayClient::RemotePortCount() const { return port_inputs_ ? port_inputs_->humans - 1 : 0; }
+int NetplayClient::SecondLocalPort() const { return port_inputs_ ? port_inputs_->partner(player_idx_) : -1; }
+bool NetplayClient::IsLocalVirtualPort(int index) const { return port_inputs_ && index >= 0 && index < RemotePortCount() && port_inputs_->virtual_local(index); }
+int NetplayClient::SenderPort(ENetPeer* peer) const {
+  for (const auto& connection : active_connections_)
+    for (const auto& entry : connection.second)
+      if (entry.first == peer && !entry.second.is_disconnected) return entry.second.player_idx;
+  return -1;
+}
+
 NetplayClient::~NetplayClient() {
   do_loop_.store(false);
   if (client_) wakeup_thread(client_);
@@ -506,12 +620,25 @@ void NetplayClient::OnData(Packet& packet, ENetPeer* peer) {
   uint8_t mid = 0;
   if (!(packet >> mid)) { host::log("slippi: empty netplay packet"); return; }
   switch (mid) {
+    case kMachinePadMessage:
     case NP_MSG_SLIPPI_PAD: {
       uint64_t cur_time = time_us();
-      int32_t frame, checksum_frame; uint32_t checksum; uint8_t packet_player_port;
-      if (!(packet >> frame) || !(packet >> packet_player_port) || !(packet >> checksum_frame) || !(packet >> checksum)) { host::log("slippi: pad packet too small"); break; }
+      int32_t frame = 0, checksum_frame = 0; uint32_t checksum = 0; uint8_t packet_player_port = 255;
+      const int sender = SenderPort(peer);
+      if (machine_pad_format_) {
+        if (mid != kMachinePadMessage) break;
+        // Sender is bound to the real connection. Header, ownership and both queues are checked
+        // together; one ACK only ever acknowledges both ports.
+        std::lock_guard<std::mutex> lk(pad_mutex_);
+        const auto got = port_inputs_->receive(packet.data(),packet.size(),sender);
+        if (!got.ok) break;
+        frame = got.frame; checksum_frame = got.checksum_frame; checksum = got.checksum;
+        packet_player_port = uint8_t(sender);
+      } else {
+        if (mid != NP_MSG_SLIPPI_PAD || !(packet >> frame >> packet_player_port >> checksum_frame >> checksum)) break;
+      }
       uint8_t pidx = PlayerIdxFromPort(packet_player_port);
-      if (pidx >= remote_player_count_) { host::log("slippi: pad packet with invalid player idx %u", pidx); break; }
+      if (pidx >= remote_player_count_) break;
       int conn_idx = 0;
       for (int i = 0; i < (int)server_.size(); ++i)
         if (peer->address.host == server_[i]->address.host && peer->address.port == server_[i]->address.port) { conn_idx = i; break; }
@@ -543,7 +670,8 @@ void NetplayClient::OnData(Packet& packet, ENetPeer* peer) {
       int64_t inputs_to_copy;
       {
         std::lock_guard<std::mutex> lk(pad_mutex_);
-        const auto received = receive::PadInputs(frame, packet.data(), packet.size(), remote_pad_queue_[pidx]);
+        const auto received = machine_pad_format_ ? receive::PadResult{1,receive::PadError::None}
+            : receive::PadInputs(frame, packet.data(), packet.size(), port_inputs_->pads[packet_player_port]);
         inputs_to_copy = received.inputs;
         if (received.error == receive::PadError::TooSmall) { host::log("slippi: pad packet too small for %lld inputs", (long long)inputs_to_copy); break; }
         if (received.error == receive::PadError::TooMany) { host::log("slippi: pad packet with too many frames (%lld)", (long long)inputs_to_copy); break; }
@@ -562,7 +690,7 @@ void NetplayClient::OnData(Packet& packet, ENetPeer* peer) {
       int32_t frame; uint8_t packet_player_port;
       if (!(packet >> frame) || !(packet >> packet_player_port)) { host::log("slippi: ack packet too small"); break; }
       uint8_t pidx = PlayerIdxFromPort(packet_player_port);
-      if (pidx >= remote_player_count_) break;
+      if (pidx >= remote_player_count_ || (machine_pad_format_ && SenderPort(peer) != packet_player_port)) break;
       last_frame_acked_[pidx] = std::max(last_frame_acked_[pidx], frame);
       auto& timers = ack_timers_[pidx];
       while (!timers.empty() && timers.front().frame < frame) timers.pop_front();
@@ -573,6 +701,8 @@ void NetplayClient::OnData(Packet& packet, ENetPeer* peer) {
       ping_sample_sum_us_.fetch_add(ping_us_[pidx], std::memory_order_relaxed);
       ping_sample_count_.fetch_add(1, std::memory_order_relaxed);
       if (pidx == 0) last_ping_ms_.store((uint32_t)(ping_us_[pidx] / 1000), std::memory_order_relaxed);
+      remote_ping_ms_[pidx].store((uint32_t)(ping_us_[pidx] / 1000), std::memory_order_relaxed);
+      remote_count_seen_.store(remote_player_count_, std::memory_order_relaxed);
       if (frame % 600 == 0 && pidx == 0) host::log("slippi: ping %llu ms", (unsigned long long)(ping_us_[0] / 1000));
       break;
     }
@@ -584,8 +714,51 @@ void NetplayClient::OnData(Packet& packet, ENetPeer* peer) {
         host::log("slippi: received selections from player %u (char %u color %u stage %u)", s->player_idx, s->character_id, s->character_color, s->stage_id);
         {
           std::scoped_lock lock(selection_mutex_, timing_mutex_, pad_mutex_);
-          receive::Selections(*s, match_info_.remote[idx], has_game_started_,
-            remote_pad_queue_[idx], early_pads_[idx]);
+#if MU_SQUAD
+        // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+        // Only a lock-in is judged: a friend room connects while both players are still choosing,
+        // and that first 0x82 carries no fighter and no lineup.
+        if (s->is_character_selected) squad_locked_seen_.store(true);
+        if ((squad_search_ || squad_peer_cap_.load()) && s->is_character_selected) {
+          // Only the peer's lineup is judged here. Ours may be mid-edit on a rematch CSS; our own
+          // SetMatchSelections refuses an invalid one, and SquadSetup uses what we transmitted.
+          const auto decision = mu_squad_decide(squad_advertised_.load() ? MU_SQUAD_CAP : 0,
+              squad_peer_cap_.load() ? MU_SQUAD_CAP : 0, squad_search_ ? 1 : 0, squad_peer_pending_);
+          if (decision == MU_SQUAD_CANCEL) {
+            // Never a silent 1v1: say on screen which side is missing what.
+            squad_cancel_text_.store(!squad_peer_cap_.load() && squad_friend_room_ && squad_peer_friend_cap_.load()
+                ? "Your friend locked in before their game switched to Squad Strike. Match not started."
+                : !squad_peer_cap_.load()
+                ? "Your opponent's game can't play Squad Strike. Match not started."
+                : !squad_search_ ? "Your opponent picked Squad Strike and you didn't. Match not started."
+                : !squad_advertised_.load() ? "Squad Strike couldn't start on this game. Match not started."
+                // Its 0xE3 named another MU_SQUAD_VERSION (a 3-fighter build): both did pick a squad.
+                : squad_peer_other_version_ ? "Your opponent's game has a different Squad Strike version. Update both games."
+                : "Your opponent hasn't picked 4 fighters. Match not started.");
+            CancelSquad(!squad_peer_cap_.load() ? "squad: peer has no squad cap, match cancelled"
+                : !squad_search_ ? "squad: peer sent a lineup to a normal match, match cancelled"
+                : !squad_advertised_.load() ? "squad: our squad cap was not sent, match cancelled"
+                : squad_peer_other_version_ ? "squad: peer lineup is another squad version, match cancelled"
+                : "squad: missing lineup before selections, match cancelled");
+            break;
+          }
+          if (decision == MU_SQUAD_NORMAL && !squad_normal_logged_) {
+            host::log("squad: neither side asked for squads, normal 1v1");
+            squad_normal_logged_ = true;
+          }
+          squad_peer_selected_ = decision == MU_SQUAD_PLAY;
+          if (squad_peer_selected_) squad_peer_ = squad_incoming_;
+          squad_peer_pending_ = false; // every 0x82 needs its own immediately preceding 0xE3
+          squad_peer_other_version_ = false;
+        }
+#endif
+          if (remote_game_started_[idx]) {
+            const int partner = port_inputs_->partner(s->player_idx);
+            if (partner >= 0) port_inputs_->pads[partner].clear();
+          }
+          receive::Selections(*s, match_info_.remote[idx], remote_game_started_, idx,
+            port_inputs_->pads[s->player_idx], early_pads_[idx]);
+          has_game_started_ = false;
         }
       }
       break;
@@ -595,6 +768,54 @@ void NetplayClient::OnData(Packet& packet, ENetPeer* peer) {
       if (!s->error) { std::lock_guard<std::mutex> lk(chat_mutex_); remote_chat_message_selection_ = std::move(s); }
       break;
     }
+#if MU_SQUAD
+    // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+    case NP_MSG_MU_SQUAD: {
+#ifdef YOUGAME_AGENT_TEST_HOOK
+      // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+      // Negative harness only: let the peer's delayed E3 race our already rejected lineup.
+      // Re-enter the production invalid-outgoing path before accepting any late setup.
+      if (yougame::net_test::config().squad_cancel_test) {
+        PlayerSelections local;
+        {
+          std::lock_guard<std::mutex> lock(selection_mutex_);
+          squad_test_late_lineup_ = true;
+          local = match_info_.local;
+        }
+        host::log("squad: cancel race: late 0xE3 after invalid lineup");
+        SetMatchSelections(local);
+        break;
+      }
+#endif
+      if (!squad_search_ && remote_player_count_ == 1) {
+        // A lineup sent to a normal 1v1: the next 0x82 refuses the match on screen.
+        std::lock_guard<std::mutex> lock(selection_mutex_);
+        squad_peer_pending_ = true;
+        break;
+      }
+      if (!squad_search_ || remote_player_count_ != 1 || player_idx_ > 1) break;
+      MuSquadSetup incoming{};
+      // Bind the authoritative side to ENet's sender, never a claimed payload port.
+      const unsigned other = 1 - player_idx_;
+      bool sender = false;
+      for (const auto& connection : active_connections_)
+        for (const auto& entry : connection.second)
+          if (entry.first == peer && !entry.second.is_disconnected && entry.second.player_idx == other) sender = true;
+      const bool valid = sender && packet.size() > 1 &&
+          mu_squad_decode(packet.data() + 1, packet.size() - 1, &incoming);
+      // The first payload byte is the sender's MU_SQUAD_VERSION: another one is a different build's
+      // lineup (not a missing pick), and the cancel on its 0x82 says to update both games.
+      const bool other_version = sender && packet.size() > 1 &&
+          packet.data()[1] != MU_SQUAD_VERSION;
+      std::lock_guard<std::mutex> lock(selection_mutex_);
+      squad_peer_pending_ = valid;
+      squad_peer_other_version_ = other_version;
+      if (valid) squad_incoming_ = incoming.sides[other];
+      else if (other_version) host::log("squad: lineup from another squad version rejected");
+      else host::log("squad: malformed lineup rejected");
+      break;
+    }
+#endif
     case NP_MSG_MU_BUILD: {
       // 'M' 'U' 'B' version, player port, mod view, fingerprint length + bytes, name length + bytes.
       uint8_t m, u, b, version, port, mod_view, fp_len, name_len;
@@ -619,15 +840,62 @@ void NetplayClient::OnData(Packet& packet, ENetPeer* peer) {
       uint32_t shield = 0;
       if ((packet >> has_shield) && has_shield == 1 && (packet >> sr >> sg >> sb))
         shield = 0x1000000u | ((uint32_t)sr << 16) | ((uint32_t)sg << 8) | sb;
+      // Then the second capability byte (the first is full), which builds before it do not send.
+      uint8_t caps2 = 0;
+      if (!(packet >> caps2)) caps2 = 0;
       const uint8_t pidx = PlayerIdxFromPort(port);
       if (pidx >= remote_player_count_) { host::log("slippi: build message with invalid player idx %u", pidx); break; }
+      // A connection speaks for its own player only: the capabilities below decide how this match reads a leaver.
+      // Only where every port's connection is known exactly: elsewhere players sharing one public address can sit in
+      // each other's slot, and dropping their builds would close this gate on this machine alone.
+      if (machine_pad_format_ && SenderPort(peer) != port) { host::log("slippi: build message for port %u from another connection", port); break; }
       {
         std::lock_guard<std::mutex> lk(build_mutex_);
         remote_build_[pidx] = {true, mod_view != 0, fp, name, (caps & 1) != 0, (caps & 2) != 0, shield, port, (caps & 4) != 0, rules_digest};
+        remote_build_[pidx].setup_hash = (caps & MU_SETUP_HASH_CAP) != 0;
+        remote_build_[pidx].pick_previews = (caps & MU_PICK_PREVIEW_CAP) != 0;
+        remote_build_[pidx].caps2 = caps2;
       }
+      host::log("setup hash: opponent %u %s", port, (caps & MU_SETUP_HASH_CAP) ? "sends a setup hash" : "has no setup hash (not checked)");
       host::log("slippi: opponent %u build: %s%s%s%s, shield colour %s%06X", port, mod_view ? "mod " : "retail game",
                 mod_view ? name.c_str() : "", mod_view ? (" " + fp.substr(0, 16)).c_str() : "",
                 (caps & 1) ? ", takes early inputs" : "", shield ? "" : "none ", shield & 0xFFFFFFu);
+#if MU_SQUAD
+      // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+      if (remote_player_count_ == 1 && port == 1 - player_idx_) {
+        // squad_peer_build_ is marked after the adoption below: until then the joiner's lock-in is
+        // held (SquadFriendWaiting), so it never reads this room as plain mid-switch.
+        const bool second_build = squad_peer_build_.load();
+        const bool had_friend_cap = squad_peer_friend_cap_.exchange((caps & MU_SQUAD_FRIEND_CAP) != 0);
+        squad_peer_cap_.store((caps & MU_SQUAD_CAP) != 0);
+        if (squad_friend_room_ && !squad_search_.load() && (caps & MU_SQUAD_CAP) && !squad_refused_.load()) {
+          if (squad_locked_seen_.load()) {
+            // Too late to switch: a lock-in already went either way, or a game started. Never a
+            // 1v1 against a friend who picked Squad Strike, never a switch mid-set: cancel.
+            squad_peer_build_.store(true);
+            squad_cancel_text_.store("Your friend picked Squad Strike after a lock-in. Match not started.");
+            CancelSquad("squad: friend's Squad Strike arrived after a lock-in, match cancelled");
+            break;
+          }
+          // The friend picked Squad Strike for this room: join it, and say so in a second build
+          // before anyone can lock in (the lock-in is held until this build arrived).
+          squad_adopted_.store(true);
+          squad_search_.store(true);
+          host::log("squad: friend picked Squad Strike, joining it");
+          SendBuild();
+        } else if (squad_friend_room_ && squad_search_.load() && !(caps & (MU_SQUAD_CAP | MU_SQUAD_FRIEND_CAP))) {
+          // Their game can neither play nor join Squad Strike, or it just said it can't load it.
+          const bool refused = second_build && had_friend_cap;
+          squad_peer_build_.store(true);
+          squad_cancel_text_.store(refused ? "Your friend's game can't load Squad Strike. Match not started."
+                                           : "Your friend's game can't play Squad Strike. Match not started.");
+          CancelSquad(refused ? "squad: friend's game can't load Squad Strike, match cancelled"
+                              : "squad: friend's game has no friend Squad Strike, match cancelled");
+          break;
+        }
+        squad_peer_build_.store(true); // heard last: SquadFriendWaiting reads it before squad_search_
+      }
+#endif
       if (caps & 2) SendPrematchPing();   // at once: a match set up right after connecting needs a ping now
       break;
     }
@@ -680,9 +948,50 @@ void NetplayClient::OnData(Packet& packet, ENetPeer* peer) {
       }
       break;
     }
+    case NP_MSG_MU_SETUP_HASH: {
+      // 'M' 'U' 'H' version, sender port, inputs hash, setup hash (mu_setup_hash.h), nothing more.
+      MuSetupHash h{};
+      if (packet.size() < 1 || !mu_setup_hash_decode(packet.data() + 1, packet.size() - 1, &h)) {
+        host::log("setup hash: malformed message rejected (%u bytes)", (unsigned)packet.size());
+        break;
+      }
+      const uint8_t pidx = PlayerIdxFromPort(h.port);
+      // Bind the hash to ENet's sender, never only to the port the payload claims.
+      bool sender = h.port != player_idx_ && pidx < remote_player_count_;
+      if (sender) {
+        sender = false;
+        for (const auto& connection : active_connections_)
+          for (const auto& entry : connection.second)
+            if (entry.first == peer && !entry.second.is_disconnected && entry.second.player_idx == h.port) sender = true;
+      }
+      if (!sender) { host::log("setup hash: message for port %u not from that peer, rejected", h.port); break; }
+      std::lock_guard<std::mutex> lk(build_mutex_);
+      setup_hash_[pidx] = {true, h};
+      break;
+    }
+    case NP_MSG_MU_PICK_PREVIEW: {
+      // Display only. The sender is ENet's peer, never a port claimed in the payload.
+      uint8_t sender = 0xFF;
+      for (const auto& connection : active_connections_)
+        for (const auto& entry : connection.second)
+          if (entry.first == peer && !entry.second.is_disconnected) sender = entry.second.player_idx;
+      if (sender >= PLAYER_COUNT_MAX || sender == player_idx_) break;
+      const uint8_t pidx = PlayerIdxFromPort(sender);
+      if (pidx >= remote_player_count_) break;
+      MuPickPreview pick{};
+      if (packet.size() <= 1 || !mu_pick_preview_decode(packet.data() + 1, packet.size() - 1, &pick)) {
+        host::log("slippi: invalid pick preview from port %u", sender);
+        break;
+      }
+      std::lock_guard<std::mutex> lk(pick_mutex_);
+      pick_remote_[pidx] = pick;
+      pick_remote_port_[pidx] = sender;
+      pick_remote_set_[pidx] = true;
+      break;
+    }
     case NP_MSG_SLIPPI_CONN_SELECTED: break;
     case NP_MSG_SLIPPI_COMPLETE_STEP: {
-      if (!yougame::active()) break;
+      if (!yougame::session()) break;
       GamePrepStep step{};
       bool valid = true;
       for (auto& b : step) if (!(packet >> b)) { valid = false; break; }
@@ -696,7 +1005,7 @@ void NetplayClient::OnData(Packet& packet, ENetPeer* peer) {
 }
 
 void NetplayClient::SendGamePrepStep(const GamePrepStep& step) {
-  if (!yougame::active()) return;
+  if (!yougame::session()) return;
   auto p = std::make_unique<Packet>();
   *p << (uint8_t)NP_MSG_SLIPPI_COMPLETE_STEP;
   for (uint8_t b : step) *p << b;
@@ -720,16 +1029,36 @@ void NetplayClient::SendBuild() {
   const bool early = online::early_inputs_accept();
   // Bit 1: pre-match pings; bit 2: Static engine; bit 3: ranked rules digest follows.
   const std::string rules_digest = online::ranked_rules_digest(online::session_mode());
-  *p << (uint8_t)((early ? 1 : 0) | 2 | (me.static_engine ? 4 : 0) | (rules_digest.empty() ? 0 : 8));
+  uint8_t caps = (uint8_t)((early ? 1 : 0) | 2 | (me.static_engine ? 4 : 0) | (rules_digest.empty() ? 0 : 8));
+  // MU_SETUP_HASH_CAP: this side sends its match setup hash and waits for the peer's. Tests only:
+  // MELEE_TEST_NO_SETUP_HASH plays a build from before it (no bit, no hash message).
+  if (!host::test_env::getenv("MELEE_TEST_NO_SETUP_HASH")) caps |= MU_SETUP_HASH_CAP;
+  caps |= MU_PICK_PREVIEW_CAP;   // takes live pick previews (NP_MSG_MU_PICK_PREVIEW)
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  caps = yougame::squad::caps(caps, 1, squad_search_.load());
+  // Friend rooms: this game joins Squad Strike when the friend picked it.
+  if (squad_friend_room_) caps |= MU_SQUAD_FRIEND_CAP;
+  // A refusal (SquadFriendRefuse): this game can neither play nor join Squad Strike any more.
+  if (squad_refused_.load()) caps &= (uint8_t)~(MU_SQUAD_CAP | MU_SQUAD_FRIEND_CAP);
+#endif
+  *p << caps;
   for (char ch : rules_digest) *p << (uint8_t)ch;
   // Then the player's own shield colour ("Shield colours", Online): a byte 1 and the three RGB bytes, or
   // a byte 0. Builds before it stop reading at the capabilities byte.
   const uint32_t shield = gx::shield_color_online();
   if (shield) *p << (uint8_t)1 << (uint8_t)(shield >> 16) << (uint8_t)(shield >> 8) << (uint8_t)shield;
   else *p << (uint8_t)0;
+  // The second capability byte: MU_BUILD_CAPS2_FRIENDS_LOBBY, this game plays the Friends lobby's frozen
+  // setup (CPUs, rules). Builds before it stop reading at the shield bytes.
+  *p << (uint8_t)(MU_BUILD_CAPS2_FRIENDS_LOBBY | MU_BUILD_CAPS2_LOCAL_PARTNER | MU_BUILD_CAPS2_GONE_OWN_FRAMES);
   host::log("slippi: sending build: %s%s%s", me.mod_view ? "mod " : "retail game", me.mod_view ? name.c_str() : "",
             early ? " (takes early inputs)" : "");
   SendAsync(std::move(p));
+#if MU_SQUAD
+  // Count the cap only after its MU_BUILD bytes were actually queued.
+  squad_advertised_.store((caps & MU_SQUAD_CAP) != 0);
+#endif
 }
 
 // A pre-match ping to every opponent that answers them, until in-match pings take over (pad acks).
@@ -759,6 +1088,32 @@ NetplayClient::RemoteBuild NetplayClient::GetRemoteBuild(int index) {
   return remote_build_[index];
 }
 
+bool NetplayClient::EveryRemoteReadsGoneOwnFrames() {
+  std::lock_guard<std::mutex> lk(build_mutex_);
+  PeerBuildRow rows[REMOTE_PLAYER_MAX];
+  const int count = std::min<int>(remote_player_count_, REMOTE_PLAYER_MAX);
+  for (int i = 0; i < count; ++i) rows[i] = {remote_build_[i].received, remote_build_[i].caps2};
+  return slippi::EveryPeerReadsGoneOwnFrames(rows, count);
+}
+
+void NetplayClient::SendSetupHash(uint64_t inputs, uint64_t setup) {
+  if (host::test_env::getenv("MELEE_TEST_NO_SETUP_HASH")) return;
+  MuSetupHash h{player_idx_, inputs, setup};
+  unsigned char bytes[MU_SETUP_HASH_WIRE];
+  const size_t size = mu_setup_hash_encode(&h, bytes, sizeof bytes);
+  if (size != MU_SETUP_HASH_WIRE) return;
+  auto p = std::make_unique<Packet>();
+  *p << (uint8_t)NP_MSG_MU_SETUP_HASH;
+  p->append(bytes, size);
+  SendAsync(std::move(p));   // reliable, ordered channel 0, after the selections it was built from
+}
+
+NetplayClient::PeerSetupHash NetplayClient::GetSetupHash(int index) {
+  std::lock_guard<std::mutex> lk(build_mutex_);
+  if (index < 0 || index >= REMOTE_PLAYER_MAX) return {};
+  return setup_hash_[index];
+}
+
 void NetplayClient::SendEarlyPad(int32_t target, const uint8_t pad[host::early_input::kPadBytes]) {
   ConnectStatus st = status_.load(std::memory_order_acquire);
   if (st != ConnectStatus::CONNECTED) return;
@@ -776,11 +1131,84 @@ void NetplayClient::SendEarlyPad(int32_t target, const uint8_t pad[host::early_i
 }
 
 void NetplayClient::EarlyPads(int index, int32_t latest, std::vector<host::early_input::Entry>& out) {
+  // Early input/ring carries only each machine's main port. The partner always uses confirmed
+  // delayed input; on its owner that queue is filled before reading, so it is never predicted.
   out.clear();
+  if (index < 0 || index >= RemotePortCount()) return;
+  const int port = port_inputs_->port(index);
+  if (port_inputs_->owner[port] != port) return;
+  index = PlayerIdxFromPort(uint8_t(port));
   if (index < 0 || index >= REMOTE_PLAYER_MAX) return;
   std::lock_guard<std::mutex> lk(pad_mutex_);
   early_pads_[index].drop_through(latest);
   out = early_pads_[index].entries();
+}
+
+void NetplayClient::SendPickPreview(const MuPickPreview& pick, uint32_t frame) {
+  if (status_.load(std::memory_order_acquire) != ConnectStatus::CONNECTED || !mu_pick_preview_valid(&pick)) return;
+  bool locked_now;
+  {
+    std::lock_guard<std::mutex> lk(selection_mutex_);
+    locked_now = match_info_.local.is_character_selected;
+  }
+  QueuePickPreview(pick, frame, locked_now);
+}
+
+// Caller holds selection_mutex_ (SetMatchSelections), so the preview is queued before the 0x82.
+void NetplayClient::SendLockedPickPreview() {
+  if (status_.load(std::memory_order_acquire) != ConnectStatus::CONNECTED) return;
+  MuPickPreview pick;
+  uint32_t frame;
+  {
+    std::lock_guard<std::mutex> lk(pick_mutex_);
+    if (!pick_local_set_) return;   // no character screen frame yet: nothing to show
+    pick = pick_local_;
+    frame = pick_sender_.last_frame;
+  }
+  QueuePickPreview(pick, frame, true);
+}
+
+void NetplayClient::QueuePickPreview(MuPickPreview pick, uint32_t frame, bool locked_now) {
+  // Once 0x82 said locked, every later preview says so too, until the selections change.
+  if (locked_now) pick.locked = 1;
+  uint8_t peers = 0;
+  {
+    std::lock_guard<std::mutex> lk(build_mutex_);
+    for (int i = 0; i < remote_player_count_ && i < REMOTE_PLAYER_MAX; ++i)
+      if (remote_build_[i].pick_previews) peers |= (uint8_t)(1u << i);
+  }
+  unsigned char bytes[MU_PICK_PREVIEW_WIRE];
+  if (mu_pick_preview_encode(&pick, bytes, sizeof bytes) != sizeof bytes) return;
+  {
+    std::lock_guard<std::mutex> lk(pick_mutex_);
+    pick_local_ = pick;
+    pick_local_set_ = true;
+    if (!peers) return;   // nobody takes them (Slippi Dolphin, an older build): no message at all
+    // A peer whose build arrived since the last send gets the current pick at once; so does a
+    // lock-in, which must precede its 0x82.
+    const bool force = (peers & ~pick_sent_peers_) != 0 || (locked_now && pick_sender_.last[MU_PICK_PREVIEW_WIRE - 1] != 1);
+    if (!mu_pick_preview_due(&pick_sender_, bytes, frame, force)) return;
+    pick_sent_peers_ = peers;
+  }
+  auto p = std::make_unique<Packet>();
+  *p << (uint8_t)NP_MSG_MU_PICK_PREVIEW;
+  p->append(bytes, sizeof bytes);
+  SendAsync(std::move(p));
+}
+
+bool NetplayClient::RemotePickPreview(int index, MuPickPreview* out, uint8_t* port) {
+  if (!out || !port || index < 0 || index >= remote_player_count_ || index >= REMOTE_PLAYER_MAX) return false;
+  std::lock_guard<std::mutex> lk(pick_mutex_);
+  if (!pick_remote_set_[index]) return false;
+  // A player who left takes their preview with them.
+  if (pick_remote_port_[index] >= PLAYER_COUNT_MAX ||
+      !player_active_[pick_remote_port_[index]].load(std::memory_order_acquire)) {
+    pick_remote_set_[index] = false;
+    return false;
+  }
+  *out = pick_remote_[index];
+  *port = pick_remote_port_[index];
+  return true;
 }
 
 void NetplayClient::WriteSelections(Packet& p, const PlayerSelections& s) {
@@ -813,11 +1241,16 @@ void NetplayClient::Send(Packet& packet) {
     uint8_t mid = packet.data()[0];
     enet_uint32 flags = ENET_PACKET_FLAG_RELIABLE;
     uint8_t channel = 0;
-    if (mid == NP_MSG_SLIPPI_PAD || mid == NP_MSG_SLIPPI_PAD_ACK) { flags = ENET_PACKET_FLAG_UNSEQUENCED; channel = 1; }
+    if (mid == NP_MSG_SLIPPI_PAD || mid == kMachinePadMessage || mid == NP_MSG_SLIPPI_PAD_ACK) { flags = ENET_PACKET_FLAG_UNSEQUENCED; channel = 1; }
     if (mid == NP_MSG_MU_PING) {
       std::lock_guard<std::mutex> lk(build_mutex_);
       if (i >= (size_t)REMOTE_PLAYER_MAX || !remote_build_[i].pings) continue;
       flags = ENET_PACKET_FLAG_UNSEQUENCED; channel = 1;
+    }
+    if (mid == NP_MSG_MU_PICK_PREVIEW) {
+      // Reliable channel 0, ordered with 0x82, and only to a peer whose build said it takes them.
+      std::lock_guard<std::mutex> lk(build_mutex_);
+      if (i >= (size_t)REMOTE_PLAYER_MAX || !remote_build_[i].pick_previews) continue;
     }
     if (mid == NP_MSG_MU_EARLY_PAD) {
       // Only to a peer whose build said it takes them; the rest never see the id.
@@ -850,6 +1283,8 @@ void NetplayClient::Disconnect() {
   active_connections_.clear();
   for (auto& a : player_active_) a.store(false, std::memory_order_release);
   server_.clear();
+  std::lock_guard<std::mutex> lk(pick_mutex_);
+  for (bool& set : pick_remote_set_) set = false;
 }
 
 void NetplayClient::SendAsync(std::unique_ptr<Packet> packet) {
@@ -868,7 +1303,7 @@ void NetplayClient::SendAsync(std::unique_ptr<Packet> packet) {
 
 void NetplayClient::ThreadFunc() {
   uint64_t start_time = time_ms();
-  const uint64_t timeout = 8000;
+  const uint64_t timeout = kConnectTimeoutMs;
   std::vector<bool> connections(remote_player_count_, false);
   std::vector<ENetAddress> remote_addrs;
   for (int i = 0; i < remote_player_count_; ++i) remote_addrs.push_back(server_[i] ? server_[i]->address : ENetAddress{});
@@ -890,6 +1325,13 @@ void NetplayClient::ThreadFunc() {
         }
         case ENET_EVENT_TYPE_DISCONNECT:
           if (ev.peer) host::log("slippi: peer disconnected while connecting");
+#if MU_SQUAD
+          // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+          if (SquadPeerDisconnect(ev.data)) {
+            Disconnect();
+            return;
+          }
+#endif
           break;
         case ENET_EVENT_TYPE_CONNECT: {
           if (!ev.peer) break;
@@ -957,7 +1399,14 @@ void NetplayClient::ThreadFunc() {
       if (!own_udp_ingress_) client_->intercept = intercept_callback;
       host::log("slippi: online connection successful");
       connected_at_ms_.store(time_ms(), std::memory_order_release);
+#if MU_SQUAD
+      // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+      if (squad_search_) SendBuild();
+#endif
       status_.store(ConnectStatus::CONNECTED, std::memory_order_release);
+#if MU_SQUAD
+      if (!squad_search_)
+#endif
       SendBuild();
       break;
     }
@@ -1079,8 +1528,22 @@ void NetplayClient::ThreadFunc() {
     if (net <= 0) continue;
     switch (ev.type) {
       case ENET_EVENT_TYPE_RECEIVE: {
+#if MU_SQUAD
+        // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+#ifdef YOUGAME_AGENT_TEST_HOOK
+        // Only the negative harness holds setup traffic too. Normal delay legs retain
+        // agent-test semantics: outgoing 0x80/0xE1 only, control packets bypass them.
+        const auto& squad_delay = yougame::net_test::config();
+        const uint64_t cancel_lag = squad_delay.squad_cancel_test ? squad_delay.delay_ms : 0;
+#else
+        const uint64_t cancel_lag = 0;
+#endif
+        if (lag_ms || cancel_lag) {
+          uint64_t due = time_ms() + (cancel_lag ? cancel_lag : lag_ms);
+#else
         if (lag_ms) {
           uint64_t due = time_ms() + lag_ms;
+#endif
           if (jitter_ms) {
             jitter_state ^= jitter_state << 13; jitter_state ^= jitter_state >> 7; jitter_state ^= jitter_state << 17;
             due += jitter_state % (jitter_ms + 1);
@@ -1096,6 +1559,10 @@ void NetplayClient::ThreadFunc() {
         break;
       }
       case ENET_EVENT_TYPE_DISCONNECT: {
+#if MU_SQUAD
+        // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+        SquadPeerDisconnect(ev.data);
+#endif
         held.clear();   // their peer is going away; nothing held for it may be handled after
         std::string key = peer_key(ev.peer);
         if (active_connections_.count(key) && active_connections_[key].count(ev.peer)) active_connections_[key][ev.peer].is_disconnected = true;
@@ -1133,8 +1600,13 @@ void NetplayClient::StartSlippiGame() {
     if (client_) wakeup_thread(client_);
   }
 #endif
-  if (yougame::active()) game_prep_.clear();
+  if (yougame::session()) game_prep_.clear();
   local_pad_queue_.clear();
+  if (SecondLocalPort() >= 0) {
+    std::lock_guard<std::mutex> lk(pad_mutex_);
+    port_inputs_->pads[SecondLocalPort()].clear();
+    port_inputs_->partner_send.clear();
+  }
   { std::lock_guard<std::mutex> lk(pad_mutex_); for (auto& b : early_pads_) b.clear(); }
   {
     std::lock_guard<std::mutex> lk(timing_mutex_);
@@ -1145,13 +1617,33 @@ void NetplayClient::StartSlippiGame() {
     std::lock_guard<std::mutex> lk(ack_mutex_);
     for (int i = 0; i < remote_player_count_; ++i) { last_frame_acked_[i] = 0; ack_timers_[i].clear(); }
   }
-  { std::lock_guard<std::mutex> lk(selection_mutex_); match_info_.Reset(); }
+  {
+    // Previews belong to one character screen: the next one starts empty and sends at once.
+    std::lock_guard<std::mutex> lk(pick_mutex_);
+    pick_sender_ = {};
+    pick_local_set_ = false;
+    pick_sent_peers_ = 0;
+    for (bool& set : pick_remote_set_) set = false;
+  }
+  { std::lock_guard<std::mutex> lk(selection_mutex_); match_info_.Reset();
+#if MU_SQUAD
+    // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+    squad_peer_selected_ = squad_peer_pending_ = squad_peer_other_version_ = false;
+#endif
+  }
 }
 
-void NetplayClient::SendSlippiPad(std::unique_ptr<Pad> pad) {
+void NetplayClient::SendSlippiPad(std::unique_ptr<Pad> pad, std::unique_ptr<Pad> partner) {
   ConnectStatus st = status_.load(std::memory_order_acquire);
   if (st == ConnectStatus::FAILED || st == ConnectStatus::DISCONNECTED) return;
-  if (pad) local_pad_queue_.push_front(std::move(pad));
+  std::unique_lock<std::mutex> pads_lock(pad_mutex_);
+  if (pad) {
+    if (SecondLocalPort() >= 0) {
+      if (!partner || partner->frame != pad->frame) return;
+      port_inputs_->local_partner(*partner);
+    }
+    local_pad_queue_.push_front(std::move(pad));
+  }
   int min_ack = INT_MAX;
   {
     std::lock_guard<std::mutex> lk(ack_mutex_);
@@ -1163,15 +1655,27 @@ void NetplayClient::SendSlippiPad(std::unique_ptr<Pad> pad) {
   if (!local_pad_queue_.empty()) min_ack = std::max(min_ack, local_pad_queue_.front()->frame - 128);
   while (!local_pad_queue_.empty() && local_pad_queue_.back()->frame < min_ack) local_pad_queue_.pop_back();
   if (local_pad_queue_.empty()) return;
+  port_inputs_->trim_send(local_pad_queue_.back()->frame);
   int32_t frame = local_pad_queue_.front()->frame;
   auto spac = std::make_unique<Packet>();
-  *spac << (uint8_t)NP_MSG_SLIPPI_PAD << frame << player_idx_ << local_pad_queue_.front()->checksum_frame << local_pad_queue_.front()->checksum;
-  for (auto& p : local_pad_queue_) spac->append(p->buf, PAD_DATA_SIZE);
+  if (machine_pad_format_) {
+    const auto bytes = port_inputs_->packet(local_pad_queue_);
+    if (bytes.empty()) return;
+    spac->append(bytes.data(), bytes.size());
+  } else {
+    *spac << (uint8_t)NP_MSG_SLIPPI_PAD << frame << player_idx_ << local_pad_queue_.front()->checksum_frame << local_pad_queue_.front()->checksum;
+    for (auto& p : local_pad_queue_) spac->append(p->buf, PAD_DATA_SIZE);
+  }
   SendAsync(std::move(spac));
+  pads_lock.unlock();
   uint64_t t = time_us();
   {
     std::lock_guard<std::mutex> lk(timing_mutex_);
     has_game_started_ = true;
+#if MU_SQUAD
+    squad_locked_seen_.store(true); // a friend's Squad Strike can no longer switch this room
+#endif
+    remote_game_started_.fill(true);
     for (int i = 0; i < remote_player_count_; ++i) last_frame_timing_[i] = {frame, t};
   }
   {
@@ -1186,10 +1690,86 @@ void NetplayClient::SetMatchSelections(PlayerSelections& s) {
     std::lock_guard<std::mutex> lk(selection_mutex_);
     match_info_.local.Merge(s);
     match_info_.local.player_idx = player_idx_;
+#if MU_SQUAD
+    // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+    if (match_info_.local.is_character_selected) squad_locked_seen_.store(true);
+    // The lineup rides with a lock-in only (a friend room's connect-time 0x82 has neither yet).
+    if (squad_advertised_.load() && match_info_.local.is_character_selected) {
+      MuSquadSetup outgoing{};
+      // Each message owns its sender's side. The peer side is a valid provisional echo;
+      // setup always takes the two authoritative sides from their respective packets.
+      const MuSquadSide& other = mu_squad_side_valid(&squad_peer_) ? squad_peer_ : squad_local_;
+      unsigned char bytes[MU_SQUAD_WIRE_MAX];
+      if (!mu_squad_combine(player_idx_, &squad_local_, 1 - player_idx_, &other, &outgoing)) {
+#ifdef YOUGAME_AGENT_TEST_HOOK
+        // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+        if (yougame::net_test::config().squad_cancel_test && !squad_test_late_lineup_) return;
+#endif
+        CancelSquad("squad: invalid outgoing lineup, match cancelled");
+        return;
+      }
+      const size_t size = mu_squad_encode(&outgoing, bytes, sizeof bytes);
+      auto lineup = std::make_unique<Packet>();
+      *lineup << (uint8_t)NP_MSG_MU_SQUAD;
+      lineup->append(bytes, size);
+      // Decode our exact outgoing bytes too: setup does not consult mutable CSS state.
+      MuSquadSetup sent{};
+      if (!mu_squad_decode(bytes, size, &sent)) {
+        CancelSquad("squad: invalid outgoing lineup encoding, match cancelled");
+        return;
+      }
+      squad_transmitted_ = sent.sides[player_idx_];
+      SendAsync(std::move(lineup)); // reliable channel 0, immediately before 0x82
+    }
+#endif
+    // A lock-in's preview goes out before its 0x82 on the same reliable channel, so no preview
+    // the peer gets after our 0x82 can still say "not locked".
+    if (match_info_.local.is_character_selected) SendLockedPickPreview();
     WriteSelections(*spac, match_info_.local);
+#if MU_SQUAD
+    if (squad_search_) { SendAsync(std::move(spac)); return; }
+#endif
   }
   SendAsync(std::move(spac));
 }
+#if MU_SQUAD
+// Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+void NetplayClient::SetSquadSelection(const MuSquadSide& side) {
+  std::lock_guard<std::mutex> lock(selection_mutex_);
+  if (squad_search_) squad_local_ = mu_squad_side_valid(&side) ? side : MuSquadSide{};
+}
+void NetplayClient::SquadFriendRefuse() {
+  if (!squad_friend_room_ || squad_refused_.exchange(true)) return;
+  squad_cancel_text_.store("Your game can't load Squad Strike lineups. Match not started.");
+  host::log("squad: this game can't load Squad Strike, telling the friend");
+  SendBuild();
+}
+void NetplayClient::CancelSquad(const char* reason) {
+  if (!squad_cancelled_.exchange(true)) {
+    host::log("%s", reason);
+    host::log("squad: cancel: Squad Strike protocol error");
+  }
+  // Existing pre-start abort path: ThreadFunc exits into Disconnect(), which
+  // gracefully disconnects ALL duplicate/fallback peers, carrying this reason.
+  ForceDisconnect(DisconnectReason::SQUAD_PROTOCOL);
+  do_loop_.store(false);
+  status_.store(ConnectStatus::DISCONNECTED, std::memory_order_release);
+}
+void NetplayClient::RefuseSquad(const char* text, const char* reason) {
+  if (!squad_cancelled_.load()) squad_cancel_text_.store(text);
+  CancelSquad(reason);
+}
+bool NetplayClient::SquadPeerDisconnect(uint32_t reason) {
+  if (!squad_search_ || reason != (uint32_t)DisconnectReason::SQUAD_PROTOCOL) return false;
+  CancelSquad("squad: peer cancelled protocol error, match cancelled");
+  return true;
+}
+bool NetplayClient::SquadSetup(MuSquadSetup* out) {
+  std::lock_guard<std::mutex> lock(selection_mutex_);
+  if (!squad_advertised_.load() || !squad_peer_cap_.load() || !squad_peer_selected_ || squad_cancelled_.load()) return false;
+  return mu_squad_combine(player_idx_, &squad_transmitted_, 1 - player_idx_, &squad_peer_, out) != 0;
+}
+#endif
 void NetplayClient::SendChatMessage(int message_id) {
   remote_sent_chat_message_id = (uint8_t)message_id;
   auto spac = std::make_unique<Packet>();
@@ -1224,22 +1804,33 @@ uint8_t NetplayClient::GetSlippiRemoteSentChatMessage(bool chat_enabled) {
   return id;
 }
 
-std::unique_ptr<RemotePadOutput> NetplayClient::GetSlippiRemotePad(int index, int max_frame_count) {
+std::unique_ptr<RemotePadOutput> NetplayClient::GetSlippiRemotePad(int index, int max_frame_count, int32_t frame) {
   std::lock_guard<std::mutex> lk(pad_mutex_);
   auto out = std::make_unique<RemotePadOutput>();
-  if (index < 0 || index >= REMOTE_PLAYER_MAX || remote_pad_queue_[index].empty()) {
+  if (index < 0 || index >= RemotePortCount()) return out;
+  if (IsLocalVirtualPort(index)) return std::make_unique<RemotePadOutput>(port_inputs_->local_output(index,frame,max_frame_count));
+  const int port = port_inputs_->port(index), owner = port_inputs_->owner[port];
+  out->player_idx = uint8_t(port);
+  out->checksum_primary = port == owner;
+  out->is_disconnected = !port_inputs_->active(port,[&](int p) { return player_active_[p].load(std::memory_order_acquire); });
+  const int machine = PlayerIdxFromPort(uint8_t(owner));
+  if (machine < remote_player_count_) {
+    out->checksum_frame = remote_checksums_[machine].frame;
+    out->checksum = remote_checksums_[machine].value;
+  } else if (!port_inputs_->pads[port].empty()) {
+    out->checksum_frame = port_inputs_->pads[port].front()->checksum_frame;
+    out->checksum = port_inputs_->pads[port].front()->checksum;
+  }
+  if (port_inputs_->pads[port].empty()) {
+    if (!machine_pad_format_) out = std::make_unique<RemotePadOutput>();   // no local pair: an empty queue says nothing yet
     Pad empty(0);
     out->latest_frame = 0;
     out->data.insert(out->data.end(), empty.buf, empty.buf + PAD_FULL_SIZE);
     return out;
   }
   out->latest_frame = 0;
-  out->checksum_frame = remote_checksums_[index].frame;
-  out->checksum = remote_checksums_[index].value;
-  out->player_idx = (uint8_t)(index >= player_idx_ ? index + 1 : index);
-  out->is_disconnected = !player_active_[out->player_idx].load(std::memory_order_acquire);
   int count = 0;
-  for (auto it = remote_pad_queue_[index].rbegin(); it != remote_pad_queue_[index].rend(); ++it) {
+  for (auto it = port_inputs_->pads[port_inputs_->port(index)].rbegin(); it != port_inputs_->pads[port_inputs_->port(index)].rend(); ++it) {
     out->latest_frame = std::max(out->latest_frame, (*it)->frame);
     out->data.insert(out->data.begin(), (*it)->buf, (*it)->buf + PAD_FULL_SIZE);
     if (++count >= max_frame_count) break;
@@ -1249,16 +1840,21 @@ std::unique_ptr<RemotePadOutput> NetplayClient::GetSlippiRemotePad(int index, in
 
 void NetplayClient::DropOldRemoteInputs(int32_t finalized_frame) {
   std::lock_guard<std::mutex> lk(pad_mutex_);
-  for (int i = 0; i < remote_player_count_; ++i)
-    while (remote_pad_queue_[i].size() > 1 && remote_pad_queue_[i].back()->frame < finalized_frame) remote_pad_queue_[i].pop_back();
+  for (int i = 0; i < RemotePortCount(); ++i) {
+    auto& queue = port_inputs_->pads[port_inputs_->port(i)];
+    while (queue.size() > 1 && queue.back()->frame < finalized_frame) queue.pop_back();
+  }
 }
 std::unordered_map<uint8_t, bool> NetplayClient::GetActivePlayerIndices() const {
   std::unordered_map<uint8_t, bool> r;
-  for (uint8_t i = 0; i < PLAYER_COUNT_MAX; ++i) if (player_active_[i].load(std::memory_order_acquire)) r[i] = true;
+  for (int i = 0; i < port_inputs_->humans; ++i)
+    if (i != player_idx_ && port_inputs_->active(i,[&](int p) { return player_active_[p].load(std::memory_order_acquire); })) r[uint8_t(i)] = true;
   return r;
 }
 void NetplayClient::ForceDisconnectPlayer(uint8_t player_idx) {
   if (player_idx >= PLAYER_COUNT_MAX) return;
+  player_idx = uint8_t(port_inputs_->owner[player_idx]);
+  if (player_idx == player_idx_) return;
   player_active_[player_idx].store(false, std::memory_order_release);
   bool any = false;
   for (uint8_t i = 0; i < remote_player_count_; ++i) if (player_active_[match_info_.remote[i].player_idx].load(std::memory_order_acquire)) any = true;
@@ -1317,7 +1913,27 @@ Matchmaking::LocalPeer Matchmaking::local_peer;
 uint16_t Matchmaking::forced_port = 0;
 bool Matchmaking::server_allowed = true;
 
-Matchmaking::Matchmaking(User* user) : user_(user) {}
+// The Mac app's sandbox grants a Slippi run exactly one UDP port and names it in
+// YOUGAME_SLIPPI_UDP_PORT (decimal, 41000-50999). --netplay-port still wins. A forced port is used
+// for the matchmaking client and the match, and never falls back to a random one.
+static uint16_t slippi_port_from_env() {
+  const char* v = std::getenv("YOUGAME_SLIPPI_UDP_PORT");
+  if (!v || !*v) return 0;
+  char* end = nullptr;
+  const long n = (*v >= '0' && *v <= '9') ? std::strtol(v, &end, 10) : -1;
+  if (n < 41000 || n > 50999 || !end || *end) {
+    host::log("slippi: YOUGAME_SLIPPI_UDP_PORT is not a port in 41000-50999; ignored");
+    return 0;
+  }
+  return (uint16_t)n;
+}
+Matchmaking::Matchmaking(User* user) : user_(user) {
+  static const uint16_t env_port = slippi_port_from_env();
+  if (!forced_port && env_port) {
+    forced_port = env_port;
+    host::log("slippi: forced port %u from YOUGAME_SLIPPI_UDP_PORT", (unsigned)env_port);
+  }
+}
 Matchmaking::~Matchmaking() {
   is_mm_terminated_ = true;
   fail("Matchmaking shut down");
@@ -1357,7 +1973,7 @@ void Matchmaking::FindMatch(MatchSearchSettings settings) {
   { std::lock_guard<std::mutex> lk(result_mutex_); error_msg_.clear(); }
 #ifdef YOUGAME_AGENT_TEST_HOOK
   if (!yougame::agent_test::matchmaking_allowed(
-          local_peer.enabled, server_allowed, yougame::agent_test::agent_script, yougame::active(), settings.mode)) {
+          local_peer.enabled, server_allowed, yougame::agent_test::agent_script, yougame::session(), settings.mode)) {
 #else
   if (!local_peer.enabled && !server_allowed) {
 #endif
@@ -1515,9 +2131,42 @@ static json local_peer_ticket(const UserInfo& me, Matchmaking::OnlinePlayMode mo
 }
 
 void Matchmaking::startMatchmaking() {
-  if (!yougame::active() && !local_peer.enabled) {
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  // Squad seats never inspect a Slippi account, version, route or socket.
+  if (!yougame::squad::blend_allowed(search_settings_.mode,
+          search_settings_.squad && search_settings_.friend_room.empty()) && !local_peer.enabled) {
+    if (!yougame::active()) { fail("Squad Strike requires YouGame"); return; }
+    startYouGameMatchmaking();
+    return;
+  }
+#endif
+  // Preserve YouGame rooms/tickets and local test peering; never blend an agent into Slippi.
+  if (host::test_env::agent_copy() && !local_peer.enabled) {
+    if (yougame::active() && !yougame::mode_policy::slippi_menu_mode(
+            search_settings_.mode, !search_settings_.friend_room.empty())) {
+      slippi_user_.reset();
+      // The same search line and link state a player without a Slippi login sees.
+      const bool vanilla_unranked = search_settings_.mode == UNRANKED &&
+                                    search_settings_.friend_room.empty() && host::gameplay::vanilla_only();
+      if (vanilla_unranked) yougame::slippi_link(false, std::string());
+      startYouGameMatchmaking(vanilla_unranked ? yougame::blend::kSearchYouGameOnly : nullptr);
+      return;
+    }
+    if (!search_settings_.friends_lobby && agent_lock::blocked(agent_lock::Operation::Matchmaking)) {
+      fail(agent_lock::refusal);
+      return;
+    }
+  }
+  // The Friends lobby is YouGame's own room: no Slippi account, blend or Direct code.
+  if (search_settings_.friends_lobby && !local_peer.enabled) {
+    if (!yougame::active()) { fail("The Friends lobby needs YouGame"); return; }
+    startYouGameMatchmaking();
+    return;
+  }
+  if (!yougame::session() && !local_peer.enabled) {
     std::string error;
-    if (!user_ || !user_->CheckOnlineCompatibility(&error)) {
+    if (!user_ || !user_->CheckSessionCompatibility(&error)) {
       fail(error.empty() ? "Could not check Slippi version. Try again." : error);
       return;
     }
@@ -1527,7 +2176,7 @@ void Matchmaking::startMatchmaking() {
 #ifdef YOUGAME_AGENT_TEST_HOOK
   // Recheck at the routing boundary: an agent search must never fall through to Slippi.
   if (yougame::agent_test::agent_script) {
-    if (!yougame::agent_test::matchmaking_allowed(local_peer.enabled, server_allowed, true, yougame::active(), search_settings_.mode)) {
+    if (!yougame::agent_test::matchmaking_allowed(local_peer.enabled, server_allowed, true, yougame::session(), search_settings_.mode)) {
       yougame::agent_test::input_policy.allowed(
           yougame::agent_test::live_input_state(search_settings_.mode), yougame::agent_test::InputKey::Script,
           [](const char* line) { host::log("%s", line); });
@@ -1544,6 +2193,12 @@ void Matchmaking::startMatchmaking() {
     return;
   }
 #endif
+  // Melee Unlocked's launcher (no YouGame app): a YouGame row picked in the online menu searches
+  // on YouGame through the launcher's bridge, as upstream does. The app keeps its own routing below.
+  if (!yougame::active() && yougame::session() && !local_peer.enabled) {
+    startYouGameMatchmaking();
+    return;
+  }
   if (yougame::active() && !local_peer.enabled) {
     slippi_user_.reset();
     const bool unranked = search_settings_.mode == UNRANKED && search_settings_.friend_room.empty();
@@ -1576,8 +2231,14 @@ void Matchmaking::startMatchmaking() {
 #else
     const bool agent = false;
 #endif
+#if MU_SQUAD
+    // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+    const auto route = yougame::squad::matchmaking_route(search_settings_.mode, true, login, agent,
+        !search_settings_.friend_room.empty(), vanilla, search_settings_.squad);
+#else
     const auto route = yougame::mode_policy::matchmaking_route(search_settings_.mode, true, login, agent,
                                                !search_settings_.friend_room.empty(), vanilla);
+#endif
     if (route == yougame::mode_policy::MatchmakingRoute::Locked) {
       fail("Sign in to Slippi to play Direct, Teams and Party");
       return;
@@ -1596,7 +2257,7 @@ void Matchmaking::startMatchmaking() {
     }
     host::log("yougame: %s via Slippi", search_settings_.mode == DIRECT ? "direct" : "doubles");
     std::string error;
-    if (!slippi_user_->CheckOnlineCompatibility(&error)) {
+    if (!slippi_user_->CheckSessionCompatibility(&error)) {
       fail(error.empty() ? "Could not check Slippi version. Try again." : error);
       return;
     }
@@ -1630,6 +2291,7 @@ void Matchmaking::startMatchmaking() {
 }
 
 std::string Matchmaking::openSlippiTicket(const UserInfo& me, const std::function<bool()>& stop, int avoid) {
+  if (agent_lock::blocked(agent_lock::Operation::Matchmaking)) return agent_lock::refusal;
 #ifdef YOUGAME_AGENT_TEST_HOOK
   // The last door before Slippi's servers: an agent search never gets through it.
   if (yougame::agent_test::agent_script) return "Matchmaking is off in automated runs";
@@ -1653,6 +2315,8 @@ std::string Matchmaking::openSlippiTicket(const UserInfo& me, const std::functio
     }
   });
   if (!resolved) return "could not resolve the Slippi server";
+  if (forced_port && host_port_ == forced_port)
+    host::log(client_ ? "slippi: forced port %d bound" : "slippi: forced port %d bind failed", host_port_);
   if (!client_) return "Failed to create mm client";
   server_ = enet_host_connect(client_, &addr, 3, 0);
   if (!server_) return "Failed to start connection to mm server";
@@ -1707,7 +2371,7 @@ void Matchmaking::dropSlippi() {
 // netplay client connects exactly as before; the address is the one that answered YouGame's punch.
 void Matchmaking::startYouGameMatchmaking(const char* status) {
   // Defense at the YouGame boundary, including scripted/retry callers.
-  if (yougame::active() && yougame::mode_policy::slippi_menu_mode(
+  if (yougame::active() && !search_settings_.friends_lobby && yougame::mode_policy::slippi_menu_mode(
           search_settings_.mode, !search_settings_.friend_room.empty())) {
     fail("Sign in to Slippi to play Direct, Teams and Party");
     return;
@@ -1726,6 +2390,19 @@ void Matchmaking::startYouGameMatchmaking(const char* status) {
 }
 bool Matchmaking::youGameSearch(yougame::Search* search) {
   search->mode = (int)search_settings_.mode;
+  if (search_settings_.friends_lobby) {
+    // Its own mode (lobby::kSearchMode), no code and no 1v1 invite: find_match refuses anything else.
+    search->friends_lobby = true;
+    search->lobby_room = search_settings_.lobby_room;
+    search->lobby_control = search_settings_.lobby_control;
+    return true;
+  }
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  search->squad = yougame::squad::selected(search->mode, search_settings_.squad,
+                                         !search_settings_.friend_room.empty());
+  search->squad_budget = search->squad ? search_settings_.squad_budget : std::string();
+#endif
   // Direct and Teams require a readable code; unused fields must still be valid UTF-8.
   std::string code;
   if (!yougame::friends::search_code(search->mode, search_settings_.connect_code, &code)) {
@@ -1740,8 +2417,16 @@ bool Matchmaking::youGameSearch(yougame::Search* search) {
   search->friend_room = search_settings_.friend_room;
   return true;
 }
-// A finished YouGame search: its match goes in as a get-ticket-resp would (host_port_ is the port it
-// searched from), or the search fails or searches again as it says.
+// Display by game port; the connection roster may skip the local partner and CPU ports.
+std::string Matchmaking::GetPlayerName(uint8_t port) const {
+  const auto lobby = yougame::friends_lobby();
+  if (lobby.open && lobby.plan && lobby.plan->ok && port < lobby.plan->ports) return lobby.plan->port[port].name;
+  std::lock_guard<std::mutex> lk(result_mutex_);
+  for (const auto& player : player_info_) if (player.port == port + 1) return player.display_name;
+  return {};
+}
+
+// A finished YouGame search becomes a ticket, or fails/retries as the search says.
 void Matchmaking::takeYouGameMatch(const yougame::Match& match) {
   if (!match.ok) {
     if (match.retry) { host::log("slippi: YouGame match not reachable (%s), searching again", match.error.c_str()); state_ = INITIALIZING; return; }
@@ -1906,6 +2591,7 @@ bool Matchmaking::ingest_ticket(const Ticket& ticket) {
 }
 
 void announce_slippi_link(const std::string& user_dir) {
+  if (agent_lock::blocked(agent_lock::Operation::AccountLink)) return;
   static std::atomic<bool> asked{false};
   if (!yougame::active() || !host::gameplay::vanilla_only() || asked.exchange(true)) return;
   // Read the app's grant off the game thread. Each Unranked search rechecks that grant.
@@ -1926,6 +2612,12 @@ void announce_slippi_link(const std::string& user_dir) {
 // and waits for the helper, so no thread, socket or late callback outlives the search into a newer
 // one. A committed side that then fails does what that side always did; the other is not resumed.
 void Matchmaking::blendMatchmaking() {
+  if (host::test_env::agent_copy()) {   // Blend is vanilla Unranked: show it as a no-login player's search
+    slippi_user_.reset();
+    yougame::slippi_link(false, std::string());
+    startYouGameMatchmaking(yougame::blend::kSearchYouGameOnly);
+    return;
+  }
   using yougame::blend::Side;
 #ifdef YOUGAME_AGENT_TEST_HOOK
   if (yougame::agent_test::agent_script) { fail("Matchmaking is off in automated runs"); return; }   // routed to YouGame above
@@ -2140,10 +2832,12 @@ void Matchmaking::blendMatchmaking() {
 }
 
 void Matchmaking::handleConnecting() {
-  if ((!yougame::active() || slippi_user_) && !local_peer.enabled) {
+  if (!local_peer.enabled && (display_provider_ != display::Provider::YouGame || !yougame::active()) &&
+      agent_lock::blocked(agent_lock::Operation::PeerConnect)) { fail(agent_lock::refusal); return; }
+  if ((!yougame::session() || slippi_user_) && !local_peer.enabled) {
     std::string error;
     User* user = slippi_user_ ? slippi_user_.get() : user_;
-    if (!user || !user->CheckOnlineCompatibility(&error)) {
+    if (!user || !user->CheckSessionCompatibility(&error)) {
       fail(error.empty() ? "Could not check Slippi version. Try again." : error);
       return;
     }
@@ -2161,8 +2855,16 @@ void Matchmaking::handleConnecting() {
     ports.push_back((uint16_t)std::atoi(ip.substr(colon + 1).c_str()));
   }
   const uint8_t remote_count = (uint8_t)std::min<size_t>(remote_ips_.size(), (size_t)REMOTE_PLAYER_MAX);
+  const auto lobby = yougame::friends_lobby();
   auto client = std::make_unique<NetplayClient>(addrs, ports, remote_count, (uint16_t)host_port_, is_host_, (uint8_t)local_player_index_,
-      display_provider_ == display::Provider::YouGame && !yg_enet_selected(), public_fallbacks_);
+      display_provider_ == display::Provider::YouGame && !yg_enet_selected(), public_fallbacks_
+#if MU_SQUAD
+      // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+      , yougame::squad::selected(search_settings_.mode, search_settings_.squad,
+                                !search_settings_.friend_room.empty()), search_settings_.squad_side,
+      !search_settings_.friend_room.empty() && search_settings_.mode == DIRECT
+#endif
+      , lobby.open && lobby.plan && lobby.plan->ok ? lobby.plan.get() : nullptr);
   bool handed_over = false;
   while (!handed_over) {
     auto st = client->GetSlippiConnectStatus();
@@ -2181,6 +2883,11 @@ void Matchmaking::handleConnecting() {
       if (client->OwnUDPPortUnavailable()) { fail("The own UDP port is unavailable"); return; }
       if (local_peer.enabled) { fail("Could not connect to the local peer"); return; }
       if (search_settings_.mode == TEAMS) { fail("Timed out waiting for other players to connect"); return; }
+#if MU_SQUAD
+      // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+      // A squad cancel while connecting is the same protocol error as after: show it, never re-search.
+      if (client->SquadCancelled()) { fail(client->SquadCancelText()); return; }
+#endif
       host::log("slippi: connection attempt failed, searching again");
       state_ = INITIALIZING;
       return;

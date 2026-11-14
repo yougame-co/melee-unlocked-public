@@ -109,6 +109,22 @@ class Events {
 };
 using Request = std::function<json(const json&, int)>; // returns bridge.result, throws on refusal
 // Structured broker codes take precedence; older app bridges forward only human text.
+// Rooms' native admission answers 503 "Please try again shortly." while its build list is cold. The app
+// forwards only the status and the error words (desktop ws-client), so match exactly that refusal.
+inline bool rooms_busy(const json& p) {
+  return str(p,"reason").find("answered 503: Please try again shortly.") != std::string::npos;
+}
+// The app's refusal of a room upgrade: "the rooms server answered 409: Room is full", in an error event's
+// message and again in the close reason (sliced to 120 characters). Two seats racing past the upgrade:
+// Rooms drops the loser with 1008 "room full"; a recovery client gets 4004 "rejoin-refused:room-full".
+inline bool rooms_full(const json& p) {
+  for (const auto* field : {"message", "reason"}) {
+    std::string text = str(p, field);
+    for (auto& ch : text) if (ch >= 'A' && ch <= 'Z') ch = char(ch + ('a'-'A'));
+    if (text.find("room is full") != std::string::npos) return true;
+  }
+  return false;
+}
 inline bool lobby_protocol_mismatch(const json& p) {
   for (const auto* field : {"errorCode", "refused"})
     if (str(p,field) == "console_mixed_builds" || str(p,field) == "lobby_mismatch") return true;
@@ -118,6 +134,44 @@ inline bool lobby_protocol_mismatch(const json& p) {
                              "different lobby configuration", "console_mixed_builds"})
     if (reason.find(phrase) != std::string::npos) return true;
   return false;
+}
+
+// Rooms' refusal of a ticket whose Teams mark differs from the room's (rooms/src/index.ts, before lobbyDiffers):
+// 403 "This room uses another Teams protocol" (a 1v1 or Friends lobby ticket at a Teams home, or the reverse) and
+// 403 "This room uses another Doubles profile" (the MU Doubles mark differs). The app forwards them as
+// "the rooms server answered 403: <error>". A room of another kind, never a gone one (host_gone is 410).
+// The app may also name rooms' refusal code in the words: "the rooms server answered <status> [<slug>]: <error>",
+// slug [a-z_]{1,32} (rooms_refusal_slug, anchored at the start: the error words can hold brackets too). A slug
+// decides: teams_protocol / doubles_profile is a room of another kind, any other slug is not. Without a slug
+// (an older app or rooms) the words decide, as before.
+inline std::string rooms_refusal_slug(const std::string& text) {
+  static const std::string lead = "the rooms server answered ";
+  if (text.compare(0, lead.size(), lead) != 0) return {};
+  size_t at = lead.size();
+  for (int i = 0; i < 3; ++i, ++at)
+    if (at >= text.size() || text[at] < '0' || text[at] > '9') return {};
+  if (text.compare(at, 2, " [") != 0) return {};
+  const size_t start = at += 2;
+  while (at < text.size() && at - start <= 32 && ((text[at] >= 'a' && text[at] <= 'z') || text[at] == '_')) ++at;
+  const size_t length = at - start;
+  if (length < 1 || length > 32 || at >= text.size() || text[at] != ']') return {};
+  return text.substr(start, length);
+}
+// -1 no slug in the close reason or the error event's message, else whether it names a room of another kind.
+inline int room_kind_slug(const json& p) {
+  for (const auto* field : {"reason", "message"}) {
+    const auto slug = rooms_refusal_slug(str(p, field));
+    if (!slug.empty()) return slug == "teams_protocol" || slug == "doubles_profile";
+  }
+  return -1;
+}
+inline bool room_kind_refusal(const json& p) {
+  if (const int slug = room_kind_slug(p); slug >= 0) return slug == 1;
+  std::string reason = str(p,"reason");
+  for (auto& ch : reason) if (ch >= 'A' && ch <= 'Z') ch = char(ch + ('a'-'A'));
+  return reason.find("answered 403") != std::string::npos &&
+         (reason.find("another teams protocol") != std::string::npos ||
+          reason.find("another doubles profile") != std::string::npos);
 }
 
 class Stream {
@@ -133,7 +187,7 @@ class Stream {
     // replacing it could deliberately evict a seat which connected after the timeout.
     if (conn_ && !closed_) return ready_ || wait_open(until, cancelled);
     if (conn_) events_.retire(conn_);
-    conn_ = 0; pending_.clear(); ready_ = false; code_ = 1006; lobby_mismatch_ = false;
+    conn_ = 0; pending_.clear(); ready_ = false; code_ = 1006; lobby_mismatch_ = false; kind_refused_ = false; busy_ = false; full_ = false;
     json q = {{"type", "netOpen"}, {"ticket", ticket}};
     if (!room.empty()) q["room"] = room;
     if (!session.empty()) q["session"] = session;
@@ -164,6 +218,7 @@ class Stream {
       else if (!conn_ || closed_ || !events_.next(conn_, p, (int)std::max<int64_t>(0, (int64_t)until - clock_()))) return false;
       const auto event = str(p, "event");
       if (event == "open") ready_ = true;
+      if (event == "error") record_error(p);
       if (event == "close") { closed_ = true; ready_ = false; record_close(p); return false; }
       if (event == "message" && !ready_) { pending_.push_back(std::move(p)); continue; }
       if (event == "message" && p.count("data") && p["data"].is_string()) {
@@ -188,6 +243,10 @@ class Stream {
   bool ready() const { std::lock_guard<std::mutex> lock(mutex_); return ready_; }
   int close_code() const { std::lock_guard<std::mutex> lock(mutex_); return code_; }
   bool lobby_mismatch() const { std::lock_guard<std::mutex> lock(mutex_); return lobby_mismatch_; }
+  bool kind_refused() const { std::lock_guard<std::mutex> lock(mutex_); return kind_refused_; }
+  bool busy() const { std::lock_guard<std::mutex> lock(mutex_); return busy_; }
+  // Rooms refused this open because every seat is taken: final, never worth another try.
+  bool full() const { std::lock_guard<std::mutex> lock(mutex_); return full_; }
   int conn() const { std::lock_guard<std::mutex> lock(mutex_); return conn_; }
 #ifdef YOUGAME_AGENT_TEST_HOOK
   uint64_t agent_test_first_open_at() const {
@@ -208,20 +267,32 @@ class Stream {
     code_ = p.value("code", 1006);
     // Embedded ws-client forwards the HTTP refusal as a fixed close reason (not the JSON code).
     lobby_mismatch_ = code_ == 1006 && lobby_protocol_mismatch(p);
+    kind_refused_ = code_ == 1006 && (kind_refused_ || room_kind_refusal(p));   // the error event may have named it
+    busy_ = code_ == 1006 && rooms_busy(p);
+    const auto reason = str(p, "reason");
+    full_ = full_ || (code_ == 1006 && rooms_full(p)) || (code_ == 1008 && reason == "room full") ||
+            (code_ == 4004 && reason == "rejoin-refused:room-full");
+  }
+  void record_error(const json& p) {
+    if (str(p, "code") == "refused" && rooms_full(p)) full_ = true;
+    if (room_kind_slug(p) == 1) kind_refused_ = true;   // a refused upgrade's error event comes before its close
   }
   bool wait_open(uint64_t until, const std::function<bool()>& cancelled) {
-    while (clock_() < until) {
+    // Events already queued are read even once the time is up: the netOpen request itself can use the
+    // whole timeout (a slow app reply, a starved thread), and its open or refusal is then already here.
+    for (;;) {
       if (cancelled && cancelled()) return false;
       json p;
-      const int slice = (int)std::min<uint64_t>(50, until - clock_());
-      if (!events_.next(conn_, p, slice)) continue;
+      const uint64_t now = clock_();
+      const int slice = now < until ? (int)std::min<uint64_t>(50, until - now) : 0;
+      if (!events_.next(conn_, p, slice)) { if (slice == 0) return false; continue; }
       if (cancelled && cancelled()) return false;
       const auto event = str(p, "event");
       if (event == "open") { ready_ = true; return true; }
       if (event == "message") pending_.push_back(std::move(p));
+      if (event == "error") record_error(p);
       if (event == "close") { record_close(p); closed_ = true; return false; }
     }
-    return false;
   }
   Events& events_;
   Request request_;
@@ -229,7 +300,7 @@ class Stream {
   mutable std::mutex mutex_;
   int conn_ = 0, code_ = 1006;
   std::atomic<bool> closed_{true};
-  bool ready_ = false, lobby_mismatch_ = false;
+  bool ready_ = false, lobby_mismatch_ = false, kind_refused_ = false, busy_ = false, full_ = false;
   std::deque<json> pending_;
 #ifdef YOUGAME_AGENT_TEST_HOOK
   bool first_open_recorded_ = false;

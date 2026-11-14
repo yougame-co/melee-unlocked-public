@@ -49,7 +49,8 @@ static AnimLoopSettings mn_803EB57C[] = {{0},{1},{2}}, mn_803EB5A0[] = {{3},{4},
 struct { int selection_count; AnimLoopSettings* anim_loop; int start_frame; u16* description_indices; void(*think)(HSD_GObj*); } mn_803EB6B0[9];
 static u16 mn_803EB66C[3];
 void mu_slippi_online_menu_think(HSD_GObj*);
-static int ranked_supported, ranked_offered, friends_offered, slippi_submenu, boot_oneshot, p2p_auto_direct, friends_confirm_hold, slippi_link_notice, friends_return;
+static int agent_copy, local_peer, agent_lock_logged;
+static int ranked_supported, ranked_offered, friends_offered, slippi_submenu, boot_oneshot, p2p_auto_direct, friends_confirm_hold, slippi_link_notice, friends_return, friends_css_host;
 static int pending_buttons, entered, last_mode = -1, published, installs, switched_menu, switched_row;
 static int p2p, cpu, granted = 1, grant_queries, notices, grant_error, grant_short;
 static int link_requests, link_leaves;
@@ -64,13 +65,16 @@ int mu_slippi_menus_enabled() { return 1; }
 void mu_content_mode(int mode) { last_mode = mode; }
 int mu_slippi_fetch_app_state() { return slp.app_state; }
 void mu_mnmain_install_online_menu();
+void mu_slippi_log_online_rows();
 int mu_online_p2p_menus() { return p2p; } int mu_online_p2p_port() { return 0; }
 int mu_ranked_setup_cpu() { return cpu; }
 void mu_slippi_load_match_state(void*) {}
 static int logged_selection_row = -1, logged_selection_option = -1;
 static int logged_highlight_row = -1, logged_highlight_option = -1;
 static std::vector<std::string> highlight_lines;
+static std::vector<std::string> row_lines;
 void mu_online_abi_log(const char* line) {
+    if (std::strstr(line, "online menu: rows offered ")) row_lines.emplace_back(line);
     if (std::strstr(line, " highlighted;")) {
         std::sscanf(line, "online menu: row %d (option %d) highlighted", &logged_highlight_row, &logged_highlight_option);
         highlight_lines.emplace_back(line);
@@ -97,7 +101,11 @@ void mn_80229894(int menu, int row, int) {
     switched_menu = menu; switched_row = row;
     mn_804A04F0.cur_menu = menu; mn_804A04F0.hovered_selection = row;
 }
+static int friends_css_answer, friends_css_queries;   // the host's one-shot "a Friends room opened the CSS"
 int mu_slippi_cmd(unsigned cmd, const void* p, unsigned, void* out, unsigned, unsigned* got) {
+    if (cmd == CMD_YOUGAME_FRIENDS_MENU && *(const u8*)p == 14) {
+        ++friends_css_queries; *(u8*)out = (u8)friends_css_answer; friends_css_answer = 0; *got = 1; return 0;
+    }
     if (cmd == MU_TOURNEY_COMMAND) {
         if (*(const u8*)p == MU_TOURNEY_JOIN) { ++joins; queue_visible = 1; }
         if (*(const u8*)p == MU_TOURNEY_LEAVE) { ++leaves; queue_visible = 0; }
@@ -117,11 +125,21 @@ int mu_slippi_cmd(unsigned cmd, const void* p, unsigned, void* out, unsigned, un
 static int checks;
 #define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr,"line %d: %s\n",__LINE__,#x); std::abort(); } } while (0)
 '''
+# Melee Unlocked 1.0 (upstream 0.9.97): the split layout's production state and helpers. Inert in
+# these fixtures: the host stub answers no YouGame byte (EF), so yg_flags stays 0 and every row,
+# cursor and lock below is the app's.
+_SHIM = (ROOT / 'sourceport/game/shim/mu_slippi_menu.c').read_text()
+STUBS = (STUBS.replace('CMD_UPDATE_APP = 0xb8,', 'CMD_UPDATE_APP = 0xb8, CMD_YOUGAME_MENU = 0xef,', 1) +
+         _SHIM[_SHIM.index('static int yg_flags;'):_SHIM.index('static int yougame_query(')] +
+         fixture.extract(_SHIM, 'yougame_query'))
 CASES = r'''
 static void press(int buttons) { pending_buttons = buttons; mn_804D6BC8.cooldown = 0; mu_slippi_online_menu_think(nullptr); }
 int main() {
     ranked_supported = ranked_offered = friends_offered = 1; slp.app_state = MU_SLP_APP_LOGGED_IN;
     mu_mnmain_install_online_menu(); mn_804A04F0.cur_menu = MENU_KIND_8;
+    CHECK(row_lines == std::vector<std::string>{"online menu: rows offered Ranked,Unranked,Friends,Slippi tournament=0\n"});
+    row_lines.clear(); press(0); press(0); CHECK(row_lines.empty());
+    mu_mnmain_install_online_menu(); CHECK(row_lines.size() == 1);
     CHECK(mu_slippi_first_unlocked() == 0 && mu_slippi_menu_count() == 4);
     const int preview[] = {0,1,2,3};
     const int descriptions[] = {0x645,0x646,0x647,0x64B};
@@ -141,7 +159,7 @@ int main() {
     mn_804A04F0.hovered_selection = 2; press(MenuInput_Confirm);
     CHECK(entered == 0 && published == 6 && mn_804D6BC8.cooldown == 5);
     // Friends' own confirm cooldown keeps the row selected, so the host keeps the picker that press
-    // opened (quality 11-01, build 30: it published 5, "friends: cancelled", the friend waited alone).
+    // opened (11-01, build 30: it published 5, "friends: cancelled", the friend waited alone).
     for (int i = 0; i < 4; ++i) { pending_buttons = 0; mu_slippi_online_menu_think(nullptr); CHECK(published == 6 && friends_confirm_hold); }
     pending_buttons = 0; mn_804D6BC8.cooldown = 0; mu_slippi_online_menu_think(nullptr);
     CHECK(published == 6 && !friends_confirm_hold);
@@ -226,6 +244,24 @@ int main() {
     CHECK(mu_slippi_menu_enter(GM_BOOT, &menu, &hovered));
     CHECK(menu == MENU_KIND_8 && hovered == mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_FRIENDS));
     CHECK(!friends_return && !slippi_submenu && !boot_oneshot);
+    // B out of the host's Friends CSS (50m leave crash): the entry opens Online on Friends, once.
+    friends_css_host = 1; CHECK(mu_slippi_menu_enter(GM_VS, &menu, &hovered));
+    CHECK(menu == MENU_KIND_8 && hovered == mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_FRIENDS) && !friends_css_host);
+    menu = hovered = 0xEE; CHECK(!mu_slippi_menu_enter(GM_VS, &menu, &hovered) && menu == 0xEE);
+    // The mark never outlives a menu entry from anywhere else.
+    friends_css_host = 1; CHECK(!mu_slippi_menu_enter(GM_BOOT, &menu, &hovered) && !friends_css_host);
+    // B out of a Friends room's online CSS (Direct mode underneath): Online with Friends highlighted,
+    // never the Slippi submenu (one more B used to leave the cursor on the hidden Slippi row).
+    slp.mode = MU_SLP_MODE_DIRECT; slippi_submenu = 1; friends_css_answer = 1; int queries = friends_css_queries;
+    CHECK(mu_slippi_menu_enter(GM_HANYU_CSS, &menu, &hovered) && friends_css_queries == queries + 1);
+    CHECK(menu == MENU_KIND_8 && hovered == mu_online_menu_row(1, 0, MU_SLP_OPT_FRIENDS) && !slippi_submenu);
+    CHECK(mu_slippi_menu_option(hovered) == MU_SLP_OPT_FRIENDS && last_mode == -1);
+    // The answer is one-shot: Direct by connect code still comes back to its own Slippi submenu row.
+    CHECK(mu_slippi_menu_enter(GM_HANYU_CSS, &menu, &hovered) && friends_css_queries == queries + 2);
+    CHECK(slippi_submenu && hovered == mu_online_menu_row(1, 1, MU_SLP_MODE_DIRECT));
+    // Every entry asks, so an answer never outlives an entry from anywhere else.
+    friends_css_answer = 1; boot_oneshot = 0; CHECK(!mu_slippi_menu_enter(GM_VS, &menu, &hovered) && !friends_css_answer);
+    slippi_submenu = 0;
     // A listing without a ladder keeps Ranked greyed and starts on Unranked.
     ranked_offered = 0;
     CHECK(!mu_slippi_option_unlocked(0) && mu_slippi_first_unlocked() == 1);
@@ -310,6 +346,8 @@ int main() {
     // A late hello inserts a focusable Tournament between Friends and Slippi.
     for (int p=0;p<4;++p) for (int i=0;i<3;++i) cached_input[p][i]=0;
     slippi_submenu = 0; queue_available = 1; press(0);
+    CHECK(row_lines.back() == "online menu: rows offered Ranked,Unranked,Friends,Tournament,Slippi tournament=1\n");
+    row_lines.clear(); press(0); press(0); CHECK(row_lines.empty());
     CHECK(mu_slippi_menu_count() == 5 && mn_803EB6B0[8].selection_count == 5);
     CHECK(mu_slippi_menu_option(2) == MU_SLP_OPT_FRIENDS);
     CHECK(mu_slippi_menu_option(3) == MU_SLP_OPT_TOURNAMENT);
@@ -333,14 +371,17 @@ int main() {
     queue_visible = 1; tournament_query(MU_TOURNEY_MENU);
     CHECK(mu_slippi_menu_enter(GM_VS, &menu, &hovered));
     CHECK(menu == MENU_KIND_8 && hovered == 3);
-    queue_visible = 0; queue_available = 0; press(0);
+    row_lines.clear(); queue_visible = 0; queue_available = 0; press(0);
+    CHECK(row_lines == std::vector<std::string>{"online menu: rows offered Ranked,Unranked,Friends,Slippi tournament=0\n"});
     CHECK(mu_slippi_menu_count() == 4 && mu_slippi_menu_option(3) == MU_SLP_OPT_SLIPPI);
     for (int r=0;r<mu_slippi_menu_count();++r) CHECK(mu_slippi_menu_option(r)!=MU_SLP_OPT_TOURNAMENT);
     std::printf("online menu: %d checks passed\n", checks);
 }
 '''
 
-ROUTE_STUBS = r'''#include <cstdio>
+ROUTE_STUBS = r'''#include "slippi_agent_lock.h"
+namespace agent_lock = slippi::agent_lock;
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -366,6 +407,7 @@ struct User {
   static std::unique_ptr<User> GrantedSlippiUser(const std::string&);
   bool IsLoggedIn() const { return login; }
   bool CheckOnlineCompatibility(std::string* error) { ++compatibility; *error = "offline version refusal"; return compatible; }
+  bool CheckSessionCompatibility(std::string* error) { return CheckOnlineCompatibility(error); }   // v0.9.101's shared check
   UserInfo GetUserInfo() const { return {}; }
   std::string dir() const { return "synthetic-user"; }
 };
@@ -377,6 +419,7 @@ namespace host { void log(const char*, ...) {} }
 namespace display { enum class Provider { Unknown, YouGame, Slippi }; }
 namespace yougame {
 bool active() { return ::active; }
+bool session() { return active(); }   // no launcher in these fixtures: the app's session
 void slippi_link(bool, const std::string&) {}
 static int ranked_visits, friend_publications;
 void ranked_screen_enter() { ++ranked_visits; }
@@ -400,7 +443,7 @@ class Matchmaking {
  public:
   enum OnlinePlayMode { RANKED, UNRANKED, DIRECT, TEAMS, PARTY };
   enum State { INITIALIZING, MATCHMAKING, OPPONENT_CONNECTING, ERROR_ENCOUNTERED };
-  struct Settings { OnlinePlayMode mode; std::string connect_code, friend_room; } search_settings_;
+  struct Settings { OnlinePlayMode mode; std::string connect_code, friend_room; bool friends_lobby = false; } search_settings_;
   struct Local { bool enabled = false; int local_port = 1; } local_peer;
   User* user_;
   std::unique_ptr<User> slippi_user_;
@@ -536,6 +579,11 @@ QUERY_CASES = r'''int main() {
     }
     g_user = nullptr; std::vector<unsigned char> q; unsigned char query = 8;
     CHECK(query_menu(&query,q) && q == std::vector<unsigned char>{0});
+    // 14: a Friends room opened the CSS the menu came back from, answered once and never published.
+    g_online_menu_visible = true; g_friends_css = true; query = 14;
+    CHECK(query_menu(&query,q) && q == std::vector<unsigned char>{1} && !g_friends_css);
+    CHECK(query_menu(&query,q) && q == std::vector<unsigned char>{0});
+    CHECK(g_online_menu_visible && !yougame::friend_publications);
     std::printf("local grant query: %d checks passed\n", checks);
 }
 '''
@@ -748,7 +796,7 @@ int main() {
 
     def test_production_entry_cursor_submenu_and_standalone(self):
         source = (ROOT / 'sourceport/game/shim/mu_slippi_menu.c').read_text()
-        names = ['tournament_query', 'tournament_menu_think', 'mu_slippi_menu_count', 'mu_slippi_menu_option',
+        names = ['mu_slippi_log_online_rows', 'tournament_query', 'tournament_menu_think', 'mu_slippi_menu_count', 'mu_slippi_menu_option',
                  'mu_slippi_menu_label_kind', 'mu_slippi_option_unlocked', 'mu_slippi_first_unlocked',
                  'mu_slippi_menu_enter', 'mu_slippi_switch_to_online_menu', 'upstream_slippi_available', 'confirm_port',
                  'log_online_highlight', 'mu_slippi_online_menu_think']
@@ -835,9 +883,10 @@ for (int row=0;row<4;++row) {
         grant = 'std::unique_ptr<User> User::GrantedSlippiUser(const std::string& user_dir) {' + literal_function(net, 'GrantedSlippiUser') + '}\n'
         host = (ROOT / 'port/runtime/hle/slippi_online.cpp').read_text()
         case = host.split('    case CMD_YOUGAME_FRIENDS_MENU:', 1)[1].split('    case CMD_YOUGAME_DATA:', 1)[0]
-        query = ('static User* g_user; static bool g_online_menu_visible;\n'
+        query = ('static User* g_user; static bool g_online_menu_visible; static std::atomic<bool> g_friends_css;\n'
+                 'static std::atomic<bool> g_doubles_lobby_request;\n'
                  'bool query_menu(const unsigned char* payload, std::vector<unsigned char>& q) {' + case + '}\n')
-        self.compile_fixture('query', '#include <functional>\n' + ROUTE_STUBS + grant +
+        self.compile_fixture('query', '#include <functional>\n#include <atomic>\n' + ROUTE_STUBS + grant +
                              'static void reset() { reads = compatibility = prepared = yg_calls = tickets = 0; }\n' + query + QUERY_CASES)
 
     def test_cancel_during_account_loading_preserves_replacement_ranked_room(self):
@@ -860,6 +909,8 @@ for (int row=0;row<4;++row) {
         stubs = r'''
 #include "slippi_account.h"
 #include <atomic>
+#include "slippi_agent_lock.h"
+namespace agent_lock = slippi::agent_lock;
 #include <future>
 #include <memory>
 #include <mutex>
@@ -869,6 +920,7 @@ using json = nlohmann::json;
 namespace fs = std::filesystem;
 static bool app_active = true;
 static int checks, discoveries;
+static void note_agent_grant() {} // slippi_net.cpp's agent-copy grant log; production login code below calls it
 static fs::path launcher;
 static std::vector<fs::path> reads;
 static std::promise<std::pair<bool,std::string>> announcement;
@@ -897,6 +949,7 @@ class User {
   static std::unique_ptr<User> GrantedSlippiUser(const std::string&);
   bool AttemptLogin(bool rediscover = false);
   void RefreshFromServer() {} // Offline transport boundary; login code is production below.
+  void ResetOnlineCompatibility() {} // v0.9.101: a changed login drops the shared version check
   bool IsLoggedIn() const { return logged_in_; }
   UserInfo GetUserInfo() const { std::lock_guard<std::mutex> lk(mutex_); return info_; }
   static std::vector<std::string> GetDefaultChatMessages() { return std::vector<std::string>(16,"test"); }
@@ -984,7 +1037,7 @@ int main(int, char** argv) {
         net = (ROOT / 'port/runtime/hle/yougame_link.cpp').read_text()
         find = literal_function(net, 'find_match')
         decline = find[find.index('  const auto decline = [&] {'):find.index('\n  if (cancelled()) {', find.index('  const auto decline = [&] {'))]
-        queue = find[find.index('  const bool queued = room_code.empty();'):find.index('\n  auto room = std::make_unique<Room>();')]
+        queue = find[find.index('  const bool queued = room_code.empty();'):find.index('\n\n  // An adopted lobby room')]
         stubs = r'''
 #include "yougame_search.h"
 #include "yougame_transport.h"
@@ -1003,6 +1056,7 @@ static std::vector<std::string> transcript;
 #define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr,"line %d: %s\n",__LINE__,#x); std::abort(); } } while (0)
 namespace host { void log(const char*, ...) {} }
 namespace friends { const char* kTeamWaiting = "team"; const char* kWaiting = "friend"; }
+namespace lobby { const char* kWaiting = "friends lobby"; const char* kDoublesWaiting = "doubles"; }
 struct { void refuse() {} } g_update_notice;
 static uint64_t now_ms() { return 1; }
 static void Sleep(int) { std::abort(); }
@@ -1027,7 +1081,9 @@ struct Socket {
 };
 static Match run() {
   const auto epoch = g_search_generation.begin();
-  const bool blend = true, friends_mode = false, team_code = false;
+  const bool blend = true, friends_mode = false, team_code = false, lobby_route = false;
+  const bool doubles_home = false, doubles_room = false;   // the Doubles home and its match room (G2)
+  const void* parked = nullptr;   // a parked Friends lobby room (none here)
   const std::string url = "fake", pass = "synthetic", direct_code;
   std::string room_code, error;
   struct Search { std::function<bool()> claim; std::function<void(int)> on_searching; std::string direct_code; } search;
@@ -1076,7 +1132,8 @@ int main() {
 #include <string>
 static bool app_active, online_visible, playing;
 static std::string link_message, console_message;
-static int begins, ends, positions, checks;
+static int begins, ends, positions, checks, styles, fonts, same_lines, reserves;
+static float g_overlay_game_aspect = 73.0f / 60.0f, pill_x, pill_y, pill_font;
 static std::vector<std::string> lines;
 #define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr,"line %d: %s\n",__LINE__,#x); std::abort(); } } while (0)
 namespace yougame {
@@ -1089,16 +1146,26 @@ namespace slippi::online {
 bool online_status_visible() { return online_visible; }
 bool is_online_match() { return playing; }
 }
+namespace screen_label { float corner_hint_bottom() { return 0.0f; } void reserve_bottom(float) { ++reserves; } }
 struct ImVec2 { float x, y; ImVec2(float a, float b):x(a),y(b){} };
 enum { ImGuiCond_Always = 1, ImGuiWindowFlags_NoDecoration = 1,
        ImGuiWindowFlags_AlwaysAutoResize = 2, ImGuiWindowFlags_NoSavedSettings = 4,
-       ImGuiWindowFlags_NoInputs = 8, ImGuiWindowFlags_NoFocusOnAppearing = 16 };
+       ImGuiWindowFlags_NoInputs = 8, ImGuiWindowFlags_NoFocusOnAppearing = 16, ImGuiStyleVar_WindowPadding = 1 };
 namespace ImGui {
 struct IO { ImVec2 DisplaySize{1280,720}; } io;
 IO& GetIO() { return io; }
-void SetNextWindowPos(ImVec2, int, ImVec2) { ++positions; }
+void SetNextWindowPos(ImVec2 at, int, ImVec2) { ++positions; pill_x = at.x; pill_y = at.y; }
+struct Style { float FontSizeBase = 13.0f; } style;
+Style& GetStyle() { return style; }
+float GetFontSize() { return 26.0f; }
+void PushStyleVar(int, ImVec2) { ++styles; } void PopStyleVar() { --styles; }
+void PushFont(void*, float size) { ++fonts; pill_font = size; } void PopFont() { --fonts; }
+void SameLine() { ++same_lines; }
 void SetNextWindowBgAlpha(float) {}
-void Begin(const char* id, void*, int) { CHECK(std::string(id)=="##yougame_friend_waiting"); ++begins; }
+void Begin(const char* id, void*, int) {
+  CHECK(std::string(id)=="##yougame_friend_waiting"); CHECK(styles==1 && fonts==1);  // padding and font apply to this window
+  ++begins;
+}
 void PushTextWrapPos(float) {} void PopTextWrapPos() {} float GetCursorPosX() { return 0; }
 ImVec2 GetWindowPos() { return {0,0}; } ImVec2 GetWindowSize() { return {0,0}; }
 void TextUnformatted(const char* text) { lines.emplace_back(text); }
@@ -1121,17 +1188,31 @@ int main() {
     for (auto message : messages) for (const char* console : {"", "Connecting...", "Cancelled", "Couldn't connect"}) {
       app_active=app; online_visible=online; playing=match;
       link_message=message.text; console_message=console;
-      begins=ends=positions=0; lines.clear(); draw();
+      begins=ends=positions=same_lines=reserves=0; lines.clear(); draw();
+      CHECK(styles==0); CHECK(fonts==0);
       bool expected=(app || online) && !match && (*console || message.visible);
-      CHECK(begins==int(expected)); CHECK(ends==begins); CHECK(positions==begins);
+      CHECK(begins==int(expected)); CHECK(ends==begins); CHECK(positions==begins); CHECK(reserves==begins);
       if (expected) {
         bool cancel=*console || link_message==friends::kWaiting;
         CHECK(lines.size()==(cancel?2u:1u));
         CHECK(lines[0]==(*console?console:message.text));
         if (cancel) CHECK(lines[1]=="Z: cancel");
+        CHECK(same_lines==int(cancel));  // one row
+        // 1280x720 at 73:60: the picture fills the height; the row sits on its bottom edge at 0.026 of it.
+        CHECK(pill_x==640.0f); CHECK(pill_y>714.0f && pill_y<718.0f);
+        CHECK(pill_font>9.3f && pill_font<9.4f);
       } else CHECK(lines.empty());
       ++scenarios;
     }
+  // Letterbox (window taller than the picture): the row sits on the picture's bottom edge, not the window's;
+  // the font stops at the UI font. A tiny picture keeps the 8 px floor.
+  app_active=true; online_visible=false; playing=false; link_message=friends::kWaiting; console_message="";
+  ImGui::io.DisplaySize = ImVec2(1280,1600); draw();
+  const float picture = 1280.0f/(73.0f/60.0f);
+  CHECK(pill_y>(1600+picture)*0.5f-7 && pill_y<(1600+picture)*0.5f-6); CHECK(pill_font==13.0f);
+  ImGui::io.DisplaySize = ImVec2(200,150); draw();
+  CHECK(pill_y==150.0f-2.0f); CHECK(pill_font==4.0f);
+  CHECK(styles==0); CHECK(fonts==0);
   std::printf("status window: %d scenarios, %d checks passed\n",scenarios,checks);
 }
 ''')

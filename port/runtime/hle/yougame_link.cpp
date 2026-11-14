@@ -1,12 +1,15 @@
 // YouGame online (see yougame_link.h).
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "slippi_agent_lock.h"
 #include "test_env.h"
 #include "yougame_link.h"
+#include "yougame_channel.h"
 #include "yougame_udp.h"
 #include "yougame_tourney.h"
 #include "yougame_tourney_queue.h"
 #include "yougame_tourney_delivery.h"
 #include "yougame_embed_toplevel.h"
+#include "yougame_embed_fullscreen.h"
 #include "opponent_display.h"
 #include "yougame_parity.h"
 #include "yougame_shortcuts.h"
@@ -21,11 +24,18 @@
 #include "yougame_exit_reason.h"
 #include "yougame_ranked.h"
 #include "yougame_room.h"
+#include "yougame_lobby.h"
+#include "yougame_doubles_lobby.h"
 #include "yougame_console_link.h"
 #include "yougame_console_card.h"
 #include "yougame_console_entry.h"
+#include "yougame_doubles.h"
 #include "yougame_update.h"
 #include "yougame_blend.h"
+#if MU_SQUAD
+// Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+#include "yougame_squad.h"
+#endif
 #include "yougame_search.h"
 #include "gameplay_policy.h"
 #ifdef YOUGAME_AGENT_TEST_HOOK
@@ -34,6 +44,7 @@
 #include <enet/yg_enet_socket.h>
 #include "host.h"
 #include "lcancel.h"
+#include "pipeline_cache_store.h"
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -61,6 +72,13 @@
 #include <set>
 #include <stdexcept>
 #include <thread>
+#ifdef _WIN32
+#include <shellapi.h>
+#else
+#include <spawn.h>
+#include <sys/wait.h>
+extern char** environ;
+#endif
 
 using json = nlohmann::json;
 
@@ -190,6 +208,21 @@ struct Stdio {
   std::atomic<bool> eof{false};
 };
 Stdio g_io;
+// The local channel (yougame_channel.h): a game started on its own (no YOUGAME_STDIO, YOUGAME_BRIDGE
+// or launcher) talks to a running YouGame app over the stdio bridge's own lines. Requests, answers and
+// pushes go through g_io and handle_app_line exactly as in stdio mode; only the writes differ.
+// g_io.eof is true whenever no channel connection is open.
+std::atomic<bool> g_channel_allowed{false};          // start(): nothing started this game
+std::mutex g_channel_mutex;
+std::shared_ptr<channel::Connection> g_channel;      // g_channel_mutex; set while probing and while up
+std::atomic<bool> g_channel_up{false};               // verified and hello answered
+std::atomic<bool> g_channel_probing{false};
+std::atomic<bool> g_channel_account_changed{false};  // the host's last refusal was accountChanged
+channel::RetryGate g_channel_retry;                  // g_channel_mutex
+channel::PlayerWait g_player_wait;                   // g_channel_mutex
+std::atomic<bool> g_player_wait_running{false};
+std::atomic<uint64_t> g_probe_started{0};           // now_ms() when the last probe began (timing lines)
+uint64_t since_probe() { const uint64_t at = g_probe_started.load(); return at ? now_ms() - at : 0; }
 relay_pads::State g_relay_pads([](const std::string& line) { host::log("%s", line.c_str()); }, false);
 std::atomic<uintptr_t> g_pad_mirror{0};
 #ifndef _WIN32
@@ -203,10 +236,14 @@ thread_local std::function<bool()> g_search_stopped;
 thread_local search_policy::BusyRetry* g_ticket_retry = nullptr;
 update::Notice g_update_notice;
 bool search_stopped() { return g_search_stopped && g_search_stopped(); }
+bool g_launcher = false;                        // MELEE_YOUGAME_LAUNCHER=1: Melee Unlocked's launcher serves the bridge
+std::atomic<int> g_online_mode_arg{0};          // --online-mode: 1 ranked, 2 direct, taken once
+std::atomic<bool> g_launcher_session{false};    // under the launcher: the online menu's last pick was a YouGame row
 std::mutex g_link_mutex;
 std::map<unsigned, int> g_link_events;
 std::map<unsigned, std::string> g_link_routes;
 std::map<unsigned, std::vector<uint64_t>> g_link_rtts;
+std::map<unsigned, uint64_t> g_link_last_rtt;   // the newest round trip per link (the Friends lobby's doors)
 std::atomic<bool> g_relaunch{false};
 std::shared_ptr<console::RelaunchWait> g_relaunch_wait; // atomic shared_ptr publication, like handoff channels
 int direct_state(unsigned id) {
@@ -364,8 +401,16 @@ void handle_app_line(const std::string& line) {
       if (auto wait = std::atomic_load(&g_relaunch_wait)) wait->push(push);
       if (console::launch_request(push)) parity::signals.console_boot_ready();
       if (g_stdio) ux::page_pause.push(push);
-      if (push.value("cmd",json()) == "leave") { friends::lobby.leave(); console::entry.stop(); } // no-op outside a held room
-      if (friends::events.push(push, now_ms()) && friends::version_reason(push)) log_friend_version();
+      if (push.value("cmd",json()) == "leave") {
+#ifdef MELEE_DOUBLES
+        doubles::ui.back_if_active();
+#endif
+        friends::lobby.leave(); console::entry.stop(); } // no-op outside a held room
+      const bool taken = friends::events.push(push, now_ms());
+      if (taken && friends::version_reason(push)) log_friend_version();
+      // Receipt only (no names or text): proves the app's notice reached the game, shown or not.
+      else if (push.value("type", "") == "notice")
+        host::log("friends: notice %.16s %s", friends::text(push, "kind", 16).c_str(), taken ? "shown" : "ignored");
       if (push.value("type", "") == "net") g_net_events.push(push);
       if (push.value("type", "") == "direct") {
         const auto notice = console::direct_notice(push);
@@ -376,6 +421,7 @@ void handle_app_line(const std::string& line) {
           if (notice.rtt) {
             auto& samples = g_link_rtts[notice.link];
             if (samples.size() < 32) samples.push_back(*notice.rtt);
+            g_link_last_rtt[notice.link] = *notice.rtt;
           }
         }
       }
@@ -395,6 +441,19 @@ void handle_app_line(const std::string& line) {
   }
   if (line.rfind("embed ", 0) == 0) {
     if (shortcuts::commands.dispatch(line.substr(6), [](const char* text) { host::log("%s", text); })) return;
+    const auto fullscreen = embed_fullscreen::state.receive(std::string_view(line).substr(6));
+    if (fullscreen != embed_fullscreen::Line::Other) {
+      if (fullscreen == embed_fullscreen::Line::Accepted) {
+        const int on = embed_fullscreen::state.display(true);
+        host::log("yougame: embed fullscreen %d (display option now %s)", on,
+                  on ? "Borderless fullscreen" : "Window");
+      } else {
+        static bool invalid_logged = false;
+        if (!invalid_logged) host::log("yougame: embed fullscreen invalid value; ignored");
+        invalid_logged = true;
+      }
+      return;
+    }
 #ifdef MELEE_LINUX_X11_EMBED
     if (g_embedded) {
       // Keep command order, including during boot. Never run Xlib on this reader thread.
@@ -438,7 +497,15 @@ void read_stdin() {
 #ifdef MELEE_LINUX_X11_EMBED
   bool discard = false;
 #endif
-  while (in && in != INVALID_HANDLE_VALUE && ReadFile(in, buf, sizeof buf, &got, nullptr) && got) {
+  // How stdin ended, logged with the quit: a launcher whose pipe never reached the game reads
+  // differently from one that closed it (0 bytes, an error) or an app that left mid-run.
+  unsigned long long total = 0;
+  DWORD read_error = 0;
+  bool read_failed = false;
+  while (in && in != INVALID_HANDLE_VALUE) {
+    if (!ReadFile(in, buf, sizeof buf, &got, nullptr)) { read_failed = true; read_error = GetLastError(); break; }
+    if (!got) break;
+    total += got;
 #ifdef MELEE_LINUX_X11_EMBED
     if (g_embedded) {
       // Discard an entire oversized line through its newline; a suffix is never a command.
@@ -479,6 +546,9 @@ void read_stdin() {
   g_relay_pads.reset_on_eof();
   g_relay_pads.flush();
   g_io.cv.notify_all();
+  if (!in || in == INVALID_HANDLE_VALUE) host::log("yougame: stdin: no handle");
+  else if (read_failed) host::log("yougame: stdin: read failed (error %lu) after %llu bytes", (unsigned long)read_error, total);
+  else host::log("yougame: stdin: end of file after %llu bytes", total);
   host::log("yougame: the YouGame app closed the bridge; quitting");
   host::request_exit(0);
 }
@@ -504,7 +574,18 @@ json bridge_stdio(const json& body, int timeout_ms, const std::function<bool()>&
   json request = body;
   request["id"] = id;
   const std::string line = "yg " + request.dump();
-  if (absolute == tourney::Deadline::max()) write_line(line);
+  if (!g_stdio) {
+    // The local channel: never a line the host would close the connection over.
+    std::shared_ptr<channel::Connection> conn;
+    { std::lock_guard<std::mutex> lock(g_channel_mutex); conn = g_channel; }
+    const bool fits = channel::line_fits(line);
+    if (absolute != tourney::Deadline::max() || !fits || !conn || !conn->write_line(line)) {
+      std::lock_guard<std::mutex> lock(g_io.mutex);
+      g_io.pending_requests.erase(id);
+      if (!fits) throw std::runtime_error("This is too large to send to YouGame");
+      throw BridgeNoAnswer("YouGame is not answering");
+    }
+  } else if (absolute == tourney::Deadline::max()) write_line(line);
   else if (!tournament_write_line(line, absolute)) throw BridgeNoAnswer("Tournament stdout deadline");
   auto lock = tournament_io_lock(absolute);
   const auto deadline = std::min(absolute, std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms));
@@ -524,6 +605,68 @@ json bridge_stdio(const json& body, int timeout_ms, const std::function<bool()>&
   json answer = std::move(g_io.answers[id]);
   g_io.answers.erase(id);
   return answer;
+}
+
+// ------------------------------------------------------------------ the local channel's requests
+constexpr const char* kChannelClosed = "YouGame is not open. Open the YouGame app, then try again.";
+void player_arrived();   // after fetch_identity, below
+void player_wait_loop();
+void start_player_wait();
+// A request over the local channel: the stdio bridge's request and answer, with the hello naming this
+// game (contract section 4). Every hello answer feeds the playerPending wait. `probing`: the probe's own
+// hello, sent before the channel counts as up.
+json bridge_channel(const json& body, int timeout_ms, const std::function<bool()>& cancelled = {}, bool probing = false) {
+  if (!probing && !g_channel_up) throw BridgeNoAnswer(kChannelClosed);
+  const bool hello = body.is_object() && body.value("type", "") == "hello";
+  json j = bridge_stdio(hello ? channel::hello_request(body, build_version()) : body, timeout_ms, cancelled);
+  if (hello && j.value("ok", false)) {
+    const json result = j.count("result") ? j["result"] : json::object();
+    const bool pending = channel::hello_pending(result), player = channel::hello_player(result);
+    host::log("yougame channel: hello answered %llu ms (%s)", (unsigned long long)since_probe(),
+              player ? "player" : pending ? "pending" : "no player");
+    bool tell = false;
+    {
+      std::lock_guard<std::mutex> lock(g_channel_mutex);
+      g_player_wait.answered(pending, player, now_ms());
+      // The probe's own hello: the probe asks for the identity itself once the channel is up.
+      if (!probing) tell = g_player_wait.take_arrival();
+    }
+    if (tell) {
+      host::log("yougame channel: player arrived by retry %llu ms", (unsigned long long)since_probe());
+      player_arrived();
+    }
+    if (!probing) start_player_wait();
+  }
+  return j;
+}
+// The playerPending retries run once the channel is up (the probe starts them after it counts it up).
+void start_player_wait() {
+  bool due;
+  { std::lock_guard<std::mutex> lock(g_channel_mutex); due = g_player_wait.due_at() != 0; }
+  if (due && g_channel_up && !g_player_wait_running.exchange(true)) {
+    std::thread([] { player_wait_loop(); g_player_wait_running = false; }).detach();
+  }
+}
+// playerPending: say hello again about 2 s and 6 s after the pending answer (PlayerWait), until the
+// player arrives, the push comes, the second retry is answered or the connection closes.
+void player_wait_loop() {
+  uint64_t scheduled = 0;   // the retry this loop is waiting for, so a cancelled one is logged once
+  for (;;) {
+    uint64_t at;
+    { std::lock_guard<std::mutex> lock(g_channel_mutex); at = g_player_wait.due_at(); }
+    if (!at || !g_channel_up) {
+      if (scheduled) host::log("yougame channel: retry hello at %llu ms (cancelled)", (unsigned long long)since_probe());
+      return;
+    }
+    scheduled = at;
+    const uint64_t now = now_ms();
+    if (now < at) { Sleep((DWORD)std::min<uint64_t>(at - now, 250)); continue; }
+    { std::lock_guard<std::mutex> lock(g_channel_mutex); g_player_wait.sent(); }
+    host::log("yougame channel: retry hello at %llu ms (sent)", (unsigned long long)since_probe());
+    scheduled = 0;
+    try { (void)bridge_channel({{"type", "hello"}}, channel::kHelloTimeoutMs); }
+    catch (const std::exception&) { }   // no answer: the next retry, if any, still goes
+  }
 }
 
 // Native WinHTTP cancels synchronous requests by closing their handle. The POSIX shim polls its
@@ -565,13 +708,13 @@ class PendingHttp {
 // POST <bridge>/sdk {type, ...} -> {ok, result | error}. Only the app's loopback address is
 // accepted: the token must never travel anywhere else.
 json bridge_http(const json& body, int timeout_ms, const std::function<bool()>& cancelled = {}) {
-  if (g_bridge_url.empty() || g_bridge_token.empty()) throw std::runtime_error("Start Melee from the YouGame app to play online");
+  if (g_bridge_url.empty() || g_bridge_token.empty()) throw std::runtime_error(g_launcher ? "Start Melee Unlocked from its launcher to play YouGame modes" : "Start Melee from the YouGame app to play online");
   Url u;
-  if (!parse_url(g_bridge_url + "/sdk", u) || u.secure || u.host != L"127.0.0.1") throw std::runtime_error("The YouGame app's address is invalid");
+  if (!parse_url(g_bridge_url + "/sdk", u) || u.secure || u.host != L"127.0.0.1") throw std::runtime_error(g_launcher ? "The launcher's address is invalid" : "The YouGame app's address is invalid");
   HINTERNET session = http_session();
   if (!session) throw std::runtime_error("Networking is unavailable");
   HINTERNET conn = WinHttpConnect(session, u.host.c_str(), u.port, 0);
-  if (!conn) throw BridgeNoAnswer("The YouGame app is not answering");
+  if (!conn) throw BridgeNoAnswer(g_launcher ? "The Melee Unlocked launcher is not answering. Keep it open while you play YouGame modes." : "The YouGame app is not answering");
   HINTERNET req = WinHttpOpenRequest(conn, L"POST", u.path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
   std::string result;
   bool sent = false;
@@ -595,27 +738,39 @@ json bridge_http(const json& body, int timeout_ms, const std::function<bool()>& 
   }
   WinHttpCloseHandle(conn);
   if (!sent && cancelled && cancelled()) throw std::runtime_error("Cancelled");
-  if (!sent) throw BridgeNoAnswer("The YouGame app is not answering");
+  if (!sent) throw BridgeNoAnswer(g_launcher ? "The Melee Unlocked launcher is not answering. Keep it open while you play YouGame modes." : "The YouGame app is not answering");
   json j = json::parse(result, nullptr, false);
-  if (j.is_discarded() || !j.is_object()) throw std::runtime_error("The YouGame app sent an invalid answer");
+  if (j.is_discarded() || !j.is_object()) throw std::runtime_error(g_launcher ? "The launcher sent an invalid answer" : "The YouGame app sent an invalid answer");
   return j;
 }
 
 // The site's refusal code from this thread's last not-ok bridge() answer (letters and _ only, <= 24), empty when
 // the last call threw for another reason (no answer, cancelled). For logs that must never carry the error text.
 thread_local std::string g_bridge_refusal;
+// The words of this thread's last update_required answer (update::error_text), empty when it carried none.
+thread_local std::string g_bridge_update_text;
+// The local channel: the raw code of this thread's last refusal (letters only, <= 24, for the timing
+// lines), and accountSwitching's wait before asking again (0 for any other answer).
+thread_local std::string g_channel_code;
+thread_local uint64_t g_channel_retry_after = 0;
 json bridge(const json& body, int timeout_ms = 15000, const std::function<bool()>& cancelled = {}) {
   g_bridge_refusal.clear();
+  g_bridge_update_text.clear();
+  g_channel_code.clear();
+  g_channel_retry_after = 0;
   search_policy::BusyRetry local_retry;
   auto& retry = g_ticket_retry ? *g_ticket_retry : local_retry;
   json j;
   for (;;) {
     if (cancelled && cancelled()) throw std::runtime_error("Cancelled");
-    j = g_stdio ? bridge_stdio(body, timeout_ms, cancelled) : bridge_http(body, timeout_ms, cancelled);
+    j = g_stdio ? bridge_stdio(body, timeout_ms, cancelled)
+        : g_channel_allowed ? bridge_channel(body, timeout_ms, cancelled)
+        : bridge_http(body, timeout_ms, cancelled);
     // The app forwards the site's code, including HTTP 409. Text/status alone never gates a build.
     const auto& refused = update::refusal(j);
     if (update::required(refused)) {
       g_bridge_refusal = "update_required";
+      g_bridge_update_text = update::error_text(j);
       if ((cancelled && cancelled()) || search_stopped()) throw std::runtime_error("Cancelled");
       if (!search_stopped()) {
         g_update_notice.refuse();
@@ -636,9 +791,21 @@ json bridge(const json& body, int timeout_ms = 15000, const std::function<bool()
   if (cancelled && cancelled() && !assigned) throw std::runtime_error("Cancelled");
   if (!j.value("ok", false)) {
     g_bridge_refusal = ranked::str(j, "code");
+    if (!g_stdio && g_channel_allowed) {
+      // The local channel's host (v1) answers only some types; the rest say notYet. Our words, never a
+      // retry: the row's search ends and the game goes back to the menu.
+      if (g_bridge_refusal.size() <= 24 && g_bridge_refusal.find_first_not_of(
+              "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_") == std::string::npos) g_channel_code = g_bridge_refusal;
+      if (g_bridge_refusal == "accountChanged") g_channel_account_changed = true;   // the connection ends next
+      // The hidden page was mid-switch (today only mpCode): the connection stays; ask again later.
+      if (g_bridge_refusal == "accountSwitching") g_channel_retry_after = channel::retry_after_ms(j);
+      if (g_bridge_refusal == "notYet") g_bridge_refusal = "not_yet";
+      const std::string ours = channel::refusal_text(j);
+      if (!ours.empty()) throw std::runtime_error(ours);
+    }
     if (g_bridge_refusal.empty() || g_bridge_refusal.size() > 24 ||
         g_bridge_refusal.find_first_not_of("abcdefghijklmnopqrstuvwxyz_") != std::string::npos) g_bridge_refusal = "refused";
-    std::string error = j.count("error") && j["error"].is_string() ? j["error"].get<std::string>() : "YouGame request failed";
+    std::string error = j.count("error") && j["error"].is_string() ? j["error"].get<std::string>() : friends::kRequestFailed;
     throw std::runtime_error(friends::version_request(body) && friends::version_reason(j) ? friends::kVersion :
                              body.value("ranked", false) ? ranked::ticket_error(j) : error);
   }
@@ -692,6 +859,9 @@ class Socket {
   // SILENT_CLOSE): it is not final, so the console backend rejoins as it does after a 1006 drop.
   bool rejoinable() const { return recoverable() || (broker_ && broker_->close_code() == 4002); }
   bool lobby_mismatch() const { return broker_ && broker_->lobby_mismatch(); }
+  bool kind_refused() const { return broker_ && broker_->kind_refused(); }   // another Teams protocol / Doubles profile
+  bool busy() const { return broker_ && broker_->busy(); }
+  bool room_full() const { return broker_ && broker_->full(); }
   int close_code() const { return broker_ ? broker_->close_code() : 1006; }
   bool brokered() const { return broker_ != nullptr; }
 #ifdef YOUGAME_AGENT_TEST_HOOK
@@ -991,12 +1161,27 @@ search_policy::LinkFailures g_direct_link_failures; // g_mutex; survives replace
 // The room of the current online session. Stays open through the match for results.
 struct Room : transport::RoomState<Socket> {
   bool friends = false;
+  // The Friends lobby (yougame_lobby.h) once its match started: its session, this player's id, the screen's
+  // control and each friend's link by connection. The room keeps them through the match and, parked between
+  // matches (close_room(Leave::Next)), until the lobby's next search adopts the room (find_match).
+  std::unique_ptr<lobby::Session> lobby_session;
+  std::shared_ptr<lobby::Control> lobby_control;
+  std::map<std::string, unsigned> lobby_links;
+  std::string lobby_me;
+  std::atomic<bool> keep_links{false};   // stopping the pump hands the links to the adopting search
+  // The Doubles home's placed match (G2): this room is the match, its home (doubles_home) stays parked in
+  // g_parked_lobby. Back on the select (close_room Next/Lost) only this room closes; the home stays.
+  bool doubles_match = false;
+  std::string doubles_home;
   ~Room() {
     // Also runs on cancelled/failed setup: no abandoned links occupy the three slots.
     transport::close_links(links, [](const json& q, int ms) { return bridge(q, ms); });
   }
 };
 std::unique_ptr<Room> g_room;
+// The Friends lobby's room between matches (g_mutex): its pump keeps the lobby current and runs the screen's
+// intents, its links stay up. Only the lobby's next search takes it; any other close leaves it.
+std::unique_ptr<Room> g_parked_lobby;
 std::atomic<unsigned> g_update_searches{0};
 bool g_slippi_match = false;  // g_mutex; identity refresh must not switch a live Slippi match's ENet
 
@@ -1042,8 +1227,52 @@ void set_status(const std::string& s) {
 
 using transport::read_roster;
 
+// Each other human's door: the route and newest round trip of their link, once it is up (nothing before).
+std::array<lobby::LinkInfo, lobby::kSeats> lobby_link_info(const lobby::Session& s, const json& roster,
+                                                           const std::map<std::string, unsigned>& by_conn) {
+  std::array<lobby::LinkInfo, lobby::kSeats> out{};
+  const int mine = s.my_seat();
+  for (const auto& seat : s.state().seats) {
+    if (seat.kind != lobby::Kind::Human || seat.seat == mine || seat.seat < 0 || seat.seat >= lobby::kSeats) continue;
+    std::string conn;
+    if (roster.is_array())
+      for (const auto& p : roster)
+        if (p.is_object() && p.value("id", "") == seat.id && p.value("localIndex", 0) == 0) conn = p.value("connectionId", "");
+    const auto it = conn.empty() ? by_conn.end() : by_conn.find(conn);
+    if (it == by_conn.end() || direct_state(it->second) != 2) continue;
+    std::lock_guard<std::mutex> lock(g_link_mutex);
+    const auto route = g_link_routes.find(it->second);
+    out[seat.seat].route = route == g_link_routes.end() || route->second.empty() ? std::string("unknown") : route->second;
+    const auto rtt = g_link_last_rtt.find(it->second);
+    out[seat.seat].rtt = rtt == g_link_last_rtt.end() ? -1 : (int)std::min<uint64_t>(rtt->second, 99999);
+  }
+  return out;
+}
+
 transport::RoomIO room_io(Room& r) {
   transport::RoomIO io;
+  // A Friends lobby room keeps its lobby through the match and while parked between matches.
+  io.message = [&r](const json& m) {
+    if (!r.lobby_session) return;
+    r.lobby_session->receive(m);
+    if (const char* bad = r.lobby_session->take_bad_frame()) host::log("friends lobby: unusable room frame (%s)", bad);
+    // sessionEnded (host_ended: the host called off a match that never began) ends only that match: the
+    // room stays parked for the lobby (the pump's stop list never includes it).
+    if (ranked::str(m, "t") == "sessionEnded")
+      host::log("friends lobby: the room ended the match (%s); the room stays", ranked::log_text(ranked::str(m, "reason"), 32).c_str());
+    // Rooms dropped the match before the splash and the session let its setup go: so does the room, so
+    // the game never plays the old plan and the next Start plans a fresh setup.
+    if (r.lobby && !r.lobby_session->has_setup()) {
+      host::log("friends lobby: the room dropped the match before it began; its setup is released");
+      r.lobby = nullptr;
+    }
+  };
+  io.tick = [&r](std::vector<json>& out) {
+    if (!r.lobby_session) return;
+    if (r.lobby_control) r.lobby_control->run(*r.lobby_session, lobby_link_info(*r.lobby_session, r.participants, r.lobby_links), r.code);
+    for (auto& f : r.lobby_session->due(now_ms())) out.push_back(std::move(f));
+  };
+  io.keep_links = [&r] { return r.keep_links.load(); };
   io.request = [&r](const json& q, int ms) {
     return bridge(q, ms, [&] { return q.value("type", "") == "mpTicket" && r.stop; });
   };
@@ -1051,6 +1280,9 @@ transport::RoomIO room_io(Room& r) {
   io.disable_links = [] { yg_enet_enable(0); };
   io.log = [](const char* message) { host::log("%s", message); };
   io.started = [](const std::string& id) { g_rank_results.pending(id); };
+#ifdef MELEE_DOUBLES
+  io.settled = [code = r.code] { doubles::ui.settle_teams(code); };
+#endif
   io.result = [&r](const json& m) {
     if (!g_rank_results.receive(m, r.set.local_participant())) g_rank_results.result_error();
     g_rank_result_visible = true;
@@ -1068,10 +1300,37 @@ transport::RoomIO room_io(Room& r) {
 void end_links(Room& r) { transport::end_links(r, room_io(r)); }
 void pump_room(Room* r) { transport::pump_room(r, g_mutex, room_io(*r)); }
 
+// The four-seat Friends lobby the page was last told it holds. Every ending tells the page it is gone, or
+// its two-seat Friends picker keeps refusing with "This Friends room has 4 seats". Only the room the page
+// still holds is cleared, so a slow ending can never wipe the report of a lobby opened after it.
+std::mutex g_lobby_report_mutex;
+std::string g_lobby_reported;
+void report_lobby(const std::string& code, const json& report) {
+  std::lock_guard<std::mutex> lock(g_lobby_report_mutex);
+  g_lobby_reported = code;
+  bridge(report, 1000);
+}
+// A 2-seat or Doubles room took over the page's report: nothing an older lobby ends may retract it.
+void lobby_report_replaced() {
+  std::lock_guard<std::mutex> lock(g_lobby_report_mutex);
+  g_lobby_reported.clear();
+}
+void report_lobby_gone(const std::string& code) {
+  std::lock_guard<std::mutex> lock(g_lobby_report_mutex);
+  if (code.empty() || g_lobby_reported != code) return;
+  g_lobby_reported.clear();
+  host::log("friends lobby: told the page the room is gone");
+  try { bridge({{"type", "mpRoom"}, {"code", nullptr}, {"players", json::array()}}, 1000); } catch (...) {}
+}
 void shutdown_room(std::unique_ptr<Room> r) {
   if (!r) return;
   r->stop = true;
   if (r->pump.joinable()) r->pump.join();
+  if (r->lobby_session) report_lobby_gone(r->code);
+  if (r->lobby_session && r->socket && !r->doubles_match) {   // the lobby's own leave frees the seat at once
+    r->lobby_session->leave();
+    for (const auto& f : r->lobby_session->due(now_ms())) if (f.value("t", "") != "leave") r->socket->send(f);
+  }
   end_links(*r);
   if (r->socket) {
     r->socket->send({{"t", "leave"}});
@@ -1088,6 +1347,33 @@ uint64_t close_room(Leave why) {
   std::unique_ptr<Room> r;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
+    // The Friends lobby back on its select: its room stays up, parked, for the lobby's next search. A
+    // friend's dropped game (Lost) brings everyone back to the select too; only leaving (Quit) closes it.
+    // The Doubles home's match back on the select: only the match room closes; its home stays parked (the
+    // next search takes it back with its picks, no auto-search).
+    if ((why == Leave::Next || why == Leave::Lost) && g_room && g_room->doubles_match) {
+      g_search_generation.begin();
+      friends::events.current_room({});
+      host::log("doubles: back to the home%s; the match room closes", why == Leave::Lost ? " (a connection dropped)" : "");
+      std::thread([old = std::move(g_room)]() mutable { shutdown_room(std::move(old)); }).detach();
+      return g_search_generation.value();
+    }
+    if ((why == Leave::Next || why == Leave::Lost) && g_room && g_room->lobby_session) {
+      g_search_generation.begin();
+      friends::events.current_room({});
+      if (g_parked_lobby) std::thread([old = std::move(g_parked_lobby)]() mutable { shutdown_room(std::move(old)); }).detach();
+      g_parked_lobby = std::move(g_room);
+      host::log("friends lobby: back to the select%s; the room stays", why == Leave::Lost ? " (a connection dropped)" : "");
+      return g_search_generation.value();
+    }
+    if (why == Leave::Next && !g_room) {   // the lobby's own next search: the parked room is its
+      g_search_generation.begin();
+      return g_search_generation.value();
+    }
+    if (g_parked_lobby) {
+      host::log("friends lobby: left the lobby");
+      std::thread([old = std::move(g_parked_lobby)]() mutable { shutdown_room(std::move(old)); }).detach();
+    }
     g_search_generation.begin();
 #ifdef YOUGAME_AGENT_TEST_HOOK
     g_pending_input = false;
@@ -1105,6 +1391,7 @@ uint64_t close_room(Leave why) {
     const bool agent_test_quit = !r->ranked && agent_test::static_quit_requested.load();
 #endif
     if (r->friends && why == Leave::Quit && !r->in_game) host::log("friends: cancelled");
+    if (r->lobby_session && why != Leave::Quit) host::log("friends lobby: the room closes (%s)", why == Leave::Lost ? "connection lost" : "over");
     bool at_once = true;
     if (r->ranked) {
       if (why == Leave::Quit) r->set.quit();
@@ -1163,16 +1450,35 @@ uint64_t close_room(Leave why) {
 
 // What two builds must share to play: the netplay protocol and this build's game. The rooms Worker
 // only matches players with the same key (lobby compatibility).
-std::string compatibility(int mode) {
-#ifdef MELEE_PORT_VERSION
-  std::string v = MELEE_PORT_VERSION;
-#else
-  std::string v = "dev";
+std::string compatibility(int mode
+#if MU_SQUAD
+    // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+    , bool squad_row = false, const std::string& squad_budget = std::string()
 #endif
+) {
+  const std::string v = online_version(yougame::build_version());
   const auto& build = slippi::online::local_build();
+#if MU_SQUAD
+  return squad::compatibility(v, build.mod_view, build.fingerprint, build.static_engine,
+      slippi::online::ranked_rules_digest(mode),
+      compat_tag_with_test_timer(compat_tag, std::getenv("MELEE_ONLINE_TEST_TIMER")),
+      mode, squad_row, squad_budget);
+#else
   return compatibility_key(v, build.mod_view, build.fingerprint, build.static_engine,
                            slippi::online::ranked_rules_digest(mode),
                            compat_tag_with_test_timer(compat_tag, std::getenv("MELEE_ONLINE_TEST_TIMER")));
+#endif
+}
+
+// The lobby's room key: friends-lobby-1 (the Friends lobby) or doubles-lobby-1 (the Doubles home, its
+// queue and its match: the same key on every call) ahead of this build's own key.
+std::string lobby_room_key(lobby::Profile profile = lobby::Profile::Friends4) {
+  const auto& build = slippi::online::local_build();
+  const std::string tag = compat_tag_with_test_timer(compat_tag, std::getenv("MELEE_ONLINE_TEST_TIMER"));
+  return lobby::compatibility(online_version(yougame::build_version()), [&](const std::string& version) {
+    return compatibility_key(version, build.mod_view, build.fingerprint, build.static_engine,
+                             slippi::online::ranked_rules_digest(1), tag);
+  }, profile);
 }
 
 thread_local bool g_friend_search = false;
@@ -1180,10 +1486,28 @@ thread_local bool g_friend_failed = false;
 // Blended Unranked's YouGame side (yougame_blend.h): cancelled because Slippi's side was first, it
 // goes quiet ("offline"), not "error: Cancelled" under a Slippi match.
 thread_local bool g_blend_search = false;
-Match fail(const std::string& why, bool retry = false, bool update_required = false) {
+// The 4-player Friends lobby's search (find_match's lobby_route). Its failures never search again: a
+// retry would hold a new room and leave the friends who joined the held code behind.
+thread_local bool g_lobby_search = false;
+// The Doubles match room this thread's Teams search joins (find_match), empty otherwise. Its transient
+// failures search the room again kMaxTries times in all, then stop on the cap's line.
+thread_local std::string g_doubles_search_room;
+Match fail(const std::string& reason, bool retry = false, bool update_required = false) {
   Match m;
-  m.error = why;
+  std::string why = reason;
   m.retry = retry && !update_required;
+  if (g_lobby_search) m.retry = false;   // the Friends lobby never searches again into a new room
+#ifdef MELEE_DOUBLES
+  if (m.retry && !g_doubles_search_room.empty() && !search_stopped()) {
+    if (doubles::ui.retry_teams(g_doubles_search_room)) {
+      host::log("doubles: the Teams search failed (%s); searching the match room again", why.c_str());
+    } else {
+      host::log("doubles: the Teams search failed (%s); not searching again after %d tries", why.c_str(), doubles::kMaxTries);
+      m.retry = false; why = doubles::kTeamsCappedLine;
+    }
+  }
+#endif
+  m.error = why;
   m.update_required = update_required;
   if (search_stopped()) return m;
   if (update_required) {
@@ -1202,12 +1526,29 @@ Match fail(const std::string& why, bool retry = false, bool update_required = fa
                     g_blend_search && why == "Cancelled" ? "offline" : "error: " + why);
   return m;
 }
+// Rooms refused a friend room's seat because the room is full: final, never retried. The line ("<host>'s
+// room is full.") shows on the character select and as a toast, and the game goes back to Friends.
+Match fail_room_full(const std::string& room_code) {
+  Match m;
+  m.error = friends::room_full_line(friends::events.inviter(room_code));
+  if (search_stopped()) return m;
+  if (!g_friend_failed) host::log("friends: invite failed: room full");
+  g_friend_failed = true;
+  set_status("offline");
+  friends::events.room_full(m.error, now_ms());
+  return m;
+}
 
 std::atomic<bool> g_identity_fetching{false};
+// The player arrived while an ask was in flight: that ask began before them (its hello was
+// "pending"), so it runs once more when it ends instead of leaving "not signed in" until the
+// Online menu is opened again (two-PC run 11-13 11:28Z: a fast PC's push landed mid-ask).
+std::atomic<bool> g_identity_again{false};
 
 Identity fetch_identity(const std::function<bool()>& cancelled = nullptr) {
   static std::once_flag said;
-  std::call_once(said, [] { host::log("yougame: YouGame mode (%s%s)", g_stdio ? "stdio bridge" : "loopback bridge", g_embedded ? ", in the player box" : ""); });
+  std::call_once(said, [] { host::log("yougame: YouGame mode (%s%s)", g_stdio ? "stdio bridge" : g_channel_allowed ? "local channel" : "loopback bridge", g_embedded ? ", in the player box" : ""); });
+  const bool via_channel = !g_stdio && g_channel_allowed;
   Identity id;
   try {
     json hello = bridge({{"type", "hello"}}, 15000, cancelled);
@@ -1217,7 +1558,7 @@ Identity fetch_identity(const std::function<bool()>& cancelled = nullptr) {
       friends::events.hello(hello);
       console::launch_hello(hello);
       if (console::requests.pending()) parity::signals.console_boot_ready();
-      if (hello.count("caps")) console::read_caps(hello, g_relaunch);
+      if (hello.count("caps") && !via_channel) console::read_caps(hello, g_relaunch);   // caps: the app's own child only
     }
     std::string diagnostic;
     {
@@ -1242,21 +1583,36 @@ Identity fetch_identity(const std::function<bool()>& cancelled = nullptr) {
     {
       std::lock_guard<std::mutex> lock(g_mutex);
       if (search_stopped()) return id;
-      if (route != transport::DatagramRoute::Standalone) g_broker = true;
+      // The app's broker is the app-started game's; a game on the local channel keeps its own sockets.
+      if (route != transport::DatagramRoute::Standalone && !via_channel) g_broker = true;
       g_direct = g_stdio && route == transport::DatagramRoute::Ring;
       select_match_transport(g_slippi_match); // refuse mode also prevents native sockets
     }
     if (g_broker && !g_direct) throw std::runtime_error("YouGame broker requires direct links v1 (1200-byte datagrams)");
 #endif
+    // Which transport this session took, so a pass can tell direct links from the app's broker.
+    // Booleans only: nothing from the hello's player, ticket or addresses.
+    host::log("yougame: hello: direct=%d broker=%d stdio=%d", g_direct ? 1 : 0, g_broker ? 1 : 0, g_stdio ? 1 : 0);
     const json& p = hello.count("player") && hello["player"].is_object() ? hello["player"] : json::object();
     id.player_id = p.value("id", "");
     id.name = p.value("name", "");
-    try {
-      json code = bridge({{"type", "mpCode"}}, 15000, cancelled);
-      if ((cancelled && cancelled()) || search_stopped()) return id;
-      id.code = code.value("code", "");
-    } catch (const std::exception& e) {
-      host::log("yougame: no connect code: %s", e.what());
+    // accountSwitching (local channel): the page was mid-switch; ask again after its retryAfter, twice at most.
+    for (int attempt = 0;; ++attempt) {
+      try {
+        json code = bridge({{"type", "mpCode"}}, 15000, cancelled);
+        if (via_channel) host::log("yougame channel: mpCode answered %llu ms ok", (unsigned long long)since_probe());
+        if ((cancelled && cancelled()) || search_stopped()) return id;
+        id.code = code.value("code", "");
+      } catch (const std::exception& e) {
+        if (via_channel)
+          host::log("yougame channel: mpCode answered %llu ms %s", (unsigned long long)since_probe(),
+                    g_channel_code.empty() ? "no answer" : g_channel_code.c_str());
+        const uint64_t wait = via_channel && attempt < 2 ? g_channel_retry_after : 0;
+        if (wait && search_policy::wait(wait, now_ms, [](int ms) { Sleep(ms); },
+                                        [&] { return (cancelled && cancelled()) || !g_channel_up; })) continue;
+        host::log("yougame: no connect code: %s", channel::log_text(e.what()).c_str());
+      }
+      break;
     }
     id.ok = !id.player_id.empty();
     if (!id.ok) id.error = "Sign in to YouGame to play online";
@@ -1267,14 +1623,182 @@ Identity fetch_identity(const std::function<bool()>& cancelled = nullptr) {
     id.error = e.what();
   }
   if ((cancelled && cancelled()) || search_stopped()) return id;
-  if (id.ok) host::log("yougame: signed in as %s (%s)", id.name.c_str(), id.code.empty() ? "no code" : id.code.c_str());
-  else host::log("yougame: not signed in: %s", id.error.c_str());
+  if (id.ok) host::log("yougame: signed in as %s (%s)", channel::log_text(id.name).c_str(), id.code.empty() ? "no code" : channel::log_text(id.code).c_str());
+  else host::log("yougame: not signed in: %s", channel::log_text(id.error).c_str());
   std::lock_guard<std::mutex> lock(g_mutex);
   if (search_stopped()) return id;
   g_identity = id;
   g_identity_asked = true;
   g_identity_at = GetTickCount64();
   return id;
+}
+
+// ------------------------------------------------------------------ the local channel's connection
+// The identity is asked again now, on this thread (the probe's, never the game's).
+// The caller holds g_identity_fetching. Asks until no player arrived during the last ask, then
+// lets it go; a player who arrives after the release starts a fresh ask through refresh_identity().
+// Only the holder clears g_identity_again (at the top): a thread that loses the flag after its
+// release leaves it set for the ask that holds it now.
+void run_identity_asks() {
+  do {
+    g_identity_again = false;
+    try { fetch_identity(); } catch (const std::exception& e) { host::log("yougame: sign-in failed: %s", channel::log_text(e.what()).c_str()); }
+    g_identity_fetching = false;
+  } while (g_identity_again.load() && !g_identity_fetching.exchange(true));
+}
+void fetch_identity_now() {
+  if (g_identity_fetching.exchange(true)) return;
+  run_identity_asks();
+}
+// The player a pending hello waited for is here (told once per connection by PlayerWait).
+void player_arrived() {   // logged by the caller (by push or by retry)
+  { std::lock_guard<std::mutex> lock(g_mutex); g_identity_at = 0; }   // identity() asks again at once
+  g_identity_again = true;   // an ask in flight began before them: it runs once more (run_identity_asks)
+  refresh_identity();
+}
+// A line from the host: the stdio handler takes answers and the pushes it knows, as for the app's
+// stdio. Not bridge lines, the pad mirror's handle, and lines that do not parse are skipped.
+void channel_line(const std::string& line) {
+  std::string handled = line;
+  switch (channel::classify(line)) {
+    case channel::LineAction::Drop: {
+      static std::atomic<int> said{0};
+      if (said.fetch_add(1) < 5) host::log("yougame channel: unparsed line (%zu bytes)", line.size());
+      return;
+    }
+    case channel::LineAction::AppOnly:
+      return;
+    case channel::LineAction::PlayerArrived: {
+      bool tell;
+      { std::lock_guard<std::mutex> lock(g_channel_mutex); g_player_wait.pushed(); tell = g_player_wait.take_arrival(); }
+      if (tell) {
+        host::log("yougame channel: player arrived by push %llu ms", (unsigned long long)since_probe());
+        // Before the probe counts the channel up, its own identity ask covers the player.
+        if (g_channel_up) player_arrived();
+      }
+      return;
+    }
+    case channel::LineAction::Answer: {
+      // accountChanged is the last answer before the host ends the connection: known before its end.
+      if (channel::answer_code(line) == "accountChanged") g_channel_account_changed = true;
+      // An answer never carries the app's caps here (they are the app-started game's own).
+      if (line.find("\"caps\"") != std::string::npos) {
+        json j = json::parse(line.substr(3), nullptr, false);
+        if (!j.is_object()) return;
+        j.erase("caps");
+        handled = "yg " + j.dump();
+      }
+      break;
+    }
+    case channel::LineAction::Push:
+      if (!g_channel_up) return;   // nothing from a host before it answered hello and passed every check
+      break;
+  }
+  try { handle_app_line(handled); }
+  catch (const std::exception&) {
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true)) host::log("yougame channel: bad line from YouGame");
+  }
+}
+bool start_channel_probe(bool force);
+// The host closed the connection (it quit, the player signed out or another account signed in), or
+// the probe gave up on it. Waiting requests fail at once; the YouGame rows go back to Coming soon.
+void channel_closed(const std::shared_ptr<channel::Connection>& conn) {
+  bool was_up;
+  {
+    // One critical section (g_channel_mutex, then g_io.mutex): a stale reader never touches the next
+    // candidate's eof.
+    std::lock_guard<std::mutex> lock(g_channel_mutex);
+    if (g_channel != conn) return;   // a later connection replaced it
+    g_channel.reset();
+    was_up = g_channel_up.exchange(false);
+    std::lock_guard<std::mutex> io(g_io.mutex);
+    g_io.eof = true;
+  }
+  g_io.cv.notify_all();
+  // Taken on every close, up or not: an accountChanged answer to the probe's own hello never stays
+  // behind to force a later, unrelated re-probe past the 5 s gate.
+  const bool account_changed = g_channel_account_changed.exchange(false);
+  if (!was_up) return;
+  host::log("yougame channel: closed");
+  { std::lock_guard<std::mutex> lock(g_mutex); g_identity = Identity{}; g_identity_asked = false; }
+  // accountChanged: connect again (and hello) to hear the new player.
+  if (account_changed) start_channel_probe(true);
+}
+// One probe: production first, then staging (Linux: three folders each). The first that connects,
+// passes the checks and answers hello is kept. One line in the log per probe.
+bool probe_channel() {
+  g_probe_started = now_ms();
+  std::string why;
+  const auto where = channel::candidates(&why);
+  if (where.empty()) { host::log("yougame channel: refused %s", why.c_str()); return false; }
+  std::string refused;
+  for (const auto& candidate : where) {
+    std::unique_ptr<channel::Connection> opened;
+    why.clear();
+    const auto opened_as = channel::Connection::open(candidate, &opened, &why);
+    if (opened_as == channel::OpenResult::Missing) continue;
+    if (opened_as == channel::OpenResult::Refused) { if (refused.empty()) refused = why; continue; }
+    std::shared_ptr<channel::Connection> conn(std::move(opened));
+    {
+      std::lock_guard<std::mutex> lock(g_channel_mutex);
+      g_channel = conn;
+      g_player_wait = channel::PlayerWait{};
+      std::lock_guard<std::mutex> io(g_io.mutex);
+      g_io.eof = false;
+    }
+    std::thread([conn] { conn->read_lines(channel_line); channel_closed(conn); }).detach();
+    json hello;
+    try { hello = bridge_channel({{"type", "hello"}}, channel::kHelloTimeoutMs, {}, true); }
+    catch (const std::exception&) { hello = json(); }
+    if (!hello.is_object() || !hello.value("ok", false)) {
+      if (refused.empty()) {
+        const std::string code = hello.is_object() ? ranked::str(hello, "code") : std::string();
+        refused = !hello.is_object() ? "no hello" : "hello refused" + (code.size() <= 24 && !code.empty() ? " " + code : std::string());
+      }
+      conn->close();   // its reader ends too
+      channel_closed(conn);
+      continue;
+    }
+    const json result = hello.count("result") ? hello["result"] : json::object();
+    bool up;
+    {
+      // Up only while this is still the connection and still open: a host that closed it during
+      // hello (its reader may already have dropped it) is no host, never a channel stuck up.
+      std::lock_guard<std::mutex> lock(g_channel_mutex);
+      up = channel::may_promote(g_channel, conn);
+      if (up) { g_channel_up = true; g_channel_probing = false; }   // in the same section: a close
+      // right after promotion still finds nothing probing, so its forced re-probe is never lost
+    }
+    if (!up) {
+      if (refused.empty()) refused = "closed during hello";
+      conn->close();
+      channel_closed(conn);
+      continue;
+    }
+    host::log("yougame channel: connected %s (verified %d)", candidate.staging ? "staging" : "production",
+              result.is_object() && result.value("verified", false) == true ? 1 : 0);
+    { std::lock_guard<std::mutex> lock(g_mutex); g_identity = Identity{}; g_identity_asked = false; }
+    start_player_wait();
+    fetch_identity_now();   // on this thread, so the Online menu opens the rows once it is in
+    return true;
+  }
+  if (refused.empty()) host::log("yougame channel: none");
+  else host::log("yougame channel: refused %s", channel::log_text(refused).c_str());
+  return false;
+}
+// Starts a probe on its own thread unless one is running or a channel is up. Without `force`, at most
+// one every 5 s (the Online menu's retries).
+bool start_channel_probe(bool force) {
+  if (!g_channel_allowed || g_channel_up) return false;
+  {
+    std::lock_guard<std::mutex> lock(g_channel_mutex);
+    if (!g_channel_retry.allow(now_ms()) && !force) return false;
+  }
+  if (g_channel_probing.exchange(true)) return false;
+  // A probe that brought the channel up cleared the flag itself, and a later probe may own it now.
+  std::thread([] { if (!probe_channel()) g_channel_probing = false; }).detach();
+  return true;
 }
 
 }  // namespace
@@ -1287,11 +1811,16 @@ void wait_console_retired(const std::function<bool()>& stop = {}) {
   if (!g_console_retired.wait(5000,stop) && !(stop && stop())) host::log("console: previous Friends room still closing");
 }
 struct ConsoleBackend {
+#ifdef MELEE_DOUBLES
+  bool doubles_room = false;
+  std::function<void(const json&)> observe;
+#endif
   std::unique_ptr<Socket> room;
   std::thread worker;
   std::atomic<bool> stop{false}, closed{false};
   std::atomic<bool> rejoining{false};
   std::atomic<bool> retiring{false};
+  std::atomic<bool> helper_missing{false}; // the app answered no_direct: its links helper is missing or won't start
   std::shared_future<void> preparation_finished;
   std::vector<json> retired_links; // mutex; SessionLink's destructor queues directClose here
   std::mutex mutex, close_mutex;
@@ -1310,9 +1839,17 @@ struct ConsoleBackend {
   ~ConsoleBackend() { close(); }
   bool open(const std::string& ticket, const std::string& code, int ms) {
     room = std::make_unique<Socket>(); std::string error;
-    if (!room->open_session("",ticket,code,&error,ms,session)) {
+    bool opened = room->open_session("",ticket,code,&error,ms,session);
+    // A cold Rooms isolate can refuse one seat while it fetches the build list. The ticket is still
+    // good, so try once more rather than dissolve the whole admission.
+    if (!opened && room->busy()) {
+      host::log("console: room open refused (busy); retrying once");
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      opened = room->open_session("",ticket,code,&error,ms,session);
+    }
+    if (!opened) {
       host::log("console: room open refused (close %d, %s)", room->close_code(),
-                room->lobby_mismatch() ? "lobby_mismatch" : "unclassified");
+                room->lobby_mismatch() ? "lobby_mismatch" : room->busy() ? "busy" : room->room_full() ? "room_full" : "unclassified");
       return false;
     }
     conn = room->connection();
@@ -1342,6 +1879,10 @@ struct ConsoleBackend {
         json m;
         if (!stop && room->next(m,10)) {
           const auto type = ranked::str(m,"t");
+#ifdef MELEE_DOUBLES
+          if (observe) observe(m);
+          if (!doubles_room) {
+#endif
           if (session_live && !handoff_pending && (type == "back" || type == "join" || type == "welcome")) {
             // The live Link validates frozen slots/accounts and new connection ids.
             // Lobby's old host id must not turn a held host's new id into a Leave;
@@ -1350,6 +1891,9 @@ struct ConsoleBackend {
             friends::lobby.observe(control); // final room closure still applies immediately
           } else friends::lobby.observe(m);
           if (friends::lobby.cancelled()) console::entry.stop();
+#ifdef MELEE_DOUBLES
+          }
+#endif
           bool ended_session = false;
           if (type == "sessionEnded") {
             std::lock_guard<std::mutex> lock(mutex);
@@ -1403,7 +1947,13 @@ struct ConsoleBackend {
           incoming.push_back(std::move(m)); cv.notify_all();
           if (type == "welcome") rejoining = false; // publish the fresh roster before allowing opens
         }
-        const auto quit = [this] { return stop.load() || friends::lobby.cancelled() || host::exit_requested(); };
+        const auto quit = [this] { return stop.load() ||
+#ifdef MELEE_DOUBLES
+            (!doubles_room && friends::lobby.cancelled()) ||
+#else
+            friends::lobby.cancelled() ||
+#endif
+            host::exit_requested(); };
         if (room->closed() && room->rejoinable() && !quit()) {
           rejoining = true;
           // Rooms holds a dropped seat for 90 s (AWAY_MS); 60 s rides out a Rooms deploy's ~30 s reset.
@@ -1411,7 +1961,7 @@ struct ConsoleBackend {
           bool recovered = false;
           uint64_t backoff = 250; // a refused ticket must not become a request storm
           host::log("console: room transport dropped (%d); trying held-seat rejoin",room->close_code());
-          while (!quit() && now_ms() < until && room->rejoinable()) {
+          while (!quit() && now_ms() < until && room->rejoinable() && !room->room_full()) {   // full: the seat is gone
             const auto budget = int(std::min<uint64_t>(2000,until-now_ms()));
             try {
               const auto ticket = renew_ticket ? renew_ticket(budget) : std::string();
@@ -1433,8 +1983,14 @@ struct ConsoleBackend {
           if (recovered) { host::log("console: held-seat rejoin connected"); continue; }
         }
         if (room->closed()) {
+#ifdef MELEE_DOUBLES
+          if (!doubles_room) {
+#endif
           if (room->close_code() == 4012) friends::lobby.closed(4012); // 1006 keeps the held seat
           if (friends::lobby.cancelled()) console::entry.stop();
+#ifdef MELEE_DOUBLES
+          }
+#endif
           closed = true; cv.notify_all(); break;
         }
         std::deque<json> send;
@@ -1507,6 +2063,7 @@ struct ConsoleBackend {
     }) && !closed;
   }
   bool attach(int ms) {
+    helper_missing = false; // only a no_direct refusal below sets it again
     if (retiring) return false; // a cancelled preparing entry must not wait on its own retire
     wait_console_retired([this] { return retiring.load(); }); // every console-session attach shares the process-global channel
     if (ms <= 0) return false;
@@ -1519,6 +2076,7 @@ struct ConsoleBackend {
         std::string code = ranked::str(raw,"code");
         if (code.empty() || code.size() > 24 || code.find_first_not_of("abcdefghijklmnopqrstuvwxyz_") != std::string::npos) code = "unknown";
         host::log("console: link helper attach refused (%s)", code.c_str());
+        helper_missing = code == "no_direct";
         return false;
       }
       const auto h = raw.count("result") ? raw["result"] : json::object();
@@ -1577,11 +2135,17 @@ SessionIO console_io(const std::shared_ptr<ConsoleBackend>& b) {
   // Console boots before the ordinary mod/card scan. Use native Direct's canonical
   // content key in both the waiting game and the fresh boot (no ranked rules).
   // The suffix is the console session protocol: console4 adds game-local save choices and rejoin agreement
-  // to the shared host save and straight-to-VS boot. Other protocols must never share a session.
+  // to the shared host save and straight-to-VS boot; console5 unlocks every fighter and stage instead of
+  // taking the roster from the loaded card. Other protocols must never share a session.
 #ifdef MELEE_PORT_VERSION
-  io.compatibility = compatibility_key(MELEE_PORT_VERSION,false,"",false) + "-console4";
+  io.compatibility = compatibility_key(online_version(MELEE_PORT_VERSION),false,"",false) + "-console5";
 #else
-  io.compatibility = compatibility_key("dev",false,"",false) + "-console4";
+  io.compatibility = compatibility_key(online_version("dev"),false,"",false) + "-console5";
+#endif
+#if MU_SQUAD
+  // A squad build's heaps, ARAM and Friends costume rule differ from a plain build's (as online,
+  // where its keys carry "sq"): a Friends session never mixes the two. Plain keys are unchanged.
+  io.compatibility += "-" + yougame::squad::build_tag("");
 #endif
   io.host_save = [] {
     const auto read = yougame::console::host_save_reader.load(std::memory_order_acquire);
@@ -1625,7 +2189,7 @@ SessionIO console_io(const std::shared_ptr<ConsoleBackend>& b) {
       catch (const std::runtime_error&) {
         host::log("console: room ticket refused (%s)", g_bridge_refusal.empty() ? "no answer" : g_bridge_refusal.c_str());
         // bridge() reports an update refusal as "Cancelled" when no search is running (Friends has none). The
-        // player needs the update notice, not "couldn't connect" (doubles-lead 11-01: a newer row went up mid-run).
+        // player needs the update notice, not "couldn't connect" (seen 11-01: a newer build row went up mid-run).
         if (g_bridge_refusal == "update_required") { g_update_notice.refuse(); throw update::Required(); }
         throw;
       }
@@ -1652,6 +2216,7 @@ SessionIO console_io(const std::shared_ptr<ConsoleBackend>& b) {
   io.rebound = [](const std::string& old_id,const std::string& new_id) { friends::lobby.rebound(old_id,new_id); };
   io.connection = [b] { return b->conn.load(); };
   io.attach = [b](int ms) { return b->attach(ms); };
+  io.helper_missing = [b] { return b->helper_missing.load(); };
   io.state = direct_state;
   io.route = [](unsigned id) { std::lock_guard<std::mutex> lock(g_link_mutex); return g_link_routes[id]; };
   io.rtt = [](unsigned id) {
@@ -1768,7 +2333,7 @@ void friends_entry(const std::string& room, bool host_reenter, bool held_reenter
   if (!entry.begin()) return;
   if (held_reenter) {
     if (!friends::lobby.resume()) { entry.finished(); return; }
-  } else friends::lobby.begin(room == "new" || host_reenter);
+  } else friends::lobby.begin(room == "new" || host_reenter, room == "new");
   if (host_reenter) friends::lobby.opened(room);
   friends::events.current_room(room == "new" ? std::string() : room);
   host::log("console: Friends opening room");
@@ -1813,6 +2378,20 @@ void friends_entry(const std::string& room, bool host_reenter, bool held_reenter
       const auto info = std::atomic_load_explicit(&handoff_join::published_info, std::memory_order_acquire);
       if (info) io.handoff_info = *info;
     }
+    io.css_scene = [] { return css_join::scene.load(std::memory_order_acquire); };
+    io.css_lock = [](bool on) {
+      const bool before = css_join::locked.exchange(on,std::memory_order_acq_rel);
+      if (before != on) host::log("css-join lock: %s",on ? "on" : "off");
+    };
+    io.css_hold = [](const std::string& name) {
+      const auto line = (name.empty() ? "Your friend" : name)+" joins when this match ends";
+      host::log("%s",line.c_str()); entry.status(line);
+      friends::events.notice(line,transport::now_ms());
+    };
+    if (css_join::available.load(std::memory_order_acquire)) io.css_begin = [] {
+      auto channel = std::make_shared<css_join::Channel>();
+      std::atomic_store(&css_join::pending,channel); return channel;
+    };
     io.handoff_css = [] { return handoff_join::host_css.load(std::memory_order_acquire); };
     io.handoff_begin = [] {
       auto channel = std::make_shared<handoff_join::Channel>();
@@ -1823,16 +2402,32 @@ void friends_entry(const std::string& room, bool host_reenter, bool held_reenter
     io.committed = [b](const SessionConfig& c) {
       std::lock_guard<std::mutex> lock(b->mutex); b->session = c.session_id; b->interrupted = false;
     };
-    io.opened = [](const std::string& code) { friends::events.current_room(code); friends::lobby.opened(code); };
-    io.roster = [](const std::string& code,const json& participants,const std::string& me,int revision) {
+    io.opened = [](const std::string& code) {
+      friends::events.current_room(code); friends::lobby.opened(code);
+      // A relaunch may follow: the caches start writing now, so the flush at the handoff usually
+      // has nothing left to write and the handoff is not delayed.
+      if (g_stdio && g_relaunch) ::gx::cache_store::request_flush_all("relaunch");
+    };
+    auto last_room = std::make_shared<json>();
+    io.roster = [last_room](const std::string& code,const json& participants,const std::string& me,int revision) {
       std::lock_guard<std::mutex> report_lock(friends_report_mutex);
       if (friends::lobby.cancelled() || entry.cancelled()) return;
       std::string player;
       for (const auto& p : participants) if (ranked::str(p,"connectionId") == me) player = ranked::str(p,"id");
       // This report completes the page's held-room contract before mpFriend.room is sent.
-      bridge({{"type","mpRoom"},{"code",code},{"queue","private"},{"size",2},{"me",player},
-          {"players",participants},{"participants",participants},{"revision",revision}},1000);
+      *last_room = {{"type","mpRoom"},{"code",code},{"queue","private"},{"size",2},{"me",player},
+          {"players",participants},{"participants",participants},{"revision",revision}};
+      lobby_report_replaced();
+      bridge(*last_room,1000);
       friends::lobby.report_ready();
+    };
+    // The guest's wait for the host's state, as the latest room report plus loading (0-100), so the page
+    // can show the same progress as the game's waiting row.
+    io.progress = [last_room](int percent) {
+      std::lock_guard<std::mutex> report_lock(friends_report_mutex);
+      if (friends::lobby.cancelled() || entry.cancelled() || last_room->empty()) return;
+      auto q = *last_room; q["loading"] = percent;
+      try { bridge(q,1000); } catch (...) {}
     };
     io.css_ready = [b] { return friends::lobby.ready() && b->peers_present.load(); };
     io.freeze_pick = [](const std::string& name) { return friends::lobby.freeze(name); };
@@ -1846,15 +2441,19 @@ void friends_entry(const std::string& room, bool host_reenter, bool held_reenter
     bool prepared = false; std::string prepared_session; int64_t handed_at = 0;
     std::shared_ptr<RelaunchWait> relaunch_wait;
     const bool relaunching = g_stdio && g_relaunch;
+    const auto css_lock = io.css_lock;
     HandoffIO handoff_io; handoff_io.clock = io.clock; handoff_io.cancelled = io.cancelled;
     io.prepared = [&,handoff_io](const SessionConfig& c) {
-      if (friends::lobby.cancelled() || entry.cancelled()) return;
+      if (friends::lobby.cancelled() || entry.cancelled() || host::exit_requested()) return;
       prepared_session = c.session_id;
       { std::lock_guard<std::mutex> lock(b->mutex); b->session = c.session_id; }
       handed_at = epoch_now();
       if (relaunching) {
         relaunch_wait = std::make_shared<RelaunchWait>(prepared_session,handed_at);
         std::atomic_store(&g_relaunch_wait,relaunch_wait);
+        // The app closes this game and starts the session in a new one, which reads the shader and
+        // pipeline caches as it starts: write them before asking (bounded; this is not a frame).
+        ::gx::cache_store::flush_all("relaunch",std::chrono::milliseconds(3000));
       }
       const char* data = std::getenv("YOUGAME_DATA");
       b->handoff_pending = true;
@@ -1862,16 +2461,40 @@ void friends_entry(const std::string& room, bool host_reenter, bool held_reenter
           epoch_now(),current_build(), [](const json& q) { write_line("yg " + q.dump()); },
           [](const std::string& line) { host::log("%s",line.c_str()); },
           [](const char* text) { entry.status(text); },handoff_io);
+      if (prepared && relaunching) {
+        css_join::relaunching.store(true,std::memory_order_release);
+        css_lock(true);
+      }
       if (!prepared) b->handoff_pending = false;
     };
     // Keep the frozen room alive while the user closes/relaunches the game. Rooms owns the gap.
     io.close = [] {};
+#ifdef MELEE_DOUBLES
+    auto doubles_home = std::make_shared<std::string>(); // the adopted Link keeps a copy of io
+    io.doubles_home = [doubles_home](const std::string& code) { *doubles_home=code; };
+#endif
+    bool css_adopted = false;
+    io.css_adopted = [&] { css_adopted = true; };
     SessionConfig c; std::string error;
     try {
       if (!g_broker || !g_direct) {
         error = "console sessions need the YouGame link helper";
         host::log("console: start failed: %s",error.c_str());
-      } else start_session({{"room",room},{"players",2},{"inputDelay",2}},c,error,std::move(io));
+      } else {
+        auto connected = start_session({{"room",room},{"players",2},{"inputDelay",2}},c,error,std::move(io));
+#ifdef MELEE_DOUBLES
+        if (!doubles_home->empty()) {
+          // The welcome path already holds a Friends seat in the home; free it before Doubles rejoins.
+          b->send({{"t","leave"}}); b->flush(1000); b->close();
+          friends::events.current_room({}); friends::lobby.leave(""); entry.finished();
+          doubles::entry(*doubles_home); return;
+        }
+#endif
+        if (css_adopted) {
+          b->handoff_pending = false; b->session_live = true;
+          entry.finished(); return; // Both engines acknowledged installation before this return.
+        }
+      }
       if (!prepared && !error.empty() && !entry.cancelled())
         entry.status(error == update::kMessage ? std::string(update::kMessage) :
                      session_notice(error) ? session_notice(error) : "Couldn't start playing together: " + error);
@@ -1896,6 +2519,8 @@ void friends_entry(const std::string& room, bool host_reenter, bool held_reenter
       host::log("console: start failed: couldn't start playing together");
       entry.status("Couldn't start playing together");
     }
+    css_join::relaunching.store(false,std::memory_order_release);
+    if (css_join::locked.exchange(false,std::memory_order_acq_rel)) host::log("css-join lock: off");
     std::atomic_store(&g_relaunch_wait,std::shared_ptr<RelaunchWait>{});
     if ((b->interrupted || (b->closed && !friends::lobby.host())) && !friends::lobby.cancelled() && !entry.cancelled()) {
       friends::lobby.session_stopped(!b->closed);
@@ -1917,6 +2542,9 @@ void friends_entry(const std::string& room, bool host_reenter, bool held_reenter
   }).detach();
 }
 } // namespace console
+#ifdef MELEE_DOUBLES
+#include "yougame_doubles_runtime.inc"
+#endif
 
 namespace relay_pads {
 void logging_ready() {
@@ -1959,10 +2587,17 @@ void start() {
     if (v) _putenv_s(name, "");
     return out;
   };
+  // The app or the launcher started this game: never the local channel (set at all, even empty).
+  // MELEE_STARTED_BY_APP (no secret) carries that into a game this one restarts (settings, an older
+  // release), which no longer sees the app's variables once take() has cleared them.
+  g_channel_allowed = !std::getenv("YOUGAME_STDIO") && !std::getenv("YOUGAME_BRIDGE") &&
+                      !std::getenv("MELEE_YOUGAME_LAUNCHER") && !std::getenv("MELEE_STARTED_BY_APP");
+  if (!g_channel_allowed) _putenv_s("MELEE_STARTED_BY_APP", "1");
   g_bridge_url = take("YOUGAME_BRIDGE");
   g_bridge_token = take("YOUGAME_TOKEN");
   g_stdio = take("YOUGAME_STDIO") == "1";
   slippi_linking::presentation.enabled = take("YOUGAME_SLIPPI_LINKABLE") == "1";
+  g_launcher = take("MELEE_YOUGAME_LAUNCHER") == "1" && !g_stdio;
   host::test_env::yougame_session = active();
 #ifdef MELEE_LINUX_X11_EMBED
   // The shared X11 helper checks this non-secret flag at window attachment.
@@ -1981,10 +2616,12 @@ void start() {
     }
   }
 #endif
+  if (g_channel_allowed) g_io.eof = true;   // until a channel connection is open (start_channel)
   if (g_stdio) {
     std::thread(read_stdin).detach();
     // Toplevel caps wait for successful creation with the requested styles.
     if (!g_embed_toplevel) parity::signals.start(true, [](const char* line) { write_line(line); });
+    parity::signals.sync_match(-1); // no log: the log file isn't open yet (see below)
     host::controller_relay::install_rumble(relay_rumble);
     host::controller_relay::install_route(relay_route);
     std::thread(relay_rumble_writer).detach();
@@ -1993,7 +2630,211 @@ void start() {
   // whole log to stdout, which in stdio mode is the bridge. fetch_identity says which mode this is.
 }
 
-bool active() { return g_stdio || (!g_bridge_url.empty() && !g_bridge_token.empty()); }
+bool active() { return g_stdio || (!g_launcher && !g_bridge_url.empty() && !g_bridge_token.empty()); }
+bool launcher() {
+  return !coming_soon() && ((g_launcher && !g_bridge_url.empty() && !g_bridge_token.empty()) || g_channel_up);
+}
+bool channel_connected() { return g_channel_up; }
+static std::atomic<bool> g_automated_run{false};
+void start_channel(bool automated) {
+  if (automated) g_automated_run = true;
+  static std::once_flag once;
+  std::call_once(once, [automated] {
+    if (!g_channel_allowed) return;
+    // Bare test runs never reach a YouGame app on the machine they run on, unless the run asks.
+    if (host::test_env::getenv("MELEE_NO_YOUGAME_CHANNEL")) { g_channel_allowed = false; return; }
+    if (automated && !host::test_env::getenv("MELEE_TEST_YOUGAME_CHANNEL")) { g_channel_allowed = false; return; }
+    start_channel_probe(true);
+  });
+}
+namespace {
+// Hidden and headless runs (agent copies, tests) never open a browser or an app on the machine they run on.
+// So do labelled AGENT TEST copies and runs with the channel off (MELEE_NO_YOUGAME_CHANNEL, the app started it).
+bool may_open_outside(const char* what) {
+  const bool test = g_automated_run.load() || host::test_env::agent_copy() || !g_channel_allowed;
+  if (!test || host::test_env::getenv("MELEE_TEST_YOUGAME_GET_PAGE")) return true;
+  host::log((std::string("yougame: ") + what + " (test run: not opened)").c_str());
+  return false;
+}
+// A fixed address handed to the system's opener (the browser for https, the YouGame app for its link type).
+bool open_outside(const char* target) {
+#ifdef _WIN32
+  // Always on a thread of its own: the shell wants COM set up there (link types can go through shell extensions).
+  const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+  const bool ok = (INT_PTR)ShellExecuteA(nullptr, "open", target, nullptr, nullptr, SW_SHOWNORMAL) > 32;
+  if (SUCCEEDED(com)) CoUninitialize();
+  return ok;
+#else
+#ifdef __APPLE__
+  const char* tool = "open";
+#else
+  const char* tool = "xdg-open";
+#endif
+  char* argv[] = {const_cast<char*>(tool), const_cast<char*>(target), nullptr};
+  pid_t pid = 0;
+  if (posix_spawnp(&pid, tool, nullptr, nullptr, argv, environ) != 0) return false;
+  std::thread([pid] { int st = 0; waitpid(pid, &st, 0); }).detach();   // reap it
+  return true;
+#endif
+}
+// The installed YouGame app (staging) registers this link type; the one link shape it accepts
+// (desktop/src/security-policy.ts deepLinkUrl) brings it up on the game's page.
+constexpr const char kAppLink[] = "yougame-staging://g/melee-unlocked";
+std::atomic<int> g_app_installed{-1};       // -1 not looked yet, 0 no, 1 yes (app_installed_now)
+std::atomic<bool> g_app_opening{false};     // open_app's 25 s wait for the app's channel
+std::atomic<bool> g_app_auto_opened{false}; // the Online menu opens the app by itself once per run
+std::atomic<int64_t> g_app_opened_at{0};
+std::atomic<bool> g_app_stale{false};       // the registered app did not open or answer: Get YouGame for this run
+// Off the game's frame: the registry (Windows) or xdg-mime (Linux) answer whether YouGame is installed.
+bool app_installed_now() {
+  if (g_app_stale.load()) { g_app_installed = 0; return false; }
+  bool yes = false;
+#ifdef _WIN32
+  HKEY h = nullptr;
+  if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Classes\\yougame-staging\\shell\\open\\command", 0, KEY_READ, &h) == ERROR_SUCCESS ||
+      RegOpenKeyExA(HKEY_CLASSES_ROOT, "yougame-staging\\shell\\open\\command", 0, KEY_READ, &h) == ERROR_SUCCESS) {
+    RegCloseKey(h);
+    yes = true;
+  }
+#elif defined(__APPLE__)
+  yes = false;   // Mac: the Get YouGame row until the LaunchServices lookup lands
+#else
+  if (FILE* f = popen("xdg-mime query default x-scheme-handler/yougame-staging 2>/dev/null", "r")) {
+    char line[256] = {};
+    yes = fgets(line, sizeof line, f) && line[0] && line[0] != '\n';
+    pclose(f);
+  }
+#endif
+  g_app_installed = yes ? 1 : 0;
+  return yes;
+}
+// Opens the installed app, then looks for its channel every second for 25 s ("Opening YouGame...").
+// Returns false when it did not ask the app (already opening, opened under 30 s ago, a test run, or the open failed).
+bool open_app(const char* why) {
+  const int64_t now = (int64_t)now_ms(), last = g_app_opened_at.load();
+  if (last != 0 && now - last < 30000) return false;
+  bool idle = false;
+  if (!g_app_opening.compare_exchange_strong(idle, true)) return false;   // one opener at a time
+  if (!may_open_outside("YouGame app is installed")) { g_app_opening = false; return false; }
+  g_app_opened_at = now;
+  const bool ok = open_outside(kAppLink);
+  host::log((std::string("yougame: opening the YouGame app (") + why + "): " + (ok ? "asked" : "could not be opened")).c_str());
+  if (!ok) { g_app_stale = true; g_app_installed = 0; g_app_opening = false; return false; }
+  std::thread([] {
+    for (int i = 0; i < 25 && !g_channel_up.load(); ++i) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      start_channel_probe(true);
+    }
+    for (int i = 0; i < 6 && g_channel_probing.load() && !g_channel_up.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    if (g_channel_up.load()) host::log("yougame: the YouGame app answered");
+    else {   // a stale registration or an app that never came up: the row offers the download page again
+      host::log("yougame: the YouGame app did not answer in 25 s: Get YouGame for this run");
+      g_app_stale = true;
+      g_app_installed = 0;
+    }
+    g_app_opening = false;
+  }).detach();
+  return true;
+}
+}  // namespace
+
+void online_menu_opened() {
+  // Never waits: this runs on the game's frame. A host found now opens the rows on the next visit.
+  start_channel_probe(false);
+  if (!coming_soon()) return;
+  // YouGame installed but not running: open it once per run by itself (the first row offers it again).
+  std::thread([] {
+    if (!app_installed_now() || g_app_auto_opened.load()) return;
+    // A running app answers the probe within its hello timeout (6 s): wait it out before opening anything.
+    for (int i = 0; i < 18 && g_channel_probing.load() && !g_channel_up.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    if (g_channel_up.load() || g_app_auto_opened.exchange(true)) return;   // it was running after all
+    open_app("Online menu");
+  }).detach();
+}
+void open_get_page() {
+  // A fixed https address, opened in the player's own browser; the game downloads and starts nothing.
+  static const char kUrl[] = "https://staging.yougame.co/desktop";
+  static std::atomic<int64_t> last{0};
+  const int64_t now = (int64_t)now_ms();
+  if (now - last.load() < 3000) return;   // one page per press, not one per repeated confirm
+  last = now;
+  if (!may_open_outside("Get YouGame picked, page")) return;
+  const bool ok = open_outside(kUrl);
+  host::log(ok ? "yougame: Get YouGame picked: download page opened" : "yougame: Get YouGame picked: download page could not be opened");
+}
+void first_row_picked() {
+  // Off the game's frame: an installed app is opened, otherwise the download page.
+  std::thread([] {
+    if (app_installed_now()) {
+      if (!open_app("first row") && g_app_stale.load()) open_get_page();   // the open failed: the page instead
+    } else {
+      open_get_page();
+    }
+  }).detach();
+}
+const char* first_row_text() {
+  if (g_app_opening.load()) return "Opening YouGame...";
+  return g_app_installed.load() == 1 ? "Open YouGame" : "Get YouGame";
+}
+bool coming_soon() {
+#ifdef MELEE_YOUGAME_COMING_SOON
+  // Only the GitHub build's own rows wait: a game the YouGame app started (active(), known from the
+  // first line of main) plays YouGame as always, rows open and labels not greyed. So does one that
+  // reached a running YouGame app over the local channel (yougame_channel.h), while it is connected.
+  return coming_soon_build() && !g_channel_up;
+#else
+  return false;
+#endif
+}
+bool coming_soon_build() {
+#ifdef MELEE_YOUGAME_COMING_SOON
+  static const bool soon = !host::test_env::getenv("MELEE_TEST_YOUGAME_OPEN");
+  return soon && !active();
+#else
+  return false;
+#endif
+}
+bool available() { return active() || launcher(); }
+bool session() { return active() || (launcher() && g_launcher_session.load()); }
+std::string build_version() {
+#ifdef MELEE_PORT_VERSION
+  return MELEE_PORT_VERSION;
+#else
+  return "dev";
+#endif
+}
+
+std::string behind_version_now() {
+  if (!launcher()) return {};
+  try {
+    const json hello = bridge({{"type", "hello"}}, 2000);
+    if (hello.count("behind") && hello["behind"].is_object()) return hello["behind"].value("version", "");
+  } catch (const std::exception& e) {
+    host::log("yougame: the launcher did not say which release YouGame is on: %s", e.what());
+  }
+  return {};
+}
+
+bool restart_older(const std::string& mode, std::string* error) {
+  if (!launcher()) { if (error) *error = "Only the launcher can switch versions."; return false; }
+  try {
+    bridge({{"type", "muRestartOlder"}, {"mode", mode}}, 5000);
+    host::log("yougame: restarting in the release YouGame is on (%s)", mode.c_str());
+    return true;
+  } catch (const std::exception& e) {
+    if (error) *error = e.what();
+    return false;
+  }
+}
+
+void set_online_mode_arg(int mode) { g_online_mode_arg = mode; }
+int take_online_mode_arg() { return g_online_mode_arg.exchange(0); }
+
+void set_launcher_session(bool yougame) {
+  if (!launcher()) return;
+  if (g_launcher_session.exchange(yougame) != yougame)
+    host::log("yougame: %s row chosen", yougame ? "a YouGame" : "a Slippi");
+}
 uintptr_t pad_mirror_handle() { return g_pad_mirror.load(); }
 #ifndef _WIN32
 pad_mirror::Attachment pad_mirror_attachment() {
@@ -2010,6 +2851,7 @@ void console_boot_ready() { parity::signals.console_boot_ready(); }
 void embed_window_ready(uintptr_t hwnd) {
   if (g_embed_toplevel) {
     parity::signals.start(g_stdio, [](const char* line) { write_line(line); }, true);
+    if (const int sent = parity::signals.sync_match(-1); sent >= 0) host::log("yougame: match %d", sent);
     // After the caps, once per created window (again if it is ever recreated).
     if (hwnd) parity::signals.emit(embed_toplevel_policy::hwnd_line(hwnd).c_str());
   }
@@ -2063,14 +2905,7 @@ std::vector<std::string> take_box_commands() {
 
 void refresh_identity() {
   if (g_identity_fetching.exchange(true)) return;
-  std::thread([] {
-    try {
-      fetch_identity();
-    } catch (const std::exception& e) {
-      host::log("yougame: sign-in failed: %s", e.what());
-    }
-    g_identity_fetching = false;
-  }).detach();
+  std::thread(run_identity_asks).detach();
 }
 
 Identity identity() {
@@ -2247,6 +3082,11 @@ void pause_event(bool pausable, bool paused, const char* reason) {
 }
 
 bool update_safe_point(bool idle_scene, bool online_busy, bool ranked_set, bool online_screen) {
+  // Opening Online asks the app to check this game for a newer build now (its timer runs every ~30 min), so
+  // an update lands before matching, not as a lobby error (11-10). Once per opening; the app debounces.
+  static bool was_online_screen = false;
+  if (online_screen && !was_online_screen && g_stdio) write_line(update::kCheckLine);
+  was_online_screen = online_screen;
   if (g_update_notice.visible()) return true;
   if (g_update_notice.pending().empty()) return false;
   std::lock_guard<std::mutex> lock(g_mutex);
@@ -2294,22 +3134,80 @@ std::string slippi_link_status(const std::string& status) {
 }
 
 nlohmann::json request_slippi_link(const nlohmann::json& request, int timeout, const std::function<bool()>& cancelled) {
+  if (slippi::agent_lock::blocked(slippi::agent_lock::Operation::AccountLink)) return {{"ok", false}};
   return bridge(request, timeout, cancelled);
 }
 
-std::string pick_friend_room(const std::function<bool()>& cancelled, const std::string& held) {
+std::string pick_friend_room(const std::function<bool()>& cancelled, const std::string& held
+#ifdef MELEE_DOUBLES
+                             , bool doubles, std::string* invited
+#endif
+                             ) {
   host::log("friends: picker requested");
+#ifdef MELEE_DOUBLES
+  auto picker_request=friends::picker(held);
+  if(doubles) {
+    picker_request["mode"]="teams"; picker_request["players"]=4;
+    picker_request["mu_doubles"]=1; picker_request["teamsLobby"]=1;
+  }
+#endif
   try {
     auto code = held.empty() ? friends::resolve_room({},
         [&](const json& q, int ms) { return bridge(q, ms, cancelled); }, cancelled)
+#ifdef MELEE_DOUBLES
+        : [&] {
+            const auto picked=bridge(picker_request,friends::kPickerTimeout,cancelled);
+            if (invited) *invited=doubles::invited(picked);
+            return friends::picker_room(picked);
+          }();
+#else
         : friends::picker_room(bridge(friends::picker(held),friends::kPickerTimeout,cancelled));
+#endif
     if (cancelled() || (!held.empty() && code != held)) throw std::runtime_error("Cancelled");
     host::log("friends: invite sent");
     return code;
   } catch (const std::exception& e) {
+    const auto full = cancelled() ? std::string() : friends::invite_room_full(g_bridge_refusal, e.what());
     if (std::string(e.what()) == friends::kVersion) log_friend_version();
-    else host::log("%s", cancelled() || std::string(e.what()) == "Cancelled" ? "friends: cancelled" :
-                          "friends: invite failed: picker failed");
+    else if (cancelled() || std::string(e.what()) == "Cancelled") host::log("friends: cancelled");
+    else if (!full.empty()) {
+      host::log("friends: invite failed: room full");
+      throw friends::RoomFull(full);
+    }
+    // The page's refusal names the failed check (a held room it no longer recognises, a seat mismatch).
+    else host::log("friends: invite failed: picker failed (%s room): %.120s", held.empty() ? "new" : "held", e.what());
+    throw;
+  }
+}
+
+void lobby_invite(const std::string& room, const std::function<bool()>& cancelled) {
+  host::log("friends lobby: invite picker requested");
+  try {
+    const json answer = bridge(friends::lobby_invite(room), friends::kPickerTimeout, cancelled);
+    const std::string code = answer.is_object() && answer.count("code") ? friends::picker_room(answer) : std::string();
+    if (cancelled() || (!code.empty() && code != room)) throw std::runtime_error("Cancelled");
+    host::log("friends lobby: invites sent");
+  } catch (const std::exception& e) {
+    const auto full = cancelled() ? std::string() : friends::invite_room_full(g_bridge_refusal, e.what());
+    if (cancelled() || std::string(e.what()) == "Cancelled") host::log("friends lobby: invite cancelled");
+    else if (!full.empty()) { host::log("friends lobby: invite failed: room full"); throw friends::RoomFull(full); }
+    else host::log("friends lobby: invite failed: %.120s", e.what());
+    throw;
+  }
+}
+
+void doubles_invite(const std::string& room, const std::function<bool()>& cancelled) {
+  host::log("doubles: partner invite requested");
+  try {
+    const json answer = bridge(friends::doubles_invite(room), friends::kPickerTimeout, cancelled);
+    const std::string code = answer.is_object() && answer.count("code") ? friends::picker_room(answer) : std::string();
+    if (cancelled() || (!code.empty() && code != room)) throw std::runtime_error("Cancelled");
+    host::log("doubles: partner invite sent");
+  } catch (const std::exception& e) {
+    const auto full = cancelled() ? std::string() : friends::invite_room_full(g_bridge_refusal, e.what());
+    if (cancelled() || std::string(e.what()) == "Cancelled") host::log("doubles: partner invite cancelled");
+    else if (!full.empty()) { host::log("doubles: partner invite failed: room full"); throw friends::RoomFull(full); }
+    else host::log("doubles: partner invite failed: %.120s", e.what());
     throw;
   }
 }
@@ -2329,6 +3227,7 @@ void with_native_udp(const std::function<void()>& create) {
 }
 
 void slippi_link(bool linked, const std::string& tag) {
+  slippi_linking::presentation.linked = linked;
   const std::string line = blend::slippi_link_line(linked, tag);
   {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -2340,8 +3239,13 @@ void slippi_link(bool linked, const std::string& tag) {
   if (g_stdio) write_line(line);
 }
 
-uint64_t begin_search() {
-  const auto epoch = close_room(Leave::Quit);
+bool lobby_parked() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  return g_parked_lobby != nullptr;
+}
+
+uint64_t begin_search(bool keep_lobby) {
+  const auto epoch = close_room(keep_lobby ? Leave::Next : Leave::Quit);
   std::lock_guard<std::mutex> lock(g_mutex);
   if (g_search_generation.current(epoch)) g_blend_reason.clear();
   return epoch;
@@ -2378,7 +3282,7 @@ bool prepare_slippi_match(const std::function<bool()>& cancelled, uint64_t epoch
 Match find_match(const Search& search, const std::function<bool()>& cancel_requested) {
   // Reserve before blocking, or use the generation reserved before the helper was launched.
   if (cancel_requested()) { Match out; out.error = "Cancelled"; return out; }
-  const uint64_t epoch = search.epoch ? search.epoch : begin_search();
+  const uint64_t epoch = search.epoch ? search.epoch : begin_search(search.friends_lobby);
   const auto cancelled = [&] { return !g_search_generation.current(epoch) || cancel_requested(); };
   struct SearchScope {
     search_policy::BusyRetry retry;
@@ -2386,6 +3290,13 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     ~SearchScope() { g_search_stopped = {}; g_ticket_retry = nullptr; --g_update_searches; }
   } scope(cancelled);
   if (cancelled()) return fail("Cancelled");
+  // The Friends lobby runs in one mode (lobby::kSearchMode, Direct) with no connect code or invite
+  // room: anything else is refused here, not half-run as another kind of search.
+  if (search.friends_lobby && (search.mode != lobby::kSearchMode || !search.direct_code.empty() || !search.friend_room.empty())) {
+    host::log("friends lobby: search refused (mode %d, code %s, invite %s)", (int)search.mode,
+              search.direct_code.empty() ? "none" : "set", search.friend_room.empty() ? "none" : "set");
+    return fail(lobby::kSearchRefused);
+  }
   try {
   struct FriendSearch {
     explicit FriendSearch(bool active) {
@@ -2402,9 +3313,29 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     explicit BlendSearch(bool active) { g_blend_search = active; }
     ~BlendSearch() { g_blend_search = false; }
   } blend_search(blend);
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  const bool squad_row = !search.friends_lobby && squad::selected(search.mode, search.squad, !search.friend_room.empty());
+  const std::string compat = compatibility(search.mode, squad_row, search.squad_budget);
+  if (squad_row && compat.empty())
+    return fail("Squad Strike budget unavailable or full version does not fit compatibility key");
+#else
   const std::string compat = compatibility(search.mode);
+#endif
   if (cancelled()) return fail("Cancelled");
   if (compat.empty()) return fail("Could not verify this mod's content. Restart the game before playing online.");
+  // The Doubles home (G2): the Friends lobby's runtime on its 2-seat profile (the lobby's Control says
+  // which). Its search runs in the home until matchmaking places it, then joins the match room in a
+  // nested find_match (doubles_room) while the home stays parked.
+  const bool doubles_room = !search.doubles_match.room.empty();
+  const lobby::Profile lobby_profile = doubles_room ? lobby::Profile::Doubles
+                                       : search.lobby_control ? search.lobby_control->profile() : lobby::Profile::Friends4;
+  const bool doubles_home = search.friends_lobby && lobby_profile == lobby::Profile::Doubles;
+  // The 4-player Friends lobby's room is keyed by its own key (friends-lobby-1, yougame_lobby_setup.h); the
+  // Doubles home, its queue and its match by doubles-lobby-1.
+  const std::string lobby_key = search.friends_lobby || doubles_room ? lobby_room_key(lobby_profile) : std::string();
+  if ((search.friends_lobby || doubles_room) && lobby_key.empty())
+    return fail("Could not verify this mod's content. Restart the game before playing online.");
 #ifdef YOUGAME_AGENT_TEST_HOOK
   struct PendingInput {
     uint64_t epoch;
@@ -2441,14 +3372,44 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
 #ifndef _WIN32
   if (g_broker && !g_direct) return fail("YouGame broker requires direct links v1 (1200-byte datagrams)");
 #endif
-  const bool team_code = search.mode == 3 && !search.direct_code.empty();
-  std::string team_room;
-  if (team_code && !friends::team_room_code(search.direct_code, &team_room)) return fail(friends::kTeamCodeError);
-  const bool friends_mode = !team_code && (!search.friend_room.empty());
-  const bool direct = search.mode == 2;
-  const int size = search.mode == 3 ? 4 : 2;
+#ifdef MELEE_DOUBLES
+  // The Doubles home found this match room (yougame_doubles_runtime.inc): join it as a 4-seat Teams room
+  // with the home's own admission profile, and play it on the 4-peer rollback client.
+  const bool doubles_match = doubles_teams::kFourPeer &&
+      doubles_teams::match_search(search.mode, !search.friend_room.empty());
+  doubles::Consent consent;
+  doubles_teams::Setup setup;          // the match Rooms froze at the host's begin (the start frame)
+  uint64_t begin_sent = 0;             // the host's last begin
+  std::string last_refusal;            // the room's last refusal, logged once (begin is resent every 2 s)
+  struct DoublesSearch {
+    explicit DoublesSearch(const std::string& room) { g_doubles_search_room = room; }
+    ~DoublesSearch() { g_doubles_search_room.clear(); }
+  } doubles_search(doubles_match ? search.friend_room : std::string());
+#else
+  const bool doubles_match = false;
+  const doubles_teams::Setup setup;    // never known without Doubles
+#endif
+  const bool team_code = (search.mode == 3 && !search.direct_code.empty()) || doubles_match;
+  std::string team_room = doubles_match ? search.friend_room : std::string();
+  if (team_code && !doubles_match && !friends::team_room_code(search.direct_code, &team_room)) return fail(friends::kTeamCodeError);
+  // The 4-player Friends lobby (yougame_lobby.h): a held room of up to four, picks and Start in the room.
+  const bool lobby_route = search.friends_lobby;   // never a team code or invite: refused at the top
+  // A room whose match is a lobby setup: the Friends lobby's, or the Doubles home's placed match.
+  const bool lobby_match = lobby_route || doubles_room;
+  struct LobbySearch {
+    explicit LobbySearch(bool active) { g_lobby_search = active; }
+    ~LobbySearch() { g_lobby_search = false; }
+  } lobby_search(lobby_match);
+  const bool friends_mode = !team_code && !lobby_match && (!search.friend_room.empty());
+  const bool direct = search.mode == 2 && !lobby_match;
+  const int size = lobby_match || search.mode == 3 ? 4 : 2;
   const json lobby = {{"version", 1}, {"minPlayers", size}, {"maxLocalPlayers", 1}, {"compatibility", compat}};
   json request = {{"type", "mpTicket"}, {"players", size}, {"mode", size == 4 ? "teams" : "singles"}, {"lobby", lobby}, {"ranked", search.mode == 0}};
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  if (squad::selected(search.mode, search.squad, !search.friend_room.empty()))
+    request["mode"] = squad::ticket_mode(search.mode, true, "singles");
+#endif
   if (search.mode == 0) {
     ranked::set_contract(request);
     {
@@ -2470,6 +3431,14 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   // Unranked keeps its two players together for the next game, as Slippi's unranked does.
   if (search.mode == 1) request["afterMatch"] = "stay";
   if (!friends_mode && direct) request["direct"] = search.direct_code;
+  if (lobby_route) request = json::object();   // set with the ticket below (lobby_hold or lobby_ticket)
+  // The queue's ticket admits this player to the match room; a renewal there asks for a match-admission
+  // ticket (Teams, teamsLobby 1, 4 players, casual, the same key; no room, party or partySearch).
+  if (doubles_room) request = friends::doubles_match_ticket(lobby_key);
+#ifdef MELEE_DOUBLES
+  if (doubles_match) request = doubles::ticket(compat, team_room, 4);
+  else
+#endif
   if (team_code) request = friends::team_ticket(compat, team_room);
 
   // Clear failed/cancelled setup without clearing a newer search's room.
@@ -2486,11 +3455,73 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   const std::string searching = search.status.empty() ? std::string("searching") : search.status;
   bool repeated_link_failure;
   { std::lock_guard<std::mutex> lock(g_mutex); repeated_link_failure = g_direct_link_failures.repeated(); }
-  set_status(team_code ? friends::kTeamWaiting : friends_mode ? friends::kWaiting :
+  set_status(doubles_home ? std::string(lobby::kDoublesWaiting) : lobby_match ? std::string(lobby::kWaiting) : team_code ? friends::kTeamWaiting : friends_mode ? friends::kWaiting :
              repeated_link_failure ? search_policy::kLinkRetry : searching);
+  // The lobby's next match: the room parked after the last one (close_room(Leave::Next)), with its socket,
+  // lobby and links. Its pump stops here with the links handed on, and anything it still owed (the last
+  // match's finish) goes out first. A parked room whose socket closed asks for the same room again.
+  std::unique_ptr<Room> parked;
+  std::string lobby_room = search.lobby_room;
+  lobby::Session::CallOff carried_call_off;   // a closed parked room's setup that never began (Options::call_off_id)
+  if (doubles_home && search.lobby_control) search.lobby_control->set_matched(false);   // back in the home
+  if (lobby_route) {
+    std::unique_ptr<Room> other;
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      if (g_parked_lobby && (lobby_room.empty() || g_parked_lobby->code == lobby_room)) parked = std::move(g_parked_lobby);
+      else other = std::move(g_parked_lobby);
+    }
+    if (other) std::thread([old = std::move(other)]() mutable { shutdown_room(std::move(old)); }).detach();
+    if (parked) {
+      parked->keep_links = true;
+      parked->stop = true;
+      if (parked->pump.joinable()) parked->pump.join();
+      parked->stop = false;
+      parked->keep_links = false;
+      std::vector<json> owed;
+      { std::lock_guard<std::mutex> lock(g_mutex); if (!parked->socket->closed()) owed = transport::due_messages(*parked, now_ms()); }
+      for (const auto& f : owed) parked->socket->send(f);
+      if (parked->socket->closed() || !parked->lobby_session) {
+        host::log("friends lobby: the room's connection closed between matches; joining it again");
+        // A setup that never began is still the room's match: the new session calls it off (as host).
+        if (parked->lobby_session) carried_call_off = parked->lobby_session->call_off();
+        if (!carried_call_off.id.empty()) host::log("friends lobby: the match that never began is called off after the re-join");
+        lobby_room = parked->code;
+        std::thread([old = std::move(parked)]() mutable { shutdown_room(std::move(old)); }).detach();
+      } else host::log("friends lobby: next match in the same room");
+    }
+  }
   json ticket;
+  g_bridge_refusal.clear();   // read in the catch below: only this ticket's refusal counts
   try {
-    if (team_code) {
+    if (lobby_route && parked) {
+      ticket = {{"url", parked->url}, {"ticket", parked->ticket}, {"room", parked->code}};
+      request = parked->ticket_request;
+      std::lock_guard<std::mutex> lock(g_mutex);
+      if (!g_search_generation.current(epoch) || cancelled()) throw std::runtime_error("Cancelled");
+      friends::events.current_room(parked->code);
+    } else if (lobby_route) {
+      // The host holds a room (the app picks its 12-character code); a guest joins its invite's code.
+      // Renewals ask for the same room again, never a new hold.
+      // The Doubles home holds a 2-seat teams home (doubles_hold) and its partner joins by code.
+      if (lobby_room.empty()) {
+        ticket = bridge(doubles_home ? friends::doubles_hold(lobby_key) : friends::lobby_hold(lobby_key), 30000, cancelled);
+        const std::string held = ticket.is_object() && ticket.count("room") && ticket["room"].is_string()
+                                     ? ticket["room"].get<std::string>() : std::string();
+        if (held.empty()) throw std::runtime_error("YouGame did not return a Friends lobby room");
+        request = doubles_home ? friends::doubles_home_ticket(lobby_key, held) : friends::lobby_ticket(lobby_key, held);
+      } else {
+        request = doubles_home ? friends::doubles_home_ticket(lobby_key, lobby_room) : friends::lobby_ticket(lobby_key, lobby_room);
+        ticket = bridge(request, 30000, cancelled);
+      }
+      std::lock_guard<std::mutex> lock(g_mutex);
+      if (!g_search_generation.current(epoch) || cancelled()) throw std::runtime_error("Cancelled");
+      friends::events.current_room(friends::room(request));
+    } else if (doubles_room) {
+      ticket = {{"url", search.doubles_match.url}, {"ticket", search.doubles_match.ticket}, {"room", search.doubles_match.room}};
+      std::lock_guard<std::mutex> lock(g_mutex);
+      if (!g_search_generation.current(epoch) || cancelled()) throw std::runtime_error("Cancelled");
+    } else if (team_code) {
       {
         std::lock_guard<std::mutex> lock(g_mutex);
         if (!g_search_generation.current(epoch) || cancelled()) throw std::runtime_error("Cancelled");
@@ -2515,8 +3546,14 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       ticket = bridge(request, 30000, cancelled);
     }
   } catch (const update::Required&) {
-    return fail(update::kMessage, false, true);
+    // update_required: the answer's own words as the app gave them (it may say it is getting the update), else ours.
+    return fail(g_bridge_update_text.empty() ? std::string(update::kMessage) : g_bridge_update_text, false, true);
   } catch (const std::exception& e) {
+    // Any refusal of the ticket (ok:false: build_mismatch, friend_update_required, teams_home, teams_lobby_off, ...)
+    // or no answer in time shows its own words and the game goes back to the menu. A ticket error never tries the
+    // room as another kind (1v1, Friends lobby, Doubles home, Teams): only the room's own kind refusal over the
+    // socket may, below, within the room's tries.
+    if (!cancelled()) host::log("yougame: ticket refused (%s)", g_bridge_refusal.empty() ? "no code" : g_bridge_refusal.c_str());
     return fail(e.what());
   }
   if (search.mode == 0 && !ranked::set_contract_matches(ticket))
@@ -2532,7 +3569,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   const std::string url = ticket.value("url", "");
   std::string pass = ticket.value("ticket", "");
   std::string room_code = ticket.count("room") && ticket["room"].is_string() ? ticket["room"].get<std::string>() : "";
-  if ((friends_mode || team_code) && room_code.empty()) room_code = friends::room(request);
+  if ((friends_mode || team_code || lobby_route) && room_code.empty()) room_code = friends::room(request);
   std::string error;
   const auto decline = [&] {
     if (!g_search_generation.current(epoch)) return;
@@ -2549,7 +3586,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     return fail("Cancelled");
   }
   if ((!g_broker && url.empty()) || pass.empty()) return fail("YouGame did not return a ticket");
-  if ((friends_mode || team_code) && (room_code != friends::room(request))) return fail("YouGame returned a different friends room");
+  if ((friends_mode || team_code || lobby_route) && (room_code != friends::room(request))) return fail("YouGame returned a different friends room");
   // The reopen loop retries every 250 ms; renewals go to the site, so at most one per 1.5 s.
   uint64_t last_renew = 0;
   bool update_refused = false;
@@ -2628,21 +3665,104 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   } else {
     if (blend && !search.claim()) { decline(); return fail("Cancelled"); }   // ticket assignment
     if (friends_mode) host::log("friends: waiting");
-    set_status(team_code ? friends::kTeamWaiting : friends_mode ? friends::kWaiting : "waiting for " + search.direct_code);
+    if (lobby_route && !parked) host::log(doubles_home ? "doubles: in the home" : "friends lobby: in the room");
+    if (doubles_room) host::log("doubles: joining the match room");
+    if (doubles_home) set_status(lobby::kDoublesWaiting);
+    else if (lobby_route) set_status(lobby::kWaiting);
+    else if (doubles_room) set_status("connecting");
+    else set_status(team_code ? friends::kTeamWaiting : friends_mode ? friends::kWaiting : "waiting for " + search.direct_code);
   }
 
-  auto room = std::make_unique<Room>();
-  room->friends = friends_mode;
-  room->size = size;
-  room->mode = search.mode;
-  room->ranked = search.mode == 0;
-  room->socket = std::make_unique<Socket>();
-  room->url = url; room->ticket = pass; room->code = room_code; room->ticket_request = request;
+  // An adopted lobby room keeps its socket, roster and lobby; only the last match's state is dropped. Its
+  // links still up go back to the lobby (early, below); the others close.
+  const bool adopted = parked != nullptr;
+  std::map<std::string, unsigned> adopted_links;
+  auto room = adopted ? std::move(parked) : std::make_unique<Room>();
+  if (adopted) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    room->games = transport::Games{};
+    room->in_game = false; room->pending_winner = -2; room->pending_team_result = nullptr;
+    room->pending_begin = false; room->begin_at = 0; room->match_id.clear(); room->lobby = nullptr;
+    room->port_ids.clear(); room->recovery = transport::Recovery{}; room->ticket_retry = {};
+    for (const auto& kv : room->lobby_links)
+      if (std::find(room->links.ids.begin(), room->links.ids.end(), kv.second) != room->links.ids.end() &&
+          direct_state(kv.second) != 3) adopted_links.insert(kv);
+  }
+  if (adopted) {
+    std::vector<unsigned> stale;
+    for (unsigned id : room->links.ids)
+      if (std::none_of(adopted_links.begin(), adopted_links.end(), [&](const auto& kv) { return kv.second == id; })) stale.push_back(id);
+    room->links.ids.clear();
+    room->lobby_links.clear();
+    for (unsigned id : stale) { try { bridge({{"type", "directClose"}, {"link", id}}, 1000); } catch (...) {} }
+  } else {
+    room->friends = friends_mode;
+    room->size = size;
+    room->mode = search.mode;
+    room->ranked = search.mode == 0;
+    room->socket = std::make_unique<Socket>();
+    room->url = url; room->ticket = pass; room->code = room_code; room->ticket_request = request;
+    room->doubles_match = doubles_room;
+    room->doubles_home = search.doubles_match.home;
+  }
 #ifdef YOUGAME_AGENT_TEST_HOOK
-  pending_input.publish(*room, json::array());
+  pending_input.publish(*room, adopted ? room->participants : json::array());
 #endif
-  if (!room->socket->open_session(url, pass, room_code, &error, 10000, cancelled)) return fail(error, !direct);
-  if (cancelled()) { room->socket->send({{"t", "leave"}}); return fail("Cancelled"); }
+  // An invited room decides 1v1, the Friends lobby or the Doubles home (friends::Events::room_kind), not the
+  // invite: a room of another kind refuses this ticket (lobby_mismatch: its lobby key or size differs), or
+  // once joined its first frames say (welcome.muLobby or a yg.mu.lobby state: a lobby, 2 seats or a
+  // `searching` key the Doubles home; neither: a 1v1 room). A refusal tries the next kind (mismatch_next);
+  // frames of another kind leave the room and queue the join again that way (room_decided), once per room.
+  const bool invited = (lobby_route && !search.lobby_room.empty() && !adopted) || friends_mode;
+  const int joined_kind = doubles_home ? friends::kRoomDoubles : lobby_route ? friends::kRoomFriends4 : friends::kRoom1v1;
+  bool kind_heard = !invited || friends::events.room_kind(room_code) >= 0;
+  uint64_t welcome_at = 0;
+  uint64_t hello_by = 0;   // an invited room's welcome deadline, from the loop's start (below)
+  bool hello_rearmed = false;   // a reopen re-arms it once: a room that keeps dropping before its welcome ends on a line
+  bool home_checked = false;   // the first welcome of an invited Doubles home was checked for a gone home
+  const auto reroute = [&](int kind, bool known, const char* why) {
+    const char* name = kind == friends::kRoomDoubles ? "a Doubles home"
+                     : kind == friends::kRoomFriends4 ? "a Friends lobby" : "a 1v1 friend room";
+    host::log("friends: room %s %s %s (%s); joining it that way", room_code.c_str(), known ? "is" : "may be", name, why);
+    if (known) friends::events.room_decided(room_code, kind);
+    else friends::events.room_retry(room_code, kind);
+    return fail("Cancelled");   // quiet: the menu takes the queued join at once
+  };
+  if (!adopted && !room->socket->open_session(url, pass, room_code, &error, 10000, cancelled)) {
+    // A full Friends lobby or Doubles home an invite named says so too, never "try again from their invite".
+    if ((friends_mode || invited) && !cancelled() && room->socket->room_full()) return fail_room_full(room_code);
+    // lobby_mismatch is also a different build's or remix's refusal: only an invite that named no size or
+    // key is tried another way (friends::Events::mismatch_reroutes), each kind once; otherwise this error
+    // stands, and when every kind was tried, the first refusal's. Rooms' "another Teams protocol" / "another
+    // Doubles profile" refusal (or its code, teams_protocol / doubles_profile) is a room of another kind too. A
+    // gone room (host_gone 410, an expired home 409) is neither: its own error stands, even on the last try
+    // (friends::Events::refusal_text).
+    // A kind refusal reroutes even a hinted join (it never means another build); a lobby_mismatch only an unhinted one.
+    const bool kind_refusal = room->socket->kind_refused();
+    if (!kind_heard && !cancelled() && (room->socket->lobby_mismatch() || kind_refusal) &&
+        friends::events.mismatch_reroutes(room_code, kind_refusal)) {
+      const int next = friends::events.mismatch_next(room_code, joined_kind, error, kind_refusal);
+      if (next >= 0) return reroute(next, false, "the room refused this kind");
+      host::log("friends: room %s refused every kind; not joining", room_code.c_str());
+      return fail(friends::kJoinRefused);
+    }
+    // A friend's room refused the socket after a good ticket (the upgrade refused, 1006, a 403 on the room GET, or
+    // no open in 10 s): one plain line, back to the menu, no other kind and no search again.
+    if (invited && !cancelled()) {
+      host::log("friends: room %s refused the connection; not joining", room_code.c_str());
+      return fail(friends::kJoinRefused);
+    }
+    return fail(friends::events.refusal_text(room_code, error, false), !direct);
+  }
+  if (cancelled()) {
+    if (adopted && room->lobby_session) {
+      report_lobby_gone(room->code);
+      room->lobby_session->leave();
+      for (const auto& f : room->lobby_session->due(now_ms())) room->socket->send(f);
+    } else room->socket->send({{"t", "leave"}});
+    for (const auto& kv : adopted_links) { try { bridge({{"type", "directClose"}, {"link", kv.second}}, 1000); } catch (...) {} }
+    return fail("Cancelled");
+  }
 
   const bool links_mode = g_direct;
   const auto requested_port = udp::port(links_mode ? nullptr : std::getenv("YOUGAME_UDP_PORT"));
@@ -2696,12 +3816,100 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   uint64_t last_ping = now_ms(), full_since = 0;
   // Only base-listing plain Unranked can meet a blending client.
   const uint64_t arrive_by = search_policy::no_show_deadline(host::gameplay::vanilla_only(), queued,
-      search.mode, friends_mode || team_code, now_ms());
+      search.mode, friends_mode || team_code, now_ms());   // a lobby has a room code: never queued
   bool arrived = false;
   int my_seat = -1;
   auto seat_of = [&](const std::string& conn) {
     return transport::connection_seat(participants, conn);
   };
+  // The Friends lobby: its state model (made once the room names this player), the links opened as each
+  // friend takes a seat, and the match plan once the host's Start froze the setup. lobby_view: the setup's
+  // humans from the room's roster, each with its setup port as its slot (the session's player index).
+  const auto request_app = [&](const json& q, int ms) { return bridge(q, ms, cancelled); };
+  // Closing a link goes out even once the search is cancelled (leaving the lobby is a cancel), as
+  // Room's destructor closes its links: request_app would throw before sending.
+  const auto close_app = [](const json& q, int ms) { return bridge(q, ms); };
+  std::unique_ptr<lobby::Session> lobby_session;
+  std::shared_ptr<const lobby::Plan> lobby_plan;
+  json lobby_view = json::array();
+  std::string lobby_me;
+  int lobby_reported = -1;
+  // Every machine of one build has the same key; the card digest has no native source yet (phase 2).
+  const std::string lobby_settings = lobby::settings_digest(lobby_key), lobby_card = lobby::kCardDigestNative;
+  struct EarlyScope {
+    lobby::EarlyLinks links;
+    std::function<json(const json&, int)> request;
+    bool keep = false;
+    ~EarlyScope() { if (!keep) links.forget_all(request); }
+  } early;
+  early.request = close_app;
+  const auto connection_of = [&](const std::string& id) {
+    for (const auto& p : participants)
+      if (p.value("id", "") == id && p.value("localIndex", 0) == 0) return p.value("connectionId", "");
+    return std::string();
+  };
+  // Leaving the search any way but into the match (a cancel, B on the select, a failure) leaves the lobby
+  // too, so the seat frees at once and nobody waits on this player.
+  // The Doubles match room has no lobby of its own (only its setup): leaving it is the room's leave.
+  struct LobbyLeave {
+    std::unique_ptr<lobby::Session>& session;
+    Room& room;
+    bool room_only;
+    const std::string& code;
+    bool handed_off = false;   // the session went on with the room; a reconnect's empty session did not
+    ~LobbyLeave() {
+      if (!handed_off && !room_only) report_lobby_gone(code);
+      if (!session || !room.socket || room.socket->closed()) return;
+      if (room_only) { room.socket->send({{"t", "leave"}}); return; }
+      session->leave();
+      for (const auto& f : session->due(now_ms())) room.socket->send(f);
+    }
+  } lobby_leave{lobby_session, *room, doubles_room, room_code};
+  // The Doubles home's search (G2): the generation Rooms names once Start went through, this player's queue
+  // socket for it, and the match room matchmaking names. The match room: when this search reached it, and
+  // its room reports.
+  lobby::DoublesParty party;
+  std::unique_ptr<Socket> queue_socket;
+  std::string queue_generation, queue_url, queue_pass, matched_room;
+  const uint64_t doubles_since = now_ms();
+  uint64_t doubles_epoch = 0;
+  bool doubles_playing_reported = false;   // the match room's report said playing (its setup is planned)
+  bool reopen_seated = false;   // an adopted lobby opens each seated friend's link again if it closed
+  if (adopted) {
+    lobby_session = std::move(room->lobby_session);
+    lobby_me = std::move(room->lobby_me);
+    participants = room->participants;
+    lobby_session->next_match();   // a match that never began: the host calls it off (Session::next_match)
+    lobby_session->take_seated();
+    early.links.by_peer = std::move(adopted_links);
+    reopen_seated = true;
+  }
+  // Idempotent once per run. The app refuses every directOpen until the game has attached.
+  const auto attach_links = [&] {
+    if (yg_enet_channel_ready()) return;
+    json h = bridge({{"type", "directAttach"}}, 10000, cancelled);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (cancelled()) throw std::runtime_error("Cancelled");
+#ifdef _WIN32
+    if (h.value("version", 0) != 1 || yg_enet_attach_handles(h.value("section", uintptr_t(0)),
+        h.value("toApp", uintptr_t(0)), h.value("toGame", uintptr_t(0))))
+      throw std::runtime_error("Could not attach direct links");
+#else
+    transport::PosixAttachment p;
+    if (!transport::posix_attachment(h, p) || yg_enet_attach_posix(p.section, p.wake, p.wait, p.size))
+      throw std::runtime_error("Could not attach YouGame POSIX direct links");
+#endif
+  };
+  // A lobby opens each friend's link when they take a seat, so attach first: a game whose first online
+  // mode this run is the lobby was refused no_direct there while a host already attached waited on it.
+  if (links_mode && lobby_route) {
+    try { attach_links(); }
+    catch (const update::Required&) { throw; }
+    catch (const std::exception& e) { host::log("yougame: direct attach before the lobby failed: %s", e.what()); }
+  }
+  // An invited room says welcome as soon as it opens: without one in kHelloMs the join ends on a line, never a
+  // silent wait (the loop's hello_by check).
+  if (invited && !adopted) hello_by = now_ms() + friends::kHelloMs;
   for (;;) {
     if (cancelled()) return fail("Cancelled");
     if (friends_mode && friends::events.take_version()) return fail(friends::kVersion);
@@ -2716,15 +3924,109 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
         return fail(update::kMessage, false, true);
       }
       const std::string t = m.value("t", "");
-      if (t == "welcome") room->me = m.value("me", "");
+      if (t == "welcome") { room->me = m.value("me", ""); hello_by = 0; }
+      // An invited Doubles guest alone in the home it joined: the friend's home expired or emptied and this ticket
+      // opened a fresh one under its code. Leave it and say the room is gone (no retry: a gone room is never
+      // another kind). Rooms opened that home before any welcome; leaving at once means the game never keeps it,
+      // reports it to the page or invites into it, so a friend's dead code never becomes this player's home.
+      if (t == "welcome" && invited && doubles_home && !home_checked) {
+        home_checked = true;
+        if (lobby::lone_welcome(m)) {
+          host::log("friends: room %s is an empty Doubles home (the friend's home is gone); leaving", room_code.c_str());
+          room->socket->send({{"t", "leave"}});
+          return fail(friends::kRoomGone);
+        }
+      }
+      if (!kind_heard) {
+        const bool lobby_frame = (t == "welcome" && m.count("muLobby") && m["muLobby"].is_object()) ||
+                                 (t == lobby::kType && ranked::str(m, "op") == "state");
+        if (lobby_frame) {
+          kind_heard = true;
+          const int kind = lobby::doubles_frame(t == "welcome" ? m["muLobby"] : m) ? friends::kRoomDoubles : friends::kRoomFriends4;
+          if (kind != joined_kind) {
+            room->socket->send({{"t", "leave"}});
+            return reroute(kind, true, "its first frames carry that lobby");
+          }
+          friends::events.room_seen(room_code, kind);
+        } else if (t == "welcome" && !welcome_at) welcome_at = std::max<uint64_t>(now_ms(), 1);
+      }
       if (m.count("participants") && m["participants"].is_array()) participants = m["participants"];
       read_roster(*room, m);
+      if (doubles_home && (t == "lobby" || t == "welcome") && party.observe(m) && !party.generation.empty() &&
+          party.generation != queue_generation)
+        host::log("doubles: the home's search is on (%d %s)", party.humans, party.humans == 1 ? "human" : "humans");
+      if (doubles_room && !lobby_plan && lobby::doubles_match_ended(m)) {
+        host::log("doubles: the match ended before it started (%s)", ranked::log_text(t, 32).c_str());
+        return fail(lobby::kDoublesEnded);
+      }
+      if (lobby_match) {
+        if (!lobby_session && !room->me.empty()) {
+          for (const auto& p : participants)
+            if (p.value("connectionId", "") == room->me && p.value("localIndex", 0) == 0) lobby_me = p.value("id", "");
+          if (!lobby_me.empty()) {
+            lobby::Session::Options o;
+            o.me = lobby_me; o.connection_id = room->me; o.profile = lobby_profile;
+            // The Doubles match room takes only the setup: no hello (the home sent it), nothing to call off.
+            if (!doubles_room) {
+              o.settings_digest = lobby_settings; o.card_digest = lobby_card;
+              o.call_off_id = carried_call_off.id; o.call_off_setup = carried_call_off.setup;
+            }
+            lobby_session = std::make_unique<lobby::Session>(o);
+          }
+        }
+        if (lobby_session) {
+          lobby_session->receive(m);
+          if (const char* bad = lobby_session->take_bad_frame()) host::log("friends lobby: unusable room frame (%s)", bad);
+          if (lobby_session->unsupported() && lobby_route) {
+            if (!kind_heard) { kind_heard = true; return reroute(friends::kRoom1v1, true, "the room has no Friends lobby"); }
+            return fail(lobby::kUnsupported);
+          }
+        }
+        if (t == "leave" || t == "away") early.links.forget(transport::leave_id(m, room->socket->brokered()), close_app);
+        // The host's call-off of a match that never began (Session::call_off_setup): Rooms ends that match
+        // (sessionEnded, reason host_ended) and sends the lobby without a setup. Only the match ended: the
+        // room, its seats, picks and rules stay, and this search goes on (never a close or a failure).
+        if (t == "sessionEnded")
+          host::log("friends lobby: the room ended the match that never began (%s); the lobby stays",
+                    ranked::log_text(ranked::str(m, "reason"), 32).c_str());
+        if (t == "command-error" && ranked::str(m, "action") == "end-session")
+          host::log("friends lobby: the room kept the match: %s", ranked::log_text(ranked::str(m, "error"), 160).c_str());
+      }
+#ifdef MELEE_DOUBLES
+      if (doubles_match) {
+        consent.observe(m);
+        if (doubles::terminal(m)) return fail("The Doubles match ended before it started");
+        // A begin before all four are ready is refused and sent again: expected, so each refusal is logged once.
+        if (t == "command-error" && !setup.known) {
+          const std::string refusal = ranked::log_text(m.value("action", ""), 32) + ": " + ranked::log_text(m.value("error", ""), 160);
+          if (refusal != last_refusal) host::log("doubles: the room refused %s", refusal.c_str());
+          last_refusal = refusal;
+        }
+        if (!setup.known && doubles_teams::start_console(m)) {
+          // The host's begin went through: the start names the session, its seed, and each seat's port and team.
+          doubles_teams::Setup started;
+          if (const char* why = doubles_teams::read_start(m, doubles::digest(), started)) {
+            host::log("doubles: the room's start is unusable (%s)", why);
+            return fail("The Doubles room started a match this game can't play. Press B to leave");
+          }
+          if (!doubles_teams::seated(started, room->me)) {
+            host::log("doubles: the room's start does not seat this player");
+            return fail("The Doubles room started a match without you. Press B to leave");
+          }
+          setup = started; room->match_id = setup.match;
+          host::log("doubles: the room started the match (teams %d%d%d%d)", setup.team[0], setup.team[1], setup.team[2], setup.team[3]);
+          doubles::ui.teams_start(team_room);
+        }
+      }
+#endif
 #ifdef YOUGAME_AGENT_TEST_HOOK
       pending_input.publish(*room, room->participants);
 #endif
       if (friends_mode && friends::version_reason(m) && (t == "error" || t == "notice" || t == "refused"))
         return fail(friends::kVersion);
       if (t == "error") return fail(m.value("error", m.value("message", "The room refused this player")), !direct);
+      if (friends_mode && t == "command-error" && m.value("action", "") == "join" &&
+          friends::says_room_full(ranked::str(m, "error"))) return fail_room_full(room_code);
       if (t == "leave" || t == "away") {
         // A player left before the match: forget what they sent (a newcomer gets a fresh exchange).
         const std::string who = transport::leave_id(m, room->socket->brokered());
@@ -2743,6 +4045,8 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
         }
       }
     } else if (room->socket->closed()) {
+      const auto seats_full = [&] { return friends_mode && room->socket->room_full(); };
+      if (seats_full()) return fail_room_full(room_code);
       if (!room->socket->recoverable()) return fail("Lost the connection to the YouGame room", !direct);
       const uint64_t until = now_ms() + 15000;
       bool reopened = false;
@@ -2750,19 +4054,209 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       while (!cancelled() && !update_refused && now_ms() < until) {
         if (retry.attempt([&] { return !update_refused && now_ms() < until && room->socket->open_session(url, pass, room_code, &error, (int)std::min<uint64_t>(3000, until - now_ms()), cancelled); },
                           [&] { if (room->socket->closed()) renew_ticket(until); })) { reopened = true; room->ticket = pass; break; }
+        if (seats_full()) break;   // final: never another try
         Sleep(250);
       }
       if (update_refused) return fail(update::kMessage, false, true);
+      if (!reopened && !cancelled() && seats_full()) return fail_room_full(room_code);
       if (!reopened) return fail("Lost the connection to the YouGame room", !direct);
       participants = json::array(); cands.clear(); sent_at.clear(); tokens.clear();
       room->me.clear(); room->participants = json::array(); full_since = 0;
+      lobby_reported = -1;   // the page dropped the report with the old ticket: report again, even if nothing moved
+      if (hello_by && !hello_rearmed) { hello_by = now_ms() + friends::kHelloMs; hello_rearmed = true; }   // once
+      if (lobby_match) {
+        // A new connection: the room's next welcome carries the lobby again (Rooms holds the seat, the
+        // pick and the host role for 5 s). Links to the old connection are gone; a fresh session
+        // re-sends hello and opens every seated friend's link again.
+        lobby_session.reset();
+        early.links.forget_all(close_app);
+      }
 #ifdef YOUGAME_AGENT_TEST_HOOK
       pending_input.publish(*room, room->participants);
 #endif
       continue;
     }
+    if (hello_by && now_ms() >= hello_by) {
+      host::log("friends: room %s opened but sent no welcome in %d s; not joining", room_code.c_str(), friends::kHelloMs / 1000);
+      room->socket->send({{"t", "leave"}});
+      return fail(friends::kJoinRefused);
+    }
     my_seat = seat_of(room->me);
-    const bool full = (int)participants.size() == size && my_seat >= 0;
+    // A welcome without the lobby, and no lobby state within a second of it: a 1v1 friend room.
+    if (!kind_heard && welcome_at && now_ms() - welcome_at >= 1000) {
+      kind_heard = true;
+      if (joined_kind != friends::kRoom1v1) {
+        room->socket->send({{"t", "leave"}});
+        return reroute(friends::kRoom1v1, true, "its first frames carry no lobby");
+      }
+      friends::events.room_seen(room_code, friends::kRoom1v1);
+    }
+    if (lobby_match && lobby_session && !lobby_route) {   // the Doubles match room: its setup, pings, report
+      for (auto& f : lobby_session->due(now_ms())) room->socket->send(f);
+      // The match's report (queue casual): assembling until the setup is planned, then once more as playing.
+      if ((room->revision != lobby_reported || (lobby_plan && !doubles_playing_reported)) && !lobby_me.empty()) {
+        lobby_reported = room->revision;
+        doubles_playing_reported = lobby_plan != nullptr;
+        if (!doubles_epoch) doubles_epoch = lobby::next_room_epoch();
+        try {
+          bridge(lobby::doubles_room_report(room_code, search.doubles_match.home, true, doubles_epoch, room->participants,
+                                            lobby_me, room->revision, lobby_plan != nullptr), 1000);
+        } catch (const update::Required&) { throw; } catch (...) {}
+      }
+      if (!lobby_plan && now_ms() - doubles_since > lobby::kDoublesSetupMs) {
+        // Past Rooms' own arrival and late-player hold: the room ends the match itself. Closed without a
+        // leave (LobbyLeave skips a closed socket): a leave in a placed match is a player walking out.
+        host::log("doubles: the match room sent no setup in %d s", (int)(lobby::kDoublesSetupMs / 1000));
+        room->socket->close();
+        return fail(lobby::kDoublesNoSetup);
+      }
+    }
+    if (lobby_route && lobby_session) {
+      if (search.lobby_control)
+        search.lobby_control->run(*lobby_session, lobby_link_info(*lobby_session, participants, early.links.by_peer), room_code);
+      for (auto& f : lobby_session->due(now_ms())) room->socket->send(f);
+      for (const auto& seated : lobby_session->take_seated())
+        if (links_mode) early.links.open<update::Required>(room->socket->connection(), connection_of(seated.id), request_app);
+      if (reopen_seated && links_mode && lobby_session->known()) {
+        reopen_seated = false;
+        for (const auto& seat : lobby_session->state().seats)
+          if (seat.kind == lobby::Kind::Human && seat.id != lobby_me)
+            early.links.open<update::Required>(room->socket->connection(), connection_of(seat.id), request_app);
+      }
+      // The app's held-room contract: the room's roster before any invite, again when it changes. The
+      // Doubles home reports the Teams summary (kind party), with a newer roomEpoch each time it is back.
+      if (room->revision != lobby_reported && !lobby_me.empty()) {
+        lobby_reported = room->revision;
+        if (doubles_home && !doubles_epoch) doubles_epoch = lobby::next_room_epoch();
+        try {
+          if (doubles_home) {
+            lobby_report_replaced();
+            bridge(lobby::doubles_room_report(room_code, room_code, false, doubles_epoch, room->participants, lobby_me,
+                                              room->revision), 1000);
+          } else
+            report_lobby(room_code, json{{"type", "mpRoom"}, {"code", room_code}, {"queue", "private"}, {"size", 4}, {"me", lobby_me},
+                                         {"players", room->participants}, {"participants", room->participants},
+                                         {"revision", room->revision}});
+        } catch (const update::Required&) { throw; } catch (...) {}
+      }
+      if (doubles_home) {
+        // Start went through (Rooms: searching, and the party's generation): this player's queue ticket for
+        // it, one socket polled here. Searching off (cancel, a cross-team mismatch, the home released) and
+        // not placed: the socket closes. matched: the home parks and the match room is joined below.
+        if (lobby_session->searching() && !queue_socket && !party.generation.empty() && party.generation != queue_generation) {
+          queue_generation = party.generation;
+          try {
+            const json queue_request = friends::doubles_queue_ticket(lobby_key, room_code, queue_generation, lobby_session->owns_local() ? 1 : party.humans);
+            const json qt = bridge(queue_request, 15000, cancelled);
+            queue_url = qt.value("url", "");
+            queue_pass = qt.value("ticket", "");
+            auto qs = std::make_unique<Socket>();
+            std::string queue_error;
+            if ((!g_broker && queue_url.empty()) || queue_pass.empty())
+              throw std::runtime_error("YouGame did not return a Doubles search ticket");
+            if (!qs->open_session(queue_url, queue_pass, "", &queue_error, 10000, cancelled)) throw std::runtime_error(queue_error);
+            queue_socket = std::move(qs);
+            host::log("doubles: searching for %s", party.humans == 2 ? "opponents" : "a team");
+          } catch (const update::Required&) { throw; }
+          catch (const std::exception& e) {
+            if (cancelled()) return fail("Cancelled");
+            host::log("doubles: the search could not open (%s); stopping it", ranked::log_text(e.what(), 120).c_str());
+            lobby_session->cancel();
+          }
+        }
+        while (queue_socket && matched_room.empty()) {
+          json qm;
+          if (!queue_socket->next(qm, 0)) break;
+          const auto& refused = update::refusal(qm);
+          if (update::required(refused)) {
+            g_update_notice.refuse();
+            return fail(update::kMessage, false, true);
+          }
+          const lobby::QueueMessage news = lobby::queue_message(qm);
+          if (news.news == lobby::QueueNews::Matched) matched_room = news.room;
+          else if (news.news == lobby::QueueNews::Searching && search.on_searching && news.waiting >= 0) search.on_searching(news.waiting);
+          else if (news.news == lobby::QueueNews::Refused) {
+            // The home hears it too (a state with the refusal, searching off): the screen says why. Cancel the
+            // home's search as well, so it never stays Searching on a refusal the home did not hear (a
+            // cancel when it is already off is a no-op in Rooms).
+            host::log("doubles: the search stopped (%s)", ranked::log_text(news.code, 32).c_str());
+            queue_socket->close();
+            queue_socket.reset();
+            lobby_session->cancel();
+          }
+        }
+        if (queue_socket && matched_room.empty() && queue_socket->closed()) {
+          host::log("doubles: the search's connection closed; stopping the search");
+          queue_socket.reset();
+          lobby_session->cancel();
+        }
+        if (queue_socket && matched_room.empty() && !lobby_session->searching() && !party.playing) {
+          queue_socket->send({{"t", "cancel"}});
+          queue_socket->close();
+          queue_socket.reset();
+          host::log("doubles: the search stopped");
+        }
+        if (!matched_room.empty()) {
+          // The match: park the home (its pump keeps it current and runs the screen; its links close, as
+          // the three link slots go to the match), then join the match room with the queue's ticket.
+          host::log("doubles: matchmaking placed the home; joining the match");
+          if (queue_socket) { queue_socket->close(); queue_socket.reset(); }
+          // The teammate's link can't carry over: a link is the app's directOpen {conn, peer} on the home's
+          // connection, and in the match room both players have new connections (and the match's links come
+          // from its own candidate exchange), so a kept one would hold one of the three slots for nothing.
+          early.links.forget_all(close_app);
+          Search next = search;
+          next.friends_lobby = false;
+          next.lobby_room.clear();
+          next.epoch = epoch;
+          next.doubles_match.url = queue_url;
+          next.doubles_match.ticket = queue_pass;
+          next.doubles_match.room = matched_room;
+          next.doubles_match.home = room_code;
+          lobby_leave.handed_off = true;
+          room->lobby_session = std::move(lobby_session);
+          room->lobby_me = lobby_me;
+          room->lobby_control = search.lobby_control;
+          room->lobby_links.clear();
+          {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            if (!g_search_generation.current(epoch) || search_stopped()) {
+              Match out; out.error = "Cancelled"; return out;   // the room's destructor closes it
+            }
+            if (g_parked_lobby) std::thread([old = std::move(g_parked_lobby)]() mutable { shutdown_room(std::move(old)); }).detach();
+            Room* raw = room.get();
+            g_parked_lobby = std::move(room);
+            raw->pump = std::thread(pump_room, raw);
+          }
+          friends_setup.keep = true;   // the home is still this player's room
+          return find_match(next, cancel_requested);
+        }
+      }
+      if (lobby_plan && !lobby_session->has_setup()) {   // Rooms dropped it before the splash
+        host::log("friends lobby: the room dropped the match before it began; back to the select");
+        lobby_plan.reset();
+      }
+    }
+    if (lobby_match && lobby_session) {
+      if (!lobby_plan && lobby_session->has_setup()) {
+        auto built = std::make_shared<lobby::Plan>(lobby::plan(lobby_session->setup(), lobby_me, lobby_settings, lobby_card, lobby_profile, lobby_session->squad_budget()));
+        if (!built->ok) {
+          host::log("%s: the room's setup is unusable (%s)", doubles_room ? "doubles" : "friends lobby", built->why.c_str());
+          return fail(doubles_room ? lobby::kDoublesUnusable : lobby::kSetupUnusable);
+        }
+        if (built->machines < 2) return fail(lobby::kCpuOnly);
+        if (built->match_id.empty()) return fail(doubles_room ? lobby::kDoublesUnusable : lobby::kSetupUnusable);
+        host::log("%s (%d players, %d CPUs, stage %d)", doubles_room ? "doubles: the match room froze the setup" : "friends lobby: the host started the match",
+                  built->humans, built->ports - built->humans, built->stage);
+        lobby_plan = built;
+        // The select shows Starting (the home's pump publishes it; the home itself never gets a setup).
+        if (doubles_room && search.lobby_control) search.lobby_control->set_matched(true);
+      }
+    }
+    if (lobby_match) lobby_view = lobby_plan ? lobby::match_roster(participants, *lobby_plan) : json::array();
+    const json& active = lobby_match ? lobby_view : participants;
+    const bool full = lobby_match ? (!lobby_view.empty() && transport::connection_seat(lobby_view, room->me) >= 0)
+                                  : (int)participants.size() == size && my_seat >= 0;
     if (full) arrived = true;
     else if (search_policy::no_show_expired(arrive_by, arrived, now_ms())) {
       host::log("yougame: unranked: opponent never joined the room after 30 s; searching again");
@@ -2771,9 +4265,20 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     }
     if (!full) full_since = 0;
     else if (!full_since) { full_since = now_ms(); set_status("connecting"); }
+#ifdef MELEE_DOUBLES
+    // The match room holds the four until each says ready for this roster (as the console admission did).
+    if (doubles_match) if (auto ready = consent.ready(full)) room->socket->send(*ready);
+    // Then the host freezes the match (Rooms' console begin) at the revision and epoch the four said
+    // ready at; a begin before the others' ready is refused and sent again.
+    if (doubles_match && full && !setup.known && room->me == room->host_connection && consent.have_epoch &&
+        consent.revision >= 0 && consent.sent_revision == consent.revision && now_ms() - begin_sent >= 2000) {
+      room->socket->send(consent.begin(3));
+      begin_sent = now_ms();
+    }
+#endif
     // My addresses, point to point, each peer with a token of its own.
     if (full) {
-      for (auto& p : participants) {
+      for (auto& p : active) {
         const std::string conn = p.value("connectionId", "");
         if (conn == room->me || p.value("localIndex", 0) != 0) continue;
         if (sent_at.count(conn) && now_ms() - sent_at[conn] < 1000) continue;
@@ -2784,21 +4289,28 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
         sent_at[conn] = now_ms();
       }
     }
-    if (now_ms() - last_ping > 5000) {
+    if (!lobby_match && now_ms() - last_ping > 5000) {   // the lobby's session keeps its own (yougame_lobby.h)
       room->socket->send({{"t", "ping"}, {"at", now_ms()}});
       last_ping = now_ms();
     }
     if (!full) continue;
     bool all = true;
-    for (auto& p : participants) {
+    for (auto& p : active) {
       const std::string conn = p.value("connectionId", "");
       if (conn != room->me && (!cands.count(conn) || !sent_at.count(conn))) all = false;
     }
-    if (all) break;
+    // A Doubles match plays only the match Rooms started (its seed, ports and teams).
+    if (all && (!doubles_match || setup.known)) break;
+    if (all && now_ms() - full_since > 20000) return fail("The Doubles match didn't start", true);
+    if (all) continue;
     // A seated opponent who never answers (crashed, stuck): give up and, in Unranked, search again.
     if (now_ms() - full_since > 15000) return fail("Your opponent did not answer", !direct);
   }
 
+  // The Friends lobby plays its setup's humans, numbered by setup port; the room's own roster stays for
+  // the room's recovery.
+  const json room_roster = participants;
+  if (lobby_match) { participants = lobby_view; my_seat = lobby_plan->local_port; }
   // Punch to every other seat.
   std::vector<PunchPeer> peers;
   std::string match_id = my_seat == 0 ? my_match_id : "";
@@ -2823,23 +4335,23 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   if (links_mode) {
     try {
       // Idempotent once per run. Mapping stays alive across matches; only the host owns ring I/O.
-      if (!yg_enet_channel_ready()) {
-        json h = bridge({{"type", "directAttach"}}, 10000, cancelled);
-        std::lock_guard<std::mutex> lock(g_mutex);
-        if (cancelled()) throw std::runtime_error("Cancelled");
-#ifdef _WIN32
-        if (h.value("version", 0) != 1 || yg_enet_attach_handles(h.value("section", uintptr_t(0)),
-            h.value("toApp", uintptr_t(0)), h.value("toGame", uintptr_t(0))))
-          throw std::runtime_error("Could not attach direct links");
-#else
-        transport::PosixAttachment p;
-        if (!transport::posix_attachment(h, p) || yg_enet_attach_posix(p.section, p.wake, p.wait, p.size))
-          throw std::runtime_error("Could not attach YouGame POSIX direct links");
-#endif
-      }
+      attach_links();
       std::vector<std::string> remotes;
       for (const auto& p : participants) if (p.value("connectionId", "") != room->me) remotes.push_back(p.value("connectionId", ""));
-      if (!transport::open_links(room->links, room->socket->connection(), remotes,
+      if (lobby_route) {
+        // The lobby opened each friend's link when they took a seat: links to anyone not in the match
+        // close, any still missing open, and the match's pass to the room (it closes them), then wait.
+        early.links.forget_dead(direct_state, close_app);
+        room->links.begin(now_ms());
+        room->links.ids = early.links.hand_over<update::Required>(room->socket->connection(), remotes, request_app, close_app);
+        if (room->links.ids.size() != remotes.size()) throw std::runtime_error("Direct link failed");
+        room->lobby_links.clear();
+        for (size_t i = 0; i < remotes.size(); ++i) room->lobby_links[remotes[i]] = room->links.ids[i];
+        while (!room->links.up(now_ms(), direct_state)) {
+          if (cancelled() || room->links.failed(now_ms(), direct_state)) throw std::runtime_error("Direct link failed");
+          Sleep(10);
+        }
+      } else if (!transport::open_links(room->links, room->socket->connection(), remotes,
           [&](const json& q, int ms) { return bridge(q, ms, cancelled); }, direct_state, now_ms, [] { Sleep(10); }, cancelled))
         throw std::runtime_error("Direct link failed");
       size_t index = 0;
@@ -2862,12 +4374,14 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       }
     } catch (const update::Required&) { throw; }
     catch (...) {
-#ifndef _WIN32
+      // Read first: any later bridge call clears it. no_direct is this computer's own helper, so no
+      // other opponent can work: say why and stop, instead of searching again and bouncing each one.
+      const bool helper_missing = g_bridge_refusal == "no_direct";
       try { throw; }
       catch (const std::exception& e) { host::log("yougame: direct links failed: %s", e.what()); }
       catch (...) { host::log("yougame: direct links failed"); }
-#endif
       if (cancelled()) return fail("Cancelled");
+      if (helper_missing) return fail(console::kHelperMissing, false);
       // Count only peers whose link failed, never a teammate who connected.
       // Even a partial successful link resets the previous failure history.
       json failed_participants = json::array();
@@ -2886,7 +4400,8 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
         if (linked) g_direct_link_failures.successful();
         repeated = g_direct_link_failures.failed(failed_participants, room->me);
       }
-      return fail(repeated ? search_policy::kLinkRetry : search_policy::kLinkFailed,
+      // The lobby never looks for another opponent (g_lobby_search: no retry), so it never says it does.
+      return fail(repeated && !lobby_match ? search_policy::kLinkRetry : search_policy::kLinkFailed,
                   transport::retry_link_failure(search.mode));
     }
   } else if (!punch(udp, my_seat + 1, peers, ingress, cancelled)) {
@@ -2908,6 +4423,17 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   out.local_index = my_seat;
   out.host = my_seat == 0;
   room->port_ids = transport::port_participants(participants, size);
+  if (lobby_match) {
+    // Results by setup port, CPUs as cpu:<seat>; the room's match is the setup's (no begin is sent).
+    room->port_ids = lobby_plan->ids;
+    room->match_id = lobby_plan->match_id;
+    room->lobby = lobby_plan;
+  }
+  // The start's seats: its result ids are the session's participants, by port.
+  if (setup.known) {
+    for (int slot = 0; slot < 4 && slot < (int)room->port_ids.size(); ++slot) room->port_ids[slot] = setup.id[slot];
+    room->setup = setup;
+  }
   for (auto& p : participants) {
     int seat = p.value("slot", -1);
     if (seat < 0 || seat >= size) continue;
@@ -2923,7 +4449,8 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     for (auto& peer : peers) if (peer.port == player.port) player.address = addr_string(peer.chosen);
     out.players.push_back(player);
   }
-  room->recovery.configure(room_code, room->me, participants);
+  room->recovery.configure(room_code, room->me, lobby_match ? room_roster : participants);
+  if (setup.known && room->socket->brokered()) room->recovery.start(room->match_id);
   if (room->ranked) room->set.configure(my_seat, room->port_ids);
   std::sort(out.players.begin(), out.players.end(), [](const Player& a, const Player& b) { return a.port < b.port; });
   std::string names;
@@ -2952,12 +4479,25 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     g_rank_read.recovery_at = 0;
     g_rank_result_visible = false;
   }
+  if (lobby_route) {
+    // The lobby goes on with the room: through the match, and parked on the select after it.
+    lobby_leave.handed_off = true;
+    raw->lobby_session = std::move(lobby_session);
+    raw->lobby_me = lobby_me;
+    raw->lobby_control = search.lobby_control;
+  } else if (doubles_room) {
+    // The Doubles match keeps its setup session (a rejoin's welcome brings the same setup); the screen's
+    // control stays with the parked home's pump, which alone runs it.
+    raw->lobby_session = std::move(lobby_session);
+    raw->lobby_me = lobby_me;
+  }
   g_room = std::move(room);
 #ifdef YOUGAME_AGENT_TEST_HOOK
   g_pending_input = false;
   g_pending_input_roster = {};
 #endif
   friends_setup.keep = true;
+  early.keep = true;   // the match's links now belong to the room
   raw->pump = std::thread(pump_room, raw);
   return out;
   } catch (const update::Required&) {
@@ -2987,6 +4527,33 @@ int seat_team(int player_idx) {
   std::lock_guard<std::mutex> lock(g_mutex);
   return g_room ? g_room->seat_team(player_idx) : -1;
 }
+DoublesRoom doubles_room() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  DoublesRoom out;
+  if (!g_room || g_room->size != 4 || g_room->mode != doubles_teams::kTeamsMode) return out;
+  const auto plan = doubles_teams::plan(g_room->setup, g_room->doubles, g_room->code);
+  out.open = true; out.refusal = plan.refusal;
+  if (plan.refusal) return out;
+  out.team = plan.team; out.seed = plan.seed;
+  out.consistent = doubles_teams::consistent(plan.seats, g_room->participants);
+  return out;
+}
+
+std::string friends_lobby_compatibility() { return lobby_room_key(); }
+
+FriendsLobby friends_lobby() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  FriendsLobby out;
+  if (!g_room || !g_room->lobby) return out;
+  out.open = true;
+  out.plan = g_room->lobby;
+  return out;
+}
+
+void lobby_refuse_setup() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (g_room && g_room->lobby_session) g_room->lobby_session->refuse_setup();
+}
 
 void game_started(int64_t rng, int stage) {
   std::lock_guard<std::mutex> lock(g_mutex);
@@ -2994,7 +4561,11 @@ void game_started(int64_t rng, int stage) {
   // Frame 1 is retried while waiting for peers; emit once per game, including later games of a set.
   if (g_room->ranked && !g_room->in_game)
     host::log("%s", lcancel::policy::ranked_start_log(lcancel::automatic_enabled()));
+  // A Doubles match room plays one match: a game after its result belongs to no match (Rooms closes it).
+  if (g_room->setup.known && g_room->settled) return;
   g_room->in_game = true;
+  // The Friends lobby's match began: from here a state without the setup no longer means it fell through.
+  if (g_room->lobby_session) g_room->lobby_session->match_began();
   // Called on every frame 1 the game sends while it waits for the opponent: the set counts a game once.
   if (g_room->ranked) { g_room->set.start_game(ranked::game_key(rng, stage)); return; }
   if (g_room->socket->brokered()) { g_room->games.start_game(g_room->match_id); return; }
@@ -3033,13 +4604,30 @@ void game_ended(const GameEnd& end) {
     return;
   }
   if (!g_room->socket->brokered()) g_room->pending_begin = false;
+  if (g_room->lobby) {
+    // A Friends lobby match: the full ranking by setup id, CPUs included, a player the netcode dropped
+    // (or who quit) last, never left out; the frozen setup echoed (Rooms compares it).
+    lobby::Outcome o;
+    o.has_placements = end.has_placements;
+    for (int i = 0; i < 4; ++i) o.placements[i] = end.placements[i];
+    o.winner = end.winner; o.end_method = end.end_method; o.lras = end.lras; o.gone = end.gone;
+    json result = lobby::finish_report(*g_room->lobby, o);
+    const auto ranking = result.find("ranking");   // never result["ranking"]: that would add a null one
+    host::log("yougame: friends lobby result: %s, %zu ranked",
+              result.value("void", false) ? "void" : result.value("draw", false) ? "draw" : "complete",
+              ranking != result.end() ? ranking->size() : (size_t)0);
+    if (g_room->socket->brokered()) g_room->games.report_team_result(std::move(result));
+    else g_room->pending_team_result = std::move(result);
+    return;
+  }
   if (g_room->size == 4) {
     int teams[4];
-    transport::outcome_teams(end.teams, g_room->port_teams.data(), g_room->ranked, teams);
+    const int* room_teams = g_room->result_teams();
+    transport::outcome_teams(end.teams, room_teams, g_room->ranked, teams);
     const int winner = ranked::team_winner(end.end_method, end.lras,
                                            end.has_placements ? end.placements : nullptr, teams);
     const json result = transport::room_team_outcome(winner, g_room->port_ids, teams,
-                                                     g_room->port_teams.data(), g_room->ranked);
+                                                     room_teams, g_room->ranked);
     if (g_room->socket->brokered()) g_room->games.report_team_result(result);
     else g_room->pending_team_result = result;
     return;

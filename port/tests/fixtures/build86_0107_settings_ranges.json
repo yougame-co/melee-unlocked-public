@@ -1,0 +1,14 @@
+[
+ {
+  "before": "      else if (key == \"rtxstageshade\") options.rtx_stage_shade = value == \"1\";\n      else if (key == \"rtxglossyfloors\") options.rtx_glossy_floors = value == \"1\";\n",
+  "after": "      else if (key == \"rtxstageshade\") options.rtx_stage_shade = value == \"1\";\n      else if (key == \"rtxmoddedstages\") options.rtx_modded_stages = value == \"1\";\n      else if (key == \"rtxeffectlight\") options.rtx_effect_light = value == \"1\";\n      else if (key == \"rtxglossyfloors\") options.rtx_glossy_floors = value == \"1\";\n"
+ },
+ {
+  "before": "       << \"\\nrtxbounce \" << (options.rtx_bounce ? 1 : 0) << \"\\nrtxreflections \" << (options.rtx_reflections ? 1 : 0)\n       << \"\\nrtxskin \" << (options.rtx_skin ? 1 : 0) << \"\\nrtxstageshade \" << (options.rtx_stage_shade ? 1 : 0)\n       << \"\\nrtxglossyfloors \" << (options.rtx_glossy_floors ? 1 : 0) << \"\\nrtxbrightness \" << options.rtx_brightness\n",
+  "after": "       << \"\\nrtxbounce \" << (options.rtx_bounce ? 1 : 0) << \"\\nrtxreflections \" << (options.rtx_reflections ? 1 : 0)\n       << \"\\nrtxskin \" << (options.rtx_skin ? 1 : 0) << \"\\nrtxstageshade \" << (options.rtx_stage_shade ? 1 : 0) << \"\\nrtxmoddedstages \" << (options.rtx_modded_stages ? 1 : 0) << \"\\nrtxeffectlight \" << (options.rtx_effect_light ? 1 : 0)\n       << \"\\nrtxglossyfloors \" << (options.rtx_glossy_floors ? 1 : 0) << \"\\nrtxbrightness \" << options.rtx_brightness\n"
+ },
+ {
+  "before": "                          \"trees cast the sun's shadows, and corners and contacts get soft shade.\");\n      if (rtx_nvidia_integrator_available()) {\n",
+  "after": "                          \"trees cast the sun's shadows, and corners and contacts get soft shade.\");\n      if (settings_toggle(\"Path tracing on stage mods\", &options.rtx_modded_stages)) changed = true;\n      if (ImGui::IsItemHovered())\n        ImGui::SetTooltip(\"On a stage whose files come from a mod: path traced like the game's own stages, or\\n\"\n                          \"off to show the mod exactly as its maker drew it.\");\n      if (settings_toggle(\"Effects light the stage\", &options.rtx_effect_light)) changed = true;\n      if (ImGui::IsItemHovered())\n        ImGui::SetTooltip(\"Fire, sparks, shines and flashes cast their own light on the stage and the fighters\\n\"\n                          \"near them, in their own colour.\");\n      if (rtx_nvidia_integrator_available()) {\n"
+ }
+]

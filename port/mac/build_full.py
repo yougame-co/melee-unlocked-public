@@ -1,4 +1,4 @@
-"""Incremental x86-64 macOS host build; staging hooks use build-mac-full-hook."""
+"""Incremental x86-64 macOS host build; staging hooks use build-mac-full-hook, squad builds add -squad."""
 from pathlib import Path
 import argparse, concurrent.futures, hashlib, json, os, shlex, shutil, subprocess, sys, time
 ROOT = Path(__file__).resolve().parents[2]
@@ -7,8 +7,13 @@ DEFAULT_GAME_LIBRARY = ROOT / 'build-mac-input' / 'melee_game.so'
 GAME_LIBRARY = Path(os.environ.get('MELEE_GAME_LIBRARY', str(DEFAULT_GAME_LIBRARY))).resolve()
 SDL = ROOT.parent / 'deps/sdl2'
 
-def build_dir(agent_test_hook=False):
-    return ROOT / ('build-mac-full-hook' if agent_test_hook else 'build-mac-full')
+def squad_env():
+    return os.environ.get('MELEE_SQUAD_STRIKE', 'OFF').upper() in ('ON', '1', 'TRUE')
+
+def build_dir(agent_test_hook=False, squad=None):
+    # Squad hosts get their own directory so a squad object never links into a vanilla app.
+    squad = squad_env() if squad is None else squad
+    return ROOT / ('build-mac-full' + ('-hook' if agent_test_hook else '') + ('-squad' if squad else ''))
 
 def memory_gate():
     while True:
@@ -33,17 +38,24 @@ def main():
     global BUILD
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--agent-test-hook', action='store_true', help='STAGING ONLY: enable agent-test.json hooks')
+    parser.add_argument('--doubles', action='store_true', help='experimental console Doubles; requires a matching Doubles game library')
     parser.add_argument('--host-only', action='store_true', help='Compile and link the host without game assets or packaging')
+    # Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+    parser.add_argument('--squad-strike', action='store_true',
+                        default=squad_env(),
+                        help='MELEE_SQUAD_STRIKE: enable squad host ABI (pair with an ON game library)')
     args = parser.parse_args()
-    BUILD = build_dir(args.agent_test_hook)
+    if args.squad_strike:
+        os.environ['MELEE_SQUAD_STRIKE'] = 'ON'  # package_full (subprocess) resolves the same directory
+    BUILD = build_dir(args.agent_test_hook, args.squad_strike)
     os.chdir(ROOT)
     BUILD.mkdir(exist_ok=True)
     gen = BUILD / 'gen/port-generated'
-    if args.agent_test_hook:
+    if BUILD != build_dir(False, False):
         # The recomp is identical; only host/runtime objects differ between variants.
         gen.mkdir(parents=True, exist_ok=True)
         for name in ['hle_decls.h', 'guest_symbols.h']:
-            shutil.copy2(build_dir()/'gen/port-generated'/name, gen/name)
+            shutil.copy2(build_dir(False, False)/'gen/port-generated'/name, gen/name)
     needed_inputs = [SDL/'include/SDL2/SDL.h', SDL/'lib/libSDL2-2.0.0.dylib', gen/'hle_decls.h', gen/'guest_symbols.h']
     if not args.host_only:
         needed_inputs += [GAME_LIBRARY, GAME_LIBRARY.with_suffix('.snapexcl'), GAME_LIBRARY.parent/'Sys/GC/dsp_coef.bin']
@@ -56,7 +68,7 @@ def main():
     for directory in ['ppc', 'hle', 'host', 'gx']:
         sources += sorted(Path('port/runtime', directory).glob('*.cpp'))
     removed = {'leaf_stencils', 'leaf_translator', 'ram_translator', 'gx_d3d11', 'gx_d3d12', 'gx_dlss5',
-               'gx_dlss5_scaling', 'gx_dxr_gpu_scene', 'gx_dxr_path_tracer', 'gx_streamline', 'gx_xess',
+               'gx_dlss5_scaling', 'gx_dxr_gpu_scene', 'gx_dxr_path_tracer', 'gx_streamline', 'gx_xess', 'gx_fsr', 'gx_fsr_vk', 'rtx_scene', 'rtx_tracer', 'rtx_melee_integrator',
                'gx_backend', 'pc_settings_dx11', 'audio'}
     sources = [p for p in sources if p.stem not in removed]
     sources += sorted(Path('port/runtime/mu_net').glob('*.cpp'))
@@ -68,18 +80,29 @@ def main():
     sources += [Path('port/mac/embed_mac.mm')]
     sources += sorted(Path('port/third_party/enet').glob('*.c'))
     sources += sorted(Path('port/third_party/monocypher').glob('*.c'))
+    # .slpz replays (main.cpp playable_replay and the compress path): replay_slpz.cpp and zstd both ways, as
+    # port/app/disc_rvz.cmake builds them for Windows and Linux.
+    sources += [Path('port/app/replay_slpz.cpp')]
+    for part in ['common', 'decompress', 'compress']:
+        sources += sorted(Path('port/third_party/zstd', part).glob('*.c'))
     sources += [Path('port/third_party/imgui', p) for p in ['imgui.cpp','imgui_draw.cpp','imgui_tables.cpp',
-        'imgui_widgets.cpp','backends/imgui_impl_sdl2.cpp','backends/imgui_impl_opengl3.cpp']]
+        'imgui_widgets.cpp','backends/imgui_impl_sdl2.cpp','backends/imgui_impl_opengl3.cpp','backends/imgui_impl_vulkan.cpp']]
     version = (ROOT/'VERSION').read_text().strip()
     flags = ['-arch','x86_64','-mmacosx-version-min=15.0','-O2','-g','-fno-strict-aliasing',
              '-ffp-contract=off','-pthread','-Wno-unknown-pragmas','-Wno-multichar','-Wno-deprecated-declarations']
     cpp = ['-std=c++17','-include','port/linux/compat/windows.h','-DMELEE_LINUX','-DGX_PC_SETTINGS',
            '-DMELEE_SOURCE_PORT', f'-DMELEE_PORT_VERSION="{version}"','-DMELEE_CPU_BASELINE_NAME="AVX2"',
-           '-DMELEE_PLAYBACK_GCT_BASE=0u','-DMELEE_PLAYBACK_GCT_SIZE=0u','-DGX_SHADER_CACHE_VERSION="mac-gl-1"']
+           '-DMELEE_PLAYBACK_GCT_BASE=0u','-DMELEE_PLAYBACK_GCT_SIZE=0u','-DGX_SHADER_CACHE_VERSION="mac-gl-1"',
+           # The Vulkan renderer (gx_vulkan.cpp, MoltenVK on the Mac) opens the loader at run time: headers only.
+           '-DIMGUI_IMPL_VULKAN_NO_PROTOTYPES']
+    if args.doubles:
+        cpp += ['-DMELEE_DOUBLES=1']
+    if args.squad_strike:
+        cpp += ['-DMU_SQUAD=1']
     for p in ['port/linux/compat','port/linux','port/app','port/runtime/ppc','port/runtime/hle','port/runtime/host',
               'port/runtime/gx','port/runtime/mu_net','port/runtime/abi','port/third_party','native',str(BUILD/'gen'),
-              str(gen),'port/third_party/enet/include','port/third_party/monocypher','port/third_party/imgui',
-              'port/third_party/imgui/backends',str(SDL/'include'),str(SDL/'include/SDL2')]:
+              str(gen),'port/third_party/enet/include','port/third_party/monocypher','port/third_party/imgui','port/third_party/onnxruntime/include',
+              'port/third_party/imgui/backends','port/third_party/vulkan-headers/include',str(SDL/'include'),str(SDL/'include/SDL2')]:
         cpp += ['-I'+p]
     cflags = ['-DHAS_SOCKLEN_T=1','-DHAS_POLL=1','-DHAS_FCNTL=1','-DHAS_MSGHDR_FLAGS=1',
               '-DHAS_GETADDRINFO=1','-DHAS_GETNAMEINFO=1','-DHAS_INET_PTON=1','-DHAS_INET_NTOP=1',
@@ -94,6 +117,9 @@ def main():
             # AppKit must not see the Win32 compatibility typedefs/macros.
             opts = [*flags, '-std=c++17', '-fblocks', '-fno-objc-arc',
                     '-I'+str(SDL/'include'), '-I'+str(SDL/'include/SDL2')]
+        # Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+        if args.squad_strike and source.suffix == '.mm':
+            opts += ['-DMU_SQUAD=1']  # AppKit units also see guarded host header layouts.
         if args.agent_test_hook and (str(source).startswith(('port/runtime/', 'port/app/',
                                                             'port/linux/', 'port/mac/')) or
                                     source == Path('port/third_party/slippilib/SlippiGame.cpp')):
@@ -101,6 +127,9 @@ def main():
             opts += ['-DYOUGAME_AGENT_TEST_HOOK']
         if source.as_posix() != 'port/app/main.cpp':
             opts += ['-mavx2', '-mfma']
+        if source.as_posix().startswith('port/third_party/zstd/') or source.as_posix() == 'port/app/replay_slpz.cpp':
+            # disc_rvz.cmake's flags: no assembly (the Huffman fast path is a .S file), zstd's xxhash kept private.
+            opts += ['-DZSTD_DISABLE_ASM=1', '-DXXH_NAMESPACE=ZSTD_'] + (['-w'] if source.suffix == '.c' else [])
         fingerprint = hashlib.sha256(repr(opts).encode()).hexdigest()
         dependencies = [source]
         if dep.exists():
@@ -133,6 +162,7 @@ def main():
         'build_script':'port/mac/build_full.py',
         'host_entry':'port/app/main.cpp',
         'agent_test_hook':args.agent_test_hook,
+        'squad_strike':args.squad_strike,
         'channel':'STAGING ONLY' if args.agent_test_hook else 'release',
         'host_sha256':hashlib.sha256((BUILD/'MeleeUnlocked').read_bytes()).hexdigest()},indent=2)+'\n')
     print('Full host:',BUILD/'MeleeUnlocked',flush=True)

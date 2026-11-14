@@ -37,6 +37,15 @@
 #include <sysdolphin/baselib/random.h>
 #include <mu_native.h>
 #include <mu_online_menu.h>
+#include <mu_pick_preview.h>
+#include <mu_lobby_wire.h>
+#ifdef MELEE_DOUBLES
+#include <mu_doubles_game.h>
+#endif
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+#include "mu_squad.h"
+#endif
 #include "mu_tourney.h"
 #include <mu_ranked.h>
 #include <mu_ranked_setup_online.h>
@@ -61,6 +70,7 @@ enum {
     CMD_NAME_ENTRY_INDEX = 0xBE,
     CMD_YOUGAME_FRIENDS_MENU = 0xE6,
     CMD_YOUGAME_RANKED = 0xFA,   /* this fork's: flags (bit 0: Ranked offered), then the header text */
+    CMD_YOUGAME_MENU = 0xEF,     /* upstream's online-menu query (upstream: 0xE7, this fork's Slippi link) */
     REPLY_CAPACITY = 4096,   /* the bridge refuses a smaller reply buffer */
     MSRB_SIZE = 962,
     OSB_SIZE = 42,
@@ -80,6 +90,17 @@ int mu_slippi_menus_enabled(void)
     }
     return menus_flag;
 }
+/* A Doubles console session boots from before main, where the host's options are all zero (the
+ * canonical menus, the same on all four), so the latch reads 0 there and kept the online menus off
+ * after the session: its results came back to VS. Mode. Each main-menu entry outside a session
+ * takes the host's menus back. This only ever turns them on, never off. */
+static void menus_relatch(void)
+{
+    if (menus_flag == 0 && (mu_game_options() & MU_OPTION_SLIPPI_MENUS) != 0) {
+        menus_flag = 1;
+        OSReport("online menu: the host's online menus are back after a console session\n");
+    }
+}
 
 /* ---- state (Slippi's r13 slots and cave bytes) ---- */
 
@@ -96,6 +117,62 @@ static int ranked_supported;
 static int ranked_offered;
 static int friends_offered;   /* FA bit 1: YouGame Online > Friends is offered */
 static int slippi_submenu;
+static int agent_copy, local_peer, agent_lock_logged; /* FA bits 3/4; menu-entry log latch */
+/* The YouGame byte at the last app-state fetch (EF). Bit 1: the split layout of the GitHub build, two
+ * pages of the same eight rows: Ranked, Unranked, Friends (YouGame), Slippi; then Slippi Unranked,
+ * Slippi Direct, Slippi Teams, Slippi Party. Bit 2: the YouGame rows are open (the launcher is signed
+ * in to YouGame). A locked row is not drawn, so each page shows only its own rows. Never set inside
+ * the YouGame app, whose rows are this fork's (FA, ranked_supported). */
+static int yg_flags;
+static int yg_pick;           /* the last row picked was a YouGame row (split layout) */
+static int last_slot = -1;    /* the last row picked (split layout): the cursor goes back to it */
+enum { YG_APP_RANKED = 1, YG_SPLIT = 2, YG_ROWS_OPEN = 4, YG_HEADER = 8, YG_OPEN_RANKED = 16, YG_OPEN_DIRECT = 32,
+       YG_COMING_SOON = 64 };
+/* Started for a YouGame mode (--online-mode): the boot menu confirms that row by itself, like the
+ * P2P session's Direct (set at the boot entry, cleared by the menu's think before any match). */
+static int auto_slot = -1;
+static int yg_open;           /* YG_OPEN_* from the first answer that carried it (the host answers it once) */
+enum { SPLIT_SLIPPI = 3, SPLIT_FIRST_SLIPPI = 4 };
+/* The split layout's rows as Slippi mode ids; rows 0-2 are YouGame's, row 3 opens Slippi's page. */
+static const signed char split_mode[8] = { MU_SLP_MODE_RANKED, MU_SLP_MODE_UNRANKED, MU_SLP_MODE_DIRECT, -1,
+                                           MU_SLP_MODE_UNRANKED, MU_SLP_MODE_DIRECT, MU_SLP_MODE_TEAMS,
+                                           MU_SLP_MODE_PARTY };
+static int split_page;        /* 0: Ranked, Unranked, Friends, Slippi; 1: Slippi's four */
+static int split_layout(void) { return !ranked_supported && (yg_flags & YG_SPLIT) != 0; }
+/* The page the online menu opens on: Slippi's own when YouGame's rows are closed and Slippi is signed
+ * in (one press less for a player without YouGame), else the first page. */
+static int split_start_page(void)
+{
+    if (yg_flags & YG_COMING_SOON) {
+        return 0;   /* everyone sees YouGame's rows marked Coming soon; the cursor starts on Slippi */
+    }
+    return !(yg_flags & YG_ROWS_OPEN) && slp.app_state == MU_SLP_APP_LOGGED_IN ? 1 : 0;
+}
+/* YouGame is not open yet: its rows stay on the menu (a locked row would vanish from it), their
+ * labels greyed out with a Coming soon sticker over them, and the cursor never stops on them. */
+static int yougame_soon(void) { return split_layout() && (yg_flags & YG_COMING_SOON) != 0; }
+static int cursor_stops(int sel)
+{
+    /* Row 0 reads "Get YouGame" while the app is not found: the cursor stops there and A opens the
+     * YouGame download page (the host, CMD_YOUGAME_MENU 0x20). Rows 1 and 2 stay Coming soon. */
+    if (yougame_soon() && split_page == 0 && sel < SPLIT_SLIPPI && sel != 0) {
+        return 0;
+    }
+    return mn_80229938(MENU_KIND_8, sel);
+}
+/* Direct's row: the P2P session menu confirms it by itself (Slippi Direct in the split layout). */
+static int direct_row(void)
+{
+    return split_layout() ? 5 : mu_online_menu_row(ranked_supported, slippi_submenu, MU_SLP_MODE_DIRECT);
+}
+/* Agent copies never reach real Slippi: the split layout's rows mapped to this fork's options. */
+static int split_agent_locked(int sel)
+{
+    if (sel < 0 || sel >= 8) return agent_copy;
+    return mu_online_agent_locked(agent_copy, 1, sel >= SPLIT_SLIPPI,
+                                  sel == SPLIT_SLIPPI ? MU_SLP_OPT_SLIPPI : split_mode[sel], local_peer);
+}
+static int yougame_query(int pick, char* out, unsigned int cap);
 static int first_boot = 1;    /* OnMenuLoad's DOFST_IS_FIRST_BOOT */
 /* A peer-to-peer session with menus (mu_online_p2p_menus): the first online submenu confirms Direct
  * by itself. Set in the boot menu entry and cleared by that menu's think a few frames later, both
@@ -106,6 +183,16 @@ static int p2p_auto_direct;
  * goes out and the friend waits for a room nobody hosts). Menu-only, like p2p_auto_direct. */
 static int friends_confirm_hold;
 static int slippi_link_notice;
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+ * Y on the Squad Strike row ("Play a friend") moved the cursor to Friends this frame: once the
+ * Friends row is published below, the host opens the friend picker for it. Menu-only. */
+static int squad_friend_invite;
+#endif
+#ifdef MELEE_DOUBLES
+/* The Doubles home was open on the last online-menu frame (E6 value 13). Menu-only. */
+static int doubles_home_seen;
+#endif
 
 MuSlippiMenuState* mu_slippi_state(void)
 {
@@ -197,12 +284,15 @@ int mu_slippi_fetch_app_state(void)
     memcpy(user_code, osb + 32, 10);
     user_code[10] = 0;
     ranked_offered = mu_slippi_ranked_header(NULL, 0);
+    yg_flags = yougame_query(-1, NULL, 0);
+    yg_open |= yg_flags & (YG_OPEN_RANKED | YG_OPEN_DIRECT);
     tournament_query(MU_TOURNEY_MENU);
     return slp.app_state;
 }
 
 /* FA: flags, then six 128-byte presentation lines. Bit 0 offers the menu row; bit 2
- * supports YouGame Ranked text and random-stage play while the row stays hidden. */
+ * supports YouGame Ranked text and random-stage play while the row stays hidden.
+ * Bit 3 identifies an agent copy; bit 4 permits explicit local-peer test modes. */
 int mu_slippi_ranked_line(unsigned int line, char* out, unsigned int cap)
 {
     u8 r[1 + 6 * 128];
@@ -213,6 +303,8 @@ int mu_slippi_ranked_line(unsigned int line, char* out, unsigned int cap)
         friends_offered = ranked_supported = 0;
         return 0;
     }
+    agent_copy = (r[0] & 8) != 0;
+    local_peer = (r[0] & 16) != 0;
     friends_offered = (r[0] & 2) != 0;
     ranked_supported = (r[0] & 4) != 0;
     if (out == NULL) return (r[0] & 1) != 0; /* menu visibility stays independent */
@@ -236,6 +328,8 @@ int mu_slippi_ranked_lines(char lines[6][128])
         friends_offered = ranked_supported = 0;
         return 0;
     }
+    agent_copy = (r[0] & 8) != 0;
+    local_peer = (r[0] & 16) != 0;
     friends_offered = (r[0] & 2) != 0;
     ranked_supported = (r[0] & 4) != 0;
     if (!ranked_supported) return 0;
@@ -254,7 +348,34 @@ int mu_slippi_ranked_header(char* out, unsigned int cap)
     return mu_slippi_ranked_line(0, out, cap);
 }
 
+/* EF: the host's YouGame byte (YG_*), then the Ranked header when YG_HEADER is set. `pick` 1 or 0
+ * first tells the host the menu chose a YouGame or a Slippi row (split layout); -1 only asks. */
+static int yougame_query(int pick, char* out, unsigned int cap)
+{
+    u8 r[64];
+    u8 p = (u8) pick;
+    unsigned int got = 0, n;
+    memset(r, 0, sizeof r);
+    if (out != NULL && cap > 0) {
+        out[0] = 0;
+    }
+    if (mu_slippi_cmd(CMD_YOUGAME_MENU, pick >= 0 ? &p : NULL, pick >= 0 ? 1u : 0u, r, sizeof r, &got) != 0 || got < 1) {
+        return 0;
+    }
+    if (got > sizeof r) {
+        got = sizeof r;
+    }
+    if (out != NULL && cap > 0 && (r[0] & YG_HEADER) && got > 1) {
+        n = got - 1 < cap - 1 ? got - 1 : cap - 1;
+        memcpy(out, r + 1, n);
+        out[n] = 0;
+    }
+    return r[0];
+}
+
 int mu_slippi_ranked_available(void) { return ranked_supported; }
+int mu_slippi_yougame_pick(void) { return split_layout() && yg_pick; }
+void mu_slippi_yougame_restart_older(void) { yougame_query(3, NULL, 0); }
 int mu_slippi_friends_available(void) { return friends_offered; }
 /* FA presentation capability identifies YouGame even when an optional row is disabled. */
 int mu_slippi_yougame_menu(void) { return ranked_supported; }
@@ -263,12 +384,37 @@ int mu_slippi_title_active(void)
     return mu_slippi_menus_enabled() && ranked_supported && slippi_submenu &&
            mn_804A04F0.cur_menu == MENU_KIND_8;
 }
+void mu_slippi_log_online_rows(void)
+{
+    char line[160];
+    if (!ranked_supported || slippi_submenu) return;
+#if MU_SQUAD && !defined(MU_NO_SLIPPI)
+#define MU_ROWS_SQUAD ",Squad Strike"
+#else
+#define MU_ROWS_SQUAD ""
+#endif
+#ifdef MELEE_DOUBLES
+    snprintf(line, sizeof line, "online menu: rows offered Ranked,Unranked,Friends,Doubles,%sSlippi%s tournament=%d\n",
+#else
+    snprintf(line, sizeof line, "online menu: rows offered Ranked,Unranked,Friends,%sSlippi%s tournament=%d\n",
+#endif
+             tournament_offered ? "Tournament," : "", MU_ROWS_SQUAD, tournament_offered ? 1 : 0);
+#undef MU_ROWS_SQUAD
+    mu_online_abi_log(line);
+}
 int mu_slippi_menu_count(void) { return mu_online_menu_count(ranked_supported, slippi_submenu); }
 int mu_slippi_menu_option(int row) { return mu_online_menu_option(ranked_supported, slippi_submenu, row); }
 int mu_slippi_menu_label_kind(int row)
 {
     int option = mu_slippi_menu_option(row);
     if (!ranked_supported) return 0;
+#ifdef MELEE_DOUBLES
+    if (option == MU_SLP_OPT_DOUBLES) return 9;
+#endif
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+    if (option == MU_SLP_OPT_SQUAD) return 10;
+#endif
     return option == MU_SLP_OPT_FRIENDS ? 1 : option == MU_SLP_OPT_SLIPPI ? 2 :
            option == MU_SLP_MODE_DIRECT ? 3 : option == MU_SLP_MODE_TEAMS ? 4 :
            option == MU_SLP_MODE_PARTY ? 5 : option == MU_SLP_MODE_RANKED ? 6 :
@@ -310,6 +456,63 @@ static void parse_match_state(MuMatchState* m, const u8* r)
     m->alt_stage_mode = r[961];
 }
 
+/* ED read beside every B3: the opponents' live picks (display only, never match setup). A host
+ * without the command answers nothing and every slot stays invalid. */
+static void load_pick_previews(MuMatchState* m)
+{
+    u8 op = MU_PICK_PREVIEW_OP_READ;
+    u8 r[MU_PICK_PREVIEW_REPLY];
+    MuPickPreviewSlot slots[MU_PICK_PREVIEW_REMOTES];
+    unsigned int got = 0;
+    int i;
+    memset(m->opp_picks, 0, sizeof m->opp_picks);
+    if (mu_slippi_cmd(MU_PICK_PREVIEW_COMMAND, &op, 1, r, sizeof r, &got) != 0 ||
+        !mu_pick_preview_reply_decode(r, got, slots)) {
+        return;
+    }
+    for (i = 0; i < MU_PICK_PREVIEW_REMOTES; i++) {
+        MuOpponentPick* o = &m->opp_picks[i];
+        const MuPickPreview* p = &slots[i].pick;
+        if (!slots[i].valid) {
+            continue;
+        }
+        o->valid = 1;
+        o->port = slots[i].port;
+        o->char_id = p->char_id;
+        o->color = p->color;
+        o->team_id = p->team_id;
+        o->squad_count = p->squad_count;
+        memcpy(o->kinds, p->kinds, sizeof o->kinds);
+        memcpy(o->colors, p->colors, sizeof o->colors);
+        o->locked = p->locked;
+    }
+}
+
+/* ED send: the host keeps it only while connected and sends it on change, rate limited. */
+void mu_pick_preview_send(unsigned char char_id, unsigned char color, unsigned char team_id,
+                          unsigned char squad_count, const unsigned char kinds[3],
+                          const unsigned char colors[3], unsigned char locked)
+{
+    MuPickPreview p;
+    u8 b[1 + MU_PICK_PREVIEW_WIRE];
+    unsigned int i;
+    mu_pick_preview_clear(&p);
+    p.char_id = char_id;
+    p.color = color;
+    p.team_id = team_id;
+    p.squad_count = squad_count <= MU_PICK_PREVIEW_SLOTS && kinds != NULL && colors != NULL ? squad_count : 0;
+    for (i = 0; i < p.squad_count; i++) {
+        p.kinds[i] = kinds[i];
+        p.colors[i] = colors[i];
+    }
+    p.locked = locked != 0;
+    b[0] = MU_PICK_PREVIEW_OP_SEND;
+    if (mu_pick_preview_encode(&p, b + 1, sizeof b - 1) != MU_PICK_PREVIEW_WIRE) {
+        return;
+    }
+    mu_slippi_cmd(MU_PICK_PREVIEW_COMMAND, b, sizeof b, NULL, 0, NULL);
+}
+
 int mu_slippi_load_match_state(MuMatchState* out)
 {
     u8 msrb[MSRB_SIZE];
@@ -318,6 +521,7 @@ int mu_slippi_load_match_state(MuMatchState* out)
     memset(msrb, 0, sizeof msrb);
     result = mu_slippi_cmd(CMD_GET_MATCH_STATE, NULL, 0, msrb, sizeof msrb, &got);
     parse_match_state(&last_match, msrb);
+    load_pick_previews(&last_match);
     if (out != NULL && out != &last_match) {
         *out = last_match;
     }
@@ -340,6 +544,11 @@ void mu_slippi_find_opponent(int mode, const unsigned char* code_sjis18)
     if (code_sjis18 != NULL) {
         memcpy(b + 1, code_sjis18, 18);
     }
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+    if (mode == MU_SLP_MODE_UNRANKED && gmSquad_OnlineChosen() &&
+        (!gmSquad_OnlineBudget() || !gmSquad_OnlineSearchReady())) return;
+#endif
     mu_slippi_cmd(CMD_FIND_OPPONENT, b, sizeof b, NULL, 0, NULL);
 }
 
@@ -426,7 +635,15 @@ int mu_slippi_on_online_sss(void) { return mu_slippi_online_state() == MU_SLP_ST
 int mu_slippi_in_online_game(void) { return mu_slippi_online_state() == MU_SLP_STATE_VS; }
 int mu_slippi_on_online_results(void) { return mu_slippi_online_state() == MU_SLP_STATE_RESULTS; }
 int mu_slippi_on_online_splash(void) { return mu_slippi_online_state() == MU_SLP_STATE_SPLASH; }
-int mu_slippi_zelda_is_sheik(void) { return mu_slippi_menus_enabled() && zelda_sheik; }
+int mu_slippi_zelda_is_sheik(void)
+{
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+     * Squads keep the picker's exact Zelda/Sheik kinds, also once a friend room turns them on. */
+    if (gmSquad_OnlineChosen() || gmSquad_LobbyChosen()) return 0;
+#endif
+    return mu_slippi_menus_enabled() && zelda_sheik;
+}
 unsigned mu_slippi_online_load_count(void) { return online_loads; }
 
 /* IncreaseTextHeap: the online CSS gets a 0x4800-byte text heap instead of 0x2400. */
@@ -455,8 +672,21 @@ unsigned char mu_slippi_team_costume(int team, int ckind)
  * today's app-state locks: Unranked/Direct/Teams/Party, Log in, or Update. */
 int mu_slippi_option_unlocked(int sel)
 {
+    if (split_layout() ? split_agent_locked(sel) :
+        mu_online_agent_locked(agent_copy, ranked_supported, slippi_submenu,
+                               mu_slippi_menu_option(sel), local_peer)) return 0;
     if (ranked_supported) return sel >= 0 && sel < mu_slippi_menu_count() &&
         (slippi_submenu || sel != MU_YG_ROW_RANKED || ranked_offered);
+    if (split_layout()) {
+        if (split_page == 0) {
+            if (sel < SPLIT_SLIPPI) {
+                /* YouGame: the launcher's account, or shown greyed out as Coming soon */
+                return (yg_flags & (YG_ROWS_OPEN | YG_COMING_SOON)) != 0;
+            }
+            return sel == SPLIT_SLIPPI;   /* Slippi: its page, or its log in / update */
+        }
+        return sel >= SPLIT_FIRST_SLIPPI && slp.app_state == MU_SLP_APP_LOGGED_IN;
+    }
     if (sel == MU_SLP_OPT_FRIENDS || sel == MU_SLP_OPT_SLIPPI) return 0;
     switch (slp.app_state) {
     case MU_SLP_APP_LOGGED_IN:
@@ -479,12 +709,17 @@ int mu_slippi_first_unlocked(void)
     int i;
     int count = mn_803EB6B0[MENU_KIND_8].selection_count;
     if (ranked_supported) return !slippi_submenu && !ranked_offered ? MU_YG_ROW_UNRANKED : 0;
-    for (i = MU_SLP_MODE_UNRANKED; i < count; i++) {
+    /* Coming soon: the cursor starts on Slippi, the first row that does something. */
+    if (yougame_soon() && split_page == 0) {
+        return SPLIT_SLIPPI;
+    }
+    /* The split layout: the first open row of the page shown. */
+    for (i = split_layout() ? 0 : MU_SLP_MODE_UNRANKED; i < count; i++) {
         if (mn_80229938(MENU_KIND_8, i)) {
             break;
         }
     }
-    return i;
+    return i < count ? i : 0;
 }
 
 /* ---- boot (boot.asm) and the main menu (Online/Menus/TitleMenu) ---- */
@@ -505,21 +740,46 @@ unsigned char mu_slippi_boot_mode(unsigned char mode)
  * the app state (InitBuffers + FetchSlippiAppState). */
 void mu_slippi_menu_prep(void)
 {
+    menus_relatch();
     if (!mu_slippi_menus_enabled()) {
         return;
     }
+    agent_lock_logged = 0;
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+    gmSquad_OnlineChoose(false);
+#endif
     mu_slippi_fetch_app_state();
     slippi_submenu = 0;
     mu_mnmain_install_online_menu();
+    if (split_layout()) {
+        /* Ranked, Unranked, Friends, Slippi ("Compete against online opponents"), then Slippi's four. */
+        static u16 split_descriptions[8] = { 0x645, 0x646, 0x647, 0x644, 0x646, 0x647, 0x64B, 0x64C };
+        mn_803EB6B0[MENU_KIND_8].description_indices = split_descriptions;
+        split_page = split_start_page();
+    }
 }
 
 static int friends_return;
+static int doubles_home_return;   /* B out of the Doubles home: back on Online, Doubles highlighted */
+/* The host's Friends lobby CSS ran since the last menu entry (MU_PR_CSS_PICK answered). */
+static int friends_css_host;
+void mu_slippi_note_friends_css(void) { friends_css_host = 1; }
 /* The jump-table entries OnMenuPrep and boot.asm replace: previous mode 8 (OnReturnFromOnline)
  * and, once after boot, previous mode GM_BOOT (OnFirstMenuLoad). Returns 1 when it set the menu.
  * A pending Friends return opens the online menu on Friends here, before the menu is built:
  * mn_80229894 frees the running menu proc, so it can't run from the scene's OnEnter. */
 int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned char* hovered)
 {
+    int from_friends_css = previous_mode == GM_VS && friends_css_host;
+    /* A Friends room opened the online character select (Direct mode underneath). The host answers
+     * once, so this asks on every entry and a stale answer never outlives one. */
+    u8 friends_query = 14, friends_online = 0;
+    unsigned int friends_got = 0;
+    const int from_friends_online = mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &friends_query, 1, &friends_online, 1,
+                                                  &friends_got) == 0 && friends_got == 1 && friends_online != 0;
+    agent_lock_logged = 0;
+    friends_css_host = 0;
     if (!mu_slippi_menus_enabled()) {
         return 0;
     }
@@ -530,7 +790,39 @@ int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned c
         *hovered = (u8) mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_TOURNAMENT);
         return 1;
     }
-    if (friends_return) {
+#ifdef MELEE_DOUBLES
+    /* A Doubles session's end (its results, or B out of its character select) comes back to Online
+     * with Doubles highlighted, where its home reopens. The host's Friends return arrives too late. */
+    /* The 4-peer route's Teams character select gives the menu back the same way. */
+    /* Only a menu that has the Doubles row takes the return; otherwise it waits for the next entry. */
+    const int doubles_teams_back =
+        previous_mode == GM_HANYU_CSS && ranked_supported && mu_doubles_take_teams_return();
+    if (doubles_teams_back) mu_content_mode(-1);   /* back from online: the offline view again */
+    if (ranked_supported && (mu_doubles_take_menu_return() || doubles_teams_back)) {
+        friends_return = 0;
+        slippi_submenu = 0;
+        mu_mnmain_install_online_menu();
+        *menu_kind = MENU_KIND_8;
+        *hovered = (u8) mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_DOUBLES);
+        return 1;
+    }
+    /* B out of the lobby's Doubles home (lobby_css_decide): back on Online with Doubles highlighted, where
+     * the home reopens, never the Direct-mode return (the Slippi submenu). */
+    if (doubles_home_return) {
+        doubles_home_return = 0;
+        if (ranked_supported) {
+            friends_return = 0;
+            slippi_submenu = 0;
+            mu_mnmain_install_online_menu();
+            *menu_kind = MENU_KIND_8;
+            *hovered = (u8) mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_DOUBLES);
+            return 1;
+        }
+    }
+#endif
+    /* B out of the host's Friends CSS closes the lobby: back on Online, Friends highlighted. */
+    if (friends_return || from_friends_css) {
+        if (from_friends_css) OSReport("friends: left the lobby's character select; online menu on Friends\n");
         friends_return = 0;
         if (previous_mode == GM_BOOT) boot_oneshot = 0;
         slippi_submenu = 0;
@@ -542,11 +834,23 @@ int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned c
     if (previous_mode == GM_HANYU_CSS) {
         mu_content_mode(-1);   /* back from online: the offline view again */
         *menu_kind = MENU_KIND_8;
-        if (ranked_supported) {
+        if (ranked_supported && from_friends_online) {
+            /* Friends runs in Direct mode: back on Online with Friends highlighted, not the Slippi
+             * submenu (and, one B later, the hidden Slippi row). */
+            OSReport("friends: left the friend room's character select; online menu on Friends\n");
+            slippi_submenu = 0;
+            mu_mnmain_install_online_menu();
+            *hovered = (u8) mu_online_menu_row(1, 0, MU_SLP_OPT_FRIENDS);
+        } else if (ranked_supported) {
             slippi_submenu = slp.mode == MU_SLP_MODE_DIRECT || slp.mode == MU_SLP_MODE_TEAMS ||
                              slp.mode == MU_SLP_MODE_PARTY;
             mu_mnmain_install_online_menu();
             *hovered = (u8) mu_online_menu_row(1, slippi_submenu, slp.mode);
+        } else if (split_layout()) {
+            /* Back from a match: the page and row it was started from. */
+            split_page = last_slot >= SPLIT_FIRST_SLIPPI ? 1 : last_slot >= 0 ? 0 : split_start_page();
+            *hovered = last_slot >= 0 && cursor_stops(last_slot) ? (u8) last_slot
+                                                                 : (u8) mu_slippi_first_unlocked();
         } else {
             *hovered = mn_80229938(MENU_KIND_8, slp.mode) ? slp.mode : (u8) mu_slippi_first_unlocked();
         }
@@ -557,6 +861,15 @@ int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned c
         mu_slippi_fetch_app_state();
         *menu_kind = MENU_KIND_8;
         *hovered = (u8) mu_slippi_first_unlocked();
+        if (split_layout() && yg_open) {
+            const int slot = (yg_open & YG_OPEN_DIRECT) ? 2 : 0;   /* Friends or Ranked */
+            yg_open = 0;
+            split_page = 0;
+            if (cursor_stops(slot)) {
+                *hovered = (u8) slot;
+                auto_slot = slot;
+            }
+        }
         if (mu_online_p2p_menus()) {
             mu_slippi_load_match_state(NULL);
             /* The session's players are already known: no choice of mode, straight to Direct's
@@ -565,8 +878,11 @@ int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned c
                 slippi_submenu = 1;
                 mu_mnmain_install_online_menu();
             }
-            if (mn_80229938(MENU_KIND_8, mu_online_menu_row(ranked_supported, slippi_submenu, MU_SLP_MODE_DIRECT))) {
-                *hovered = (u8) mu_online_menu_row(ranked_supported, slippi_submenu, MU_SLP_MODE_DIRECT);
+            if (split_layout()) {
+                split_page = 1;   /* Slippi Direct's page */
+            }
+            if (mn_80229938(MENU_KIND_8, direct_row())) {
+                *hovered = (u8) direct_row();
                 p2p_auto_direct = 1;
             } else {
                 OSReport("[p2p] menus: Direct is locked (app state %d); staying on the online menu\n",
@@ -578,16 +894,17 @@ int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned c
     return 0;
 }
 
+/* The host bridge runs outside every menu proc, so it never calls mn_80229894 (that frees the
+ * running proc: NULL here, HSD_ASSERT gobjplink.c:109, the 50m host leave crash). From a match
+ * scene the next menu entry opens Online on Friends; leaving the lobby's CSS already did. */
 void mu_slippi_return_to_friends(void)
 {
-    friends_return = 1;
     if (gm_GetCurrentGameMode() == GM_MENU) {
-        slippi_submenu = 0;
-        mu_mnmain_install_online_menu();
-        mn_80229894(MENU_KIND_8, (u16) mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_FRIENDS), 1);
-        slp.force_clear = 1;
         friends_return = 0;
+        OSReport("friends: lobby closed while in the menu; menu left as it is\n");
+        return;
     }
+    friends_return = 1;
 }
 /* OnMenuLoad, end of mnMain_Scene_OnEnter: the "Melee" voice on the first boot, then BA on every
  * entry. The title-screen user text is intentionally off in this build. */
@@ -598,7 +915,7 @@ void mu_slippi_main_menu_loaded(void)
     slippi_link_notice = 0;
     mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &friends_menu, 1, NULL, 0, NULL);
     if (!mu_slippi_menus_enabled()) {
-        friends_return = 0; /* a pending Friends return never outlives a load without the online menu */
+        friends_return = friends_css_host = doubles_home_return = 0; /* a pending Friends return never outlives a load without the online menu */
         return;
     }
     if (first_boot) {
@@ -616,6 +933,10 @@ void mu_slippi_main_menu_loaded(void)
  * force the old menu to clear (AllowSwapToSameSubmenu). Runs from the 1P menu's think. */
 void mu_slippi_switch_to_online_menu(void)
 {
+    agent_lock_logged = 0;
+    if (split_layout()) {
+        split_page = split_start_page();
+    }
     mn_80229894(MENU_KIND_8, (u16) mu_slippi_first_unlocked(), 1);
     slp.force_clear = 1;
 }
@@ -689,7 +1010,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
     int port;
     MenuExitData* data;
     int auto_direct = 0;
-    int selected_row, selected_option;
+    int selected_row, selected_option, steps;
     int friends_visible = ranked_supported && !slippi_submenu;
     int online_visible = 1;
     /* The menu takes no input while its entry cooldown runs (mn_80229624 answers 0 and counts it
@@ -704,6 +1025,22 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         input[port][2] = gm_801A36C0((u8) port);
     }
     buttons = mn_80229624(4);
+    if (auto_slot >= 0 && accepts_input) {
+        /* Once: confirm the YouGame row the launcher started this game for. */
+        mn_804A04F0.hovered_selection = (u8) auto_slot;
+        buttons = MenuInput_Confirm;
+        auto_slot = -1;
+    }
+    /* Refuse even a stale/forced highlight before any confirm side effect or submenu change. */
+    if ((buttons & MenuInput_Confirm) &&
+        (split_layout() ? split_agent_locked(mn_804A04F0.hovered_selection) :
+         mu_online_agent_locked(agent_copy, ranked_supported, slippi_submenu, mu_slippi_menu_option(mn_804A04F0.hovered_selection), local_peer))) {
+        if (!agent_lock_logged) {
+            mu_online_abi_log("agent test: slippi locked");
+            agent_lock_logged = 1;
+        }
+        return;
+    }
     if (ranked_supported && tournament_menu_think(gp, buttons)) return;
     /* The refusal owns Y until an actual navigation/back/confirm leaves it. Cooldown and
      * focus changes never withdraw the context of an open app sheet. */
@@ -727,25 +1064,96 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         /* Once per run: confirm Direct as a press on this frame would, whatever the pads hold. */
         p2p_auto_direct = 0;
         if (mu_online_p2p_menus() && mn_804A04F0.cur_menu == MENU_KIND_8 &&
-            mn_80229938(MENU_KIND_8, mu_online_menu_row(ranked_supported, slippi_submenu, MU_SLP_MODE_DIRECT)))
+            mn_80229938(MENU_KIND_8, direct_row()))
         {
             auto_direct = 1;
             if (ranked_supported && mu_ranked_setup_cpu()) {
                 slippi_submenu = 0;
                 mu_mnmain_install_online_menu();
             }
-            mn_804A04F0.hovered_selection = (u8) mu_online_menu_row(ranked_supported, slippi_submenu,
-                mu_ranked_setup_cpu() ? MU_SLP_MODE_RANKED : MU_SLP_MODE_DIRECT);
+            mn_804A04F0.hovered_selection = (u8) (split_layout() ? direct_row() :
+                mu_online_menu_row(ranked_supported, slippi_submenu,
+                    mu_ranked_setup_cpu() ? MU_SLP_MODE_RANKED : MU_SLP_MODE_DIRECT));
             buttons = MenuInput_Confirm;
             OSReport("[p2p] menus: entering the Direct character select (pad port %d)\n",
                      mu_online_p2p_port());
         }
     }
+#ifdef MELEE_DOUBLES
+    /* A join opens the Doubles home over this menu with no press here: put the cursor on Doubles
+     * once per opening, so the highlighted row and its description match the home. */
+    if (friends_visible && mn_804A04F0.cur_menu == MENU_KIND_8) {
+        u8 home_query = 13, home_open = 0;
+        unsigned int got = 0;
+        const int home = mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &home_query, 1, &home_open, 1, &got) == 0 &&
+                         got == 1 && home_open != 0;
+        if (home && !doubles_home_seen)
+            mn_804A04F0.hovered_selection = (u8) mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_DOUBLES);
+        doubles_home_seen = home;
+    }
+    /* The home found a match on the 4-peer route: each seat picks on its own Teams character select
+     * (E6 value 14 answers once, with this seat's team from the room). */
+    if (friends_visible && mn_804A04F0.cur_menu == MENU_KIND_8) {
+        u8 teams_query = 14, teams[2] = { 0, 0xFF };
+        unsigned int teams_got = 0;
+        if (mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &teams_query, 1, teams, 2, &teams_got) == 0 &&
+            teams_got == 2 && teams[0] == 1)
+        {
+            OSReport("doubles: opening the Teams character select (team %d)\n", teams[1] == 0xFF ? -1 : teams[1]);
+#if MU_SQUAD
+            /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+            gmSquad_OnlineChoose(0);
+#endif
+            mu_doubles_teams_enter(teams[1]);
+            slp.mode = MU_SLP_MODE_TEAMS;
+            slp.is_winner = MU_SLP_WINNER_NULL;
+            slp.chose_stage = 0;
+            slp.team_idx = (u8) (teams[1] == 1 ? 2 : 1);   /* the toggle's 1-based team; red 1, blue 2 */
+            mu_content_mode(slp.mode);
+            data = gm_GetCurrentSceneExitData();
+            data->pending_mode = GM_HANYU_CSS;
+            gm_801A4B60();
+            return;
+        }
+    }
+#endif
     /* Confirm may replace the menu and its row mapping below. Log the option
      * actually pressed, before entering or leaving the Slippi submenu. */
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+     * "Play a friend": Y on the Squad Strike row (A searches online). Squad Strike goes with the
+     * Friends row, which opens the friend picker as its own press does; the friend room then plays
+     * Squad Strike, and the friend's game joins it. Mapped GameCube Y only, like the Slippi notice. */
+    if (friends_visible && accepts_input && mn_804A04F0.cur_menu == MENU_KIND_8 &&
+        mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_SQUAD &&
+        !(buttons & (MenuInput_Confirm | MenuInput_Back | MenuInput_Up | MenuInput_Down)))
+    {
+        const int friends_row = mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_FRIENDS);
+        for (port = 0; port < 4; ++port) {
+            if (!(input[port][1] & 0x0800)) continue;
+            if (!mn_80229938(MENU_KIND_8, friends_row)) {
+                sfxBack();
+                OSReport("squad: play a friend refused, Friends is locked\n");
+                break;
+            }
+            gmSquad_OnlineChooseFriend(false);
+            mn_804A04F0.hovered_selection = (u8) friends_row;
+            mn_804D6BC8.cooldown = 5;
+            friends_confirm_hold = 1;
+            squad_friend_invite = 1;
+            sfxForward();
+            OSReport("squad: play a friend from the Squad Strike row (pad %d)\n", port + 1);
+            break;
+        }
+    }
+#endif
     selected_row = mn_804A04F0.hovered_selection;
     selected_option = mu_slippi_menu_option(selected_row);
     mn_804A04F0.buttons = buttons;
+    if (yougame_soon() && split_page == 0 && mn_804A04F0.cur_menu == MENU_KIND_8) {
+        /* The host draws the Coming soon stickers while this page is on screen. */
+        yougame_query(0x10 | (mn_804A04F0.hovered_selection & 3), NULL, 0);
+    }
     if ((buttons & MenuInput_Confirm) && ranked_supported && tournament_offered &&
         selected_option == MU_SLP_OPT_TOURNAMENT) {
         tournament_query(MU_TOURNEY_JOIN);
@@ -753,6 +1161,15 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         mn_804D6BC8.cooldown = 5;
         sfxForward();
         mu_slippi_tournament_notice(gp, tournament_text);
+#ifdef MELEE_DOUBLES
+    } else if ((buttons & MenuInput_Confirm) && friends_visible && selected_option == MU_SLP_OPT_DOUBLES) {
+        /* The Doubles row opens the 2-seat Doubles home's select (G2: the Friends lobby on its Doubles
+         * profile, E6 value 16). The 4-seat md:1 console home (value 12) stays for md:1 invites. */
+        u8 open_doubles = 16;
+        mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &open_doubles, 1, NULL, 0, NULL);
+        mn_804D6BC8.cooldown = 5;
+        sfxForward();
+#endif
     } else if ((buttons & MenuInput_Confirm) && friends_visible &&
         mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_FRIENDS)
     {
@@ -775,19 +1192,59 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         sfxBack();
         slippi_link_notice = 1;
         mu_slippi_signin_notice(gp);
+    } else if ((buttons & MenuInput_Confirm) && yougame_soon() && split_page == 0 &&
+               mn_804A04F0.hovered_selection == 0) {
+        /* Get YouGame: the host opens the download page in the browser; the menu stays. Coming back
+         * to the Online menu looks for the app again (the plain query), and the rows open once found. */
+        yougame_query(0x20, NULL, 0);
+        mn_804D6BC8.cooldown = 30;
+        sfxForward();
     } else if (buttons & MenuInput_Confirm) {
         mn_804D6BC8.cooldown = 5;
         mn_804A04F0.entering_menu = 1;
         friends_visible = 0;
         online_visible = 0;
         gm_801677E8(auto_direct ? (s8) mu_online_p2p_port() : (s8) confirm_port());
-        switch (mu_slippi_menu_option(mn_804A04F0.hovered_selection)) {
+        {
+        int sel = mn_804A04F0.hovered_selection;
+        int act = mu_slippi_menu_option(sel);
+        if (split_layout() && sel == SPLIT_SLIPPI) {
+            /* Slippi: its page, or its log in or update when that is what it needs first. */
+            act = slp.app_state == MU_SLP_APP_LOGGED_IN ? -1
+                : slp.app_state == MU_SLP_APP_UPDATE ? MU_SLP_OPT_UPDATE : MU_SLP_OPT_LOGIN;
+            if (act < 0) {
+                sfxForward();
+                split_page = 1;
+                mn_80229894(MENU_KIND_8, (u16) mu_slippi_first_unlocked(), 1);
+                slp.force_clear = 1;
+            }
+        } else if (split_layout()) {
+            act = split_mode[sel];
+        }
+#if MU_SQUAD
+        /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+        gmSquad_OnlineChoose(act == MU_SLP_OPT_SQUAD);
+#endif
+        switch (act) {
+#if MU_SQUAD
+        /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+        case MU_SLP_OPT_SQUAD:
+#endif
         case MU_SLP_MODE_RANKED:
         case MU_SLP_MODE_UNRANKED:
         case MU_SLP_MODE_DIRECT:
         case MU_SLP_MODE_TEAMS:
         case MU_SLP_MODE_PARTY:
-            slp.mode = (u8) mu_slippi_menu_option(mn_804A04F0.hovered_selection);
+            slp.mode = (u8) act;
+#if MU_SQUAD
+            if (gmSquad_OnlineChosen()) slp.mode = MU_SLP_MODE_UNRANKED;
+#endif
+            if (split_layout()) {
+                /* The host learns which service the next search uses before its character select. */
+                yg_pick = sel < SPLIT_SLIPPI;
+                last_slot = sel;
+                yougame_query(yg_pick, NULL, 0);
+            }
             if (mu_online_p2p_menus()) {
                 /* No game was played yet: neither winner nor loser. The character select gives the
                  * first game's stage pick to one player once the two are connected and their
@@ -812,6 +1269,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
             mu_slippi_cmd(CMD_UPDATE_APP, NULL, 0, NULL, 0, NULL);
             break;
         }
+        }
     } else if ((buttons & MenuInput_Back) && ranked_supported && slippi_submenu) {
         slippi_submenu = 0;
         friends_visible = 1;
@@ -820,6 +1278,12 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         sfxBack();
         mn_80229894(MENU_KIND_8, mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_SLIPPI), 3);
         slp.force_clear = 1;
+    } else if (buttons & MenuInput_Back && split_layout() && split_page == 1 && split_start_page() == 0) {
+        /* Slippi's page: back to Ranked, Unranked, Friends, Slippi. */
+        sfxBack();
+        split_page = 0;
+        mn_80229894(MENU_KIND_8, SPLIT_SLIPPI, 3);
+        slp.force_clear = 1;
     } else if (buttons & MenuInput_Back) {
         friends_visible = 0;
         online_visible = 0;
@@ -827,25 +1291,33 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         mn_804A04F0.entering_menu = 0;
         mn_80229894(MENU_KIND_1P, SEL_1P_2, 3);
     } else if (buttons & MenuInput_Up) {
+        steps = mu_slippi_menu_count();
         direction = PAD_ANY_UP;
         sfxMove();
+        /* A Coming soon row (split layout) is drawn, so it reads as unlocked, but never holds the cursor. */
         do {
-            if (mn_804A04F0.hovered_selection == 0) {
-                mn_804A04F0.hovered_selection = mu_slippi_menu_count() - 1;
-            } else {
-                mn_804A04F0.hovered_selection--;
-            }
-        } while (!mn_80229938(MENU_KIND_8, mn_804A04F0.hovered_selection));
+            do {
+                if (mn_804A04F0.hovered_selection == 0) {
+                    mn_804A04F0.hovered_selection = mu_slippi_menu_count() - 1;
+                } else {
+                    mn_804A04F0.hovered_selection--;
+                }
+            } while (!mn_80229938(MENU_KIND_8, mn_804A04F0.hovered_selection) && --steps > 0);
+        } while (!cursor_stops(mn_804A04F0.hovered_selection) && --steps > 0);
     } else if (buttons & MenuInput_Down) {
+        steps = mu_slippi_menu_count();
         direction = PAD_ANY_DOWN;
         sfxMove();
+        /* A Coming soon row (split layout) is drawn, so it reads as unlocked, but never holds the cursor. */
         do {
-            if (mn_804A04F0.hovered_selection == mu_slippi_menu_count() - 1) {
-                mn_804A04F0.hovered_selection = 0;
-            } else {
-                mn_804A04F0.hovered_selection++;
-            }
-        } while (!mn_80229938(MENU_KIND_8, mn_804A04F0.hovered_selection));
+            do {
+                if (mn_804A04F0.hovered_selection == mu_slippi_menu_count() - 1) {
+                    mn_804A04F0.hovered_selection = 0;
+                } else {
+                    mn_804A04F0.hovered_selection++;
+                }
+            } while (!mn_80229938(MENU_KIND_8, mn_804A04F0.hovered_selection) && --steps > 0);
+        } while (!cursor_stops(mn_804A04F0.hovered_selection) && --steps > 0);
     }
     /* One melee.log line per highlighted row and per select, so a menu walk is provable from the log. */
     {
@@ -876,6 +1348,33 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         /* Track Online even with the Friends row hidden; bit 2 is status-area visibility. */
         if (online_visible) friends_menu |= 4;
         mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &friends_menu, 1, NULL, 0, NULL);
+#if MU_SQUAD
+        /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+        if (gmSquad_OnlineFriend() && (!friends_visible || !friends_hovered)) {
+            /* Off the Friends row: Squad Strike no longer goes with the next friend room. */
+            gmSquad_OnlineChoose(false);
+            squad_friend_invite = 0;
+            OSReport("squad: friend room squad mode off (left the Friends row)\n");
+        } else if (gmSquad_OnlineFriend()) {
+            if (squad_friend_invite) {
+                u8 invite[2] = { MU_SQUAD_OP_FRIEND, MU_SQUAD_FRIEND_INVITE }, opening = 0;
+                unsigned int got = 0;
+                squad_friend_invite = 0;
+                if (mu_slippi_cmd(MU_SQUAD_COMMAND, invite, sizeof invite, &opening, 1, &got) || got != 1 || !opening)
+                    OSReport("squad: play a friend, the host did not open the friend picker\n");
+            } else {
+                /* The picker closed without a room (or never opened): Squad Strike goes with it. */
+                u8 intent[2] = { MU_SQUAD_OP_FRIEND, MU_SQUAD_FRIEND_INTENT }, on = 0;
+                unsigned int got = 0;
+                if (mu_slippi_cmd(MU_SQUAD_COMMAND, intent, sizeof intent, &on, 1, &got) || got != 1 || !on) {
+                    gmSquad_OnlineChoose(false);
+                    OSReport("squad: friend picker closed, Squad Strike off\n");
+                }
+            }
+            /* Re-applied each frame, as the Slippi sign-in line is: the row's own text would come back. */
+            if (gmSquad_OnlineFriend()) mu_slippi_tournament_notice(gp, "Invite a friend to Squad Strike.");
+        }
+#endif
     }
 }
 
@@ -891,20 +1390,407 @@ void mu_slippi_splash_init(void)
 {
     mu_slippi_load_match_state(NULL);
     mu_replay_apply_game_info(&gmVsMelee_GetVsData()->start, last_match.game_info);
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+    if (mu_lobby_css()) {
+        unsigned char query = MU_SQUAD_OP_LOBBY_MODE, squad = 0;
+        mu_slippi_cmd(MU_SQUAD_COMMAND, &query, 1, &squad, 1, NULL);
+        gmSquad_LobbyChoose(squad != 0);
+    }
+    if (gmSquad_OnlineChosen() || gmSquad_LobbyChosen()) gmSquad_OnlineSetup(&gmVsMelee_GetVsData()->start);
+#endif
+}
+
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+ * The opponent left between lock-in and the first frame: the host has cancelled the match and
+ * says why. Back to the CSS, which restores the lineup, instead of a splash or a game against
+ * nobody. */
+static int squad_opponent_gone(const char* where)
+{
+    if (!gmSquad_OnlineLive(slp.mode) && !gmSquad_LobbyChosen()) return 0;
+    if (!mu_slippi_load_match_state(NULL) &&
+        last_match.connection_state == MU_SLP_MM_CONNECTION_SUCCESS) return 0;
+    OSReport("squad: opponent gone at the %s (connection %u), back to the CSS\n", where,
+             (unsigned) last_match.connection_state);
+    return 1;
+}
+#endif
+
+/* ---- the 4-player Friends lobby's select (port/runtime/abi/mu_lobby_wire.h) ----
+ * The Friends row or an accepted lobby invite armed the lobby before this major loaded. Its select is
+ * Melee's VS 4-door one (mu_friends4_css.inc draws the other doors from the view); the host's Start
+ * goes through the stage select; once every link is up and everyone locked in, the splash and the
+ * match. After it, the same select again with its picks: the room parks, the next ENTER adopts it. */
+static struct {
+    int major;            /* this online major runs the lobby's select */
+    int view_ok;
+    MuLobbyView view;     /* this frame's (mu_lobby_read) */
+    VsModeData vs;        /* the select's own VS data: picks kept between matches, offline VS untouched */
+    int vs_ready;
+    int exit;             /* MU_LOBBY_EXIT_*: where the select left to */
+    int watching;         /* a guest on the host's stage select: 1 watching, 2 on its way back */
+    int played;           /* the select left for a match: the next visit parks the room first */
+    int curtain;          /* the stage is picked: the select is only passed through, hidden (mu_lobby_curtain) */
+    int curtain_frames, curtain_started;
+    unsigned char curtain_refusals;   /* view.refusal_seq when it went up: a new refusal lifts it at once */
+    unsigned char arm;    /* the arming this select opened on (view.arm): another one is never left */
+    int partner_source, partner_b_held;   /* Doubles: the controller that plays Player 2's door, its B */
+    int partner_want;     /* Doubles: the partner door's tab, MU_LOBBY_WANT_* (this machine's own; FIND each home) */
+    int cancel_held;      /* Doubles: B was down on the last pad read while the home searched */
+    int cancel_mask;      /* Doubles: the B that cancelled the search is kept from the select until let go */
+    GameRules rules;      /* the player's own rules, back when the lobby closes */
+} lobby;
+
+static int lobby_view_op(unsigned char op, MuLobbyView* out)
+{
+    unsigned char buf[MU_LOBBY_VIEW_SIZE];
+    unsigned int got = 0;
+    if (mu_slippi_cmd(MU_LOBBY_COMMAND, &op, 1, buf, sizeof buf, &got) != 0) return 0;
+    return mu_lobby_view_decode(buf, got, out);
+}
+static int lobby_read_into(MuLobbyView* out) { return lobby_view_op(MU_LOBBY_OP_READ, out); }
+
+int mu_lobby_css(void)
+{
+    return lobby.major && mu_slippi_menus_enabled() && mu_slippi_on_online_css();
+}
+
+const MuLobbyView* mu_lobby_read(void)
+{
+    if (!lobby.major) return NULL;
+    if (lobby_read_into(&lobby.view)) lobby.view_ok = 1;
+    return lobby.view_ok ? &lobby.view : NULL;
+}
+
+int mu_lobby_send(const unsigned char* request, unsigned int size)
+{
+    unsigned char ok = 0;
+    unsigned int got = 0;
+    if (!lobby.major || !mu_lobby_request_ok(request, size)) return 0;
+    if (mu_slippi_cmd(MU_LOBBY_COMMAND, request, size, &ok, 1, &got) != 0) return 0;
+    return got == 1 && ok == 1;
+}
+
+void mu_lobby_css_exit(int where) { lobby.exit = where; }
+
+/* The links come up and everyone locks in on the select, so the game passes through it between the
+ * stage select and the splash: hidden, with no pads. It shows again if the room calls the match off
+ * or never starts it, with the reason, and after 10 s rather than leave a black screen. */
+#define LOBBY_CURTAIN_GRACE 90    /* frames the room has to answer the host's Start */
+#define LOBBY_CURTAIN_MAX 600
+
+int mu_lobby_curtain(void) { return lobby.major && lobby.curtain; }
+
+void mu_lobby_curtain_frame(const MuLobbyView* v)
+{
+    int lift;
+    if (!lobby.curtain) return;
+    ++lobby.curtain_frames;
+    if (v && (v->flags & MU_LOBBY_F_STARTED)) {
+        lobby.curtain_started = 1;
+        lift = 0;
+    } else {
+        lift = lobby.curtain_started || lobby.curtain_frames > LOBBY_CURTAIN_GRACE ||
+               (v && v->refusal_seq != lobby.curtain_refusals);
+    }
+    if (lift || lobby.curtain_frames > LOBBY_CURTAIN_MAX) {
+        OSReport("friends lobby: the match did not start after %d frames, the select shows\n", lobby.curtain_frames);
+        lobby.curtain = 0;
+    }
+}
+
+/* Friends: the host went to the stage select, so this guest's select follows it there. */
+void mu_lobby_watch_stage(void)
+{
+    lobby.exit = MU_LOBBY_EXIT_SSS;
+    lobby.watching = 1;
+}
+
+/* A guest only watches the stage select: no pad reaches it. It ends when the host's does or the lobby
+ * closes or a setup starts (even if the frame closing it was lost), back to the select, where a started
+ * setup goes on to the match just as the host's does.
+ * gm_801A4B60 is the scene-loop flag only. Returns 1 when these pads were taken. */
+int mu_lobby_watch_pads(PADStatus* status)
+{
+    const MuLobbyView* v;
+    if (!lobby.major || !lobby.watching || !mu_slippi_menus_enabled() || !mu_slippi_on_online_sss()) return 0;
+    memset(status, 0, sizeof(PADStatus) * 4);
+    v = mu_lobby_read();
+    if (lobby.watching == 1 && (!v || !(v->mode & MU_LOBBY_M_STAGE_SELECT) || !(v->flags & MU_LOBBY_F_ARMED) ||
+                                v->block_hint == MU_LOBBY_HINT_CLOSED || (v->flags & MU_LOBBY_F_STARTED))) {
+        OSReport("friends lobby: the stage select ended, back to the select\n");
+        /* The host's pick started the match: the guests hear the pick as Melee plays it (sfxForward, the
+         * host's own stage select sound), since their stage select takes no press of its own. */
+        if (v && (v->flags & MU_LOBBY_F_STARTED)) sfxForward();
+        lobby.watching = 2;
+    }
+    if (lobby.watching == 2) gm_801A4B60();   /* every frame: the scene loop may reset the flag while it loads */
+    return 1;
+}
+
+/* Only this player's pad, on its own seat's door; the other doors are the lobby's. The other people's
+ * seats get still, connected pads (their cursors show, idle); open and CPU seats get none, so their
+ * cursors hide as in Melee and the host's HMN/CPU switch goes open -> CPU -> open (an empty port can't
+ * be HMN). Before the seat is known, the pad stays on its own port. While the Doubles home searches the
+ * select is locked: this pad goes still too, and a B press cancels the search (Rooms refuses it with
+ * match_active once the match is placed; the hint says so). That B stays off the select until it is let go,
+ * so the press that cancelled the search never also takes back this player's pick. */
+void mu_lobby_pads(PADStatus* status)
+{
+    PADStatus mine, partner;
+    int src, seat, i;
+    if (!mu_lobby_css()) return;
+    src = gm_801677F0() & 3;
+    seat = lobby.view_ok && lobby.view.my_seat < MU_LOBBY_SEATS ? lobby.view.my_seat : src;
+    mine = status[src];
+    memset(&partner, 0, sizeof partner);
+    partner.err = PAD_ERR_NO_CONTROLLER;
+    if (lobby.view_ok && mu_lobby_local_owned(&lobby.view)) {
+        /* Player 2's door (the partner tab on P2 claimed it: mu_friends4_partner_cycle) is played by the first
+         * other connected controller, taken as it is plugged in; until one is, the door stays a person's with a
+         * still pad, as if a 2nd controller were plugged in. */
+        if (lobby.partner_source < 0 || lobby.partner_source == src || status[lobby.partner_source].err != 0) {
+            for (i = 0; i < 4; ++i)
+                if (i != src && status[i].err == 0) break;
+            if (i < 4 && i != lobby.partner_source) {
+                OSReport("doubles: Player 2's door is controller %d's\n", i + 1);
+                lobby.partner_source = i;
+                lobby.partner_b_held = (status[i].button & PAD_BUTTON_B) != 0;   /* a B already down never leaves */
+            }
+        }
+        partner.err = 0;
+        if (lobby.partner_source >= 0 && lobby.partner_source != src && status[lobby.partner_source].err == 0) {
+            const int b = (status[lobby.partner_source].button & PAD_BUTTON_B) != 0;
+            partner = status[lobby.partner_source];
+            partner.button &= (u16) ~PAD_BUTTON_START; /* only the main controller starts a search */
+            if (!(lobby.view.seats[1].flags & MU_LOBBY_S_PICKED) && b) {
+                if (!lobby.partner_b_held) {
+                    const unsigned char release[2] = { MU_LOBBY_OP_LOCAL_SEAT, 0 };
+                    if (mu_lobby_send(release, sizeof release)) lobby.partner_want = MU_LOBBY_WANT_FIND;
+                }
+                partner.button &= (u16) ~PAD_BUTTON_B; /* never B out of the home's main door */
+            }
+            lobby.partner_b_held = b;
+        }
+    }
+    for (i = 0; i < 4; ++i) {
+        const int person = lobby.view_ok && (lobby.view.seats[i].kind == MU_LOBBY_KIND_HUMAN || lobby.view.seats[i].kind == MU_LOBBY_KIND_LOCAL);
+        memset(&status[i], 0, sizeof status[i]);
+        status[i].err = person ? 0 : PAD_ERR_NO_CONTROLLER;
+    }
+    if (lobby.view_ok && (lobby.view.mode & MU_LOBBY_M_SEARCHING)) {
+        const int b = (mine.button & PAD_BUTTON_B) != 0;
+        if (b && !lobby.cancel_held) {
+            unsigned char cancel = MU_LOBBY_OP_CANCEL;
+            OSReport("doubles: B, cancel the search%s\n", mu_lobby_send(&cancel, 1) ? "" : " (not sent)");
+            lobby.cancel_mask = 1;
+        }
+        lobby.cancel_held = b;
+        memset(&mine, 0, sizeof mine);
+    } else if (lobby.view_ok && (lobby.view.mode & MU_LOBBY_M_DOUBLES) && (lobby.view.flags & MU_LOBBY_F_HOST) &&
+               (lobby.view.flags & MU_LOBBY_F_INVITING)) {
+        /* Doubles: the host's B takes the invite back (the friend list closes) and the door stays on Invite. */
+        const int b = (mine.button & PAD_BUTTON_B) != 0;
+        if (b && !lobby.cancel_held) {
+            unsigned char cancel = MU_LOBBY_OP_CANCEL;
+            OSReport("doubles: B, cancel the invite%s\n", mu_lobby_send(&cancel, 1) ? "" : " (not sent)");
+            lobby.cancel_mask = 1;
+        }
+        lobby.cancel_held = b;
+        if (lobby.cancel_mask) mine.button &= (u16) ~PAD_BUTTON_B;
+    } else {
+        lobby.cancel_held = (mine.button & PAD_BUTTON_B) != 0;   /* a B held into the search never cancels it */
+        if (!lobby.cancel_held) lobby.cancel_mask = 0;
+        if (lobby.cancel_mask) mine.button &= (u16) ~PAD_BUTTON_B;   /* the cancel's B, still down */
+    }
+    if (lobby.curtain) memset(&mine, 0, sizeof mine);   /* nothing to act on while it is hidden */
+    if (lobby.view_ok && mu_lobby_local_owned(&lobby.view)) status[1] = partner;
+    status[seat] = mine;
+    status[seat].err = 0;
+}
+
+/* The physical controller that claimed door 2 stays fixed through this home's matches. */
+int mu_lobby_partner_source(void)
+{
+    return lobby.major && lobby.view_ok && (lobby.view.mode & MU_LOBBY_M_LOCAL_OWNER) &&
+           lobby.view.seats[1].kind == MU_LOBBY_KIND_LOCAL ? lobby.partner_source : -1;
+}
+
+/* Doubles: the partner door's tab (mu_friends4_css.inc). Kept on this machine through the home's matches; the
+ * room only ever sees what it fills the seat with. */
+int mu_lobby_partner_want(void)
+{
+    return lobby.partner_want;
+}
+void mu_lobby_set_partner_want(int want)
+{
+    if (want < MU_LOBBY_WANT_FIND || want > MU_LOBBY_WANT_CPU) want = MU_LOBBY_WANT_FIND;
+    lobby.partner_want = want;
+}
+
+static void lobby_open(void)
+{
+    MuLobbyView v;
+    memset(&lobby, 0, sizeof lobby);
+    if (!lobby_read_into(&v) || !(v.flags & MU_LOBBY_F_ARMED)) return;
+#if MU_SQUAD
+    gmSquad_OnlineChoose(false); /* the lobby carries its own mode and canonical setup */
+    gmSquad_LobbyChoose(false);
+#endif
+    lobby.partner_source = -1;
+    lobby.major = 1;
+    lobby.view = v;
+    lobby.view_ok = 1;
+    lobby.arm = v.arm;
+    lobby.rules = *gmMainLib_GetGameRules();
+    OSReport("friends lobby: the %s select (%s)\n", (v.mode & MU_LOBBY_M_DOUBLES) ? "Doubles 2-door" : "4-door",
+             (v.flags & MU_LOBBY_F_GUEST) ? "guest" : "host");
+}
+
+/* Every way out of the major (B, L+R+A+START, an error) leaves the lobby and closes its links, but only
+ * the lobby this select opened on: an invite accepted here (a 1v1 room, or another lobby) already let it
+ * go or armed a new one (view.arm changed), and a LEAVE now would close that new connection. */
+static void lobby_close(void)
+{
+    unsigned char op = MU_LOBBY_OP_LEAVE, ok = 0;
+    MuLobbyView now;
+    if (!lobby.major) return;
+    /* PEEK, not READ: a READ after a pre-match drop takes the parked room back, which a LEAVE ends. */
+    if (lobby_view_op(MU_LOBBY_OP_PEEK, &now) && (now.flags & MU_LOBBY_F_ARMED) && now.arm == lobby.arm)
+        mu_slippi_cmd(MU_LOBBY_COMMAND, &op, 1, &ok, 1, NULL);
+    else
+        OSReport("friends lobby: another match took over; no leave\n");
+    *gmMainLib_GetGameRules() = lobby.rules;
+    OSReport("friends lobby: left the select\n");
+    memset(&lobby, 0, sizeof lobby);
+#if MU_SQUAD
+    gmSquad_LobbyChoose(false);
+#endif
+}
+
+static void lobby_css_prep(GameModeState* state)
+{
+    unsigned char op = MU_LOBBY_OP_ENTER, ok = 0;
+    if (!lobby.vs_ready) {
+        int i;
+        lobby.vs = *gmVsMelee_GetVsData();
+        for (i = 0; i < 4; ++i) {
+            lobby.vs.start.players[i].ckind = ChKind_None;
+            lobby.vs.start.players[i].slot_type = Gm_PKind_NA;
+        }
+        lobby.vs.start.rules.is_teams = 0;
+        lobby.vs_ready = 1;
+    }
+    if (lobby.played) {
+        /* Back from a match: the room parks with its links (cleanup 2 = the next lobby match). */
+        unsigned char next = 2;
+        mu_slippi_cmd(CMD_CLEANUP_CONNECTIONS, &next, 1, NULL, 0, NULL);
+        lobby.played = 0;
+    }
+    lobby.exit = MU_LOBBY_EXIT_NONE;
+    lobby.watching = 0;
+    lobby.curtain_frames = lobby.curtain_started = 0;
+    {
+        /* This build's costume counts (m-ex ones included): every machine's match clamps colours to them. */
+        unsigned char costumes[1 + MU_LOBBY_CHARS];
+        unsigned ch;
+        costumes[0] = MU_LOBBY_OP_COSTUMES;
+        for (ch = 0; ch < MU_LOBBY_CHARS; ++ch) {
+            unsigned n = gm_GetNumCostumesForCKind((u8) ch);
+            costumes[1 + ch] = (unsigned char) (n < 1 ? 1 : n > MU_LOBBY_COLOR_MAX + 1 ? MU_LOBBY_COLOR_MAX + 1 : n);
+        }
+        if (!mu_lobby_send(costumes, sizeof costumes)) OSReport("friends lobby: costume counts not sent\n");
+    }
+    mu_slippi_cmd(MU_LOBBY_COMMAND, &op, 1, &ok, 1, NULL);
+    gmVsMelee_EnterCss(state, &lobby.vs, VS_MELEE);
+#if MU_SQUAD
+    if (!(lobby.view.mode & MU_LOBBY_M_DOUBLES)) gmSquad_LobbyAdmission();
+#endif
+}
+
+/* 1 when the lobby owns this decide. */
+static int lobby_css_decide(GameModeState* state)
+{
+    CSSData* css = gm_GetGameModeStateExitData(state);
+    if (!lobby.major) return 0;
+    OSReport("friends lobby: select exit request %u, to %d\n", (unsigned) css->pending_scene_change, lobby.exit);
+    if (css->pending_scene_change == 2) {
+        /* B back (also from "The lobby closed"): Online with its row highlighted (Friends, or Doubles for
+         * the Doubles home). Without this the menu entry falls to the Direct-mode return, the Slippi
+         * submenu, one A from connect codes. */
+        if (lobby.view.mode & MU_LOBBY_M_DOUBLES) doubles_home_return = 1;
+        else friends_return = 1;
+        gm_ChangeGameModeAfterCurrentScene(GM_MENU);   /* the major's unload leaves the lobby */
+        return 1;
+    }
+    gmVsMelee_ExitCss(state, &lobby.vs);
+    if (lobby.exit == MU_LOBBY_EXIT_SSS) {
+        gm_SetNextGameModeStateId(MU_SLP_STATE_SSS);
+    } else if (lobby.exit == MU_LOBBY_EXIT_SPLASH) {
+        lobby.played = 1;
+        lobby.curtain = 0;
+        mu_slippi_splash_init();
+        if (last_match.connection_state != MU_SLP_MM_CONNECTION_SUCCESS) {
+            gm_SetNextGameModeStateId(MU_SLP_STATE_CSS);
+        } else
+#if MU_SQUAD
+        if (gmSquad_LobbyChosen() && !gmSquad_OnlineReady()) {
+            gm_SetNextGameModeStateId(MU_SLP_STATE_CSS);
+        } else
+#endif
+        gm_SetNextGameModeStateId(MU_SLP_STATE_SPLASH);
+    } else {
+        gm_SetNextGameModeStateId(MU_SLP_STATE_CSS);
+    }
+    lobby.exit = MU_LOBBY_EXIT_NONE;
+    return 1;
+}
+
+/* The host's stage (random is 0: the room picks), sent with Start; back to the select either way. */
+static int lobby_sss_decide(GameModeState* state)
+{
+    SSSData* sss = gm_GetGameModeStateExitData(state);
+    if (!lobby.major) return 0;
+    if (sss->start_game && !lobby.watching) {
+        unsigned char start[2];
+        unsigned stage = sss->vs.start.rules.stkind;
+        start[0] = MU_LOBBY_OP_START;
+        start[1] = (unsigned char) (mu_lobby_stage_ok(stage) && stage != 0 ? stage : 0);
+        OSReport("friends lobby: start, stage %u\n", (unsigned) start[1]);
+        (void) mu_lobby_read();   /* the select's last snapshot predates the stage select */
+        lobby.curtain_refusals = lobby.view.refusal_seq;
+        if (mu_lobby_send(start, sizeof start)) lobby.curtain = 1;
+        else OSReport("friends lobby: start not sent\n");
+    } else if (!lobby.watching) {
+        const unsigned char closed[2] = { MU_LOBBY_OP_STAGE_SELECT, 0 };   /* the host backed out: the guests too */
+        if (!mu_lobby_send(closed, sizeof closed)) OSReport("friends lobby: stage select close not sent\n");
+    } else if (lobby.view_ok && (lobby.view.flags & MU_LOBBY_F_STARTED)) {
+        lobby.curtain_refusals = lobby.view.refusal_seq;
+        lobby.curtain = 1;   /* a guest: the host's Start ended the stage select */
+    }
+    gm_SetNextGameModeStateId(MU_SLP_STATE_CSS);
+    return 1;
 }
 
 /* MajorSceneLoad. */
 static void online_on_load(void)
 {
+    lobby_open();
     mu_ranked_set_reset();
     gmMainLib_804D3EE0->vs.unk_530.x6 = gm_801677F0();   /* the 1P port for the event CSS slot */
     zelda_sheik = 1;                                       /* the Zelda icon picks Sheik */
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+    if (gmSquad_OnlineChosen()) zelda_sheik = 0; /* keep the picker's exact Zelda/Sheik kinds */
+#endif
     online_loads++;
 }
 
 /* MajorSceneUnload. */
 static void online_on_unload(void)
 {
+    lobby_close();
     mu_ranked_practice_control(MU_YG_PRACTICE_STOP);
     mu_ranked_update_reset(); // leaving the online major abandons any unfinished set
     mu_ranked_set_reset();
@@ -916,8 +1802,17 @@ static void css_prep(GameModeState* state)
 {
     struct EventData* ev = &gmMainLib_804D3EE0->vs.unk_530;
     CSSData* css = gm_GetGameModeStateEnterData(state);
+    if (lobby.major) {
+        lobby_css_prep(state);
+        return;
+    }
     gm_801B06B0(css, 0xE, ev->x2, 0, ev->x3, ev->nametag, 0, ev->x6);
     lbDvd_SetupVsPreloadCache();
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+    gmSquad_OnlineRoom(slp.mode); /* a choice this mode or friend room doesn't carry is dropped */
+    if (gmSquad_OnlineChosen()) gmSquad_OnlineCss();
+#endif
 }
 
 /* CSSSceneDecide (runs the event CSS decide first to save the choice). */
@@ -926,6 +1821,7 @@ static void css_decide(GameModeState* state)
     struct EventData* ev = &gmMainLib_804D3EE0->vs.unk_530;
     CSSData* css = gm_GetGameModeStateExitData(state);
 
+    if (lobby_css_decide(state)) return;
     /* Record the guest's exit request before the main-menu load sends BA.
      * A cleanup line after returning to the menu does not explain the CSS exit. */
     OSReport("slippi CSS: exit mode %u request %u connection %u\n",
@@ -960,6 +1856,12 @@ static void css_decide(GameModeState* state)
         /* Unranked and Party. */
         break;
     }
+#if MU_SQUAD
+    if (squad_opponent_gone("CSS exit")) {
+        gm_SetNextGameModeStateId(MU_SLP_STATE_CSS);
+        return;
+    }
+#endif
     mu_slippi_splash_init();
     gm_SetNextGameModeStateId(MU_SLP_STATE_SPLASH);
 }
@@ -967,6 +1869,10 @@ static void css_decide(GameModeState* state)
 /* SSSScenePrep: the vanilla VS-mode SSS prep. */
 static void sss_prep(GameModeState* state)
 {
+    if (lobby.major) {
+        gmVsMelee_EnterSss(state, &lobby.vs);   /* the lobby select's own picks and Teams */
+        return;
+    }
     gmVsMelee_EnterSss(state, gmVsMelee_GetVsData());
 }
 
@@ -974,6 +1880,7 @@ static void sss_prep(GameModeState* state)
 static void sss_decide(GameModeState* state)
 {
     SSSData* sss = gm_GetGameModeStateExitData(state);
+    if (lobby_sss_decide(state)) return;
     if (!sss->start_game) {
         gm_SetNextGameModeStateId(MU_SLP_STATE_CSS);
         return;
@@ -1243,6 +2150,10 @@ static void splash_prep(GameModeState* state)
             mask |= lbAudioAx_80026E84((CharacterKind) start->players[i].ckind);
         }
     }
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+    if (gmSquad_OnlineReady()) mask |= gmSquad_SoundMask();
+#endif
     mask |= lbAudioAx_80026EBC((StKind) start->rules.stkind);
     lbAudioAx_8002702C(4, mask);
     lbAudioAx_80027168();
@@ -1252,6 +2163,12 @@ static void splash_prep(GameModeState* state)
 static void splash_decide(GameModeState* state)
 {
     (void) state;
+#if MU_SQUAD
+    if (squad_opponent_gone("splash")) {
+        gm_SetNextGameModeStateId(MU_SLP_STATE_CSS);
+        return;
+    }
+#endif
     gm_SetNextGameModeStateId(MU_SLP_STATE_VS);
 }
 

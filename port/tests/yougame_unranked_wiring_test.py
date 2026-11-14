@@ -35,7 +35,7 @@ class UnrankedWiringTest(unittest.TestCase):
         practice = source('port/runtime/hle/native_practice.cpp')
         self.assertIn('yougame::unranked::allow_training_return(yougame::active(), session_mode_seen)', practice)
         for option in ('back_to_training', 'return_training'):
-            self.assertIn('played && allow_training && gx::RenderOptions::live_online_' + option, practice)
+            self.assertIn('if (allow_training && gx::RenderOptions::live_online_' + option, practice.replace('} else if (allow', 'if (allow'))
         policy = source('port/runtime/hle/yougame_unranked.h')
         self.assertIn('return active && mode == 1;', policy)
         # Direct, Teams, Friends and standalone cannot enter the exception.
@@ -57,11 +57,12 @@ class UnrankedWiringTest(unittest.TestCase):
     def test_ranked_set_over_and_training_destination_remain_on_css(self):
         import online_menu_test as menu
         runtime = source('port/runtime/hle/native_practice.cpp')
-        begin = runtime.index('  {\n    static bool session_seen')
+        begin = runtime.index('  {\n    static yougame::unranked::SessionWatch session_watch')
         end = runtime.index('\n  // Entering major 8', begin)
         tick = 'void tick() {\n' + runtime[begin:end] + '\n}\n'
         decide = menu.fixture.extract(source('sourceport/game/shim/mu_slippi_menu.c'), 'vs_decide')
         stubs = r"""
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -105,7 +106,7 @@ static int session_mode_value=-1,guest_mode=0,training=0,kTrainingMajor=28,g_ori
 static bool active=true,back_setting=false,return_setting=false,g_restore_training=false,online_scene=true,playing=false;
 namespace yougame { bool active() { return ::active; } }
 namespace slippi {
-namespace online { int session_mode() { return session_mode_value; } bool is_online_match() { return playing; } int local_player_index() { return 0; } }
+namespace online { int session_mode() { return session_mode_value; } bool is_online_match() { return playing; } int local_player_index() { return 0; } bool friends_lobby_armed() { return false; } }
 namespace playback { bool enabled() { return false; } }
 }
 namespace gx { struct RenderOptions {
@@ -113,6 +114,11 @@ static bool live_online_back_to_training() { return back_setting; }
 static bool live_online_return_training() { return return_setting; }
 }; }
 struct Lifecycle { Phase phase() { return Phase::Idle; } int return_after_session() { return 1; } } g_lifecycle;
+// Upstream v0.9.93: the session remembers the last online opponent for Training's CPU.
+struct PracticePlayer { bool active=false; u8 character=0, costume=0; };
+struct PracticeConfig { PracticePlayer players[4]; };
+PracticeConfig capture_practice() { return {}; }
+int g_last_opponent=-1; u8 g_last_opponent_costume=0;
 void run_decision(int) { ++training; }
 bool is_online_scene() { return online_scene; } int online_mode() { return guest_mode; }
 void enter_training_after_session(MatchMode, int = -1, int = -1) { ++training; }
@@ -163,6 +169,7 @@ int main() {
                  'switch(dt.msrb.connection_state) {\n' + idle + '\ndefault:return 0; }}\n'
                  'void css_hint() { int conn=dt.msrb.connection_state;\n' + css[hint_start:hint_end] + '\n}\n')
         stubs = r"""
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -171,10 +178,13 @@ MU_SLP_MM_IDLE=0,MU_SLP_MM_CONNECTION_SUCCESS=4,HSD_PAD_X=1,HSD_PAD_START=2,HSD_
 MU_SLP_WINNER_NULL=-1,MU_YG_PRACTICE_START=1,MU_YG_PRACTICE_STOP=0,SB_RAND=0,ST_PRESS_D=8 };
 struct { int mode,is_winner,chose_stage; } state;
 auto* mu_slippi_state() { return &state; }
-struct { struct { int connection_state; } msrb; int chat_window_opened; } dt;
+struct { struct { int connection_state; } msrb; int chat_window_opened; unsigned char doubles_searched; } dt;
+int doubles_teams() { return 0; } void mu_slippi_sss_find_match() { std::abort(); }   // the 4-peer Doubles CSS: off here
 unsigned char chosen;unsigned char* char_chosen=&chosen;
 int capability,p2p,ready,allowed,starts,searches;
 std::string hint;
+int st_opp_picks=-1; const void* m=nullptr;
+void opponent_picks_line(const void*,char*,size_t) { std::abort(); }
 void set_text(int,const char* text) { hint=text; }
 int mu_ranked_practice_allowed() { return allowed; }
 int mu_ranked_practice() { return starts!=0; }

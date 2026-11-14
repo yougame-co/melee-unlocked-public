@@ -135,8 +135,17 @@ void apply_shortcuts() {
   static_assert(std::size(actions) == static_cast<size_t>(BindAction::Count));
   for (size_t i = 0; i < std::size(actions); ++i) {
     const int vk = g_key_bindings.vk[i];
-    if (vk && (vk == config.menu.key || vk == config.chat.key))
-      log("embed: shortcut overrides keyboard action %s (key %d)", actions[i], vk);
+    for (const auto combo : {config.menu, config.chat}) {
+      if (!vk || vk != combo.key) continue;
+      std::string chord;
+      if (combo.modifiers & yougame::shortcuts::Shift) chord += "Shift+";
+      if (combo.modifiers & yougame::shortcuts::Ctrl) chord += "Ctrl+";
+      if (combo.modifiers & yougame::shortcuts::Alt) chord += "Alt+";
+      chord += vk == 9 ? "Tab" : vk == 13 ? "Enter" : vk == 192 ? "Backquote" :
+          vk >= 112 && vk <= 123 ? "F" + std::to_string(vk - 111) : std::string(1, char(vk));
+      log("embed: shortcut %s shares key %d with keyboard action %s (the plain key still goes to the game)",
+          chord.c_str(), vk, actions[i]);
+    }
   }
 }
 bool shortcut_swallowed(int vk) {
@@ -324,7 +333,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
       const bool visible = g_embed_view.has_view ? yg_embed_view_visible(&g_embed_view) : w != 0;
       // A hidden game must not keep the keyboard. The page hides the box without a blur (its play menu,
       // a sheet, the box scrolled away) and nobody can click a hidden window to take the keys back, so
-      // Keep input routed to the page after a match.
+      // they stopped reaching the page after a match.
       if (!visible && GetFocus() == h) {
         SetLastError(0);
         const HWND rc = SetFocus(GetParent(h));
@@ -453,6 +462,7 @@ bool window_focused(HWND) { return linux_compat::window_focused(); }
 }  // namespace
 
 #ifdef _WIN32
+void window_prefer_background(bool) {}
 void window_prefer_vulkan(bool) {}   // a Win32 window takes any renderer
 
 void* window_create(int w, int h, const wchar_t* title, bool visible, bool flip) {
@@ -1295,7 +1305,21 @@ box::State g_box_keyboard[2];
 box::State g_box_keyboard_navigation;
 box::State g_box_hid[2][4];
 
-void apply_family_options(PadFamily family, PadState& pad) {
+// The snapback filter (input_bindings.h snapback_axis) on an Xbox, PlayStation or Switch controller's
+// control stick, before deadzone and radius (GitHub #72). [0] the game's read, [1] the Controls tab's
+// preview, each with its own state.
+SnapbackAxis g_snapback[2][(size_t)PadFamily::Count][4][2];
+void apply_snapback(PadFamily family, int slot, int lane, PadState& pad) {
+  if (family == PadFamily::GameCube || family == PadFamily::Box || slot < 0 || slot >= 4) return;
+  const Deadzone& dz = g_deadzones[(size_t)family];
+  SnapbackAxis* axes = g_snapback[lane & 1][(size_t)family][slot];
+  const double now = now_seconds();
+  pad.stick_x = snapback_axis(axes[0], pad.stick_x, now, dz.snapback_x, dz.snapback_ms_x);
+  pad.stick_y = snapback_axis(axes[1], pad.stick_y, now, dz.snapback_y, dz.snapback_ms_y);
+}
+
+void apply_family_options(PadFamily family, PadState& pad, int slot = -1, int lane = 0) {
+  apply_snapback(family, slot, lane, pad);
   const Deadzone& dz = g_deadzones[(size_t)family];
   apply_deadzone(dz, pad.stick_x, pad.stick_y, false);
   apply_deadzone(dz, pad.sub_x, pad.sub_y, true);
@@ -1704,9 +1728,9 @@ static void read_devices(PadState out[4], InputDebugSnapshot& debug, bool side_e
   // see what the game gets.
   for (int idx = 0; idx < 4; ++idx) {
     if (gc_mask & (1u << idx)) apply_family_options(PadFamily::GameCube, gc[idx]);
-    if (xin_connected[idx]) apply_family_options(PadFamily::Xbox, xin[idx]);
-    if (ds4_connected[idx]) apply_family_options(PadFamily::PlayStation, ds4[idx]);
-    if (swpro_connected[idx]) apply_family_options(PadFamily::Switch, swpro[idx]);
+    if (xin_connected[idx]) apply_family_options(PadFamily::Xbox, xin[idx], idx, 0);
+    if (ds4_connected[idx]) apply_family_options(PadFamily::PlayStation, ds4[idx], idx, 0);
+    if (swpro_connected[idx]) apply_family_options(PadFamily::Switch, swpro[idx], idx, 0);
     if (hid_connected[idx]) apply_family_options(PadFamily::Box, hid[idx]);
   }
 
@@ -1727,7 +1751,9 @@ static void read_devices(PadState out[4], InputDebugSnapshot& debug, bool side_e
   }
   for (int port = 0; port < 4; ++port) {
     PortSource src = effective_port_source(g_port_sources, facts, port);
-    if (console && keyboard_actions) src = controller_relay::console_source(src);
+    // A held window-keyboard action beats the app's idle page-keyboard pad in every read, menus
+    // included: embedded on Windows the game window has focus, so the page pad never sees the keys.
+    if (keyboard_actions) src = controller_relay::console_source(src);
     if (side_effects) {
       g_port_feeding[port] = src;
       controller_relay::routed(src.kind, src.index, port);
@@ -1835,7 +1861,7 @@ struct UiSnapshot {
     const uint64_t menu_now = static_cast<uint64_t>(now_seconds() * 1000.0);
     yougame::parity::signals.emit(g_overlay_pad.tick(menu_now));
     bool toggle_settings = false;
-    const bool invite_focused = g_hwnd && window_focused(g_hwnd);
+    const bool home_input = g_background_input || (g_hwnd && window_focused(g_hwnd));
     for (int i = 0; i < 4; ++i) {
       // Only ImGui receives the filtered keyboard copy. All chord/console/friends readers
       // below keep the original routed pad, including Start and the arrow-made stick.
@@ -1848,12 +1874,27 @@ struct UiSnapshot {
       yougame::parity::signals.emit(g_overlay_pad.poll(yougame::stdio_bridge(), i,
           pads[i].err == 0, menu_buttons, menu_now, g_ui_settings_chord_held[i]));
       if (!console && yougame::active() && !opened_here && !g_ui_capture.load()) {
-        if (yougame::console::entry.poll(i, pads[i].err == 0 && invite_focused, menu_buttons)) {
+        // These follow the game's background-input rule, not focus: START/B in a home work exactly
+        // when the menu does. With background input off an unfocused window reads as unplugged, so a
+        // button held while focus comes back must be released first.
+        if (
+#ifdef MELEE_DOUBLES
+            yougame::doubles::ui.poll(i, pads[i].err == 0 && home_input, menu_buttons) ||
+#endif
+            yougame::console::entry.poll(i, pads[i].err == 0 && home_input, menu_buttons)) {
           const auto err = pads[i].err;
           pads[i] = {}; pads[i].err = err;
           g_ui_navigation_pads[i] = pads[i];
           menu_buttons = 0;
-        } else yougame::friends::events.poll_pad(i, pads[i].err == 0, menu_buttons);  // the game's menu takes this A unfocused too
+        } else {
+#ifdef MELEE_DOUBLES
+          if (const uint16_t carried = yougame::doubles::ui.carried_over(i)) {
+            pads[i].button &= static_cast<uint16_t>(~carried);
+            menu_buttons &= static_cast<uint16_t>(~carried);
+          }
+#endif
+          yougame::friends::events.poll_pad(i, pads[i].err == 0, menu_buttons);  // the game's menu takes this A unfocused too
+        }
       }
       if (!(menu_buttons & 0x1000)) pads[i].button &= static_cast<uint16_t>(~0x1000);
       g_ui_navigation_pads[i].button &= pads[i].button; // preserve consumed chords/shortcuts
@@ -2237,9 +2278,9 @@ void input_debug_snapshot(InputDebugSnapshot& snapshot) {
   }
   for (int idx = 0; idx < 4; ++idx) {
     if (facts.gc[idx]) apply_family_options(PadFamily::GameCube, gc[idx]);
-    if (facts.xinput[idx]) apply_family_options(PadFamily::Xbox, xin[idx]);
-    if (facts.ds4[idx]) apply_family_options(PadFamily::PlayStation, ds4[idx]);
-    if (facts.switch_pro[idx]) apply_family_options(PadFamily::Switch, swpro[idx]);
+    if (facts.xinput[idx]) apply_family_options(PadFamily::Xbox, xin[idx], idx, 1);
+    if (facts.ds4[idx]) apply_family_options(PadFamily::PlayStation, ds4[idx], idx, 1);
+    if (facts.switch_pro[idx]) apply_family_options(PadFamily::Switch, swpro[idx], idx, 1);
     if (facts.hid[idx]) apply_family_options(PadFamily::Box, hid[idx]);
   }
   snapshot.keyboard_pad = kb;

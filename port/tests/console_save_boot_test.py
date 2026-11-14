@@ -33,6 +33,8 @@ using u8=unsigned char;
 enum { GM_BOOT=0x28, GM_VS=2, GM_DEBUG_VS=6 };
 enum lbCardResult { LbCardResult_Ready=0, LbCardResult_2=2, LbCardResult_NoFile=4 };
 static bool g_console_boot, active;
+struct Origin { bool join_boot=false; std::vector<unsigned char> card; } g_css_origin;
+int mu_css_origin_host(int op) { return op==32 && g_css_origin.join_boot; }
 namespace yougame::console {
 struct Config { std::string card_digest; int my_port; } config;
 struct Engine { const Config& config() const { return console::config; } } engine;

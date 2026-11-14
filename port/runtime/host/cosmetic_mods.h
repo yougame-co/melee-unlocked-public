@@ -17,7 +17,7 @@ constexpr uint32_t kMaxArchiveEntries = 4096;
 struct AssetInfo {
   std::string id;
   std::string name;
-  std::string kind;              // character_costume, fighter_sound, stage_visual, or effect_visual
+  std::string kind;              // character_costume, fighter_sound, stage_visual, effect_visual, or pause_screen
   std::string target_path;       // logical GALE01 FST path, e.g. PlFxGr.dat
   std::string character;
   std::string costume;
@@ -181,10 +181,11 @@ uint32_t voice_bank_count();
 // "<fighter> <color>: from <pack_name>" in that costume's list; nothing is selected. Needs the game
 // disc open (host::disc_open) to compare against. Scanning the same unchanged disc again does
 // nothing; a changed disc updates its entries and drops the ones that no longer differ.
-// A pack that carries its own character select file (MnSlChr.usd or .dat) also gives each of its
-// plain costumes the portrait that file shows for the slot, when it differs from the game's: it is
-// stored as the skin's "csp" picture, like the portrait an imported skin brings. A pack's
-// alternate sets have no cell of their own in that file and get none.
+// A pack's character select file supplies each costume's own "csp" picture. For m-ex, the MxDt
+// costume rows and mexSelectChr CSP stride identify both original and additional costumes and
+// their portraits. Additional costumes with supported retail model roots become choices for that
+// existing native costume slot, including cloned filenames such as PlMsNr2.dat. Unmapped alternate
+// sets get no guessed portrait. An older scan is refreshed automatically on the next boot.
 ImportResult scan_disc_skins(const std::string& iso_path, const std::string& pack_name,
                              std::string* error = nullptr);
 // Exact looks ("Diet Classic", "Diet 64", "Crystal"): built once from the player's own retail disc and the
@@ -199,6 +200,9 @@ std::vector<LookPackStatus> look_packs();
 // Slow (minutes): call from a worker thread. The message says what happened either way.
 bool build_look_packs(const std::string& patcher_folder, const std::string& retail_disc, const std::string& xdelta_tool,
                       std::string* message);
+// Off: the shipped xdelta3 is the only patch tool used; a missing or broken one is never fetched again.
+// The host sets it once at startup (default on).
+void set_tool_recovery(bool allowed);
 // One click (Settings > Looks > Get mod looks): 0 Diet Melee (Classic, 64 and Crystal), 1 Animelee
 // Complete Edition, 2 Animelee x DBZ (its Dragon Ball Z edition). The authors' own download, checked
 // against its published SHA-256, built from the player's clean disc with the shipped xdelta3; each
@@ -210,6 +214,9 @@ struct OfficialLookState {
   std::string disc;       // Animelee: the built disc's path
 };
 OfficialLookState official_look_state(int which, const std::string& mods_folder);
+// True only for the complete, hash-verified Animelee discs built by the official look installer.
+// Their Source Port online view keeps verified costumes/music over standard gameplay files.
+bool official_cosmetic_disc(const std::string& disc_path);
 void install_official_look(int which, const std::string& retail_disc, const std::string& xdelta_tool, const std::string& mods_folder);
 // At startup with the game disc open: scans every built look disc as its pack.
 void scan_look_packs();
@@ -224,6 +231,22 @@ uint32_t disc_skin_count(const std::string& iso_path);
 // sets ("alt L", "alt R") step after the standard costume like any skin. Empty: no such disc
 // (the default, and always on the Static Recomp, where a pack disc runs its own L / R).
 void set_session_pack(const std::string& iso_path);
+// The disc whose alternate stages are this session's stages: a dynamic alternate stages disc keeps a
+// folder of alternates per stage ("GrSt/GrSt-surfshop(L).dat") and its stage code picks one each
+// match. With this set, every match picks among that disc's alternates of the stage the same way: a
+// held button names one (the probe below), otherwise any of them, whatever the random stage skin
+// setting says. Online only alternates that play like the game's stage are in the pick.
+void set_session_stage_pack(const std::string& iso_path);
+// Buttons held on any controller, in the game's pad bits (L 0x40, R 0x20, Z 0x10, B 0x200, X 0x400, Y 0x800).
+using StageButtonProbe = uint32_t (*)();
+void set_stage_button_probe(StageButtonProbe probe);
+// True while this game runs in lockstep with another (a Friends console session): no stage skin is
+// served then (a saved pick, a random draw or the session disc's alternates could differ between the
+// two games), and both load the game's own stage file.
+using LockstepProbe = bool (*)();
+void set_lockstep_probe(LockstepProbe probe);
+// The pack name a scanned disc's skins are listed under, or empty when it has none.
+std::string disc_pack_name(const std::string& iso_path);
 // True for a costume skin scanned from that disc. The Source Port lets these serve a costume file
 // the pack itself replaced; a skin from anywhere else leaves the pack's own file in place.
 bool session_pack_skin(const std::string& asset_id);
@@ -288,6 +311,15 @@ struct LiveCycle {
   std::string partner_slot, partner_previous_id;
 };
 LiveCycle cycle_slot_live(const std::string& slot, int direction);
+struct CharacterCycle {
+  LiveCycle pick;
+  std::string target;
+  int costume = -1;
+};
+// Offline: all of this fighter's native colors and installed skins, with their actual slot kept.
+// allowed_costumes excludes colors occupied by another player of the same fighter. Online callers
+// keep cycle_slot_live: their team/lock-in costume rules are unchanged.
+CharacterCycle cycle_character_live(int character, int costume, int direction, uint32_t allowed_costumes = ~0u);
 // Publishes one costume slot again from the saved profile: the same work apply_to_fst does for it,
 // on the table apply_to_fst patched at startup. The slot's entries get their new lengths and the
 // read snapshot is swapped as a whole, so a reader sees the old file or the new one, never a mix.
@@ -401,6 +433,8 @@ struct DatInspection {
   std::vector<std::string> roots;
 };
 DatInspection inspect_dat(const std::vector<uint8_t>& bytes);
+bool apply_look_patch(const std::string& tool, const std::string& source, const std::string& patch,
+                     const std::string& output, std::string* error);
 bool visual_dat_only(const std::vector<uint8_t>& clean, const std::vector<uint8_t>& candidate,
                      std::string* error);
 // The public costume_skeleton_matches, kept under its old name for the tests.

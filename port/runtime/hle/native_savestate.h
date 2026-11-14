@@ -33,6 +33,24 @@ std::vector<Span> subtract(const std::vector<MuStateRegion>& regions,
 // 64-bit hash of the bytes the spans cover, for determinism checks (not a wire checksum).
 uint64_t hash_spans(const std::vector<Span>& spans);
 
+// Immutable, reusable same-process checkpoint. Destinations are fixed at capture; no file or
+// process can supply addresses. Independent of the match rollback pool and its load/free policy.
+class Snapshot {
+ public:
+  struct Difference { size_t span; uint32_t offset, size; uint8_t expected, actual; };
+  void capture(std::vector<Span> spans);
+  void restore() const;
+  std::vector<Difference> differences(size_t limit = 16) const;
+  const std::vector<Span>& spans() const { return spans_; }
+  size_t bytes() const { return bytes_.size(); }
+  bool ready() const { return !spans_.empty(); }
+  double capture_ms() const { return capture_ms_; }
+ private:
+  std::vector<Span> spans_;
+  std::vector<uint8_t> bytes_;
+  double capture_ms_ = 0;
+};
+
 struct Stats {
   uint64_t captures = 0, loads = 0, missing_loads = 0;
   double capture_ms_total = 0, capture_ms_max = 0;

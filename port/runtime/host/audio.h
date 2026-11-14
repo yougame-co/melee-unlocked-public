@@ -44,6 +44,7 @@ bool audio_running();
 // volume_percent 0..100; 0 keeps the session muted (default for development).
 bool audio_open(int volume_percent, const char* wav_dump_path = nullptr, bool open_device = true);
 void audio_close();
+void audio_reset_stream(); // discard queued output; preserve local device/volume/mute preferences
 // `bytes` of big-endian 16-bit samples ordered R, L, R, L ... (GameCube AI DMA format).
 void audio_push(const uint8_t* be_samples, size_t bytes);
 // Native AX writes the same R,L sample words in host byte order.

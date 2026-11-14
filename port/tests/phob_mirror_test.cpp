@@ -15,6 +15,7 @@ struct Sample {
 template<class T, class = void> struct HasSocket : std::false_type {};
 template<class T> struct HasSocket<T, std::void_t<decltype(std::declval<T>().phob_socket)>> : std::true_type {};
 int main(int argc, char** argv) {
+  setenv("YOUGAME_AGENT_COPY", "1", 1);  // the AGENT TEST app's flag: agent_test::load ignores the file without it
   using namespace host::phob;
   uint8_t report[37] = {0x21}; HardwareInput input;
   for (int port=0; port<4; ++port) for (uint8_t type : {0x10,0x20}) {

@@ -5,6 +5,10 @@
 #include "yougame_agent_paths.h"
 #endif
 #include "host.h"
+#if MU_SQUAD
+// Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+#include "squad_digest.h"
+#endif
 #include "session_logs.h"
 #include "sim_work.h"
 #include "audio.h"
@@ -22,6 +26,7 @@
 #include "guest_registry.h"
 #include "guest_symbols.h"
 #include "gx_core.h"
+#include "pipeline_cache_store.h"
 #include "gx_shader.h"
 #include "authored_pose.h"
 #include "window.h"
@@ -55,7 +60,7 @@
 #include <filesystem>
 #include <fstream>
 
-namespace hle { void audio_tick(bool force); uint64_t audio_next_due(); }
+namespace hle { void audio_tick(bool force); uint64_t audio_next_due(); void audio_shift(uint64_t ticks); }
 
 namespace hle { void dvd_poll(); void dvd_settle(); }
 namespace host {
@@ -141,8 +146,111 @@ static void open_log_file() {
     if (GlobalMemoryStatusEx(&memory))
       std::fprintf(g_log_file, "memory: %.1f GB installed, %.1f GB free, %.1f GB more the system can hand out\n",
                    memory.ullTotalPhys / 1073741824.0, memory.ullAvailPhys / 1073741824.0, memory.ullAvailPageFile / 1073741824.0);
+    std::fprintf(g_log_file, "%s\n", cpu_power_line("at start").c_str());
   }
 }
+
+// "cpu: Intel(R) Core(TM) i5-9300H, rated 2400 MHz, now 1190 MHz, limit 2400 MHz, on battery (64%), power plan
+// Balanced": a laptop on battery or a power saving plan runs the game step at a fraction of its speed, which
+// a report could not tell from a slow processor (a GTX 1650 laptop, 11-10: three times this PC's step time).
+#ifndef _WIN32
+// Linux: /proc/cpuinfo, cpufreq and the power supply class.
+static std::string read_first_line(const std::string& path) {
+  std::ifstream f(path);
+  std::string line;
+  std::getline(f, line);
+  return line;
+}
+std::string cpu_power_line(const char* when) {
+  std::string name = "?";
+  {
+    std::ifstream f("/proc/cpuinfo");
+    std::string line;
+    while (std::getline(f, line))
+      if (line.rfind("model name", 0) == 0) { const size_t c = line.find(':'); if (c != std::string::npos) name = line.substr(c + 2); break; }
+  }
+  std::string out = std::string("cpu (") + when + "): " + name;
+  const std::string cpufreq = "/sys/devices/system/cpu/cpu0/cpufreq/";
+  const std::string max = read_first_line(cpufreq + "cpuinfo_max_freq"), now = read_first_line(cpufreq + "scaling_cur_freq"),
+                    limit = read_first_line(cpufreq + "scaling_max_freq"), governor = read_first_line(cpufreq + "scaling_governor");
+  const auto mhz = [](const std::string& khz) { return std::to_string(std::atol(khz.c_str()) / 1000); };
+  if (!max.empty()) out += ", rated " + mhz(max) + " MHz";
+  if (!now.empty()) out += ", now " + mhz(now) + " MHz";
+  if (!limit.empty()) out += ", limit " + mhz(limit) + " MHz";
+  if (!governor.empty()) out += ", governor " + governor;
+  std::error_code ec;
+  bool battery = false, on_ac = false, any_ac = false;
+  std::string capacity;
+  for (const auto& e : std::filesystem::directory_iterator("/sys/class/power_supply", ec)) {
+    const std::string type = read_first_line((e.path() / "type").string());
+    if (type == "Mains") { any_ac = true; on_ac = on_ac || read_first_line((e.path() / "online").string()) == "1"; }
+    if (type == "Battery") { battery = true; capacity = read_first_line((e.path() / "capacity").string()); }
+  }
+  if (battery && any_ac && !on_ac) out += ", on battery" + (capacity.empty() ? std::string() : " (" + capacity + "%)");
+  else if (battery) out += ", plugged in";
+  else out += ", mains power (no battery)";
+  return out;
+}
+#else
+std::string cpu_power_line(const char* when) {
+  char name[128] = "?";
+  DWORD rated = 0;
+  HKEY key = nullptr;
+  if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, KEY_READ, &key) == ERROR_SUCCESS) {
+    DWORD size = sizeof name - 1, type = 0;
+    if (RegQueryValueExA(key, "ProcessorNameString", nullptr, &type, (LPBYTE)name, &size) != ERROR_SUCCESS || type != REG_SZ) std::strcpy(name, "?");
+    name[sizeof name - 1] = 0;
+    size = sizeof rated;
+    RegQueryValueExA(key, "~MHz", nullptr, &type, (LPBYTE)&rated, &size);
+    RegCloseKey(key);
+  }
+  const char* trimmed = name;
+  while (*trimmed == ' ') ++trimmed;
+  std::string out = std::string("cpu (") + when + "): " + trimmed;
+  if (rated) out += ", rated " + std::to_string(rated) + " MHz";
+  // powrprof.dll at run time: the game links nothing more for one log line.
+  struct ProcessorPower { ULONG number, max_mhz, current_mhz, mhz_limit, max_idle, current_idle; };
+  using CallNtPower = LONG(WINAPI*)(int, void*, ULONG, void*, ULONG);
+  using ActiveScheme = DWORD(WINAPI*)(HKEY, GUID**);
+  using FriendlyName = DWORD(WINAPI*)(HKEY, const GUID*, const GUID*, const GUID*, UCHAR*, DWORD*);
+  if (HMODULE power = LoadLibraryW(L"powrprof.dll")) {
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    std::vector<ProcessorPower> cores(si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 1);
+    auto call = (CallNtPower)GetProcAddress(power, "CallNtPowerInformation");
+    if (call && call(11 /* ProcessorInformation */, nullptr, 0, cores.data(), (ULONG)(cores.size() * sizeof(ProcessorPower))) == 0) {
+      ULONG now = 0, limit = 0;
+      for (const ProcessorPower& c : cores) { now = std::max(now, c.current_mhz); limit = std::max(limit, c.mhz_limit); }
+      out += ", now " + std::to_string(now) + " MHz, limit " + std::to_string(limit) + " MHz";
+    }
+    auto active = (ActiveScheme)GetProcAddress(power, "PowerGetActiveScheme");
+    auto friendly = (FriendlyName)GetProcAddress(power, "PowerReadFriendlyName");
+    GUID* scheme = nullptr;
+    if (active && friendly && active(nullptr, &scheme) == ERROR_SUCCESS && scheme) {
+      wchar_t plan[128] = {};
+      DWORD bytes = sizeof plan - sizeof(wchar_t);
+      if (friendly(nullptr, scheme, nullptr, nullptr, (UCHAR*)plan, &bytes) == ERROR_SUCCESS) {
+        char narrow[256] = {};
+        WideCharToMultiByte(CP_UTF8, 0, plan, -1, narrow, sizeof narrow - 1, nullptr, nullptr);
+        out += std::string(", power plan ") + narrow;
+      }
+      LocalFree(scheme);
+    }
+    FreeLibrary(power);
+  }
+  SYSTEM_POWER_STATUS status{};
+  if (GetSystemPowerStatus(&status)) {
+    if (status.ACLineStatus == 0) {
+      out += ", on battery";
+      if (status.BatteryLifePercent <= 100) out += " (" + std::to_string(status.BatteryLifePercent) + "%)";
+    } else if (status.ACLineStatus == 1) {
+      out += status.BatteryFlag == 128 ? ", mains power (no battery)" : ", plugged in";
+    }
+    if (status.SystemStatusFlag & 1) out += ", Windows battery saver on";
+  }
+  return out;
+}
+#endif
 
 // Reports that end in "bad allocation" or 8007000E said nothing about memory: the size of this
 // process and what Windows still had, logged now and then, tell a leak from a full machine.
@@ -228,8 +336,35 @@ static std::atomic<bool> g_process_ending{false};
 void set_process_ending() { g_process_ending.store(true); }
 bool process_ending() { return g_process_ending.load(); }
 
+// die() is ending the process: a crash, an abort or a lost device. The caches are not flushed then
+// (the device may be gone, and an abort may hold the very locks a flush takes), and the savers are
+// frozen (no save starts or renames a file from then on); what they already wrote stays.
+static std::atomic<bool> g_dying{false};
+
+static std::mutex g_file_writes_mutex;
+static std::condition_variable g_file_writes_done;
+static int g_file_writes = 0;
+void file_write_begin() { std::lock_guard<std::mutex> lock(g_file_writes_mutex); ++g_file_writes; }
+void file_write_end() {
+  { std::lock_guard<std::mutex> lock(g_file_writes_mutex); --g_file_writes; }
+  g_file_writes_done.notify_all();
+}
+void mark_dying() { g_dying.store(true); }
+
+void wait_file_writes(unsigned max_ms) {
+  if (g_dying.load() && max_ms > 2000u) max_ms = 2000u;   // a crashing process never waits 20 s for a replay
+  std::unique_lock<std::mutex> lock(g_file_writes_mutex);
+  g_file_writes_done.wait_for(lock, std::chrono::milliseconds(max_ms), [] { return g_file_writes <= 0; });
+}
+
 [[noreturn]] void end_process(int code) {
+  // A replay still being written is kept (upstream 0.9.110); a dying process waits less for it.
+  wait_file_writes();   // 2 s once dying (wait_file_writes caps it)
   set_process_ending();
+  // The shader and pipeline caches are saved as the game runs; this writes whatever is still new
+  // (bounded) so a process ended here never makes the next start compile again. Nothing to do when
+  // the renderer is already gone (its destructor saved).
+  if (!g_dying.load()) ::gx::cache_store::flush_all("exit", std::chrono::milliseconds(1500));
   log_flush();
   std::fflush(nullptr);
   TerminateProcess(GetCurrentProcess(), (UINT)code);
@@ -240,6 +375,8 @@ static void (*g_die_hook)(const char*) = nullptr;
 void set_die_hook(void (*hook)(const char*)) { g_die_hook = hook; }
 
 [[noreturn]] void die(const char* fmt, ...) {
+  ::gx::cache_store::freeze();
+  g_dying.store(true);
   log_flush();
   va_list ap; va_start(ap, fmt);
   std::fprintf(stderr, "\nFATAL: ");
@@ -1073,6 +1210,13 @@ void boot_setup() {
   // then served by file identity, so a larger mod never aliases the next physical ISO file.
   cosmetics::apply_to_fst(ptr(fst_addr, g_fst_size), g_fst_size);
   cosmetics::set_online_probe([] { return ram != nullptr && rd8(0x80479D30) == 8; });
+  // The buttons held on the four controllers (the game's pad copy, 0x44 bytes a port): a disc with
+  // alternate stages picks by them as a match starts, as its own stage code does.
+  cosmetics::set_stage_button_probe([]() -> uint32_t {
+    uint32_t held = 0;
+    if (ram) for (uint32_t port = 0; port < 4; ++port) held |= rd32(0x804C20BCu + port * 0x44u);
+    return held;
+  });
   wr32(0x80000038, fst_addr);
   g_fst_addr = fst_addr;
   wr32(0x8000003C, g_fst_max);
@@ -1160,6 +1304,8 @@ void request_restart() {
   wchar_t exe[MAX_PATH];
   if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) { log("restart: cannot find this executable"); return; }
   std::wstring cmd = GetCommandLineW();
+  // The replacement reads the shader and pipeline caches as it starts: write them first.
+  ::gx::cache_store::flush_all("relaunch", std::chrono::milliseconds(3000));
   STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
   // The new process must not inherit the window or the adapter, so it waits for this one to go.
   if (!CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
@@ -1169,6 +1315,69 @@ void request_restart() {
   CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
   log("restart: relaunched, shutting down this instance");
   request_exit(0);
+}
+// Splits a Windows command line the way the C runtime does: spaces outside quotes separate, 2n
+// backslashes before a quote are n backslashes and a quote that toggles, 2n+1 are n and a literal quote.
+static std::vector<std::wstring> split_command_line(const std::wstring& line) {
+  std::vector<std::wstring> out;
+  size_t i = 0;
+  while (i < line.size()) {
+    while (i < line.size() && (line[i] == L' ' || line[i] == L'\t')) ++i;
+    if (i >= line.size()) break;
+    std::wstring arg;
+    bool quoted = false;
+    while (i < line.size() && (quoted || (line[i] != L' ' && line[i] != L'\t'))) {
+      size_t slashes = 0;
+      while (i < line.size() && line[i] == L'\\') { ++slashes; ++i; }
+      if (i < line.size() && line[i] == L'"') {
+        arg.append(slashes / 2, L'\\');
+        if (slashes % 2) arg += L'"'; else quoted = !quoted;
+        ++i;
+      } else {
+        arg.append(slashes, L'\\');
+        if (i < line.size() && (quoted || (line[i] != L' ' && line[i] != L'\t'))) arg += line[i++];
+      }
+    }
+    out.push_back(arg);
+  }
+  return out;
+}
+static std::wstring quote_argument(const std::wstring& arg) {
+  std::wstring out = L"\"";
+  size_t slashes = 0;
+  for (const wchar_t ch : arg) {
+    if (ch == L'\\') { ++slashes; continue; }
+    if (ch == L'"') { out.append(slashes * 2 + 1, L'\\'); out += L'"'; }
+    else { out.append(slashes, L'\\'); out += ch; }
+    slashes = 0;
+  }
+  out.append(slashes * 2, L'\\');
+  return out + L"\"";
+}
+bool restart_with_mod_looks() {
+  if (!g_mod_disc || g_mod_clean || options.mod_base_iso.empty()) return false;
+  wchar_t exe[MAX_PATH];
+  if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) { log("restart: cannot find this executable"); return false; }
+  const std::vector<std::wstring> args = split_command_line(GetCommandLineW());
+  if (args.empty()) return false;
+  std::wstring cmd = quote_argument(args[0]);
+  for (size_t i = 1; i < args.size(); ++i) {
+    if ((args[i] == L"--iso" || args[i] == L"--mod-base-iso" || args[i] == L"--look-iso") && i + 1 < args.size()) { ++i; continue; }
+    cmd += L" " + quote_argument(args[i]);
+  }
+  cmd += L" --iso " + quote_argument(std::filesystem::u8path(options.mod_base_iso).wstring()) +
+         L" --look-iso " + quote_argument(std::filesystem::u8path(options.iso).wstring());
+  // The new copy reads the shader and pipeline caches as it starts: write them first (as request_restart).
+  ::gx::cache_store::flush_all("relaunch", std::chrono::milliseconds(3000));
+  STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
+  if (!CreateProcessW(exe, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+    log("restart: CreateProcess failed, error %lu", (unsigned long)GetLastError());
+    return false;
+  }
+  CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+  log("restart: starting the standard game with this mod's looks for Unranked and Party; shutting down this instance");
+  request_exit(0);
+  return true;
 }
 int exit_code() { return g_exit_code.load(); }
 uint32_t retrace_count() { return g_retraces; }
@@ -1186,6 +1395,10 @@ void (*native_state_snapshot)(MuStatePod*) = nullptr;
 bool retrace_due() { return cpu->tb >= g_next_retrace_tb && !g_in_retrace; }
 uint64_t next_retrace_tb() { return g_next_retrace_tb; }
 void advance_time(uint64_t ticks) { cpu->tb += ticks; }
+void shift_time(uint64_t ticks) {
+  cpu->tb += ticks; g_next_retrace_tb += ticks;   // the retrace keeps its phase in the frame
+  hle::audio_shift(ticks);
+}
 static void advance_frame() {
   if (cpu->tb < g_next_retrace_tb) cpu->tb = g_next_retrace_tb;   // idle: jump to the boundary
   g_next_retrace_tb += TB_PER_FRAME;
@@ -1218,6 +1431,17 @@ static void validate_alarm_queue(const char* where);
 // Set when the game hands over the frame's picture (the display copy): from then until the retrace it
 // is only waiting, so its polls may wait for real time without delaying any game work.
 static bool g_frame_submitted = false;
+std::function<void()> capture_native_boot_clock() {
+  const auto tb = cpu->tb, next = g_next_retrace_tb;
+  const auto retraces = g_retraces;
+  return [=] {
+    cpu->tb = tb; g_next_retrace_tb = next; g_retraces = retraces;
+    g_profiler_frame.store(retraces);
+    g_next_frame = std::chrono::steady_clock::now();
+    g_in_retrace = false; g_in_interrupt = false; g_frame_submitted = false;
+    g_completions.clear(); g_pe_finish_pending = false; g_pe_token_pending = false;
+  };
+}
 void note_frame_submitted() { g_frame_submitted = true; }
 
 // The game's own stack (64 KB on the console) running past its end. Calls that deep also run this
@@ -1399,6 +1623,10 @@ std::atomic<int> g_game_language{0};
 std::atomic<bool> g_cpu_20xx{false};   // "20XX CPUs", see hackpack_ai.cpp
 std::atomic<bool> g_freeze_fd{false};   // "Freeze Final Destination", see apply_freeze_final_destination
 std::atomic<bool> g_hide_ko_explosions{false};   // "Hide KO explosions", see apply_ko_explosions
+std::atomic<bool> g_stage_file_modded{false};
+std::atomic<bool> g_stage_water{false};
+std::atomic<bool> g_hide_hud_emblems{false};   // "Hide emblems behind percents", see apply_hud_emblems
+std::atomic<uint32_t> g_community_codes{0};       // "Community codes", MU_DISPLAY_OPTION_CODES_ALL bits
 int game_language_override() {
   const int choice = g_game_language.load(std::memory_order_relaxed);
   return choice == 1 ? 0 : choice == 2 ? 1 : -1;
@@ -1547,6 +1775,127 @@ void install_low_poly_fighters() {
     ppc::set_hook(kPartsShow, nullptr);   // never leave a hook with nothing to call behind it
     log("low poly: the fighter parts function has no dispatch entry; the option has no effect");
   }
+}
+// A costume from a look or a skin (Diet Melee 64's in a 0.9.106 report) can lack a texture animation
+// that the fighter's data lists for its costume textures (the eyes): the game stopped with "can't
+// find fighter texture anim!" (OSPanic at ftanim.c:1236). That setup is ftAnim_80070200, which the
+// game's own compiler also built into ftAnim_80070308 (the fighter's animation setup at every load),
+// so both run here instead, as the Source Port's does: the list of animated costume textures ends at
+// the first one without an animation, and those textures stay still. Display only; with retail files
+// it does what the game does. Offsets are the console's: Fighter +0x4 kind, +0x10C ft_data, +0x5CC
+// CostumeTObjList {count, texture ids, 5 TObjs}, +0x5EC DObjList, +0x619 costume; ftData +0x8 -> +0x8
+// {count, per-costume id lists}; HSD_TObj +0x64 aobj; HSD_AObj +0x10 rate.
+static void costume_texture_list(ppc::Context& c, uint8_t* m, uint32_t fp, uint32_t data, uint32_t list, uint32_t dobjs) {
+  constexpr uint32_t kCostumeTObj = 0x80075240u;   // ftParts_80075240(DObjList*, int): the n-th TObj
+  static bool told_missing = false, told_over = false;
+  uint32_t count = rd32(data);
+  if (count > 5) {   // the game's own "fighter tobj num over!" (ftanim.c:1228): the list holds five
+    if (!told_over) { told_over = true; log("fighters: a costume lists %u animated textures; the first 5 animate", count); }
+    count = 5;
+  }
+  const uint32_t table = rd32(data + 4);
+  uint32_t ids = rd32(table + 4u * rd8(fp + 0x619));
+  if (ids == 0) ids = rd32(table);
+  wr32(list, count);
+  wr32(list + 4, ids);
+  for (uint32_t i = 0; i < count; ++i) {
+    c.r[3] = dobjs;
+    c.r[4] = rd16(ids + 2 * i);
+    c.lr = 0;
+    ppc::call(c, m, kCostumeTObj);
+    const uint32_t tobj = c.r[3];
+    wr32(list + 8 + 4 * i, tobj);
+    const uint32_t aobj = tobj ? rd32(tobj + 0x64) : 0;
+    if (aobj == 0) {
+      wr32(list, i);
+      if (!told_missing) { told_missing = true; log("fighters: a costume has no animation for one of its animated textures; it stays still"); }
+      break;
+    }
+    wr32(aobj + 0x10, 0);   // HSD_AObjSetRate(aobj, 0.0F)
+  }
+}
+// The host functions below make a frame of their own below the caller's, back-chained, for the
+// calls they make (as call_guest does), and give back r1 and LR as the guest function would.
+static void costume_texture_anims(ppc::Context& c, uint8_t* m) {   // ftAnim_80070200(fp, data, list, dobjs)
+  const uint32_t fp = c.r[3], data = c.r[4], list = c.r[5], dobjs = c.r[6];
+  const uint32_t return_lr = c.lr, saved_r1 = c.r[1];
+  c.r[1] = (saved_r1 - 0x40u) & ~7u;
+  wr32(c.r[1], saved_r1);
+  costume_texture_list(c, m, fp, data, list, dobjs);
+  c.r[1] = saved_r1;
+  c.lr = return_lr;
+}
+static void fighter_anim_setup(ppc::Context& c, uint8_t* m) {   // ftAnim_80070308(gobj)
+  constexpr uint32_t kCostumeLists = 0x803C0EC0u;   // CostumeListsForeachCharacter: {costume list, count} per kind
+  constexpr uint32_t kJObjAddAnimAll = 0x8036FB5Cu, kJObjReqAnimAll = 0x8036F8BCu;
+  const uint32_t gobj = c.r[3];
+  const uint32_t return_lr = c.lr, saved_r1 = c.r[1];
+  const uint32_t fp = rd32(gobj + 0x2C), jobj = rd32(gobj + 0x28);
+  c.r[1] = (saved_r1 - 0x40u) & ~7u;
+  wr32(c.r[1], saved_r1);
+  // HSD_JObjAddAnimAll(jobj, NULL, the costume's material animation joint, NULL)
+  const uint32_t costume = rd32(kCostumeLists + 8u * rd32(fp + 4)) + 24u * rd8(fp + 0x619);
+  c.r[3] = jobj; c.r[4] = 0; c.r[5] = rd32(costume + 4); c.r[6] = 0;
+  c.lr = 0;
+  ppc::call(c, m, kJObjAddAnimAll);
+  // HSD_JObjReqAnimAll(jobj, the game's 0.0F constant)
+  c.r[3] = jobj;
+  c.f[1].ps0 = c.f[1].ps1 = ppc::float_bits_to_double(rd32(c.r[2] - 30532u));
+  c.lr = 0;
+  ppc::call(c, m, kJObjReqAnimAll);
+  costume_texture_list(c, m, fp, rd32(rd32(fp + 0x10C) + 8) + 8, fp + 0x5CC, fp + 0x5EC);
+  c.r[1] = saved_r1;
+  c.lr = return_lr;
+}
+// Then the game animates those textures by index (ftAnim_80070458, and the same built into
+// ftAnim_800704F0): an index past the shortened list stopped it with "texture no exist!"
+// (ftanim.c:1264). As in the Source Port, that texture stays still and the rest runs as before.
+static void costume_tobj_anim(ppc::Context& c, uint8_t* m, uint32_t tobj, const ppc::FPR& frame) {
+  c.r[3] = rd32(tobj + 0x64);   // HSD_AObjReqAnim(tobj->aobj, frame)
+  c.f[1] = frame;
+  c.lr = 0;
+  ppc::call(c, m, 0x8036410Cu);
+  c.r[3] = tobj;                // HSD_TObjAnim(tobj)
+  c.lr = 0;
+  ppc::call(c, m, 0x8035EB6Cu);
+}
+static void costume_texture_frame(ppc::Context& c, uint8_t* m) {   // ftAnim_80070458(fp, list, index, frame)
+  const uint32_t list = c.r[4], index = c.r[5];
+  const ppc::FPR frame = c.f[1];
+  const uint32_t return_lr = c.lr, saved_r1 = c.r[1];
+  if (index < rd32(list)) {
+    c.r[1] = (saved_r1 - 0x40u) & ~7u;
+    wr32(c.r[1], saved_r1);
+    costume_tobj_anim(c, m, rd32(list + 8 + 4 * index), frame);
+    c.r[1] = saved_r1;
+  }
+  c.lr = return_lr;
+}
+static void fighter_texture_frame(ppc::Context& c, uint8_t* m) {   // ftAnim_800704F0(gobj, index, frame)
+  constexpr uint32_t kTextureCallbacks = 0x803C2258u;   // ftData_UnkCallbackPairs0: {x0, x4} per kind
+  const uint32_t gobj = c.r[3], index = c.r[4];
+  const ppc::FPR frame = c.f[1];
+  const uint32_t return_lr = c.lr, saved_r1 = c.r[1];
+  const uint32_t fp = rd32(gobj + 0x2C);
+  c.r[1] = (saved_r1 - 0x40u) & ~7u;
+  wr32(c.r[1], saved_r1);
+  if (index < rd32(fp + 0x5CC)) costume_tobj_anim(c, m, rd32(fp + 0x5D4 + 4 * index), frame);
+  const uint32_t callback = rd32(kTextureCallbacks + 8u * rd32(fp + 4) + 4);
+  if (callback != 0) {
+    c.r[3] = gobj; c.r[4] = index; c.f[1] = frame;
+    c.lr = 0;
+    ppc::call(c, m, callback);
+  }
+  wr8(fp + 0x221E, (uint8_t)(rd8(fp + 0x221E) | 1));   // fp->x221E_b7 = true
+  c.r[1] = saved_r1;
+  c.lr = return_lr;
+}
+void install_costume_texture_anims() {
+  const bool list = ppc::redirect_to_host(0x80070200u, costume_texture_anims);
+  const bool setup = ppc::redirect_to_host(0x80070308u, fighter_anim_setup);
+  const bool frame = ppc::redirect_to_host(0x80070458u, costume_texture_frame);
+  const bool fighter_frame = ppc::redirect_to_host(0x800704F0u, fighter_texture_frame);
+  if (!list || !setup || !frame || !fighter_frame) log("fighters: the costume texture setup keeps the game's own code");
 }
 // MELEE_TEST_ADVENTURE_SCENE=<decimal scene id> (tests only, Static Recomp): Adventure starts at
 // that scene (stage * 8 + part: 25 is the Zelda fight, 33 the Kirby team), as the Source Port's hook
@@ -1820,6 +2169,27 @@ void spawn_ko_explosion(ppc::Context& c, uint8_t* m) {
   wr32(pos + 4, y);   // the death goes on with its own position
 }
 }  // namespace
+// "Hide emblems behind percents" on the Static Recomp. The emblem's draw (ifStatus_802F5E50) is a
+// GX link callback, reached only through the dispatch table: while the option is on it draws
+// nothing. The emblem is still made and animated, as on the Source Port (if/ifstatus.c).
+namespace {
+ppc::Fn g_hud_emblem_draw = nullptr;
+void draw_hud_emblem(ppc::Context& c, uint8_t* m) {
+  if (g_hide_hud_emblems.load(std::memory_order_relaxed)) return;
+  g_hud_emblem_draw(c, m);
+}
+}  // namespace
+void apply_hud_emblems() {
+  constexpr uint32_t kEmblemDraw = 0x802F5E50u;
+  if (g_hud_emblem_draw || !ram || !g_hide_hud_emblems.load(std::memory_order_relaxed)) return;
+  if (!try_ptr(kEmblemDraw, 4) || rd32(kEmblemDraw) != 0x7C0802A6u) {   // mflr r0: the game's own function
+    static bool logged = false;
+    if (!logged) { logged = true; log("hud: the emblem draw is not the original game's; emblems stay"); }
+    return;
+  }
+  g_hud_emblem_draw = ppc::set_hook(kEmblemDraw, draw_hud_emblem);   // null: the table is not ready yet, next frame
+  if (g_hud_emblem_draw) log("hud: emblems behind percents hidden");
+}
 void apply_ko_explosions() {
   static bool live = false, ours[4] = {};
   if (!ram) return;
@@ -1990,6 +2360,10 @@ void report_object_memory();
 // The last files a mod disc's game asked for by name: the heap stop's report prints them, so it
 // names the fighters and the stage that were being loaded.
 static char g_recent_files[12][24];
+// The last file the game asked for that this disc does not have (empty when none): a stop in lbfile
+// right after it is the game finding no such file, so the crash names it.
+static char g_missing_file[64];
+const char* last_missing_file() { return g_missing_file; }
 static uint32_t g_recent_file_count = 0;
 static void note_file_asked(const char* path) {
   const char* slash = std::strrchr(path, '/');
@@ -2044,6 +2418,12 @@ void dvd_convert_path_checked(ppc::Context& c, uint8_t*) {
       static bool told = false;
       if (!told && entry >= 0) { told = true; log("mods: the game asked for a movie this disc does not have (%s); another movie plays in its place", base); }
     }
+    if (entry < 0) {
+      std::strncpy(g_missing_file, base, sizeof g_missing_file - 1);
+      g_missing_file[sizeof g_missing_file - 1] = 0;
+    }
+  } else {
+    g_missing_file[0] = 0;   // only the newest lookup counts
   }
   c.r[3] = (uint32_t)entry;
 }
@@ -2549,6 +2929,63 @@ void agent_test_digest_state(MuStatePod* out) {
 }
 #endif
 
+#if MU_SQUAD
+// Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+// Only the squad/local-peer command interceptor calls this. No test hook needed.
+static FILE* g_squad_confirmed = nullptr;
+static FILE* g_squad_presented_frontier = nullptr;
+static FILE* g_squad_late = nullptr;
+static squad_digest::Pending g_squad_pending;
+static int32_t g_squad_body = -1, g_squad_frontier = -1;
+static uint32_t g_squad_match_frame = 0, g_squad_late_same = 0, g_squad_late_unknown = 0;
+void squad_digest_observe(int32_t body, int32_t frontier, bool ending) {
+  if (!g_state_digest || !native_state_snapshot) return;
+  if (!g_squad_confirmed) {
+    g_squad_confirmed = std::fopen((options.state_digest + ".confirmed.csv").c_str(), "w");
+    g_squad_presented_frontier = std::fopen((options.state_digest + ".presented-frontier.csv").c_str(), "w");
+    g_squad_late = std::fopen((options.state_digest + ".late.csv").c_str(), "w");
+    if (!g_squad_confirmed || !g_squad_presented_frontier || !g_squad_late) die("cannot open squad digest");
+    squad_digest::header(g_squad_confirmed);
+    std::fprintf(g_squad_presented_frontier, "frame,match_frame,body_frame,confirmed_frontier\n");
+    squad_digest::late_header(g_squad_late);
+    std::fflush(g_squad_late);
+  }
+  if (!ending) {
+    MuStatePod state{};
+    read_digest_state(state); // exactly the presented digest's source, no new state fields
+    squad_digest::LateRow late{};
+    switch (g_squad_pending.sample(body, g_retraces, state, &late)) {
+    case squad_digest::Late::none: break;
+    case squad_digest::Late::same: ++g_squad_late_same; break; // e.g. a selftest rollback
+    case squad_digest::Late::unknown: ++g_squad_late_unknown; break;
+    case squad_digest::Late::different:
+      squad_digest::write_late(g_squad_late, late);
+      std::fflush(g_squad_late);
+      log("squad digest: confirmed body %d (match frame %u) re-simulated with a different state", late.body,
+          late.confirmed_match_frame);
+      break;
+    }
+    g_squad_match_frame = state.match_frame;
+    g_squad_body = body;
+  }
+  // Received inputs are not enough until their rollback has actually run. During
+  // catch-up publish only through this completed body, after replacing its row.
+  g_squad_frontier = std::min(body, frontier);
+  g_squad_pending.confirm(g_squad_frontier, [](const squad_digest::Row& row) {
+    squad_digest::write(g_squad_confirmed, row);
+  });
+  std::fflush(g_squad_confirmed);
+  if (ending) {
+    g_squad_pending.discard_tail(); // never promote an unconfirmed tail
+    g_squad_body = -1; // menu retraces can retain the VS counter; they are not match presentations
+    g_squad_match_frame = 0;
+    log("squad digest: %u late resims with the same state, %u beyond the kept window",
+        g_squad_late_same, g_squad_late_unknown);
+    log("squad digest: %u new bodies on a held match frame", g_squad_pending.held());
+  }
+}
+#endif
+
 static void digest_state() {
   if (!g_state_digest) return;
   MuStatePod state{};
@@ -2568,6 +3005,15 @@ static void digest_state() {
   }
   std::fputc('\n', g_state_digest);
   std::fflush(g_state_digest);
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  // A separate sidecar preserves the presented CSV schema for all existing tools.
+  if (g_squad_presented_frontier && state.match_frame == g_squad_match_frame && state.match_frame) {
+    std::fprintf(g_squad_presented_frontier, "%u,%u,%d,%d\n", g_retraces, state.match_frame,
+                 g_squad_body, g_squad_frontier);
+    std::fflush(g_squad_presented_frontier);
+  }
+#endif
 }
 
 // A local mailbox only. The launcher owns network presence and authentication; the simulation
@@ -2645,6 +3091,7 @@ void publish_lobby_result(int winner_index, int end_method, int lras, const uint
     end.characters[1] = facts.characters[1];
     end.rng = facts.rng;
     for (int i = 0; i < 4; ++i) end.teams[i] = facts.teams[i];
+    end.gone = slippi::online::disconnected_ports();   // the netcode's own call: ranked as forfeits, never left out
     yougame::game_ended(end);
   }
   const auto& cfg = slippi::online::config();
@@ -2733,6 +3180,7 @@ void report_sim_work() {
       t.work.mean(), t.work.p99(), t.work.maximum, (unsigned long long)t.work.count,
       t.step.mean(), t.step.p99(), t.mean(perf::Stage::Decode), t.mean(perf::Stage::Submit),
       t.mean(perf::Stage::Input), t.mean(perf::Stage::Wait), (unsigned long long)t.resim_frames);
+  log("%s", cpu_power_line("at the end").c_str());
 }
 double last_sim_frame_work_ms() { return g_last_sim_work_ms; }
 bool last_sim_frame_late() { return g_last_sim_late; }
@@ -2824,6 +3272,9 @@ static void sleep_probe_start() {
     }).detach();
   });
 }
+static std::atomic<double> g_game_rate{0.0};
+void set_game_rate(double hz) { g_game_rate.store(hz, std::memory_order_relaxed); }
+double game_rate() { return g_game_rate.load(std::memory_order_relaxed); }
 double sleep_slack() {
   sleep_probe_start();
   return coarse_sleep_test() == 2 ? 0.0 : g_sleep_slack.load(std::memory_order_relaxed);
@@ -2938,6 +3389,11 @@ bool wait_until_console_time(uint64_t tb) {
 void retrace() {
   if (!perf::active) perf::active = &perf::sim_timer;
   struct Guard { Guard() { g_in_retrace = true; } ~Guard() { g_in_retrace = false; } } guard;
+  // Tests: MELEE_TEST_GAME_LOAD_MS=<ms> adds that much work to every game frame, offline too: a PC whose
+  // CPU cannot step the game at 60 Hz (the pacing hold in threaded_backend.cpp).
+  static const double test_load_ms = [] { const char* v = host::test_env::getenv("MELEE_TEST_GAME_LOAD_MS"); return v ? std::atof(v) : 0.0; }();
+  if (test_load_ms > 0.0)
+    for (const double until = now_seconds() + test_load_ms / 1000.0; now_seconds() < until;) {}
   g_frame_submitted = false;
   ++g_retraces;
   if (!native_retrace) apply_early_rng_seed();
@@ -3074,6 +3530,12 @@ void retrace() {
     gx_stats(&commands, &draws, &vertices, &copies);
     log("[frame %u] gx: %llu cmds %llu draws %llu verts %u efb-copies | disc: %llu reads %.1f MB | %s",
         g_retraces, commands, draws, vertices, copies, g_disc_reads, g_disc_bytes / 1048576.0, sim_cost_line(60).c_str());
+    if (draws) {
+      uint64_t dl_draws = 0, dl_vertices = 0;
+      gx::display_list_stats(&dl_draws, &dl_vertices);
+      log("[frame %u] gx sources: display lists %llu draws %llu verts, immediate %llu draws %llu verts",
+          g_retraces, dl_draws, dl_vertices, draws - dl_draws, vertices - dl_vertices);
+    }
     // Same-thread, fixed-frame reading of authored coverage: comparable between the two engines.
     if (const auto& a = gx::authored_stats(); a.posed_draws)
       log("[frame %u] authored coverage: posed draws %u (envelope %u), skinned draws %u",

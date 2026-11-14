@@ -7,6 +7,11 @@
 #include <string>
 #include <vector>
 #include "native_online_policy.h"
+#if MU_SQUAD
+#include "squad_costume_rule.h"
+#endif
+
+namespace yougame::lobby { enum class Profile; }   // yougame_lobby_wire.h: Friends4, Doubles
 
 namespace slippi::online {
 
@@ -70,6 +75,26 @@ uint64_t rollback_count();
 constexpr int32_t kRollbackFrameUnknown = INT32_MIN;
 void note_rollback(int32_t to_frame = kRollbackFrameUnknown);
 bool is_online_match();
+#if MU_SQUAD
+// Squad Strike (squad_costume_rule.h). While an online squad match is set up (op 5 handed the game
+// its setup, until the next op 0 or 5 or the connection ends), a costume or Kirby hat path (lower
+// case, leading '/') has its fixed size and the standard copy checked in that match's final view;
+// false otherwise. The lookup opens squad_costume::pick of them. first_fallback is true once per
+// path per match (its log line). refuse cancels the match: a lookup found nothing within its size.
+// The copy finder gives a path's standard copy in the current view; a copy over its size refuses
+// the search (op 4) and the match (op 5).
+struct SquadCostume { squad_costume::Budget budget; squad_costume::Standard standard; };
+// console: a Friends console session runs; then Friends' synced select's copies apply while its
+// squads are in play (MU_SQUAD_OP_CONSOLE, armed by the game) and no online match is set up.
+bool squad_costume_rule(const std::string& path, SquadCostume* out, bool console);
+bool squad_costume_first_fallback(const std::string& path);
+void squad_costume_refuse(const std::string& path, bool mod);
+void set_squad_standard_copy(squad_costume::Standard (*copy)(const std::string& path));
+// Forgets Friends' armed costume rule and its logs: called when a console session begins or ends
+// (EngineHooks::session_edge) and on an in-process host reset. Any thread; the game thread applies
+// it before it next reads or changes the rule.
+void squad_console_reset();
+#endif
 // The in-game slot the local player occupies in the running online match (0-3).
 int local_player_slot();
 // The shield colour the opponent on in-game `slot` sent after connecting (0x1000000 | RGB), 0 none.
@@ -78,6 +103,8 @@ uint32_t remote_shield_color(int slot);
 std::array<std::string, 4> player_names_for_overlay();
 // Most recent measured round trip to the opponent, in milliseconds; 0 when not connected.
 int ping_ms();
+// Every other player's ping in a Slippi match (Teams: up to three), empty when there is none.
+std::vector<int> remote_pings_ms();
 // The online mode of the session that is running or being set up, as a Matchmaking::OnlinePlayMode
 // value (RANKED 0, YouGame mode only; UNRANKED 1, DIRECT 2, TEAMS 3, PARTY 4). -1 when there is no online session at
 // all, which is what "offline" means to the rest of the port. Covers matchmaking, the online
@@ -107,6 +134,26 @@ bool native_start_match(int mode, const std::string& connect_code, uint8_t chara
                         uint8_t color, std::string* error, const std::string& friend_room = {});
 NativeMatchPoll native_poll_match();
 void native_cleanup_match();
+// The 4-player Friends lobby (yougame_lobby.h, mode_policy::friends_lobby4): arms the 4-door select's lobby
+// and starts its search. room empty: the Friends row, which holds a new room (this player hosts); else an
+// accepted invite's room (a guest). The select then drives it through MU_LOBBY_COMMAND until B leaves it.
+void arm_friends_lobby(const std::string& room);
+// The same lobby on a profile: Doubles (G2) is the 2-seat home (me and a partner); its Start searches for
+// opponents through Rooms, and the 4-player match runs in its own room while the home stays parked.
+void arm_friends_lobby(const std::string& room, yougame::lobby::Profile profile);
+// The Doubles row asked for a new Doubles home (CMD_YOUGAME_FRIENDS_MENU 16): true once per press.
+bool take_doubles_lobby_request();
+bool friends_lobby_armed();
+// Another match takes over (a 1v1 friend invite accepted on the lobby's select): the lobby is let go
+// without its LEAVE, so the select's unload can't close the new connection (view.arm changed).
+void disarm_friends_lobby();
+// The Squad Strike row's "Play a friend" is waiting on the friend picker (it keeps the 1v1 friend room).
+bool squad_friend_intent();
+// Squad Strike in a friend room ("Play a friend" on the Squad Strike row). The room the friend
+// picker returned (picked) carries it; any other room joined clears it (picked = false).
+void squad_friend_room(const std::string& room, bool picked);
+// The friend picker closed without a room (cancelled, failed, refused, or left): Squad Strike off.
+void squad_friend_picker_closed();
 // The --online-test ranked harness: locks in the same character and colour again (a random legal
 // stage) for the set's next game, when a ranked pair is connected and not locked in. True if it did.
 bool native_ranked_next_game(uint8_t character, uint8_t color);
@@ -120,6 +167,8 @@ struct GameFacts {
   int64_t rng = -1;   // the match's rng offset: the same on both players' games
 };
 GameFacts last_game_facts();
+// Ports (bit per 0-based port) the netcode marked disconnected in the current or last match.
+unsigned disconnected_ports();
 // The character (and costume) the local player has picked on the online character select, false
 // when none is picked yet.
 bool local_css_selection(uint8_t* character, uint8_t* color);

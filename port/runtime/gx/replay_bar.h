@@ -18,6 +18,9 @@ bool active();
 // Everything the replay viewer draws hidden (for recording clips): H, B on the controller, or
 // "Clean replays" at the start. Every control keeps working.
 bool all_hidden();
+// The bar is on screen (the mouse moved, or no controller layer): the controller layer's own
+// timeline and buttons step aside, so the two never stack.
+bool shown();
 void toggle_hidden();
 
 }  // namespace replay_bar
@@ -26,6 +29,10 @@ void toggle_hidden();
 // stage select screen). Any thread may set it; the UI thread draws it.
 namespace screen_label {
 void draw_corner_hint(float width, float height, float game_aspect);
+// Bottom edge of the corner hint while it shows (0 when hidden), so notices can sit below it.
+float corner_hint_bottom();
+// The bottom-edge row's top this frame; toasts sit above it while it shows.
+void reserve_bottom(float top);
 void show(const char* text, double seconds);
 void draw(float width, float height, float game_aspect = 73.0f / 60.0f);
 }  // namespace screen_label

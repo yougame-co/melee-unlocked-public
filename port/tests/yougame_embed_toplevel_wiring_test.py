@@ -94,7 +94,7 @@ class ToplevelWiringTest(unittest.TestCase):
         self.assertNotIn('SetWindowPos', top)
         for path in ('port/app/main.cpp', 'port/runtime/gx/threaded_backend.cpp'):
             text = source(path)
-            self.assertRegex(text, r'#ifdef _WIN32\s*(?://[^\n]*\n\s*)?if \(yougame::embed_toplevel\(\)\) \w+\.exclusive_fullscreen = false;')
+            self.assertRegex(text, r'#ifdef _WIN32\s*(?://[^\n]*\n\s*)*if \(yougame::embedded\(\)\) \w+\.exclusive_fullscreen = false;')
         fullscreen = block(self.window, 'void window_set_fullscreen(')
         self.assertIn('if (yougame::embedded()) return;', fullscreen)
 
@@ -110,7 +110,8 @@ class ToplevelWiringTest(unittest.TestCase):
             text = source(f'port/runtime/gx/gx_{backend}.cpp')
             self.assertIn('synced, yougame::embed_toplevel());', text)
             fullscreen = block(text, '::apply_fullscreen_mode()')
-            self.assertIn('if (yougame::embed_toplevel()) opts_.exclusive_fullscreen = false;', fullscreen)
+            self.assertIn('if (yougame::embedded()) opts_.exclusive_fullscreen = false;', fullscreen)
+            self.assertNotIn('embed_toplevel()) opts_.exclusive_fullscreen', fullscreen)
 
     def test_focus_return_grants_only_the_pid_then_emits_then_logs(self):
         focus = block(self.window, 'void return_toplevel_focus(HWND h)')

@@ -133,6 +133,24 @@ struct Link : SessionLink {
   void pump(int ms) override { n.pump(ms); }
   std::optional<std::string> lost() const override { return {}; }
 };
+// Model-only callback transcript: this binary does NOT link mu_os.c/mu_vi.c, OSSetAlarm,
+// mu_poll, OSRestoreInterrupts or VIWaitForRetrace dispatch. Observe the existing rumble
+// wait adapter below; these entries are not evidence about production hardware callbacks.
+struct ModelCallback {
+  std::string handler;
+  int payload;
+  uint64_t ticks, offset; // logical time and position after this body's boundary
+  bool operator==(const ModelCallback& other) const {
+    return handler == other.handler && payload == other.payload &&
+        ticks == other.ticks && offset == other.offset;
+  }
+};
+struct CallbackAttempt {
+  int body;
+  uint64_t start;
+  bool replay;
+  std::vector<ModelCallback> entries; // delivery order, including duplicates; never overwritten
+};
 struct Context {
   Engine session; Bookkeeping online{}; State state; Network* network = nullptr;
   native_savestate::Engine snapshots;
@@ -143,6 +161,9 @@ struct Context {
   std::vector<uint8_t> audio_state;
   int voices = 0, keyoffs = 0, motors = 0, last_motor = 0, music = 0;
   bool slippi = false;
+  bool transcript = false;
+  unsigned pending_wait_loads = 0;
+  std::vector<CallbackAttempt> callbacks; // observation only: outside the snapshotted State
 };
 Pads issued_hardware(Context& c) {
   const auto frame = c.network && c.network->authoritative[c.session.config().my_port - 1].size() ==
@@ -204,7 +225,12 @@ bool load_state(int f) {
   u8 payload[32]{}; payload[0] = u32(f) >> 24; payload[1] = u32(f) >> 16;
   payload[2] = u32(f) >> 8; payload[3] = f;
   unsigned got = 0;
-  return ::mu_online_abi_command(0xB2, payload, sizeof payload, nullptr, 0, &got) == 0;
+  const bool loaded = ::mu_online_abi_command(0xB2, payload, sizeof payload, nullptr, 0, &got) == 0;
+  if (loaded && current->transcript && f == 1) {
+    CHECK(current->state.rumble_wait == 3); // registered before checkpoint, still pending on load
+    ++current->pending_wait_loads;
+  }
+  return loaded;
 }
 int mu_console_abi(int, unsigned, u8*, u8*, unsigned*, int*);
 static int console_pad_renew(PADStatus*);
@@ -218,8 +244,20 @@ void mu_console_replace_raw() {
 void mu_console_rumble_step() {
   // Active wait adapter: its state belongs to the real native checkpoints, not audio bookkeeping.
   auto& s = current->state;
+  auto record = [&](const char* handler, int payload) {
+    if (!current->transcript) return;
+    CHECK(!current->callbacks.empty());
+    auto& attempt = current->callbacks.back();
+    CHECK(attempt.body == s.engine.unk_0);
+    const auto ticks = current->session.clock_ticks();
+    attempt.entries.push_back({handler, payload, ticks, ticks - attempt.start});
+  };
+  record("model.rumble_step", s.rumble_wait);
   ++s.rumble_steps;
-  if (s.rumble_wait && !--s.rumble_wait) s.rumble_expired = s.engine.unk_0;
+  if (s.rumble_wait && !--s.rumble_wait) {
+    record("model.wait_expired", s.rumble_wait);
+    s.rumble_expired = s.engine.unk_0;
+  }
 }
 #include "../../sourceport/game/shim/mu_console_rollback.inc"
 int mu_console_abi(int op, unsigned body, u8* local, u8* rxb, unsigned* epoch, int* port) {
@@ -261,7 +299,10 @@ int32_t host_call(int32_t op, uint32_t body, MuConsoleInputs* out) {
     }
     return e.inputs(body, false, *out);
   case MU_CONSOLE_VALIDATED: return e.validated(body);
-  case MU_CONSOLE_BOUNDARY: return e.boundary(body, diagnostic(c.state, true));
+  case MU_CONSOLE_BOUNDARY:
+    if (!e.boundary(body, diagnostic(c.state, true))) return 0;
+    if (c.transcript) c.callbacks.push_back({int(body), e.clock_ticks(), c.phase, {}});
+    return 1;
   case MU_CONSOLE_BODY_END: return e.finish_body(body);
   case MU_CONSOLE_CONFIRM: return e.confirm(body) && e.inputs(body, false, *out);
   case MU_CONSOLE_COMMIT:
@@ -379,6 +420,49 @@ void hash_logs(Network& net, Context& a, Context& b) {
     }
   }
 }
+void callback_transcripts(Context& a, Context& b, int bodies, int depth) {
+  std::map<int, const CallbackAttempt*> original;
+  for (const auto& attempt : b.callbacks)
+    original.emplace(attempt.body, &attempt); // first B execution; all later attempts checked below
+  CHECK(original.size() == size_t(bodies));
+  auto dump = [](const char* label, const CallbackAttempt& attempt) {
+    std::cerr << label << " body " << attempt.body << (attempt.replay ? " replay" : " forward") << '\n';
+    for (size_t i = 0; i < attempt.entries.size(); ++i) {
+      const auto& entry = attempt.entries[i];
+      std::cerr << "  position " << i << " handler " << entry.handler << " payload " << entry.payload
+                << " logical ticks " << entry.ticks << " offset " << entry.offset << '\n';
+    }
+    if (attempt.entries.empty()) std::cerr << "  <no deliveries>\n";
+  };
+  for (auto* c : {&a, &b}) {
+    CHECK(std::count_if(c->callbacks.begin(), c->callbacks.end(), [](const auto& attempt) {
+      return attempt.replay;
+    }) == c->online.resim_frames);
+    for (const auto& attempt : c->callbacks) {
+      const auto& expected = *original.at(attempt.body);
+      if (attempt.entries != expected.entries) {
+        std::cerr << "model callback transcript mismatch, depth " << depth << " seat "
+                  << c->session.config().my_port << '\n';
+        dump("original B", expected); dump("actual", attempt);
+      }
+      CHECK(attempt.entries == expected.entries);
+      // A load must replay the pending wait, with one delivery at body 3 in EACH timeline.
+      // Raw re-executions are retained above, not collapsed into a last-write-wins map.
+      CHECK(attempt.entries.size() == size_t(attempt.body == 3 ? 2 : 1));
+      CHECK(attempt.entries.front().handler == "model.rumble_step");
+      CHECK(attempt.entries.front().offset == 0);
+      if (attempt.body == 3) {
+        CHECK(attempt.entries.back().handler == "model.wait_expired");
+        CHECK(attempt.entries.back().payload == 0 && attempt.entries.back().offset == 0);
+      }
+    }
+  }
+  CHECK(a.pending_wait_loads > 0); // forced checkpoint 1 restores the wait scheduled before it
+  CHECK(a.callbacks.size() > size_t(bodies)); // comparisons include repeated simulation bodies
+  std::cout << "model callback transcript: " << bodies << " bodies, " << a.callbacks.size() << "/"
+            << b.callbacks.size() << " forward/replay attempts equal; pending wait delivered once at body 3\n";
+  a.transcript = b.transcript = false;
+}
 void boundary_race(bool replay_race) {
   ++cases;
   Network net; net.origin = 0; net.race = true; net.race_replay = replay_race;
@@ -426,6 +510,7 @@ void run(int depth, bool noisy = false, bool over_horizon = false, bool missing 
   ++cases;
   Network net; net.depth = depth; net.noisy = noisy; net.over_horizon = over_horizon;
   Context a, b;
+  a.transcript = b.transcript = true;
   a.missing = missing;
   MuHostApi api{}; api.version = MU_HOST_API_VERSION; api.console_rollback = host_call;
   set_test_console_host(&api);
@@ -491,6 +576,7 @@ void run(int depth, bool noisy = false, bool over_horizon = false, bool missing 
   CHECK(a.session.clock_ticks() == b.session.clock_ticks());
   CHECK(a.session.retrace_count() == b.session.retrace_count());
   CHECK(a.session.alarm_ticks() != b.session.alarm_ticks());
+  callback_transcripts(a, b, bodies, depth);
   CHECK(a.online.loads > 0 && a.online.mispredictions > 0 && a.online.resim_frames > 0);
   CHECK(a.phases == int(a.online.loads)); CHECK(a.samples == bodies && b.samples == bodies);
   CHECK(a.online.max_depth <= 7); CHECK(a.snapshots.stats().missing_loads == 0);

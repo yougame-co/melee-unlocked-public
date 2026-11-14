@@ -20,6 +20,8 @@ def source(path):
     return (ROOT / path).read_text(encoding="utf-8-sig")
 
 
+# Melee Unlocked 1.0: these sites follow yougame::session() (an app session, or a YouGame row
+# picked under the launcher), not the app-only yougame::active().
 class YouGame0965MergeTest(unittest.TestCase):
     def test_merge_boundaries_have_no_markers(self):
         for path in CONFLICTED:
@@ -31,7 +33,7 @@ class YouGame0965MergeTest(unittest.TestCase):
         prepare = function(online, "prepare_online_match_state")
         gate = re.search(r"if\s*\(([^{};]*?)\)\s*\{\s*std::string version_error;", prepare)
         self.assertIsNotNone(gate)
-        for condition in ("local_ready", "remote_ready", "!yougame::active()",
+        for condition in ("local_ready", "remote_ready", "!yougame::session()",
                           "!Matchmaking::local_peer.enabled"):
             self.assertIn(condition, gate.group(1))
         version = prepare[gate.end():].split("if (remote_count == 1)", 1)[0]
@@ -43,21 +45,30 @@ class YouGame0965MergeTest(unittest.TestCase):
         self.assertIn("if (version == 0) remote_ready = 0;", version)
         self.assertIn("g_user->ResetOnlineCompatibility();", function(online, "cleanup_connection"))
         self.assertIn("g_user->ResetOnlineCompatibility();", function(online, "handle_online_inputs"))
-        ranked = prepare.split("if (yougame::active() && g_last_search.mode == Matchmaking::RANKED)", 1)[1]
+        ranked = prepare.split("if (yougame::session() && g_last_search.mode == Matchmaking::RANKED)", 1)[1]
         self.assertLess(ranked.index("if (yougame::ranked_set_over())"),
                         ranked.index("g_user->PollOnlineCompatibility("))
         self.assertIn("cleanup_connection(yougame::Leave::Over);", ranked)
         self.assertIn("if (yougame::ranked_hold()) remote_ready = 0;", ranked)
 
     def test_initial_search_and_connection_check_the_selected_slippi_login(self):
-        net = code(source("port/runtime/hle/slippi_net.cpp"))
+        from squad_wiring_test import without_squad
+        net = code(without_squad(source("port/runtime/hle/slippi_net.cpp")))
+        # v0.9.101: one shared version verification per search (User::CheckSessionCompatibility); every
+        # matchmaking and connect check goes through it, never the uncached CheckOnlineCompatibility.
+        for name in ("startMatchmaking", "handleConnecting"):
+            with self.subTest(name=name):
+                self.assertIn("CheckSessionCompatibility(&error)", function(net, name))
+                self.assertNotIn("CheckOnlineCompatibility(&error)", function(net, name))
         search = function(net, "startMatchmaking")
         # Standalone's gate and the agent short circuit must remain ahead of app routing.
-        self.assertRegex(search, r"^\s*if \(!yougame::active\(\) && !local_peer.enabled\) \{")
-        self.assertIn("if (!user_ || !user_->CheckOnlineCompatibility(&error)) {", search)
+        self.assertRegex(search, r"^\s*if \(host::test_env::agent_copy\(\) && !local_peer.enabled\) \{")
+        self.assertLess(search.index("agent_lock::Operation::Matchmaking"),
+                        search.index("if (!yougame::session() && !local_peer.enabled)"))
+        self.assertIn("if (!user_ || !user_->CheckSessionCompatibility(&error)) {", search)
         self.assertIn("if (is_mm_terminated_ || state_ != INITIALIZING) return;", search)
-        self.assertLess(search.index("if (yougame::agent_test::agent_script)"),
-                        search.index("slippi_user_.reset();"))
+        hook = search.index("if (yougame::agent_test::agent_script)")
+        self.assertLess(hook, search.index("slippi_user_.reset();", hook))
         agent = search.split("if (yougame::agent_test::agent_script)", 1)[1].split("#endif", 1)[0]
         self.assertIn("startYouGameMatchmaking();", agent)
         self.assertIn("return;", agent)
@@ -76,9 +87,10 @@ class YouGame0965MergeTest(unittest.TestCase):
         ticket = function(net, "openSlippiTicket")
         self.assertLess(ticket.index("yougame::with_native_udp(create)"), ticket.index("enet_host_create"))
         connecting = function(net, "handleConnecting")
-        self.assertRegex(connecting, r"^\s*if \(\(!yougame::active\(\) \|\| slippi_user_\) && !local_peer.enabled\) \{")
+        self.assertLess(connecting.index("agent_lock::Operation::PeerConnect"),
+                        connecting.index("if ((!yougame::session() || slippi_user_) && !local_peer.enabled)"))
         self.assertIn("User* user = slippi_user_ ? slippi_user_.get() : user_;", connecting)
-        refusal = connecting.split("if (!user || !user->CheckOnlineCompatibility(&error)) {", 1)[1].split("}", 1)[0]
+        refusal = connecting.split("if (!user || !user->CheckSessionCompatibility(&error)) {", 1)[1].split("}", 1)[0]
         self.assertIn("fail(", refusal)
         self.assertIn("return;", refusal)
         self.assertIn("if (is_mm_terminated_ || state_ != OPPONENT_CONNECTING) return;", connecting)

@@ -3,6 +3,7 @@
 #pragma once
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -12,9 +13,11 @@
 #include <new>
 #include <vector>
 #include "gx_regs.h"
+#include "prewarm.h"
 #include "native_draw_audit.h"
 #include "../abi/mu_native_pose.h"
 #include "../host/tick_timing.h"
+#include "rtx_semantics.h"
 #include "texture_snapshot.h"
 
 struct MuNativePoseSnapshot;
@@ -152,6 +155,9 @@ struct DrawCall {
   // backdrop plane authored to fill the 4:3 view (Poke Floats' sky gradient). True widescreen leaves
   // it at its authored projection so it fills the widened picture instead of showing as a 4:3 box.
   bool frustum_backdrop = false;
+  // Render semantics from the native game (tokens 0xF3-0xF6, rtx_semantics.h): indices into
+  // Frame::rtx. Display only, like owner_player: not part of `identity`, never in a shader UID.
+  RtxDrawInfo rtx;
   // Render-thread cache: the pipeline resolved for this draw (valid for the backend that set it).
   // Sub-frames re-present the same draws, so the shader UIDs are hashed once per simulation frame.
   mutable void* cached_pipeline = nullptr;
@@ -194,10 +200,26 @@ struct HudPlayerSnapshot {
   int combo_link = -1;
   float percent = 0;
   bool stunned = false;
+  // The community codes' overlays: Nana's damage (-1 no Nana in play) and the team (-1 not teams).
+  int nana_damage = -1, team = -1;
 };
 
+// The frame's vertex storage leaves new elements uninitialised on resize (Vertex is plain data):
+// decode_run writes every byte of each vertex it decodes, on the decode worker, so the simulation
+// thread no longer zeroes about 4 MB a frame with Animelee CE only for the worker to overwrite it.
+// resize(n, Vertex{}) still zeroes where a caller wants that.
+template <class T>
+struct UninitAllocator : std::allocator<T> {
+  template <class U> struct rebind { using other = UninitAllocator<U>; };
+  UninitAllocator() noexcept = default;
+  template <class U> UninitAllocator(const UninitAllocator<U>&) noexcept {}
+  template <class U> void construct(U* p) noexcept { ::new ((void*)p) U; }
+  template <class U, class... A> void construct(U* p, A&&... a) { ::new ((void*)p) U(std::forward<A>(a)...); }
+};
+using VertexVector = std::vector<Vertex, UninitAllocator<Vertex>>;
+
 struct Frame {
-  std::vector<Vertex> vertices;
+  VertexVector vertices;
   std::vector<DrawSegment> segments;
   std::vector<DrawCall> draws;
   std::vector<EfbCopy> copies;
@@ -223,6 +245,8 @@ struct Frame {
   // Display latency test (set_latency_test): -1 the picture as drawn, 0 all black, 1 all white. Decided
   // from the pads the game read for this frame, so a photodiode times the same input-to-photon path.
   int8_t test_fill = -1;
+  // Render semantics the native game sent with this frame's draws (empty unless rtx_semantics_enabled).
+  RtxFrameSemantics rtx;
   // Reserve enough storage for an ordinary match before the first large scene is decoded. DrawCall
   // is about 5 KB, so a vector growth during a Stadium transformation can otherwise copy several
   // megabytes on the simulation thread and miss a 16.7 ms frame. Recycled frames retain this memory.
@@ -247,7 +271,7 @@ struct Frame {
   // and the renderer decides when to present by comparing sequences. Leaving a stale one on a
   // buffer that is about to be refilled is only harmless while every producer remembers to assign
   // one before pushing.
-  void clear() { vertices.clear(); segments.clear(); draws.clear(); copies.clear(); commands.clear(); hud_players = {}; player_names = {}; sequence = 0; source_retrace = source_match_frame = 0; time = 0.0; tick = {}; discontinuous = false; hard_cut = false; test_fill = -1; }
+  void clear() { vertices.clear(); segments.clear(); draws.clear(); copies.clear(); commands.clear(); hud_players = {}; player_names = {}; sequence = 0; source_retrace = source_match_frame = 0; time = 0.0; tick = {}; discontinuous = false; hard_cut = false; test_fill = -1; rtx.clear(); }
 };
 
 // Display latency test for photodiode testers that press X + D-pad Down (LDAT, pico lag testers;
@@ -317,6 +341,8 @@ bool clean_replay_active();
 void set_native_hud_player(int slot, bool present, int damage, int stocks, float tag_x, float tag_y,
                            bool tag_visible);
 void set_native_hud_combo(int slot, int link, float percent, bool stunned);   // MuHostApi.hud_combo, simulation thread
+// Since host API 31 (upstream's 24): Nana's damage and the player's team, for the community codes' overlays.
+void set_native_hud_extras(int slot, int nana_damage, int team);
 // The actions in which a fighter cannot act for the combo counter: damage and tumble, down and tech,
 // grabbed, thrown and carried (ftCo_MS_* ids; the game's mu_combo_stun_action is the same list).
 inline bool combo_stun_action(uint32_t a) {
@@ -358,6 +384,17 @@ inline bool frame_in_match(const Frame& f) {
   const bool match_mode = major == 0x02 || (major >= 0x10 && major <= 0x13) || major == 0x1B || major == 0x1C ||
                           (major >= 0x1D && major <= 0x1F);
   return match_mode && minor >= 2;
+}
+
+// What the app hears as a match (yg {"match":1}): frame_in_match without the screens that follow a
+// VS match. The lobby chip hides during the fight and comes back on the results screen, which is
+// minor 4 and up in VS and its variants (2 the match, 3 sudden death).
+inline bool frame_in_app_match(const Frame& f) {
+  if (!frame_in_match(f)) return false;
+  const uint8_t major = f.scene_major;
+  const bool vs_family = major == 0x02 || (major >= 0x10 && major <= 0x13) || major == 0x1B || major == 0x1C ||
+                         (major >= 0x1D && major <= 0x1F);
+  return !vs_family || f.scene_minor <= 3;
 }
 
 // Whether a frame's scene is presented wide when a widescreen mode is on. Every screen in the game
@@ -429,6 +466,50 @@ inline bool skip_for_effects(const EffectsFilter& e, const DrawCall& dc) {
   // items (projectiles) and the stage do not carry that token and stay.
   return e.level >= 3 && dc.owner_player == kEffectOwner;
 }
+
+// A fighter draw with its colour overlay on (hit flashes, charge glow, invincibility blink): ftMaterial
+// appends one last TEV stage after the material's own, either the light overlay CPREV + colour * RASA
+// (ftMaterial_800BF534) or the colour overlay lerp(CPREV, colour, ratio) (ftMaterial_800BF6BC), its
+// inputs a colour register or a constant. False when that stage adds nothing (ratio or colour 0).
+inline bool fighter_overlay_draw(const DrawCall& dc) {
+  if (dc.owner_player >= 6) return false;
+  const int n = (int)dc.bp.numtevstages();
+  const uint32_t cc = dc.bp.tev_color(n);
+  const uint32_t a = (cc >> 12) & 15, b = (cc >> 8) & 15, c = (cc >> 4) & 15, d = cc & 15;
+  auto reg = [](uint32_t sel) { return sel == 2 || sel == 4 || sel == 6 || sel == 14; };   // C0, C1, C2, konst
+  // The value an input of that stage reads (RGB summed, 0..765).
+  auto value = [&](uint32_t sel) -> int {
+    if (sel == 14) {
+      const int k = dc.bp.ksel_kc(n);
+      if (k < 8) return 765 - 96 * k;   // the fixed constants 1, 7/8, ... 1/8
+      if (k >= 12 && k < 16) return dc.tev_kcolors[k - 12][0] + dc.tev_kcolors[k - 12][1] + dc.tev_kcolors[k - 12][2];
+      if (k >= 16 && k < 32) return 3 * dc.tev_kcolors[(k - 16) & 3][(k - 16) >> 2];
+      return 0;
+    }
+    const int r = (int)sel / 2;   // C0 1, C1 2, C2 3
+    return dc.tev_colors[r][0] + dc.tev_colors[r][1] + dc.tev_colors[r][2];
+  };
+  if (a == 15 && reg(b) && c == 11 && d == 0) return value(b) > 6;          // light overlay
+  if (a == 0 && reg(b) && reg(c) && d == 15) return value(c) > 6;           // colour overlay
+  return false;
+}
+
+// One of the scene's effects: a particle, one of the game's effect objects, or an item or model effect
+// (a projectile's glow, the shield bubble) that blends or does not write depth. The path tracer makes
+// the bright ones light the scene (gx_fx_lights.h).
+inline bool scene_effect_draw(const DrawCall& dc) {
+  if (dc.xf_regs[0x26] != 0) return false;   // orthographic: the HUD's
+  const bool particle = dc.rtx.pass == 1;   // MU_RTX_PASS_PARTICLES (abi/mu_rtx_tokens.h)
+  const bool effect_owner = dc.owner_player == kEffectOwner || dc.owner_player == kModelEffectOwner ||
+                            dc.owner_player == kGameplayOwner;
+  if (!particle && !effect_owner) return false;
+  const uint32_t zm = dc.bp.zmode();
+  const bool writes_depth = (zm & 1) && ((zm >> 4) & 1);
+  return (dc.bp.blendmode() & 1) || !writes_depth;
+}
+// The RTX Remix bridge leaves these out of Remix's scene; the renderer composes them, exactly as the
+// game drew them, into the layer laid over Remix's picture (fireballs, sparks, flashes, shields).
+inline bool remix_effect_draw(const DrawCall& dc) { return scene_effect_draw(dc); }
 
 // "Lightweight" (RenderOptions::lightweight, 0 to 5): one ladder of display-only savings for weak
 // PCs, each level including the ones below it. 1 low poly fighters, 2 no stage backgrounds, 3 flat
@@ -629,10 +710,6 @@ inline int lightweight_effects_level(int effects_level, int lightweight) { retur
 // rollback: an online rollback, a few frames back on the same match, so fighters may still be
 // smoothed through it. Anything else is a hard cut.
 void mark_discontinuity(bool rollback = false);
-// Optional online frame protection temporarily pauses sub-frames while the game thread is over
-// budget and restores them after sustained headroom. The presentation loop honours suspension.
-void set_subframe_suspended(bool suspended);
-bool subframe_suspended();
 void set_subframes_active(bool active);
 bool subframes_active();
 
@@ -641,6 +718,11 @@ bool subframes_active();
 struct RenderOptions;
 struct Backend {
   virtual ~Backend() = default;
+  virtual PrewarmStats prewarm_stats() const { return {}; }
+  // Simulation restart, dispatched synchronously on the backend's owning thread.
+  // Unknown backends refuse BEFORE game memory is restored.
+  virtual bool supports_game_reset() const { return false; }
+  virtual void reset_game_state() {}
   virtual const RenderOptions* presentation_options() const { return nullptr; }
   virtual void resize(int, int) {}
   virtual void presentation_stats(uint32_t* frames, uint32_t* pipelines, uint32_t* textures) const {
@@ -671,9 +753,8 @@ struct Backend {
   // The display's counts could be read at the last look (false while Windows composes the window).
   virtual bool display_counts_readable() const { return false; }
   // From the presentation loop, every frame: the monitor's nominal refresh rate (what the verdict
-  // above is judged against), and whether to present synced even with V-Sync off. The loop asks for
-  // that on a display that follows the frames, where it costs no delay while the rate stays under
-  // the refresh, and stops every tear.
+  // above is judged against), and an explicit scanline-sync request. VRR detection changes the
+  // frame cap only; it must not silently turn V-Sync on when the player has switched it off.
   virtual void set_display_refresh(double /*hz*/, bool /*tear_free*/) {}
   // Scanline sync on a fixed-refresh display (vblank_clock.h): the first vertical blank at or after
   // `after` (now_seconds clock) and the refresh period, or false with the reason in `why`. Render thread.
@@ -693,9 +774,14 @@ struct Backend {
 };
 
 void init(Backend* backend);
+bool supports_game_reset();
+std::function<void()> capture_boot_state();
 void write_fifo(uint32_t value, int bytes);   // write-gather pipe byte stream
 void write_fifo_bytes(const uint8_t* data, size_t bytes);   // the same stream in bulk, big-endian as the pipe carries it
 void stats(uint64_t* commands, uint64_t* draws, uint64_t* vertices, uint32_t* efb_copies);
+// The share of stats()' draws and vertices recorded inside display lists (models, stages); the rest
+// is immediate-mode geometry (effects, HUD, text). Cumulative, like stats().
+void display_list_stats(uint64_t* draws, uint64_t* vertices);
 void set_native_draw_audit(bool enabled);
 void native_render_scope_event(const NativeRenderScopeEvent& event);
 NativeDrawAuditStats native_draw_audit_stats();

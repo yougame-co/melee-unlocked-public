@@ -75,23 +75,26 @@ bool Engine::valid(const SessionConfig& c) {
   return std::find(c.ports.begin(), c.ports.end(), c.my_port) != c.ports.end();
 }
 void Engine::log(const std::string& text) const { if (hooks_.log) hooks_.log(text); }
-bool Engine::begin(std::unique_ptr<SessionLink> link, const SessionConfig& c, EngineHooks hooks, bool rollback) {
-  if (active_ || started_ || !link || !valid(c)) return false;
-  config_ = c; hooks_ = std::move(hooks); link_ = std::move(link);
+bool Engine::begin(std::unique_ptr<SessionLink>&& link, const SessionConfig& c, EngineHooks hooks, bool rollback) {
+  if (!link || !can_begin(c)) return false;
+  config_ = c; hooks_ = std::move(hooks);
   if (!hooks_.now_ms) hooks_.now_ms = monotonic_ms;
-  active_ = true; ended_ = false; frame_ = 0;
+  ended_ = false; frame_ = 0;
   ticks_ = 0; next_retrace_ = frame_ticks; retraces_ = 0;
-  if (this == &global_engine) global_active.store(true, std::memory_order_release);
   enable_rollback(rollback);
   log(rollback_enabled_ ? "console: rollback on" : "console: rollback off (lockstep)");
   pads_.fill(disconnected());
   for (int p : c.ports) pads_[p - 1] = MuPadStatus{};
   // Everybody sends the initial neutral window. It is confirmed like every later frame.
   for (int f = 0; f < c.input_delay; ++f) {
-    local_[f] = MuPadStatus{}; link_->send_pad(f, MuPadStatus{});
+    local_[f] = MuPadStatus{}; link->send_pad(f, MuPadStatus{});
   }
   log("console: session " + c.session_id + " port " + std::to_string(c.my_port) + " of " +
       std::to_string(c.ports.size()) + " delay " + std::to_string(c.input_delay));
+  link_ = std::move(link); // last: every allocation, callback and initial send above may throw
+  active_ = true;
+  if (this == &global_engine) global_active.store(true, std::memory_order_release);
+  if (hooks_.session_edge) hooks_.session_edge();
   return true;
 }
 void Engine::end(const std::string& reason, bool desync) {
@@ -107,8 +110,16 @@ void Engine::end(const std::string& reason, bool desync) {
   pads_.fill(disconnected()); local_.clear(); checks_.clear();
   for (auto& history : remote_) history.clear();
   log("console: session ended: " + reason);
+  if (hooks_.session_edge) hooks_.session_edge();
+  // Alarms set during the session ran on the engine clock; after End the host clock fires them.
+  if (hooks_.host_ticks) {
+    const auto host = hooks_.host_ticks(), alarm = alarm_ticks();
+    log("console: alarm clock " + std::string(alarm >= host ? "ahead of" : "behind") + " the host by " +
+        std::to_string((alarm >= host ? alarm - host : host - alarm) / 40500) + " ms");
+    if (alarm > host && hooks_.host_catch_up) hooks_.host_catch_up(alarm - host);
+  }
   const auto message = session_notice(reason);
-  if (hooks_.notice && reason != kSelfLeft) hooks_.notice(message ? message : desync ? "Your game and your friend's game went out of sync." :
+  if (hooks_.notice && reason != kSelfLeft && reason != "css-join abort") hooks_.notice(message ? message : desync ? "Your game and your friend's game went out of sync." :
                                          "Lost connection to your friend.");
   link_.reset();
 }
@@ -119,6 +130,9 @@ void Engine::relink_notice() {
   const bool recovering = link_->reconnecting();
   const bool waiting = input_waiting_ || recovering;
   const char* notice = recovering ? kReconnecting : kWaitingForFriend;
+#ifdef MELEE_DOUBLES
+  if (config_.doubles) notice = recovering ? kReconnectingPlayers : kWaitingForPlayers;
+#endif
   const auto now = hooks_.now_ms();
   if (waiting) {
     if (!relink_started_) relink_started_ = now;

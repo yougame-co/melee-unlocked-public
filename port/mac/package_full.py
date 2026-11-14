@@ -66,7 +66,7 @@ def main():
     shutil.copytree(GAME_ASSETS/'Sys',res/'Sys',dirs_exist_ok=True,symlinks=False)
     copy(GAME_ASSETS/'Sys/GC/dsp_coef.bin',res/'Sys/GC/dsp_coef.bin')
     copy(GAME_ASSETS/'Sys/GC/dsp_coef.bin',res/'SysPlayback/GC/dsp_coef.bin')
-    # Two of Slippi's Sys files are mostly Nintendo's own disc assets (compliance-lead, 10-25): they never ship. The
+    # Two of Slippi's Sys files are mostly Nintendo's own disc assets (compliance review, 10-25): they never ship. The
     # host rebuilds them from the player's disc (host/sysgen.cpp reads Resources/deltas, next to Sys).
     deltas = json.loads((ROOT/'port/sys_deltas/manifest.json').read_text())
     disc_derived = {f['target'] for f in deltas['files']}
@@ -98,7 +98,7 @@ def main():
             for pair in node.iter.elts:
                 copy(rooted_path(pair.elts[0]), res/'licenses'/ast.literal_eval(pair.elts[1]))
     (res/'EXPERIMENTAL.txt').write_text('M7 0.9.56 full macOS host spike; unsigned. See port/mac/README.md for measured limitations.\n')
-    staging = 'STAGING ONLY — STAGING AGENT-TEST BUILD — NOT FOR PRODUCTION\n\n' if artifact_hook else ''
+    staging = 'STAGING ONLY: STAGING AGENT-TEST BUILD. NOT FOR PRODUCTION\n\n' if artifact_hook else ''
     (res/'README.txt').write_text(staging + 'Melee Unlocked macOS experimental build; unsigned.\n', encoding='utf-8')
     (res/'build-manifest.json').write_text(json.dumps(built, indent=2)+'\n')
     version = (ROOT/'VERSION').read_text().strip()

@@ -11,6 +11,9 @@ the GNU General Public License for more details. You should have received a copy
 General Public License along with this program (LICENSE in the source, licenses\COPYING.txt in
 a release). If not, see <https://www.gnu.org/licenses/>.
 
+Source: download the exact source of this build from its page on YouGame (Download source),
+https://staging.yougame.co/g/melee-unlocked
+
 Releases up to and including 0.8.1 were published under GPL-2.0-or-later. Starting with 0.8.5
 the project is published under GPL-3.0-or-later. Source files whose header names another
 project keep that project's notice (for example GPL-2.0-or-later for code ported from Dolphin
@@ -20,11 +23,18 @@ and Slippi Ishiiruka); those terms are compatible with version 3 of the GPL.
 Additional permission under GNU GPL version 3 section 7
 
 If you modify this Program, or any covered work, by linking or combining it with the NVIDIA
-Streamline SDK, the NVIDIA DLSS (NGX) SDK, the NVIDIA Reflex SDK or the Intel XeSS SDK (or a
-modified version of those libraries), containing parts covered by the terms of the NVIDIA RTX
-SDKs License, the License Agreement for NVIDIA Software Development Kits or the Intel
-Simplified Software License, the licensors of this Program grant you additional permission to
+Streamline SDK, the NVIDIA DLSS (NGX) SDK, the NVIDIA Reflex SDK, the Intel XeSS SDK or the AMD FSR
+SDK (or a modified version of those libraries), containing parts covered by the terms of the NVIDIA
+RTX SDKs License, the License Agreement for NVIDIA Software Development Kits, the Intel
+Simplified Software License or the AMD FSR SDK license, the licensors of this Program grant you additional permission to
 convey the resulting work.
+
+The same permission covers the RTX Pack: a renderer library loaded at run time from the game's
+RTX folder (melee_rtx_nvidia.dll) through the gx::RtxIntegrator interface
+(port/runtime/gx/rtx_integrator.h), built with the NVIDIA RTXDI, NRD, NRI and SHaRC SDKs, and the
+NVIDIA RTX Remix runtime loaded from the game's Remix folder through its C API. Such a library and
+runtime may be conveyed with the Program, or separately, under their own terms; their source need
+not be released under this License.
 
 This permission is granted by the copyright holders of Melee Unlocked's own code and applies to
 every file of the Program whose copyright they hold. Code that this project takes from other
@@ -46,11 +56,15 @@ Rank badge images (sourceport/game/shim/assets/rank_badges/*.png) © 2026 YouGam
 - JSON for Modern C++ (MIT): notice at the top of port/third_party/nlohmann/json.hpp
 - dht (MIT): port/third_party/dht/LICENCE
 - Monocypher (BSD-2-Clause or CC0-1.0): port/third_party/monocypher/LICENCE.md
+- Zstandard 1.5.7 decoder (BSD-3-Clause): port/third_party/zstd/LICENSE
+- bzip2 1.0.8 (BSD-style): port/third_party/bzip2/LICENSE
+- LZMA SDK 25.01 LZMA and LZMA2 decoders (public domain): port/third_party/lzma/lzma-sdk.txt
 - SlippiLib (GPL-2.0-or-later, from Slippi Ishiiruka): port/third_party/slippilib
 - NVIDIA Streamline headers and import library (MIT): port/third_party/streamline/license.txt
 - NVIDIA NGX library, builds with DLSS 5 only (NVIDIA RTX SDKs License):
   port/third_party/ngx/LICENSE.txt
 - Intel XeSS headers (Intel license): port/third_party/xess/LICENSE.txt
+- AMD FSR SDK 2.4 API headers (MIT): port/third_party/fsr/LICENSE.md
 - Steinberg ASIO SDK 2.3.4 host files (ASIO output, audio mode 3): asio.cpp, asio.h,
   asiosys.h and iasiodrv.h under the SDK's GPL Version 3 option (port/third_party/asio/LICENSE.txt);
   asiodrivers, asiolist and ginclude under a BSD-3-Clause style notice
@@ -60,7 +74,26 @@ Rank badge images (sourceport/game/shim/assets/rank_badges/*.png) © 2026 YouGam
   Exception)
 
 Code ported or adapted from other projects:
-- Dolphin (GPL-2.0-or-later): GX shader generation, AX audio emulation, the fres and frsqrte
+- Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0
+  (idea: Chris's friend Tyler, Squad Strike Gecko codes). Optional MELEE_SQUAD_STRIKE mode, off by default.
+  Includes fixes from v1.0.1; the author's confirmation for those is pending.
+  These files: licence not stated; used with the author's permission (11-03-2026); not covered by
+  this repository's GPL grant until the author confirms:
+    port/cmake/squad.cmake
+    port/runtime/abi/mu_squad_wire.h
+    port/runtime/hle/squad_test_spec.h
+    port/runtime/hle/yougame_squad.h
+    port/runtime/host/squad_digest.h
+    sourceport/game/include/mu_squad.h
+    sourceport/game/shim/mu_squad.c
+    sourceport/game/shim/mu_squad_css.c
+    sourceport/game/shim/mu_squad_label_art.h
+    sourceport/game/shim/mu_squad_online.c
+    sourceport/game/tests/squad_lineup.c
+  Chris's gmsquad.c and gmsquad.h became mu_squad.c and mu_squad.h; his mncharsel_squad.h became
+  mu_squad_css.c. The MU_SQUAD-guarded hooks in other files carry the same permission. Everything else
+  stays under this repository's licence.
+- Dolphin (GPL-2.0-or-later): the RVZ and WIA disc image reader, GX shader generation, AX audio emulation, the fres and frsqrte
   tables, the GameCube adapter protocol
 - Slippi Ishiiruka (GPL-2.0-or-later): the Slippi EXI device, online play, replay playback,
   custom texture naming
@@ -79,6 +112,12 @@ Code ported or adapted from other projects:
 - slippi-js (LGPL-3.0-or-later): the landing lag table in the launcher
 - hps_decode (MIT): docs/licenses/hps_decode-MIT.txt
 - Slippi Lab (MIT): docs/licenses/slippilab-MIT.txt
+- Phillip / slippi-ai by Vlad Firoiu (x_pilot) (MIT, https://github.com/vladfi1/slippi-ai): the observation
+  and controller contract of its published policies, in port/runtime/hle/phillip_ai.cpp;
+  docs/licenses/slippi-ai-MIT.txt
+- onnxruntime C API headers (MIT): port/third_party/onnxruntime/LICENSE
+- libmelee (LGPL-3.0, https://github.com/altf4/libmelee): Randall's path on Yoshi's Story, generated into
+  port/runtime/hle/phillip_randall.h
 - GD's Melee (GPL-2.0-or-later): settings motion and art, docs/third-party-ui-attribution.md
 - Twemoji graphics (CC BY 4.0): docs/third-party-ui-attribution.md
 - Source Sans 3 (SIL Open Font License 1.1):
@@ -94,8 +133,15 @@ Shipped beside the program under their own terms, not covered by the GPL:
   SDKs License); third-party notices: docs/licenses/nvidia-dlss-third-party.txt
 - NVIDIA Reflex (sl.reflex.dll, sl.pcl.dll): port/third_party/streamline/reflex.license.txt
 - Intel XeSS (libxess.dll, Intel Simplified Software License): port/third_party/xess/LICENSE.txt
+- AMD FSR (amd_fidelityfx_loader_dx12/vk.dll, amd_fidelityfx_upscaler_dx12/vk.dll,
+  amd_fidelityfx_framegeneration_dx12.dll, AMD's signed binaries, fetched by the game from AMD's
+  repository when the player asks): port/third_party/fsr/LICENSE.md
+- onnxruntime (onnxruntime.dll, MIT): port/third_party/onnxruntime/LICENSE; third-party notices:
+  port/third_party/onnxruntime/ThirdPartyNotices.txt
+- Phillip's trained policies (ProAI\*.onnx, MIT, from huggingface.co/vladfi/phillip-models):
+  docs/licenses/slippi-ai-MIT.txt
 - Microsoft Visual C++ runtime DLLs (Microsoft Visual Studio distributable code)
 
 Super Smash Bros. Melee is the property of Nintendo and HAL Laboratory. Melee Unlocked is not
-affiliated with or endorsed by Nintendo, HAL Laboratory, NVIDIA, Intel or the projects above.
+affiliated with or endorsed by Nintendo, HAL Laboratory, NVIDIA, Intel, AMD or the projects above.
 You supply your own disc image.

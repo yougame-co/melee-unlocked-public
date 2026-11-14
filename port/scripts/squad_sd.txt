@@ -1,0 +1,15 @@
+# Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+# P1 means this process's LOCAL controller, on both peers. The game sends its
+# sample through CMD_ONLINE_INPUTS, then uses the delayed/rollback input queues.
+# @match starts at online frame 1; squad_pair.py enables the existing
+# MELEE_TEST_SCRIPT_PAD_FRAMES=1 clock, so stalls do not advance the script.
+# Fountain (stage 2): run off its right ledge. Horizontal input also leaves the
+# respawn platform. Hold across respawns: each new fighter repeats the SD without a
+# stock-specific timer or any direct state mutation. No automatic recovery input.
+# Intended to exhaust 4 stocks (one per fighter) within ~3000 match frames; verify on Linux.
+# Under delay the stick alternates between two full-right values (Melee clamps both to 1.0, so the run is the
+# same) every 3 frames: each change is a misprediction on the other side, so rollbacks keep crossing the swaps.
+@match
+0 sx=100
+3 sx=110
+@loop 6

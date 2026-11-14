@@ -73,6 +73,7 @@ bool set_constants(const FrameConstants&) { return false; }
 bool evaluate(ID3D12GraphicsCommandList*, const EvaluateInputs&) { return false; }
 bool evaluate_ray_reconstruction(ID3D12GraphicsCommandList*, const RayReconstructionInputs&) { return false; }
 bool frame_generation_available() { return false; }
+void tag_frame_generation_ui(ID3D12GraphicsCommandList*, ID3D12Resource*, uint32_t, uint32_t, uint32_t) {}
 void frame_generation_after_present() {}
 bool reflex_available() { return false; }
 uint32_t frame_generation_max_multiplier() { return 1; }
@@ -117,6 +118,7 @@ sl::DLSSMode g_mode = sl::DLSSMode::eOff;
 uint32_t g_out_w = 0, g_out_h = 0;
 float g_prev_proj[16] = {};
 bool g_have_prev = false;
+
 
 void log_callback(sl::LogType type, const char* msg) {
   // MELEE_TEST_SL_VERBOSE (tests only): Streamline's verbose log, information lines included.
@@ -480,6 +482,15 @@ bool set_constants(const FrameConstants& c) {
 }
 
 bool frame_generation_available() { return g_ready && g_fg_ok; }
+void tag_frame_generation_ui(ID3D12GraphicsCommandList* list, ID3D12Resource* ui, uint32_t state, uint32_t width, uint32_t height) {
+  if (!frame_generation_available() || !g_token || !list || !ui) return;
+  sl::Resource resource(sl::ResourceType::eTex2d, ui, state);
+  sl::Extent extent{0, 0, width, height};
+  sl::ResourceTag tag(&resource, sl::kBufferTypeUIColorAndAlpha, sl::ResourceLifecycle::eValidUntilPresent, &extent);
+  const sl::Result result = driver_call([&] { return slSetTagForFrame(*g_token, g_viewport, &tag, 1, list); });
+  static bool logged = false;
+  if (!logged) { logged = true; host::log("dlss-g: HUD handed to frame generation as its UI layer (%d)", (int)result); }
+}
 bool reflex_available() { return g_ready && g_reflex_ok; }
 std::atomic<float> g_latency_ms{0.0f};
 void set_reflex(int mode, uint32_t frame_limit_us) {
@@ -506,7 +517,6 @@ bool reflex_sleep(uint32_t frame_index) {
   }
   { host::perf::Scope wait_cost(host::perf::Stage::Wait);
     driver_call([&] { return slReflexSleep(*g_token); }); }
-  driver_call([&] { return slPCLSetMarker(sl::PCLMarker::eSimulationStart, *g_token); });
   return true;
 }
 float reflex_latency_ms() { return g_latency_ms.load(std::memory_order_relaxed); }
@@ -695,6 +705,20 @@ bool evaluate_ray_reconstruction(ID3D12GraphicsCommandList* list, const RayRecon
   options.outputHeight = in.out_h;
   options.colorBuffersHDR = sl::Boolean::eTrue;
   options.normalRoughnessMode = sl::DLSSDNormalRoughnessMode::ePacked;
+  // The normal guide is in camera view space (rtx_direct.hlsl write_guides), so world and view are
+  // the same space to Ray Reconstruction. Left unset these matrices are all zeros, and RR's
+  // normals collapsed: every edge shimmered from frame to frame on a still scene.
+  float ident[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+  options.worldToCameraView = to_sl_matrix(ident);
+  options.cameraViewToWorld = to_sl_matrix(ident);
+  // Ray Reconstruction's model: preset E in every mode. The default model shimmered on every edge
+  // of a still Melee scene (Battlefield: frame-to-frame edge flicker 2.6 against 0.65 without path
+  // tracing); E holds them as steady as the game (0.54) and halves it on Yoshi's Story.
+  // MELEE_TEST_RR_PRESET=<n> (tests only) picks another.
+  sl::DLSSDPreset preset = sl::DLSSDPreset::ePresetE;
+  if (const char* p = host::test_env::getenv("MELEE_TEST_RR_PRESET")) preset = (sl::DLSSDPreset)std::atoi(p);
+  options.dlaaPreset = options.qualityPreset = options.balancedPreset = options.performancePreset =
+      options.ultraPerformancePreset = options.ultraQualityPreset = preset;
   sl::Result result = driver_call([&] { return slDLSSDSetOptions(g_viewport, options); });
   if (result != sl::Result::eOk) {
     host::log("dlss-rr: slDLSSDSetOptions failed (%d)", (int)result);

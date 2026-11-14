@@ -18,6 +18,11 @@ static void capture(const char* line)
 }
 static const MuHostApi host = { .log = capture };
 const MuHostApi* mu_host = &host;
+#if MU_SQUAD
+/* Stand-in for shim/mu_squad_css.c: -1 off the online Squad Strike CSS, else 0-3 picked. */
+static int squad_count = -1;
+int gmSquad_CssPickCount(void) { return squad_count; }
+#endif
 
 int main(void)
 {
@@ -78,6 +83,34 @@ int main(void)
     mu_host = &host;
     mu_css_state_log(2, 0, doors, names);
     CHECK(logs == before + 1);
+#if MU_SQUAD
+    {
+        int two[4][4] = { {0, 2, 2, 0}, {3, 255, -1, 0}, {3, 255, -1, 0}, {3, 255, -1, 0} };
+        const char* fox[4] = { "Fox", NULL, NULL, NULL };
+        mu_css_state_reset();
+        mu_css_state_log(2, 0, two, fox);
+        CHECK(strstr(last, "\"squad\"") == NULL); /* not the squad CSS: no field */
+        before = logs;
+        squad_count = 0;
+        mu_css_state_log(2, 0, two, fox);
+        CHECK(logs == before + 1 && strcmp(last + strlen(last) - 21, ",\"squad\":{\"count\":0}}") == 0);
+        /* The count alone is a change; the same count is not. */
+        squad_count = 2;
+        mu_css_state_log(2, 0, two, fox);
+        CHECK(logs == before + 2 && strstr(last, "\"p4\":{\"kind\":\"closed\"},\"squad\":{\"count\":2}}") != NULL);
+        mu_css_state_log(2, 0, two, fox);
+        CHECK(logs == before + 2);
+        squad_count = 3;
+        mu_css_state_log(2, 0, two, fox);
+        CHECK(logs == before + 3 && strstr(last, ",\"squad\":{\"count\":3}}") != NULL);
+        squad_count = 4; /* all four picked */
+        mu_css_state_log(2, 0, two, fox);
+        CHECK(logs == before + 4 && strstr(last, ",\"squad\":{\"count\":4}}") != NULL);
+        squad_count = -1;
+        mu_css_state_log(2, 0, two, fox);
+        CHECK(logs == before + 5 && strstr(last, "\"squad\"") == NULL);
+    }
+#endif
     printf("css_state: %d checks passed\n", checks);
     return 0;
 }

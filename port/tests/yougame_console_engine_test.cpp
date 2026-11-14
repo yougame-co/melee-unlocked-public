@@ -495,6 +495,79 @@ void menu_hint_and_stalls() {
   run(6,240001,0); // a fresh menu window, excluding match time
   CHECK(std::count_if(logs.begin(),logs.end(),[](const std::string& s) { return s.find("console: menu stalls ") == 0; }) == 2);
 }
+void css_origin_clock_adoption() {
+  ++cases; Engine e;
+  CHECK(!e.adopt_css_clock(12345,7));
+  Bus bus; bus.echo_digest=true; std::vector<std::string> logs, notices;
+  CHECK(e.begin(std::make_unique<Loopback>(bus,1),config(1),hooks(bus,logs,notices),false));
+  CHECK(e.adopt_css_clock(12345,7));
+  CHECK(e.clock_ticks()==12345 && e.alarm_ticks()==12345 && e.retrace_count()==7);
+  for (uint32_t f=0;f<8;++f) bus.pads[1][f]=MuPadStatus{};
+  CHECK(e.advance(hardware(0),MuStatePod{}));
+  CHECK(!e.adopt_css_clock(0,0));
+}
+void alarm_clock_catch_up() {
+  ++cases;
+  for (const uint64_t host_ms : {100, 2000, 1000}) {
+    Engine e; Bus bus; std::vector<std::string> logs, notices; std::vector<uint64_t> moved;
+    auto h = hooks(bus, logs, notices);
+    const bool ahead = host_ms < 1000;
+    const uint64_t host = host_ms * 40500ull;
+    h.host_ticks = [=] { return host; };
+    h.host_catch_up = [&](uint64_t ticks) { moved.push_back(ticks); };
+    CHECK(e.begin(std::make_unique<Loopback>(bus, 1), config(1), std::move(h), false));
+    CHECK(e.adopt_css_clock(1000 * 40500ull, 60));
+    e.end("test");
+    // Ahead: the host moves forward by exactly the gap, once. Behind or equal: nothing moves.
+    CHECK(moved == (ahead ? std::vector<uint64_t>{900 * 40500ull} : std::vector<uint64_t>{}));
+    CHECK(std::count(logs.begin(), logs.end(), host_ms == 100 ? "console: alarm clock ahead of the host by 900 ms"
+                                               : host_ms == 2000 ? "console: alarm clock behind the host by 1000 ms"
+                                                                 : "console: alarm clock ahead of the host by 0 ms") == 1);
+    e.end("again"); CHECK(moved.size() == (ahead ? 1u : 0u));
+  }
+}
+// session_edge: once when a session begins, once when it ends (an End with none running calls
+// nothing), never for a begin the engine refuses.
+void session_edges() {
+  ++cases;
+  Engine e; Bus bus; std::vector<std::string> logs, notices; int edges = 0;
+  auto h = hooks(bus, logs, notices);
+  h.session_edge = [&] { ++edges; };
+  CHECK(!e.begin(std::make_unique<Loopback>(bus, 1), SessionConfig{}, h, false) && edges == 0);
+  CHECK(e.begin(std::make_unique<Loopback>(bus, 1), config(1), std::move(h), false) && edges == 1);
+  e.end("test"); CHECK(edges == 2);
+  e.end("again"); CHECK(edges == 2);
+}
+void begin_exception_ownership() {
+  for (int at : {0,1,2}) {
+    ++cases;
+    Bus bus; Engine engine; int destroyed=0, calls=0;
+    struct ThrowLink : Loopback {
+      int& destroyed; bool fail;
+      ThrowLink(Bus& b,int& d,bool f) : Loopback(b,1), destroyed(d), fail(f) {}
+      ~ThrowLink() override { ++destroyed; }
+      void send_pad(uint32_t f,const MuPadStatus& p) override {
+        if (fail) throw std::runtime_error("injected send");
+        Loopback::send_pad(f,p);
+      }
+    };
+    std::unique_ptr<SessionLink> link=std::make_unique<ThrowLink>(bus,destroyed,at==1);
+    EngineHooks h;
+    h.log=[&](const std::string&) { if (++calls==(at==0?1:2) && at!=1) throw std::runtime_error("injected log"); };
+    bool threw=false;
+    try { engine.begin(std::move(link),config(1),h,false); } catch (const std::runtime_error&) { threw=true; }
+    CHECK(threw && !engine.active() && link && !destroyed);
+    engine.end("css-join abort");
+    CHECK(link && !destroyed); // inactive engine owns no Link/requests claim
+    link.reset(); CHECK(destroyed==1);
+    CHECK(engine.begin(std::make_unique<Loopback>(bus,1),config(1),{},false));
+    engine.end("css-join abort"); CHECK(!engine.active());
+  }
+  ++cases;
+  Bus bus; Engine engine; std::vector<std::string> logs,notices;
+  CHECK(engine.begin(std::make_unique<Loopback>(bus,1),config(1),hooks(bus,logs,notices),false));
+  engine.end("css-join abort"); CHECK(notices.empty());
+}
 void card(const std::filesystem::path& root) {
   ++cases;
   auto data = root / ("console-engine-test-" + std::to_string(
@@ -533,7 +606,7 @@ int main(int argc, char** argv) {
     timeout_and_loss(false); timeout_and_loss(true); desync(); inert();
     sparse_ports_and_delay(); four_players(); reentrant_close(); missing_digest();
     retained_inputs(); terminal_wait_failure(); rollback_switches(); legacy_digest_layout();
-    rollback_test::all(); menu_hint_and_stalls();
+    rollback_test::all(); menu_hint_and_stalls(); css_origin_clock_adoption(); alarm_clock_catch_up(); session_edges(); begin_exception_ownership();
     if (argc > 1) card(argv[1]);
     std::cout << cases << " cases, " << assertions << " assertions passed\n"; return 0;
   } catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }

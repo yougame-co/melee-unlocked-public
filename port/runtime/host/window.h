@@ -29,6 +29,7 @@ void* window_create(int w, int h, const wchar_t* title, bool visible = true);
 // Linux: the next window_create makes a Vulkan window instead of an OpenGL one (SDL allows one
 // kind per window). Windows draws either way into the same window, so it ignores this.
 void window_prefer_vulkan(bool on);
+void window_prefer_background(bool on);   // prewarm: no app activation, before video initialization
 void window_set_resize_callback(ResizeCallback cb);
 // For a window that scales its own contents with the monitor (the standalone settings window).
 // While a callback is set, a move to a monitor with another DPI calls it with the new DPI and then

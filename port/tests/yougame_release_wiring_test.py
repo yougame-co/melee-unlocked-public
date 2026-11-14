@@ -93,6 +93,21 @@ int main() {
         self.assertIn('++g_update_searches', literal_function(link, 'find_match'))
         self.assertIn('--g_update_searches', literal_function(link, 'find_match'))
         self.assertIn('update: safe point, handing back to YouGame', safe)
+        # Opening Online asks the app for an update check at once, once per opening (11-10).
+        self.assertIn('if (online_screen && !was_online_screen && g_stdio) write_line(update::kCheckLine);', safe)
+        self.assertIn('kCheckLine = "yougame: update check"', source('port/runtime/hle/yougame_update.h'))
+
+    def test_every_room_key_carries_the_online_protocol(self):
+        # Builds 88 and 92 shared "mu-0.9.110" and broke at an invite (11-11): every key the game sends is
+        # "mu-<version>-p<N>", N bumped by hand under the rule beside kOnlineProtocol.
+        compat = source('port/runtime/hle/yougame_compatibility.h')
+        self.assertIn('inline constexpr int kOnlineProtocol = ', compat)
+        self.assertIn('BUMP RULE', compat)
+        link = source('port/runtime/hle/yougame_link.cpp')
+        self.assertIn('const std::string v = online_version(yougame::build_version());', link)
+        self.assertIn('return lobby::compatibility(online_version(yougame::build_version()), [&]', link)
+        self.assertIn('compatibility_key(online_version(MELEE_PORT_VERSION),false,"",false) + "-console5"', link)
+        self.assertNotRegex(link, r'(compatibility_key|lobby::compatibility|squad::compatibility)\((yougame::build_version\(\)|MELEE_PORT_VERSION|"dev")')
 
     def test_scene_loop_is_held_and_renderer_repaints_without_subframes(self):
         host = source('port/app/source_host.cpp')
@@ -162,7 +177,8 @@ int main() {
         self.assertIn('catch (const update::Required&) { cancel_open_ = {}; throw; }', literal_function(link, 'open_session'))
     def test_queue_and_room_refusal_before_assignment(self):
         find = literal_function(source('port/runtime/hle/yougame_link.cpp'), 'find_match')
-        self.assertEqual(find.count('if (update::required(refused))'), 2)
+        # The room's, the queue's (a Teams search), and the Doubles home's own queue socket (G2).
+        self.assertEqual(find.count('if (update::required(refused))'), 3)
         self.assertLess(find.index('if (update::required(refused))'), find.index('if (t == "matched"'))
         self.assertIn('yougame: update required (current %s)', find)
     def test_notice_processed_before_window_and_persistent(self):
@@ -225,7 +241,29 @@ class ReleaseWiringTest(unittest.TestCase):
         self.assertIn('friends::team_ticket(compat, team_room)', find)
         self.assertIn('friends::request_ticket(compat, search.friend_room, request,', find)
         friends = source("port/runtime/hle/yougame_friends.h")
-        self.assertEqual(friends.count('{"compatibility", compatibility}'), 2)
+        # request_ticket and team_ticket, then the 4-player Friends lobby's lobby_hold and lobby_ticket,
+        # and the Doubles home's doubles_lobby and doubles_hold, whose key (lobby_room_key) is built from
+        # the same tagged compatibility_key.
+        self.assertEqual(friends.count('{"compatibility", compatibility}'), 6)
+        lobby = function(code(raw), "lobby_room_key")
+        self.assertIn('compat_tag_with_test_timer(compat_tag', lobby)
+        self.assertIn('friends::lobby_hold(lobby_key)', find)
+        self.assertIn('friends::lobby_ticket(lobby_key, lobby_room)', find)
+        self.assertIn('friends::doubles_hold(lobby_key)', find)
+        self.assertIn('friends::doubles_home_ticket(lobby_key, lobby_room)', find)
+        self.assertIn('friends::doubles_queue_ticket(lobby_key, room_code, queue_generation, lobby_session->owns_local() ? 1 : party.humans)', find)
+        # The match room's admission renewals (review G2 #3): a match-admission ticket on the same key, never
+        # the queue's ticket (party_room, partySearch, party).
+        self.assertIn('if (doubles_room) request = friends::doubles_match_ticket(lobby_key);', find)
+        self.assertNotIn('doubles_match.request', raw)
+        # The lobby searches in one mode, never retries into a new room, and closes its links uncancelled.
+        self.assertIn('search.friends_lobby && (search.mode != lobby::kSearchMode', find)
+        self.assertIn('LobbySearch', find)
+        self.assertIn('if (g_lobby_search) m.retry = false;', function(code(raw), "fail"))
+        self.assertIn('early.request = close_app;', find)
+        self.assertIn('early.links.hand_over<update::Required>(', find)
+        self.assertIn('early.links.open<update::Required>(', find)
+        self.assertNotIn('early.links.for_peers(', find)
         key = source("port/runtime/hle/yougame_compatibility.h")
         self.assertIn('const std::string& tag = compat_tag', key)
         self.assertLess(key.index('suffix += "-" + tag'), key.index('key.substr(0, 64 - suffix.size())'))
@@ -323,7 +361,7 @@ class ReleaseWiringTest(unittest.TestCase):
                           'if ((slippi_mode || (unranked && vanilla)) && user_)',
                           'slippi_user_ = User::GrantedSlippiUser(user_->dir());'):
             self.assertIn(condition, start)
-        self.assertIn('slippi_user_->CheckOnlineCompatibility(&error)', start)
+        self.assertIn('slippi_user_->CheckSessionCompatibility(&error)', start)
         self.assertLess(start.index('prepare_slippi_match('), start.index('openSlippiTicket('))
         self.assertIn('display_provider_ = display::Provider::Slippi;', start)
         self.assertNotIn('search_settings_.connect_code =', start) # Preserve the game's raw Slippi bytes.

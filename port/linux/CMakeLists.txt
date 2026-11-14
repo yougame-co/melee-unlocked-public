@@ -1,5 +1,7 @@
 # Native Linux Source Port. No Windows PE loader or compatibility runtime.
 cmake_minimum_required(VERSION 3.25)
+# Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+include("${PROJECT_SOURCE_DIR}/port/cmake/squad.cmake")
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
@@ -17,6 +19,7 @@ endif()
 
 file(STRINGS "${PROJECT_SOURCE_DIR}/VERSION" MELEE_LINUX_VERSION LIMIT_COUNT 1)
 add_executable(melee_linux main.cpp host_services.cpp input_script.cpp gc_adapter.cpp "${PROJECT_SOURCE_DIR}/port/runtime/hle/ax_ucode.cpp")
+mu_squad_target(melee_linux)
 target_compile_features(melee_linux PRIVATE cxx_std_17)
 target_compile_definitions(melee_linux PRIVATE MELEE_PORT_VERSION="${MELEE_LINUX_VERSION}" MELEE_LINUX_USB MELEE_NO_SLIPPI
   MELEE_LINUX_CPU_BASELINE="${MELEE_CPU_BASELINE}")
@@ -45,7 +48,7 @@ if(MELEE_LINUX_GRAPHICS)
     renderer_presenter.cpp "${LINUX_HOST_FOBJ}"
     ../runtime/gx/gx_core.cpp ../runtime/gx/gx_shader.cpp ../runtime/gx/gx_texture.cpp
     ../runtime/gx/native_draw_audit.cpp ../runtime/gx/native_pose_bridge.cpp
-    ../runtime/gx/authored_pose.cpp ../runtime/gx/subframe.cpp)
+    ../runtime/gx/authored_pose.cpp ../runtime/gx/subframe.cpp ../runtime/gx/rtx_semantics.cpp)
   target_link_libraries(melee_linux PRIVATE SDL2::SDL2 OpenGL::GL GLEW::GLEW)
   find_program(MELEE_XVFB_RUN xvfb-run)
   if(MELEE_XVFB_RUN)

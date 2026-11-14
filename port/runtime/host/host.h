@@ -45,6 +45,9 @@ struct Options {
   // Static Recomp mod runs: the boot disc (iso) is a mod, and this is the player's vanilla 1.02 disc.
   // The mod's changed game code then runs from RAM, compared against the vanilla code.
   std::string mod_base_iso;
+  // The standard game with this mod disc's looks (--look-iso): its costumes, stages, HUD and effects
+  // that pass the online look check are served over the game's own files, and none of its code runs.
+  std::string look_iso;
 };
 
 extern Options options;
@@ -55,6 +58,8 @@ extern ppc::Context* cpu;
 
 // ---- logging ----
 void log(const char* fmt, ...);
+// One log line on the processor and power: name, rated and current clock, AC or battery, power plan.
+std::string cpu_power_line(const char* when);
 void log_guest_text(const char* data, size_t len);  // OSReport output
 void log_flush();   // writes every queued log line now (log() hands lines to a writer thread)
 void log_memory();  // one line: this process's size and the memory Windows has left
@@ -77,6 +82,14 @@ template <class Body> void optional_work(const char* what, Body&& body) noexcept
 // Ends the process now, with everything of ours already saved, without running DLL unload code
 // (see end_process in host.cpp for why).
 [[noreturn]] void end_process(int code);
+// A file being written on a thread of its own (a match's replay, so the game does not wait on the
+// disk at GAME!). end_process waits for these first, up to 20 s, so quitting right after a match
+// still keeps the file. wait_file_writes waits for them without ending anything.
+void file_write_begin();
+void file_write_end();
+void wait_file_writes(unsigned max_ms = 20000);
+// A crash path calls this before it saves anything: every wait_file_writes after it waits at most 2 s.
+void mark_dying();
 // The game is ending on purpose (end_process, or the Source Port's shutdown). From here an exception
 // nobody catches on some other thread (a driver's or an overlay's, tearing down) ends the process
 // quietly instead of reporting a crash.
@@ -145,6 +158,10 @@ constexpr uint32_t kVanillaDolSize = 0x4385E0u;
 bool vanilla_dol_image(const std::vector<uint8_t>& image);
 bool disc_has_vanilla_dol();     // the disc's main.dol is retail NTSC 1.02 (modded discs are not)
 void init_state_digest();        // source path skips boot_setup but shares the digest writer
+#if MU_SQUAD
+// Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+void squad_digest_observe(int32_t body, int32_t frontier, bool ending);
+#endif
 
 // ---- events (interrupt delivery at guest wait points) ----
 using Completion = std::function<void()>;
@@ -155,6 +172,7 @@ void wait_event();                     // one OSSleepThread step
 void pump_completions();               // deliver queued callbacks now (from HLE entry points)
 void retrace();                        // one VI retrace: time, alarms, VI interrupt
 bool retrace_due();                    // the timebase has reached the next retrace boundary
+std::function<void()> capture_native_boot_clock();
 uint64_t next_retrace_tb();            // timebase of the next retrace boundary
 // Source port: the game is native code, not the recompiled guest. When set, retrace() calls this in
 // place of the guest's alarm, audio and VI interrupt delivery (everything else, pacing, window,
@@ -190,6 +208,10 @@ void publish_lobby_result(int winner_index, int end_method, int lras = -1, const
 // Used for settings a running device cannot adopt, the graphics backend being the one that
 // matters today.
 void request_restart();
+// A Static Recomp mod disc session (--iso <mod> --mod-base-iso <game>) starts again as the standard
+// game with that disc's looks (--iso <game> --look-iso <mod>): the form Unranked and Party play.
+// False when this is not such a session or the new process could not be started.
+bool restart_with_mod_looks();
 int exit_code();
 uint32_t retrace_count();
 // Frame id read by the optional sampling profiler. It is atomic because the
@@ -212,6 +234,9 @@ bool last_sim_frame_late();          // the most recent frame finished after its
 constexpr uint64_t TB_HZ = 40500000ull;   // bus clock / 4
 constexpr uint64_t TB_PER_FRAME = TB_HZ / 60;
 void advance_time(uint64_t ticks);
+// Moves the whole timebase forward: the time, the next retrace and the AI DMA clock, so nothing
+// already scheduled on it falls due early (a console session's End, source_host.cpp).
+void shift_time(uint64_t ticks);
 // Idle-wait pacing: waits until the real time of console time `tb` inside the frame now running
 // (the frame started at its tick deadline; the coming retrace is one frame later on both clocks),
 // then advances the timebase to `tb`. False, without waiting, when `tb` is not before the coming
@@ -221,6 +246,7 @@ void install_audio_pacing();
 void install_clean_mode_music();   // Static Recomp, clean mode: music through the host's player
 void install_preload_room();   // Static Recomp: the preloader makes room in a full heap instead of stopping
 void install_mod_disc_guards();   // Static Recomp, mod disc: a file the disc lacks opens as an empty file   // Static Recomp: audio blocks at their 5 ms times during the frame wait
+const char* last_missing_file();   // the last file the game asked for that the disc lacks, or ""
 void report_recent_files();   // a mod disc's game stopped: one line with the last files it asked for by name
 void report_heap_panic(ppc::Context& c);   // OSPanic at lbmemory.c:233: logs the heap that had no room and the title demo's draw
 void note_scene_memory();     // a mod disc's scene changed: one line with the current object heap's size and use
@@ -229,6 +255,7 @@ bool grow_object_heap(uint32_t heap, uint32_t bytes);   // a full heap: add spac
 void apply_wide_fighter_draw();   // Static Recomp, once per game frame: fighters in the added sides draw under True 16:9
 void install_console_clock();  // Static Recomp: OSGetTime carries the date (see os_get_time_dated)
 void install_language_override();  // Static Recomp: the functions that read the saved language follow g_game_language
+void install_costume_texture_anims();   // Static Recomp: a costume missing a texture animation no longer stops the game (ftanim.c:1236)
 void install_low_poly_fighters();  // Static Recomp: the fighter parts hook behind "Low poly fighters" (gx::low_poly_fighters_active)
 void apply_player_tags_always();   // Static Recomp, once per game frame: keeps the P1 / P2 markers up while the option is on
 void apply_arcade_hitboxes();      // Static Recomp, once per game frame: the Arcade look's hitbox switches as the code's own words
@@ -238,6 +265,7 @@ void install_cobj_guard();        // Static Recomp: an unknown camera projection
 void install_sub_color_guard();   // Static Recomp: a tint index past 4 no longer stops the game (fighter.c:828)
 void apply_freeze_final_destination();   // Static Recomp, once per game frame: "Freeze Final Destination" on or off
 void apply_final_destination_guard();   // Static Recomp, once per game frame: a Final Destination skin without its background animation does not stop the game
+void apply_hud_emblems();   // Static Recomp, once per game frame: "Hide emblems behind percents" on or off
 void apply_ko_explosions();   // Static Recomp, once per game frame: "Hide KO explosions" on or off
 uint64_t console_epoch_ticks(); // the console clock at start: ticks since 2000-01-01, local time
 void note_frame_submitted();   // the game handed over the frame's picture; until the retrace it only waits
@@ -251,6 +279,10 @@ double now_seconds();
 // Seconds a short timed sleep wakes late by on this system, as last measured (0 on a healthy one).
 // A wait that must end on time sleeps only when it has that much room, and spins otherwise.
 double sleep_slack();
+// Game frames a second over the last second (the render thread measures it; 0 paused or not known). The
+// FPS counter shows it beside the presented rate when the game runs slower than 60 Hz.
+void set_game_rate(double hz);
+double game_rate();
 bool latency_trace_enabled();
 TickTiming& tick_timing();
 // Per-draw scopes run tens of thousands of times a frame, so they read the CPU time stamp counter
@@ -359,6 +391,17 @@ extern std::atomic<bool> g_freeze_fd;
 // "Hide KO explosions" (Video tab, both engines): the blast-zone explosion is spawned far out of
 // sight. Source Port: MU_DISPLAY_OPTION_NO_KO_EXPLOSIONS; Static Recomp: apply_ko_explosions().
 extern std::atomic<bool> g_hide_ko_explosions;
+// "Hide emblems behind percents" (Video tab, both engines): the emblem behind each damage percent is
+// not drawn. Source Port: MU_DISPLAY_OPTION_NO_HUD_EMBLEMS; Static Recomp: apply_hud_emblems().
+extern std::atomic<bool> g_hide_hud_emblems;
+// The stage file the game loaded last came from a mod (Source Port: set on the disc read that starts
+// a stage file). Path tracing's polished-floor look is tuned on the original stages; a mod's floors
+// are kept as drawn.
+extern std::atomic<bool> g_stage_file_modded;
+extern std::atomic<bool> g_stage_water;   // the stage loaded is Fountain of Dreams (GrIz.dat): its floor is water
+// "Community codes" (HUD tab): the native versions of players' favourite Gecko codes, as the
+// MU_DISPLAY_OPTION_* bits in MU_DISPLAY_OPTION_CODES_ALL. Source Port only; picture and sound only.
+extern std::atomic<uint32_t> g_community_codes;
 void input_rumble(int game_port, bool on);
 // Immediately clear any motors that were active when the Controls switch is turned off.
 void input_stop_all_rumble();

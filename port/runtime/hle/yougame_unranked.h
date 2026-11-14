@@ -6,4 +6,27 @@ inline bool keep_css(bool active, int mode) { return active && mode == 1; }
 // Ranked (including local Ranked practice) owns its CSS result reveal. Never
 // let either Training setting replace it. Unranked's existing policy is unchanged.
 inline bool allow_training_return(bool active, int mode) { return mode != 0 && !keep_css(active, mode); }
+
+// Watches for "the online session is over, with a match played", once per tick. A Friends or Doubles
+// lobby never counts: its select is the place to be after a match, and leaving it is the player's own
+// choice. It also keeps a search open between matches, so a session reads as running across them, and
+// reads as over for a moment while the next match connects (the search has ended, the match not begun).
+class SessionWatch {
+public:
+  bool tick(bool session, bool match_running, bool lobby) {
+    if (session) {
+      seen_ = true;
+      played_ |= match_running;
+      lobby_ |= lobby;
+      return false;
+    }
+    if (!seen_) return false;
+    const bool over = played_ && !lobby_ && !lobby;
+    seen_ = played_ = lobby_ = false;
+    return over;
+  }
+
+private:
+  bool seen_ = false, played_ = false, lobby_ = false;
+};
 } // namespace yougame::unranked

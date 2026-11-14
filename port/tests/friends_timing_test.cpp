@@ -14,6 +14,8 @@ struct TransferIO {
   std::function<bool()> cancelled,room_closed;
   std::function<bool(int)> flush_room;
   std::function<void(const std::string&)> log;
+  std::function<void(const std::string&,bool)> waiting;
+  std::function<void(int)> progress;
   std::function<bool(Json&,int)> next_room;
   std::function<bool(const Json&)> send_room;
 };
@@ -84,6 +86,8 @@ static void paced_transfer(size_t size, bool guest) {
   TransferIO io;
   io.clock=[&] {return now;}; io.cancelled=[] {return false;}; io.room_closed=[] {return false;};
   io.flush_room=[](int ms) {CHECK(ms>0);return true;}; io.log=[&](const std::string& s) {logs.push_back(s);};
+  std::vector<std::string> rows; io.waiting=[&](const std::string& s,bool ready) {CHECK(!ready); rows.push_back(s);};
+  std::vector<int> percents; io.progress=[&](int p) {CHECK(p>=0 && p<=100 && p%5==0); percents.push_back(p);};
   if(guest) {auto q=std::make_shared<Request>();q->serial=1;q->operation=Operation::GuestCSS;channel->request=q; enqueue("mu-hj-base");}
   io.next_room=[&](Json& m,int wait) {
     const auto q=std::atomic_load(&channel->request);
@@ -118,6 +122,10 @@ static void paced_transfer(size_t size, bool guest) {
   };
   transfer(io,!guest,"peer",config,channel);
   CHECK(logs.back()=="handoff-join: refuse start-at-N-unavailable");
+  // The guest sees the base arrive in 5% steps, ending at 100%; the host shows nothing.
+  CHECK(guest ? rows.size()>=2 && rows.size()<=21 && rows.back()=="Getting the match from your friend... 100%" &&
+        rows.front().rfind("Getting the match from your friend... ",0)==0 : rows.empty());
+  CHECK(percents.size()==rows.size() && (!guest || (percents.back()==100 && std::is_sorted(percents.begin(),percents.end()))));
   CHECK(guest || (finished_base && base_count==n && delta_count==n));
   CHECK(std::count_if(logs.begin(),logs.end(),[](const std::string& s) {return s.find("handoff-join: deadline ")==0;})==2);
   CHECK(transfer_budget(size)>10000 && transfer_budget(size)<=200000);

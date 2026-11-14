@@ -8,6 +8,7 @@ add_executable(port_settings_mouse_test
 target_include_directories(port_settings_mouse_test PRIVATE
   "${PROJECT_SOURCE_DIR}/port/runtime/gx" "${PROJECT_SOURCE_DIR}/port/third_party/imgui")
 target_compile_features(port_settings_mouse_test PRIVATE cxx_std_17)
+target_compile_definitions(port_settings_mouse_test PRIVATE YOUGAME_AGENT_TEST_HOOK)
 add_test(NAME port_settings_mouse COMMAND port_settings_mouse_test)
 add_executable(port_settings_nav_test "${PROJECT_SOURCE_DIR}/port/tests/settings_nav_test.cpp")
 target_include_directories(port_settings_nav_test PRIVATE "${PROJECT_SOURCE_DIR}/port/runtime/host")

@@ -146,7 +146,7 @@ int main() {
     CHECK(!gx::skip_for_effects(gx::effects_filter(match, 2), match.draws[1]));
   }
   gx::RenderOptions aspect_options;
-  CHECK(aspect_options.vsync); // New installs start with synchronized presentation.
+  CHECK(!aspect_options.vsync); // Fresh installs avoid VSync display queueing.
   CHECK(aspect_options.te_options == 0x10u); // recognized TE save is enabled by default
   aspect_options.widescreen = true;
   CHECK(gx::presented_aspect(aspect_options, 1920, 1080) == 16.0f / 9.0f);
@@ -156,6 +156,14 @@ int main() {
   CHECK(gx::presented_aspect(aspect_options, 1920, 1080) == 16.0f / 9.0f);
 
   const fs::path path = fs::temp_directory_path() / "melee_unlocked_settings_load_test.ini";
+  {
+    std::ofstream(path) << "fps 144\n";
+    gx::RenderOptions no_vsync_key;
+    no_vsync_key.settings_path = path.string();
+    int missing_key_volume = 70;
+    gx::load_pc_settings(no_vsync_key, missing_key_volume);
+    CHECK(!no_vsync_key.vsync); // Older settings without a choice use the lower-latency default.
+  }
   {
     std::ofstream f(path);
     // The order the game writes: the preset line sits above the controls.
@@ -202,6 +210,15 @@ int main() {
   CHECK(!reloaded.vsync);
   CHECK(reloaded.mod_choices == options.mod_choices);
   CHECK(reloaded.mod_choices.at("abcdef0123456789") == 0);
+  // The lower-latency default must not erase a player's saved choice in either direction.
+  for (bool enabled : {true, false}) {
+    options.vsync = enabled;
+    CHECK(gx::save_pc_settings(options, volume));
+    reloaded = gx::RenderOptions{};
+    reloaded.settings_path = path.string();
+    gx::load_pc_settings(reloaded, volume);
+    CHECK(reloaded.vsync == enabled);
+  }
   // The volume a player set survives a save and a restart. It came back at full volume before.
   CHECK(gx::save_pc_settings(options, 35));
   int restarted = 70;
@@ -380,6 +397,25 @@ int main() {
     std::error_code ec;
     fs::remove(low_path, ec);
   }
+  // ... and for a Vulkan player with an FSR mode: saved and loaded, Low spec off gives Vulkan and the
+  // same FSR mode back (the file could only say d3d11 or d3d12, and modes above 10 were dropped).
+  {
+    const fs::path low_path = fs::temp_directory_path() / "melee_unlocked_settings_lowspec_vk_test.ini";
+    gx::RenderOptions o;
+    o.settings_path = low_path.string();
+    o.api = gx::RenderApi::Vulkan; o.dlss_mode = 12;
+    gx::apply_low_spec(o, false);
+    int vol = 100;
+    CHECK(gx::save_pc_settings(o, vol));
+    gx::RenderOptions next;
+    next.settings_path = low_path.string();
+    gx::load_pc_settings(next, vol);
+    CHECK(next.low_spec);
+    gx::restore_low_spec(next);
+    CHECK(next.api == gx::RenderApi::Vulkan && next.dlss_mode == 12);
+    std::error_code ec;
+    fs::remove(low_path, ec);
+  }
 
   // The Lossless adapter lag test arms one launch. 0.9.62's switch stayed on, so every launch after
   // it booted to an FFA character select that rumbled and turned the picture black and white on X/A.
@@ -460,7 +496,7 @@ int main() {
     fs::remove(old_path, ec);
   }
   // One Display choice and one Widescreen choice: a file with both of a pair on (possible only by
-  // hand) loads as one of them, exclusive fullscreen and True 16:9.
+  // hand) loads as one of them, exclusive fullscreen and True widescreen filling the screen.
   {
     const fs::path pair_path = fs::temp_directory_path() / "melee_unlocked_settings_pairs_test.ini";
     { std::ofstream f(pair_path); f << "fullscreen 1\nexclusivefullscreen 1\nwidescreen 1\ntruewidescreen 1\n"; }
@@ -469,8 +505,9 @@ int main() {
     int vol = 0;
     gx::load_pc_settings(o, vol);
     CHECK(o.exclusive_fullscreen && !o.fullscreen);
-    CHECK(!o.widescreen && o.true_widescreen && o.true_aspect == gx::TrueAspect::Wide16_9);
+    CHECK(!o.widescreen && o.true_widescreen && o.true_aspect == gx::TrueAspect::FitWindow);
     CHECK(gx::presented_aspect(o, 1920, 1080) == 16.0f / 9.0f);
+    CHECK(gx::presented_aspect(o, 1512, 982) == 1512.0f / 982.0f);
     std::error_code ec;
     fs::remove(pair_path, ec);
   }
@@ -507,7 +544,7 @@ int main() {
     std::error_code ec;
     fs::remove(display_path, ec);
   }
-  // Widescreen is True widescreen only (0.9.63): a saved Slippi code choice loads as True 16:9 and
+  // Widescreen is True widescreen only (0.9.63): a saved Slippi code choice fills the screen and
   // is saved that way, so a player who had it keeps a wide picture.
   {
     const fs::path ws_path = fs::temp_directory_path() / "melee_unlocked_settings_slippi_ws_test.ini";
@@ -516,10 +553,41 @@ int main() {
     o.settings_path = ws_path.string();
     int vol = 0;
     gx::load_pc_settings(o, vol);
-    CHECK(!o.widescreen && o.true_widescreen && o.true_aspect == gx::TrueAspect::Wide16_9);
+    CHECK(!o.widescreen && o.true_widescreen && o.true_aspect == gx::TrueAspect::FitWindow);
+    CHECK(gx::presented_aspect(o, 1920, 1080) == 16.0f / 9.0f);
+    CHECK(gx::presented_aspect(o, 1512, 982) == 1512.0f / 982.0f);
     CHECK(gx::save_pc_settings(o, vol));
     const std::string saved = read_text(ws_path);
     CHECK(saved.find("\nwidescreen 0\n") != std::string::npos && saved.find("\ntruewidescreen 1\n") != std::string::npos);
+    std::error_code ec;
+    fs::remove(ws_path, ec);
+  }
+  // Old True widescreen 16:9 files fill the screen once. A later explicit 16:9 choice survives
+  // both the migration marker and another save/load, independent of key order.
+  {
+    const fs::path ws_path = fs::temp_directory_path() / "melee_unlocked_settings_truews_fit_test.ini";
+    for (bool migrated : {false, true}) {
+      {
+        std::ofstream f(ws_path);
+        if (migrated) f << "truewsfit 1\n";
+        f << "truewsaspect 0\ntruewidescreen 1\n";
+      }
+      gx::RenderOptions o;
+      o.settings_path = ws_path.string();
+      int vol = 0;
+      gx::load_pc_settings(o, vol);
+      CHECK(o.true_widescreen && !o.widescreen);
+      CHECK(o.true_aspect == (migrated ? gx::TrueAspect::Wide16_9 : gx::TrueAspect::FitWindow));
+      CHECK(gx::presented_aspect(o, 1920, 1080) == 16.0f / 9.0f);
+      CHECK(gx::presented_aspect(o, 1512, 982) == (migrated ? 16.0f / 9.0f : 1512.0f / 982.0f));
+      o.true_aspect = gx::TrueAspect::Wide16_9;   // the player explicitly picks 16:9 after migration
+      CHECK(gx::save_pc_settings(o, vol));
+      CHECK(read_text(ws_path).find("\ntruewsfit 1\n") != std::string::npos);
+      gx::RenderOptions again;
+      again.settings_path = ws_path.string();
+      gx::load_pc_settings(again, vol);
+      CHECK(again.true_widescreen && again.true_aspect == gx::TrueAspect::Wide16_9);
+    }
     std::error_code ec;
     fs::remove(ws_path, ec);
   }

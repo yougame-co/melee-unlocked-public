@@ -37,6 +37,13 @@ class PacingDiagnosticsWiringTest(unittest.TestCase):
                 clean = clean.replace('  pacing_diagnostics_.statistics(diagnostic_statistics_result, st);\n', '')
                 clean = re.sub(r' +pacing_diagnostics_\.present\(present_call, opts_\.vsync,\n +present\.interval, present\.flags, opts_\.fps_cap, fullscreen_state_\.exclusive_active\);\n', '', clean)
                 clean = clean.replace('  pacing_diagnostics_.poll(swapchain_.Get(), hwnd_);\n', '')
+                # Build 88's slow-frame log times the GPU wait (an observer: the wait itself is unchanged).
+                clean = clean.replace('    Stopwatch gpu_wait_sw;\n', '')
+                clean = clean.replace('    ++slow_.gpu_waits; slow_.gpu_wait_ms += gpu_wait_sw.lap() * 1e3;\n', '')
+                # v0.9.96 rewords the variable-refresh log line only (the cap and V-Sync are unchanged here).
+                new_line = '"display; frame cap below %.0f fps, V-Sync follows the player\'s setting"'
+                self.assertEqual(clean.count(new_line), 1)
+                clean = clean.replace(new_line, '"display; frames are presented synced under %.0f a second, so they never tear"')
                 # v0.9.83 adds MSAA, shared presentation shaders, and occlusion handling.
                 # Pin the unaffected pacing routines rather than freezing the entire renderer.
                 from yougame_console_wiring_test import body
@@ -84,6 +91,39 @@ class PacingDiagnosticsWiringTest(unittest.TestCase):
 
     def test_settings_event_is_windows_only_and_preserves_toggle(self):
         s = source('port/runtime/gx/pc_settings.cpp')
+        # Build 60: the waiting pill is one row on the picture's bottom edge. Reverse it to its 60 px form first.
+        pill_now = '''      // One row on the picture's bottom edge, sized to the picture: 60 px up it sat on the retail menus'
+      // description box (VS. Mode, Name Entry) and on the CSS name cards.
+      const float picture = std::min(screen.y, screen.x / std::max(0.1f, g_overlay_game_aspect));
+      const float font = std::min(ImGui::GetFontSize(), std::max(8.0f, picture * 0.026f));
+      ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, (screen.y + picture) * 0.5f - std::max(2.0f, picture * 0.006f)),
+                              ImGuiCond_Always, ImVec2(0.5f, 1));
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(font * 0.6f, font * 0.3f));
+      ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * font / ImGui::GetFontSize());
+      ImGui::Begin("##yougame_friend_waiting", nullptr, passive_flags);
+      screen_label::reserve_bottom(ImGui::GetWindowPos().y);
+      ImGui::TextUnformatted(yougame::slippi_link_status(status).c_str());
+      if (status == yougame::friends::kWaiting || !console_status.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Z: cancel");
+      }
+      ImGui::End();
+      ImGui::PopFont();
+      ImGui::PopStyleVar();
+'''
+        pill_before = '''      ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, screen.y - 60), ImGuiCond_Always, ImVec2(0.5f, 1));
+      ImGui::Begin("##yougame_friend_waiting", nullptr, passive_flags);
+      ImGui::TextUnformatted(yougame::slippi_link_status(status).c_str());
+      if (status == yougame::friends::kWaiting || !console_status.empty()) ImGui::TextDisabled("Z: cancel");
+      ImGui::End();
+'''
+        self.assertEqual(s.count(pill_now), 1)
+        s = s.replace(pill_now, pill_before)
+        # Doubles 64: the Doubles home draws its own box above the pill. Reverse exactly that block.
+        box_start = s.index("#ifdef MELEE_DOUBLES\n    // The Doubles home's own box")
+        box = s[box_start:s.index('    // Online menu/CSS visibility alone', box_start)]
+        self.assertTrue(box.endswith('#endif\n') and box.count('ImGui::Begin(') == 1, box)
+        s = s.replace(box, '', 1)
         addition = '''#ifdef _WIN32
     const bool diagnostic_vsync_before = options.vsync;
 #endif
@@ -93,6 +133,84 @@ class PacingDiagnosticsWiringTest(unittest.TestCase):
       host::log("present: vsync %s (settings)", options.vsync ? "on" : "off");
 #endif'''
         self.assertIn(addition, s)
+        # Build 96.3 merges upstream v0.9.116 (snapback filter size and time as separate settings): reverse
+        # exactly its pc_settings.cpp hunks (v0.9.115 -> v0.9.116) first.
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build963_0116_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
+        # Builds 93-95 merge upstream v0.9.111-v0.9.113 (Lighting choices, the frame-protection live value
+        # moved, and more): reverse exactly their pc_settings.cpp hunks (v0.9.110 -> v0.9.113) first.
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build95_0113_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
+        # Build 90 merges upstream v0.9.110 (shiny floors on stage mods, glowing stage art lights the fighters):
+        # reverse exactly its pc_settings.cpp hunks (vs build 89) first.
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build90_0110_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
+        # Build 86 merges upstream v0.9.107 (path tracing on stage mods, effects light the stage): reverse exactly
+        # its pc_settings.cpp hunks (vs build 85).
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build86_0107_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
+        # Doubles 67 merges the shader cache saver and --prewarm-only (load_pc_settings returns before the
+        # gameplay files in a graphics-only run; the graphics settings it needs move above that return):
+        # reverse exactly its pc_settings.cpp hunks (vs Doubles 66).
+        for approved in json.loads((ROOT / 'port/tests/fixtures' / 'doubles67_prewarm_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
+        # Build 66 merges upstream v0.9.105 (the launcher's settings window keeps path tracing on, the RTX
+        # Brightness slider's own ID, the panel-nav test driver): reverse exactly its pc_settings.cpp hunks
+        # (vs build 65).
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build66_0105_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
+        # Build 65 merges upstream v0.9.104 (path tracing and HDR keys, AMD FSR upscaling, frame generation and
+        # its download, pause-screen looks; in the YouGame app the FSR download and the one-click mod looks
+        # are hidden): reverse exactly its pc_settings.cpp hunks (vs build 64).
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build65_0104_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
+        # Build 58 merges upstream v0.9.102 (the full Fountain of Dreams reflections tooltip): reverse exactly
+        # its pc_settings.cpp hunk (vs build 57).
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build58_0102_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
+        # Build 56 merges upstream v0.9.99 and v0.9.100 (offline-only community codes: Instant Melee, the
+        # unrestricted pause camera): reverse exactly its pc_settings.cpp hunks (vs build 55).
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build56_0999_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
+        # Build 54 merges upstream v0.9.98 (the Practice menu follows the last pad, XeSS as its own
+        # download, hidden in the YouGame app): reverse exactly its pc_settings.cpp hunks (vs build 53).
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build54_0998_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
+        # Build 53 merges upstream v0.9.97 (community codes, Coming soon stickers, the V-Sync tooltip):
+        # first reverse exactly its pc_settings.cpp hunks (vs build 52).
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build53_0997_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
+        # Build 52 scripted mouse events and diagnostics.
+        for changed in json.loads((ROOT / 'port/tests/fixtures/build52_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(changed['after']), 1, changed['after'])
+            s = s.replace(changed['after'], changed['before'], 1)
+        # Build 51 fullscreen and agent settings hooks: reverse only these exact ranges.
+        for changed in json.loads((ROOT / 'port/tests/fixtures/build51_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(changed['after']), 1, changed['after'])
+            s = s.replace(changed['after'], changed['before'], 1)
+        # Build 50m merges upstream v0.9.96: first reverse exactly its pc_settings.cpp hunks (vs v0.9.95).
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build50m_0996_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
+        # Build 49.2 merges upstream v0.9.95: first reverse exactly its pc_settings.cpp hunks (vs v0.9.94).
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build492_0995_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
+        # Build 49 merges upstream v0.9.94: first reverse exactly its pc_settings.cpp hunks (vs v0.9.93).
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build49_0994_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
         # Build 44 merges upstream v0.9.91: first reverse exactly its pc_settings.cpp hunks (vs v0.9.89).
         for approved in json.loads((ROOT / 'port/tests/fixtures/build44_0991_settings_ranges.json').read_text()):
             self.assertEqual(s.count(approved['after']), 1, approved['after'])
@@ -179,6 +297,16 @@ class PacingDiagnosticsWiringTest(unittest.TestCase):
             self.assertEqual(s.count(addition), 1)
             s = s.replace(addition, '')
         # Build 40: a friend's chat message gets its own toast under the invite toast.
+        # Build 60: the invite toast starts below the corner hint. Reverse it to build 40's form first.
+        for now, before in (('    // A new notice also brings the corner hint back at the picture\'s top-right; start below it.\n'
+                             '    float notice_bottom = std::max(16.0f, screen_label::corner_hint_bottom() + 8.0f);\n',
+                             '    float notice_bottom = 16.0f;\n'),
+                            ('ImGui::SetNextWindowPos(ImVec2(screen.x - 16, notice_bottom), ImGuiCond_Always, ImVec2(1, 0));\n'
+                             '      ImGui::SetNextWindowBgAlpha(0.85f);\n      ImGui::Begin("##yougame_invite_notice"',
+                             'ImGui::SetNextWindowPos(ImVec2(screen.x - 16, 16), ImGuiCond_Always, ImVec2(1, 0));\n'
+                             '      ImGui::SetNextWindowBgAlpha(0.85f);\n      ImGui::Begin("##yougame_invite_notice"')):
+            self.assertEqual(s.count(now), 1)
+            s = s.replace(now, before)
         for addition in ('    float notice_bottom = 16.0f;\n',
                          '      notice_bottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y + 8.0f;\n      ImGui::End();\n    }\n    if (const auto message = yougame::friends::events.message(now); !message.empty()) {\n      // Under the invite toast when both show, so a chat line never hides an invite.\n      ImGui::SetNextWindowPos(ImVec2(screen.x - 16, notice_bottom), ImGuiCond_Always, ImVec2(1, 0));\n      ImGui::SetNextWindowBgAlpha(0.85f);\n      ImGui::Begin("##yougame_message_notice", nullptr, passive_flags);\n      ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + std::min(380.0f, screen.x - 64));\n      ImGui::TextUnformatted(message.c_str());\n      ImGui::PopTextWrapPos();\n'):
             self.assertEqual(s.count(addition), 1)

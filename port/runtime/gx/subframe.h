@@ -39,7 +39,12 @@ struct SubFrameStats { uint32_t draws = 0, paired = 0, rigid = 0, blended = 0, c
   // Draws found to be standing still in the world and therefore advanced by the camera alone, as one
   // rigid piece. Large on a stage seen with a moving camera; zero when the camera is still.
   uint32_t stage_locked = 0;
+  // Menu draws whose vertex stream cannot blend (route 6), held or advanced this build.
+  uint32_t menu_held = 0, menu_advanced = 0;
 };
+
+// Cached diagnostic bit 64, exposed so backend startup can report the legacy menu hold mode.
+bool subframe_menu_hold_diag_enabled();
 
 // The endpoint invariant. In Interpolate a presented frame at phase 1 IS the current simulation
 // frame, so every draw must leave the solver with exactly the matrices the game loaded. A draw that

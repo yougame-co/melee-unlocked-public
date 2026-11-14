@@ -231,7 +231,9 @@ inline bool music_packs_enabled() { return false; }
 inline void set_melee_volume(uint8_t) {}
 inline void set_next_song_gain(float) {}
 inline void set_paused(bool) {}
-inline void mix(int16_t*, size_t, double, double = 32000.0) {}
+inline void set_output_rate(uint32_t) {}
+inline void mix(int16_t*, size_t, double, double = 32000.0, uint32_t = 0) {}
+inline void mix(float*, size_t, double, double = 32000.0, uint32_t = 0) {}
 inline void set_user_volume(int percent) { host::netplay::set_music_volume(percent); }
 inline int user_volume() { return host::netplay::music_volume(); }
 }  // namespace jukebox
@@ -282,6 +284,7 @@ inline int local_player_index() { return host::netplay::local_player_slot(); }
 inline uint32_t remote_shield_color(int) { return 0; }
 inline std::array<std::string, 4> player_names_for_overlay() { return host::netplay::player_names(); }
 inline int ping_ms() { return host::netplay::ping_ms(); }
+inline std::vector<int> remote_pings_ms() { return {}; }
 inline int session_mode() { return host::netplay::session_mode(); }
 inline bool in_online_menus() { return host::netplay::in_online_menus(); }
 inline bool online_status_visible() { return in_online_menus() && !is_online_match(); }

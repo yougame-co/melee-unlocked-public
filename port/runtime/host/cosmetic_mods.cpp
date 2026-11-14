@@ -3,6 +3,7 @@
 #define NOMINMAX
 #include "test_env.h"
 #include "cosmetic_mods.h"
+#include "disc_costume_metadata.h"
 #include "gameplay_policy.h"
 #include "stage_dat_safety.h"
 #include "stage_read_pin.h"
@@ -74,6 +75,7 @@ struct AssetRecord {
   std::string source_member;
   std::string source_id;
   std::vector<Companion> companions;
+  std::map<std::string, std::string> costume_aliases;  // m-ex exports -> native slot exports, applied after source hash verification
   // A skin that lives inside a mod disc or a files pack (source_kind "disc"): no copy is kept. The
   // bytes are read from disc_path at disc_offset when the skin is applied, and checked against the
   // catalog's SHA-256 then. disc_size and disc_mtime are the container's size and time at the scan,
@@ -99,8 +101,12 @@ struct DiscScan { std::string path; uint64_t size = 0; int64_t mtime = 0; uint32
 // skeleton check reads the relocation table (a joint at data offset 0 is a joint) and its reason
 // names the bone. 5: a costume whose blended mesh names a bone with no bind matrix is marked, since
 // the game stops when it draws one. 6: stage skins. 7: fighter move sound archives. A disc scanned
-// under an older number is scanned again at the next boot.
-constexpr uint32_t kScanRules = 8;
+// under an older number is scanned again at the next boot. 9: m-ex costume filenames and the
+// portrait animation's own stride, dimensions and palette keys, including added costumes. 10: an m-ex
+// stage stub (stage code, no collision data) is not a stage skin, and the alternates of a
+// dynamic alternate stages disc ("GrSt/GrSt-name(L).dat") are stage skins of their stage. 11: an m-ex
+// costume's stock icon from the HUD file's "Stc_icns".
+constexpr uint32_t kScanRules = 11;
 constexpr const char* kImportPack = "import";
 constexpr const char* kDiscSource = "disc";
 constexpr const char* kDiscChanged = "disc file missing or changed";
@@ -189,6 +195,12 @@ std::string g_session_pack;
 // The exact look in force ("Diet Classic", "Diet 64", "Crystal") or empty: every file of the pack scanned
 // under that name is served while it is set (publish_locked), on top of the player's own picks.
 std::string g_look_pack;
+// The disc whose alternate stages are this session's stages (set_session_stage_pack), as a scan's key.
+std::string g_session_stage_pack;
+// Buttons held on any controller, asked when a match's stage is planned (set_stage_button_probe).
+uint32_t (*g_stage_buttons)() = nullptr;
+// A lockstep session is running (set_lockstep_probe).
+bool (*g_lockstep)() = nullptr;
 // Newly built packs have been hash-verified, but are scanned for assets at the next start.
 bool g_look_prepared_this_run = false;
 
@@ -415,6 +427,19 @@ void load_companions(const json& item, AssetRecord* asset) {
       throw std::runtime_error("companion");
     asset->companions.push_back(std::move(companion));
   }
+  // Separate optional field: older builds ignore it instead of rejecting every catalog entry
+  // because their known companion kinds predate pause-screen imports.
+  const auto label = item.find("pause_text");
+  if (label != item.end() && label->is_object() && asset->info.kind == "pause_screen") {
+    AssetRecord::Companion companion;
+    companion.kind = "pause_text";
+    companion.stored_path = label->value("stored_path", std::string());
+    companion.sha256 = label->value("sha256", std::string());
+    companion.source_member = label->value("source_member", std::string());
+    if (!safe_relative_path(companion.stored_path) || companion.sha256.size() != 64)
+      throw std::runtime_error("pause text");
+    asset->companions.push_back(std::move(companion));
+  }
 }
 
 // A skin's sound bank is its own "voice" object, not one of "companions": a build that predates
@@ -450,6 +475,14 @@ void load_disc_fields(const json& item, AssetRecord* asset) {
   if (asset->disc_path.empty() || !asset->disc_length || asset->disc_length > kMaxAssetBytes)
     throw std::runtime_error("disc");
   asset->info.variant = item.value("variant", std::string());
+  const auto aliases = item.find("costume_aliases");
+  if (aliases != item.end()) {
+    asset->costume_aliases = aliases->get<std::map<std::string, std::string>>();
+    if (asset->costume_aliases.size() > 2) throw std::runtime_error("costume aliases");
+    for (const auto& alias : asset->costume_aliases)
+      if (alias.first.empty() || alias.second.empty() || alias.first.size() > 255 || alias.second.size() > 255)
+        throw std::runtime_error("costume alias");
+  }
   const auto online = item.find("online");
   // A verdict saved under an older online rule is worked out again (kOnlineRule).
   if (online != item.end() && online->is_object() && online->value("rule", 0) == kOnlineRule) {
@@ -486,9 +519,15 @@ json catalog_json_locked() {
       item["disc"] = {{"path", asset.disc_path}, {"offset", asset.disc_offset}, {"length", asset.disc_length},
                       {"size", asset.disc_size}, {"mtime", asset.disc_mtime}};
     if (!asset.info.variant.empty()) item["variant"] = asset.info.variant;
+    if (!asset.costume_aliases.empty()) item["costume_aliases"] = asset.costume_aliases;
     if (asset.online_known) item["online"] = {{"ok", asset.online_ok}, {"note", asset.online_note}, {"rule", kOnlineRule}};
     item["companions"] = json::array();
     for (const auto& companion : asset.companions) {
+      if (companion.kind == "pause_text") {
+        item["pause_text"] = {{"stored_path", companion.stored_path}, {"sha256", companion.sha256},
+                              {"source_member", companion.source_member}};
+        continue;
+      }
       item["companions"].push_back({{"kind", companion.kind},
                                       {"stored_path", companion.stored_path},
                                       {"sha256", companion.sha256},
@@ -1791,6 +1830,8 @@ bool costume_skeleton_matches(const std::vector<uint8_t>& clean, const std::vect
 // The full sentence stays in the log.
 std::string online_reason_short(const std::string& detail) {
   if (detail.empty()) return "the standard file could not be read";
+  const size_t incomplete = detail.rfind("incomplete visual conversion (");
+  if (incomplete != std::string::npos) return detail.substr(incomplete);
   if (detail.find("joints match") != std::string::npos) return detail;
   // "Skeleton joint 12 ... (moved)." names the bone, so a player knows which one to put back, and
   // the bracket (what changed, or the two joint counts) is carried over as written.
@@ -3243,7 +3284,8 @@ ImportResult install_vault_locked(const fs::path& source, VaultPlan plan,
     if (digest.empty()) { result.message = "A Nucleus resource could not be hashed."; return result; }
     std::string identity = sha256_text(resource.source_id + "\n" + resource.target_path + "\n" + digest);
     if (identity.empty()) { result.message = "A Nucleus resource identity could not be hashed."; return result; }
-    std::string id = (resource_source_kind == "nucleus_project" ? "nucleus-resource-" : "stage-") + identity;
+    std::string id = (resource_source_kind == "nucleus_project" ? "nucleus-resource-" :
+                      resource_source_kind == "pause_screen" ? "pause-" : "stage-") + identity;
     auto existing = std::find_if(next_assets.begin(), next_assets.end(), [&](const AssetRecord& item) {
       return item.source_kind == resource_source_kind && item.source_id == resource.source_id;
     });
@@ -3290,7 +3332,7 @@ ImportResult install_vault_locked(const fs::path& source, VaultPlan plan,
     }
     std::string visual_error, classification;
     std::vector<uint8_t> effect_runtime;
-    bool validated_now = resource.kind == "stage_visual" ||
+    bool validated_now = resource.kind == "stage_visual" || resource.kind == "pause_screen" ||
         materialize_effect_with_open_disc(resource.target_path, resource.bytes, &effect_runtime,
                                           &classification, &visual_error);
     const std::string key = selection_key(*recorded);
@@ -3349,6 +3391,12 @@ ImportResult install_vault_locked(const fs::path& source, VaultPlan plan,
   }
   result.ok = true; result.already_present = added == 0;
   result.already_present = result.already_present && resource_added == 0;
+  if (resource_source_kind == "pause_screen") {
+    result.message = std::to_string(resource_added) + " new / " + std::to_string(resource_refreshed) +
+                     " existing pause screens imported. Choose a style under Mods, Pause screen, then restart.";
+    g_message = result.message;
+    return result;
+  }
   result.message = (resource_source_kind == "nucleus_project" ?
                     "Nucleus project committed atomically: " : "Stage import committed atomically: ") +
                    std::to_string(added) +
@@ -3358,6 +3406,60 @@ ImportResult install_vault_locked(const fs::path& source, VaultPlan plan,
                    std::to_string(plan.rejected_resources.size()) +
                    " structurally unsupported records quarantined. Effects require exact-ISO materialization; stage visuals are checked before online use.";
   return result;
+}
+
+// The game's pause loader indexes joints 1, 9, 10 and 11 and takes joint 1's child.
+// Keep that contract when accepting presentation-only archives from a pause-screen pack.
+bool pause_screen_valid(const std::vector<uint8_t>& bytes, std::string* error) {
+  VisualLayout layout;
+  if (!parse_visual_layout(bytes, &layout, error)) return false;
+  if (layout.roots.size() != 1 || layout.roots[0] != "ScGamPause_scene_data" || be32(bytes.data() + 16) != 0) {
+    *error = "A pause screen must contain only ScGamPause_scene_data, without external code references."; return false;
+  }
+  disc_metadata::Archive archive(bytes);
+  uint32_t scene, models, model, joint;
+  if (!archive.parse() || !archive.root("ScGamPause_scene_data", &scene) || !archive.bounds(scene, 16) ||
+      !archive.pointer(scene, &models) || !archive.bounds(models, 8) || archive.word(models + 4) ||
+      !archive.pointer(models, &model) || !archive.bounds(model, 16) || !archive.pointer(model, &joint)) {
+    *error = "The pause screen has no supported scene model."; return false;
+  }
+  std::set<uint32_t> visited;
+  std::vector<uint32_t> order;
+  std::function<bool(uint32_t, unsigned)> walk = [&](uint32_t at, unsigned depth) {
+    if (depth > 128 || order.size() >= 4096 || !archive.bounds(at, 64) || !visited.insert(at).second) return false;
+    order.push_back(at);
+    // Particle, spline and instance joints can reach runtime tables outside this visual archive.
+    if (archive.word(at + 4) & (0x20u | 0x4000u | 0x1000u)) return false;
+    for (uint32_t field : {8u, 12u}) {
+      uint32_t next;
+      if (archive.pointer(at + field, &next)) { if (!walk(next, depth + 1)) return false; }
+      else if (archive.word(at + field)) return false;
+    }
+    return true;
+  };
+  uint32_t child;
+  if (!walk(joint, 0) || order.size() < 12 || !archive.pointer(order[1] + 8, &child) || !visited.count(child)) {
+    *error = "The pause screen is missing required controls joints or has a cyclic joint tree."; return false;
+  }
+  return true;
+}
+
+bool pause_filename(const std::string& name) {
+  const std::string base = lower(path_filename_utf8(fs::u8path(name)));
+  return base == "gmpause.usd" || base == "gmpause.dat" || base == "gmpausenohud.usd" || base == "gmpausenohud.dat";
+}
+
+bool pause_resource(const fs::path& source, const std::string& member, std::vector<uint8_t> bytes,
+                    VaultResourcePlan* out, std::string* error) {
+  if (!pause_screen_valid(bytes, error)) return false;
+  out->source_id = "pause:" + sha256(bytes);
+  out->source_member = member;
+  out->kind = "pause_screen"; out->target_path = "GmPause.usd";
+  out->group = "Menus"; out->slot = "Pause screen";
+  const bool no_hud = lower(member.empty() ? path_filename_utf8(source) : member).find("nohud") != std::string::npos;
+  out->display_name = source.stem().u8string() + (no_hud ? " (no pause overlay)" : " (PAUSE label)");
+  out->bytes = std::move(bytes);
+  return true;
 }
 
 std::vector<uint8_t> load_runtime_asset_locked(const AssetRecord& asset, std::string* error) {
@@ -3376,6 +3478,13 @@ std::vector<uint8_t> load_runtime_asset_locked(const AssetRecord& asset, std::st
     }
   }
   if (asset.info.kind == "character_costume") {
+    if (!asset.costume_aliases.empty()) {
+      std::vector<uint8_t> renamed;
+      if (!disc_metadata::alias_roots(bytes, asset.costume_aliases, &renamed)) {
+        *error = asset.info.name + ": costume export names no longer match the catalog."; return {};
+      }
+      bytes = std::move(renamed);
+    }
     auto dat = inspect_dat_impl(bytes);
     if (!dat.ok || dat.target_path != asset.info.target_path) {
       *error = asset.info.name + ": stored DAT identity no longer matches its catalog target."; return {};
@@ -3400,6 +3509,8 @@ std::vector<uint8_t> load_runtime_asset_locked(const AssetRecord& asset, std::st
       return {};
     }
     bytes = std::move(safe);
+  } else if (asset.info.kind == "pause_screen") {
+    if (asset.info.target_path != "GmPause.usd" || !pause_screen_valid(bytes, error)) return {};
   } else if (asset.info.kind == "stage_visual" || asset.info.kind == "effect_visual") {
     VisualLayout layout;
     if (!parse_visual_layout(bytes, &layout, error)) {
@@ -3432,7 +3543,8 @@ bool refresh_assets_locked(bool prune_invalid_selections, std::string* error) {
       asset.info.available = !load_runtime_asset_locked(asset, &validation_error).empty();
     }
     asset.info.availability_message = asset.info.available ?
-        (asset.info.kind == "character_costume" || asset.info.kind == kPortraitKind || asset.info.kind == "fighter_sound" ? std::string() :
+        (asset.info.kind == "character_costume" || asset.info.kind == kPortraitKind || asset.info.kind == "fighter_sound" ||
+         asset.info.kind == "pause_screen" ? std::string() :
          asset.info.kind == "stage_visual" ?
              "Stage replacement is offline unless exact-ISO validation proves texture-only changes." :
              "Exact clean-ISO effect validation and safe materialization are required when selected and repeated at every launch.") :
@@ -3526,6 +3638,19 @@ bool disc_fighter_sound_member(const std::string& raw) {
 // name; *variant names the set as for a costume. The content is checked by the caller.
 bool disc_stage_member(const std::string& raw, std::string* target, std::string* label, std::string* variant) {
   const std::string name = lower(raw);
+  // A dynamic alternate stages disc keeps a folder per stage: "GrSt/GrSt-surfshop(L).dat". The text
+  // after the dash names the alternate, and a button in brackets is the one that picks it there.
+  const size_t dash = name.find('-'), last_dot = name.rfind('.');
+  if (dash != std::string::npos && last_dot != std::string::npos && last_dot > dash + 1 && name.size() == last_dot + 4 &&
+      (name.compare(last_dot, 4, ".dat") == 0 || name.compare(last_dot, 4, ".usd") == 0)) {
+    for (const auto& resource : kStageResources) {
+      if (name.compare(0, dash, resource.token) != 0) continue;
+      *target = resource.path; *label = resource.label;
+      *variant = raw.substr(dash + 1, last_dot - dash - 1);
+      return true;
+    }
+    return false;
+  }
   const size_t dot = name.find('.');
   if (dot == std::string::npos || name.size() != dot + 4) return false;
   for (const auto& resource : kStageResources) {
@@ -3536,19 +3661,41 @@ bool disc_stage_member(const std::string& raw, std::string* target, std::string*
   return false;
 }
 
-// A pack's character select file, where its portraits are: the English MnSlChr.usd when the pack
-// has one (it is the one this game loads), otherwise MnSlChr.dat.
+// The button a dynamic alternate's name carries ("surfshop(L)"), as the game's pad bit, or 0. The
+// stage code of such a disc looks for these six, in this order.
+uint32_t stage_alternate_button(const std::string& variant) {
+  static constexpr struct { const char* tag; uint32_t bit; } kButtons[] = {
+      {"(l)", 0x40}, {"(r)", 0x20}, {"(z)", 0x10}, {"(b)", 0x200}, {"(x)", 0x400}, {"(y)", 0x800}};
+  const std::string name = lower(variant);
+  for (const auto& button : kButtons) if (name.find(button.tag) != std::string::npos) return button.bit;
+  return 0;
+}
+
+// m-ex's exported portrait symbol file when present, otherwise the English character select file
+// and then the other supported menu filenames. Only data is read from these archives.
 void note_select_screen(const std::string& name, const fs::path& file, uint64_t offset, uint64_t length,
                         DiscCandidate* screen) {
   const std::string wanted = lower(name);
-  if (wanted == "mnslchr.usd" || (wanted == "mnslchr.dat" && screen->member.empty()))
+  // Modern m-ex loads this exported symbol file directly; when present it is authoritative.
+  if (wanted == "mexselectchr.dat") { *screen = {name, file, offset, length}; return; }
+  if (lower(screen->member) == "mexselectchr.dat") return;
+  if (wanted == "mnslchr.usd" ||
+      (wanted == "mnslchr.dat" && lower(screen->member) != "mnslchr.usd") ||
+      (wanted == "mnslchr.0sd" && screen->member.empty()))
     *screen = {name, file, offset, length};
+}
+
+// m-ex gives additional costumes arbitrary DAT filenames. Only its validated costume table can
+// identify them; collect potential files here and let the table and model roots decide below.
+bool possible_mex_costume(const std::string& name) {
+  const std::string extension = lower(fs::u8path(name).extension().u8string());
+  return extension == ".dat" || extension == ".usd";
 }
 
 // Every file in a disc image whose name is a costume, fighter sound archive, or stage skin.
 // *screen gets the disc's character select file when it has one.
-bool disc_costume_files(const fs::path& iso, std::vector<DiscCandidate>* out, DiscCandidate* screen,
-                        std::string* error) {
+bool disc_costume_files(const fs::path& iso, std::vector<DiscCandidate>* out, DiscCandidate* screen, DiscCandidate* metadata,
+                        DiscCandidate* hud, std::string* error) {
   std::vector<uint8_t> header;
   if (!read_range(iso, 0, 0x440, &header)) { *error = "The disc image could not be read."; return false; }
   const uint64_t fst_offset = be32(header.data() + 0x424), fst_size = be32(header.data() + 0x428);
@@ -3563,14 +3710,17 @@ bool disc_costume_files(const fs::path& iso, std::vector<DiscCandidate>* out, Di
     const std::string name = slash == std::string::npos ? file.path : file.path.substr(slash + 1);
     std::string variant, stage, label;
     note_select_screen(name, iso, file.start, file.size, screen);
+    if (lower(name) == "mxdt.dat") *metadata = {name, iso, file.start, file.size};
+    if (lower(name) == "ifall.usd") *hud = {name, iso, file.start, file.size};
     if (!disc_skin_member(name, &variant) && !disc_stage_member(name, &stage, &label, &variant) &&
-        !disc_fighter_sound_member(name)) continue;
+        !disc_fighter_sound_member(name) && !possible_mex_costume(name)) continue;
     out->push_back({name, iso, file.start, file.size});
   }
   return true;
 }
 
-void folder_costume_files(const fs::path& root, std::vector<DiscCandidate>* out, DiscCandidate* screen) {
+void folder_costume_files(const fs::path& root, std::vector<DiscCandidate>* out, DiscCandidate* screen, DiscCandidate* metadata,
+                          DiscCandidate* hud) {
   std::error_code ec;
   for (fs::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
     if (!it->is_regular_file(ec)) continue;
@@ -3579,8 +3729,10 @@ void folder_costume_files(const fs::path& root, std::vector<DiscCandidate>* out,
     const uint64_t length = it->file_size(ec);
     if (ec) continue;
     note_select_screen(name, it->path(), 0, length, screen);
+    if (lower(name) == "mxdt.dat") *metadata = {name, it->path(), 0, length};
+    if (lower(name) == "ifall.usd") *hud = {name, it->path(), 0, length};
     if (!disc_skin_member(name, &variant) && !disc_stage_member(name, &stage, &label, &variant) &&
-        !disc_fighter_sound_member(name)) continue;
+        !disc_fighter_sound_member(name) && !possible_mex_costume(name)) continue;
     out->push_back({name, it->path(), 0, length});
   }
 }
@@ -3592,8 +3744,10 @@ void folder_costume_files(const fs::path& root, std::vector<DiscCandidate>* out,
 // (mn/mncharsel.c), so the keys, not the order of the table, name the picture of a slot. This is
 // the reading tools/companion_texture_diagnostic.py does to make companion_texture_map.h.
 constexpr uint32_t kPortraitWidth = 136, kPortraitHeight = 188, kPortraitFormat = 9;   // 8 bit palette indices
-constexpr uint32_t kPortraitBytes = (kPortraitWidth / 8) * (kPortraitHeight / 4) * 32;
-struct SelectPortrait { uint32_t pixels = 0, colors = 0, palette_format = 0, palette_entries = 0; };
+struct SelectPortrait {
+  uint32_t pixels = 0, colors = 0, palette_format = 0, palette_entries = 0;
+  uint32_t width = kPortraitWidth, height = kPortraitHeight, format = kPortraitFormat;
+};
 
 // Frame -> value of one animation track that holds whole-number keys. `block` is the archive's data
 // block; every read stays inside it.
@@ -3613,9 +3767,10 @@ bool texture_track_keys(const uint8_t* block, size_t size, uint32_t track, std::
   while (at < end) {
     uint8_t byte = block[at++];
     const uint32_t opcode = byte & 0xF;
+    if (opcode < 1 || opcode > 6) return false;
     uint32_t count = (byte >> 4) & 7, shift = 3;
     while (byte & 0x80) {
-      if (at >= size || shift > 24) return false;
+      if (at >= end || shift > 24) return false;
       byte = block[at++];
       count |= (uint32_t)(byte & 0x7F) << shift; shift += 7;
     }
@@ -3623,7 +3778,7 @@ bool texture_track_keys(const uint8_t* block, size_t size, uint32_t track, std::
       bool has_value = false;
       double value = 0;
       if (opcode == 1 || opcode == 2 || opcode == 3 || opcode == 4 || opcode == 6) {
-        if (size - at < sizes[kind]) return false;
+        if (end - at < sizes[kind]) return false;
         const uint8_t* raw = block + at;
         at += sizes[kind];
         switch (kind) {
@@ -3636,12 +3791,12 @@ bool texture_track_keys(const uint8_t* block, size_t size, uint32_t track, std::
         has_value = true;
       }
       if (opcode == 4 || opcode == 5) {
-        if (slope_kind > 4 || size - at < sizes[slope_kind]) return false;
+        if (slope_kind > 4 || end - at < sizes[slope_kind]) return false;
         at += sizes[slope_kind];
       }
       uint32_t wait = 0, wait_shift = 0;
       for (;;) {
-        if (at >= size || wait_shift > 28) return false;
+        if (at >= end || wait_shift > 28) return false;
         byte = block[at++];
         wait |= (uint32_t)(byte & 0x7F) << wait_shift; wait_shift += 7;
         if (!(byte & 0x80)) break;
@@ -3659,9 +3814,47 @@ bool texture_track_keys(const uint8_t* block, size_t size, uint32_t track, std::
 // Frame -> portrait of a character select file, from the first texture animation whose tables hold
 // portraits. False when the file has no such animation (not a character select file, or one built
 // another way): then no portrait is taken from it.
-bool select_portraits(const std::vector<uint8_t>& dat, std::map<int, SelectPortrait>* frames) {
+bool texture_animation_frames(const std::vector<uint8_t>& dat, uint32_t mex_animation, std::map<int, SelectPortrait>* frames);
+
+bool select_portraits(const std::vector<uint8_t>& dat, std::map<int, SelectPortrait>* frames, int* mex_stride = nullptr) {
   frames->clear();
-  if (dat.size() < 0x20) return false;
+  if (mex_stride) *mex_stride = 0;
+  disc_metadata::Archive archive(dat);
+  if (!archive.parse()) return false;
+  uint32_t mex_root = 0, mex_animation = UINT32_MAX;
+  int stride = 0;
+  if (archive.root("mexSelectChr", &mex_root)) {
+    uint32_t material;
+    if (!archive.bounds(mex_root, 20) || !archive.pointer(mex_root + 12, &material) ||
+        !archive.bounds(material, 12) || !archive.pointer(material + 8, &mex_animation)) return false;
+    stride = (int)archive.word(mex_root + 16);
+    if (stride < 26 || stride > 512) return false;
+  }
+  if (!texture_animation_frames(dat, mex_animation, frames)) return false;
+  if (mex_stride) *mex_stride = stride;
+  return true;
+}
+
+// The m-ex stock icons of a HUD file (IfAll): "Stc_icns" = {reserved frames, frames per costume row,
+// material animation joint}. A fighter's icon is frame reserved + costume * stride + m-ex internal id.
+bool mex_stock_icons(const std::vector<uint8_t>& dat, std::map<int, SelectPortrait>* frames, int* reserved, int* stride) {
+  frames->clear();
+  disc_metadata::Archive archive(dat);
+  uint32_t root = 0, joint = 0, material = 0, animation = 0;
+  if (!archive.parse() || !archive.root("Stc_icns", &root) || !archive.bounds(root, 8) ||
+      !archive.pointer(root + 4, &joint) || !archive.bounds(joint, 12) || !archive.pointer(joint + 8, &material) ||
+      !archive.bounds(material, 12) || !archive.pointer(material + 8, &animation)) return false;
+  const uint32_t head = archive.word(root);
+  *reserved = (int)(head >> 16); *stride = (int)(head & 0xFFFF);
+  if (*stride < 26 || *stride > 512) return false;
+  return texture_animation_frames(dat, animation, frames);
+}
+
+// Frame -> picture of one texture animation: the one at mex_animation, or with UINT32_MAX the first whose
+// tables hold retail character select portraits.
+bool texture_animation_frames(const std::vector<uint8_t>& dat, uint32_t mex_animation, std::map<int, SelectPortrait>* frames) {
+  frames->clear();
+  const int stride = mex_animation != UINT32_MAX;   // a named animation: any picture size
   const uint64_t data_size = be32(dat.data() + 4), relocations = be32(dat.data() + 8);
   if (0x20ull + data_size + relocations * 4ull > dat.size()) return false;
   const uint8_t* block = dat.data() + 0x20;
@@ -3676,47 +3869,76 @@ bool select_portraits(const std::vector<uint8_t>& dat, std::map<int, SelectPortr
     // {next, id, animation, image table, palette table, images (16 bit), palettes (16 bit)}
     if (pointer < 0xC || (uint64_t)pointer + 12 > data_size) continue;
     const uint32_t anim = pointer - 0xC;
+    if (stride && anim != mex_animation) continue;  // the named CSP animation, never an unrelated menu texture
     if (!relocated(pointer + 4) || !relocated(anim + 8)) continue;
     const uint32_t images = word(pointer), palettes = word(pointer + 4);
     const uint32_t image_count = be16(block + pointer + 8), palette_count = be16(block + pointer + 10);
-    if (image_count < 20 || image_count > 400 || image_count != palette_count) continue;
-    if ((uint64_t)images + 4ull * image_count > data_size || (uint64_t)palettes + 4ull * image_count > data_size) continue;
+    if (image_count < (stride ? 1u : 20u) || image_count > 4096 || !palette_count || palette_count > 4096) continue;
+    if ((uint64_t)images + 4ull * image_count > data_size || (uint64_t)palettes + 4ull * palette_count > data_size) continue;
     std::vector<SelectPortrait> entries(image_count);
     std::vector<bool> valid(image_count, false);
     size_t good = 0;
     bool broken = false;
     for (uint32_t i = 0; i < image_count; ++i) {
-      const uint32_t image = word(images + 4ull * i), palette = word(palettes + 4ull * i);
-      if ((uint64_t)image + 24 > data_size || (uint64_t)palette + 14 > data_size) { broken = true; break; }
+      const uint32_t image = word(images + 4ull * i);
+      if ((uint64_t)image + 24 > data_size) { broken = true; break; }
       SelectPortrait entry;
       entry.pixels = word(image);
-      if (be16(block + image + 4) != kPortraitWidth || be16(block + image + 6) != kPortraitHeight ||
-          word(image + 8) != kPortraitFormat || (uint64_t)entry.pixels + kPortraitBytes > data_size) continue;
-      entry.colors = word(palette);
-      entry.palette_format = word(palette + 4);
-      entry.palette_entries = be16(block + palette + 12);
-      if (entry.palette_format > 2 || !entry.palette_entries || entry.palette_entries > 256 ||
-          (uint64_t)entry.colors + 2ull * entry.palette_entries > data_size) continue;
+      entry.width = be16(block + image + 4); entry.height = be16(block + image + 6); entry.format = word(image + 8);
+      if (!entry.width || !entry.height || entry.width > 1024 || entry.height > 1024 ||
+          (!stride && (entry.width != kPortraitWidth || entry.height != kPortraitHeight)) ||
+          (entry.format != 8 && entry.format != 9) ||
+          (uint64_t)entry.pixels + gx_image_size(entry.width, entry.height, entry.format, 0, 0) > data_size) continue;
       entries[i] = entry; valid[i] = true; ++good;
     }
     if (broken || good * 5 < (size_t)image_count * 4) continue;
     // animation -> its first track; the image index track is type 1
     const uint32_t animation = word(anim + 8);
     if ((uint64_t)animation + 12 > data_size) continue;
-    std::map<int, int> keys;
-    bool have_keys = false;
+    std::map<int, int> keys, palette_keys;
+    bool have_keys = false, have_palette_keys = false, bad_track = false;
     uint32_t track = word(animation + 8);
     for (int guard = 0; track && guard < 64; ++guard) {
       if ((uint64_t)track + 0x14 > data_size) { have_keys = false; break; }
-      if (block[track + 0xC] == 1) have_keys = texture_track_keys(block, (size_t)data_size, track, &keys);
+      if (block[track + 0xC] == 1) {
+        have_keys = texture_track_keys(block, (size_t)data_size, track, &keys);
+        bad_track |= !have_keys;
+      }
+      if (block[track + 0xC] == 2) {
+        have_palette_keys = texture_track_keys(block, (size_t)data_size, track, &palette_keys);
+        bad_track |= !have_palette_keys;
+      }
       track = word(track);
     }
-    if (!have_keys) continue;
+    if (!have_keys || bad_track || track) continue;
     bool in_table = true;
     for (const auto& key : keys) in_table &= key.second >= 0 && (uint32_t)key.second < image_count;
     if (!in_table) continue;
-    for (const auto& key : keys)
-      if (valid[(size_t)key.second]) (*frames)[key.first] = entries[(size_t)key.second];
+    for (const auto& key : palette_keys) in_table &= key.second >= 0 && (uint32_t)key.second < palette_count;
+    if (!in_table || (!have_palette_keys && palette_count != 1 && palette_count != image_count)) continue;
+    std::set<int> keyframes;
+    for (const auto& key : keys) keyframes.insert(key.first);
+    for (const auto& key : palette_keys) keyframes.insert(key.first);
+    for (const int frame : keyframes) {
+      auto image_key = keys.upper_bound(frame);
+      if (image_key == keys.begin()) continue;
+      const int image_index = std::prev(image_key)->second;
+      if (!valid[(size_t)image_index]) continue;
+      int palette_index = palette_count == 1 ? 0 : image_index;
+      if (have_palette_keys) {
+        auto palette_key = palette_keys.upper_bound(frame);
+        if (palette_key == palette_keys.begin()) continue;
+        palette_index = std::prev(palette_key)->second;
+      }
+      const uint32_t palette = word(palettes + 4ull * palette_index);
+      if ((uint64_t)palette + 14 > data_size) continue;
+      SelectPortrait entry = entries[(size_t)image_index];
+      entry.colors = word(palette); entry.palette_format = word(palette + 4);
+      entry.palette_entries = be16(block + palette + 12);
+      if (entry.palette_format > 2 || !entry.palette_entries || entry.palette_entries > (entry.format == 8 ? 16u : 256u) ||
+          (uint64_t)entry.colors + 2ull * entry.palette_entries > data_size) continue;
+      (*frames)[frame] = entry;
+    }
     return !frames->empty();
   }
   return false;
@@ -3741,13 +3963,17 @@ int portrait_frame(const SlotName& slot) {
 // One portrait as 8 bit RGBA, top row first. The image is rows of 8x4 texel blocks of palette
 // indices; the palette is 16 bit colors in one of the console's three palette formats.
 std::vector<uint8_t> decode_portrait(const uint8_t* block, const SelectPortrait& portrait) {
-  std::vector<uint8_t> rgba((size_t)kPortraitWidth * kPortraitHeight * 4, 0);
+  std::vector<uint8_t> rgba((size_t)portrait.width * portrait.height * 4, 0);
   const uint8_t* source = block + portrait.pixels;
-  for (uint32_t block_y = 0; block_y < kPortraitHeight; block_y += 4)
-    for (uint32_t block_x = 0; block_x < kPortraitWidth; block_x += 8)
-      for (uint32_t y = 0; y < 4; ++y)
+  const uint32_t block_height = portrait.format == 8 ? 8 : 4;
+  size_t texel = 0;
+  for (uint32_t block_y = 0; block_y < portrait.height; block_y += block_height)
+    for (uint32_t block_x = 0; block_x < portrait.width; block_x += 8)
+      for (uint32_t y = 0; y < block_height; ++y)
         for (uint32_t x = 0; x < 8; ++x) {
-          const uint32_t index = *source++;
+          const uint32_t index = portrait.format == 8 ? (source[texel / 2] >> (texel % 2 ? 0 : 4)) & 15 : source[texel];
+          ++texel;
+          if (block_x + x >= portrait.width || block_y + y >= portrait.height) continue;
           if (index >= portrait.palette_entries) continue;   // no such color: left transparent
           const uint32_t color = be16(block + portrait.colors + 2 * index);
           uint32_t r, g, b, a = 255;
@@ -3763,7 +3989,7 @@ std::vector<uint8_t> decode_portrait(const uint8_t* block, const SelectPortrait&
             a = (color >> 12) & 7; r = (color >> 8) & 15; g = (color >> 4) & 15; b = color & 15;
             a = (a << 5) | (a << 2) | (a >> 1); r *= 17; g *= 17; b *= 17;
           }
-          uint8_t* out = rgba.data() + ((size_t)(block_y + y) * kPortraitWidth + block_x + x) * 4;
+          uint8_t* out = rgba.data() + ((size_t)(block_y + y) * portrait.width + block_x + x) * 4;
           out[0] = (uint8_t)r; out[1] = (uint8_t)g; out[2] = (uint8_t)b; out[3] = (uint8_t)a;
         }
   return rgba;
@@ -3811,14 +4037,44 @@ std::vector<uint8_t> rgba_png(const std::vector<uint8_t>& rgba, uint32_t width, 
 
 // Gives each plain costume of a scan the portrait the pack's character select file shows for its
 // slot, when that picture differs from the game's own. The picture is written beside the catalog as
-// the skin's "csp" companion. Alternate sets are skipped: the file has one cell per slot, and it is
-// the plain costume's. Returns how many portraits were stored. The game disc's English file is the
-// one compared against, since its portraits are the ones the renderer replaces.
-size_t pack_portraits_locked(const DiscCandidate& screen, std::map<std::string, AssetRecord>* fresh) {
+// the skin's "csp" companion. m-ex names each costume's portrait with its external fighter ID,
+// costume index and CSP stride; its extra costumes must not use the retail animation's columns.
+// m-ex also renames the exported skeleton/material symbols for new colors. Map those names to
+// the native costume whose visibility tables the pack explicitly chose; model data stays intact.
+bool prepare_mex_costume(const disc_metadata::MexCostume& row, std::vector<uint8_t>* bytes,
+                         testing::DatInspection* inspected, std::map<std::string, std::string>* aliases) {
+  *inspected = inspect_dat_impl(*bytes);
+  if (inspected->ok) return inspected->target_path.substr(2, 2) == row.family;
+  for (const auto& family : families) {
+    if (row.family != family.file_code) continue;
+    const std::string prefix = std::string("Ply") + family.root_name + "5K";
+    const std::string suffix = "_Share_joint";
+    if (row.joint.size() < prefix.size() + suffix.size() || row.joint.compare(0, prefix.size(), prefix) ||
+        row.joint.compare(row.joint.size() - suffix.size(), suffix.size(), suffix)) return false;
+    std::istringstream colors(family.colors);
+    std::string color;
+    if (row.visibility > 15) return false;
+    for (uint32_t i = 0; i <= row.visibility; ++i) if (!(colors >> color)) return false;
+    const std::string joint = prefix + (color == "Nr" ? "" : color) + suffix;
+    (*aliases)[row.joint] = joint;
+    if (!row.matanim.empty()) {
+      const std::string expected = row.joint.substr(0, row.joint.size() - 6) + "_matanim_joint";
+      if (row.matanim != expected) return false;
+      (*aliases)[row.matanim] = joint.substr(0, joint.size() - 6) + "_matanim_joint";
+    }
+    std::vector<uint8_t> renamed;
+    if (!disc_metadata::alias_roots(*bytes, *aliases, &renamed)) return false;
+    *inspected = inspect_dat_impl(renamed);
+    if (!inspected->ok || inspected->target_path != std::string("Pl") + family.file_code + color + ".dat") return false;
+    *bytes = std::move(renamed);
+    return true;
+  }
+  return false;
+}
+
+size_t pack_portraits_locked(const DiscCandidate& screen, const disc_metadata::MexCostumes& costumes,
+                            std::map<std::string, AssetRecord>* fresh) {
   if (screen.member.empty()) return 0;
-  bool wanted = false;
-  for (const auto& item : *fresh) wanted |= item.second.info.variant.empty();
-  if (!wanted) return 0;
   uint32_t retail_offset = 0, retail_size = 0;
   std::vector<uint8_t> pack, retail;
   if (!host::disc_find_file("MnSlChr.usd", &retail_offset, &retail_size) || !retail_size || retail_size > kMaxAssetBytes ||
@@ -3826,23 +4082,68 @@ size_t pack_portraits_locked(const DiscCandidate& screen, std::map<std::string, 
   retail.resize(retail_size);
   if (!host::disc_read(retail_offset, retail.data(), retail_size) || pack == retail) return 0;
   std::map<int, SelectPortrait> ours, theirs;
-  if (!select_portraits(retail, &ours) || !select_portraits(pack, &theirs)) return 0;
+  int stride = 0;
+  if (!select_portraits(retail, &ours) || !select_portraits(pack, &theirs, &stride)) return 0;
   size_t stored = 0;
   for (auto& item : *fresh) {
     AssetRecord& asset = item.second;
     SlotName slot;
-    if (!asset.info.variant.empty() || !find_slot(asset.info.target_path, &slot)) continue;
-    const int frame = portrait_frame(slot);
-    const auto standard = ours.find(frame), picture = theirs.find(frame);
-    if (frame < 0 || standard == ours.end() || picture == theirs.end()) continue;
+    if (asset.info.kind != "character_costume" || !find_slot(asset.info.target_path, &slot)) continue;
+    const int standard_frame = portrait_frame(slot);
+    int frame = standard_frame;
+    const auto origin = costumes.find(lower(asset.source_member));
+    if (stride && origin != costumes.end() && origin->second.family == slot.family->file_code)
+      frame = (int)origin->second.external + stride * (int)origin->second.costume;
+    else if (!asset.info.variant.empty()) continue;  // no explicit picture for this alternate
+    else if (stride && frame >= 0)
+      frame = frame / 30 * stride + frame % 30 + (frame % 30 >= 19 ? 1 : 0);
+    const auto standard = ours.find(standard_frame), picture = theirs.find(frame);
+    if (frame < 0 || picture == theirs.end()) continue;
     const std::vector<uint8_t> rgba = decode_portrait(pack.data() + 0x20, picture->second);
-    if (rgba == decode_portrait(retail.data() + 0x20, standard->second)) continue;   // the game's own picture
-    const std::vector<uint8_t> png = rgba_png(rgba, kPortraitWidth, kPortraitHeight);
+    if (standard != ours.end() && picture->second.width == standard->second.width && picture->second.height == standard->second.height &&
+        rgba == decode_portrait(retail.data() + 0x20, standard->second)) continue;
+    const std::vector<uint8_t> png = rgba_png(rgba, picture->second.width, picture->second.height);
     AssetRecord::Companion companion;
     companion.kind = "csp";
     companion.sha256 = sha256(png);
     companion.source_member = screen.member;
     companion.stored_path = (fs::path(L"assets") / fs::u8path(asset.info.id) / L"companions" / L"csp.png").generic_u8string();
+    std::string write_error;
+    if (companion.sha256.empty() ||
+        !write_atomic(g_root / fs::u8path(companion.stored_path), png.data(), png.size(), &write_error)) continue;
+    asset.companions.push_back(std::move(companion));
+    ++stored;
+  }
+  return stored;
+}
+
+// Gives each m-ex costume the stock icon the pack's HUD file shows for it (mex_stock_icons), as the
+// skin's "stock" companion. m-ex picks the icon by its own ids, which the standard game cannot read,
+// so without this an m-ex pack's stock icons never show outside the full mod.
+size_t pack_stock_icons_locked(const DiscCandidate& hud, const disc_metadata::MexCostumes& costumes,
+                               std::map<std::string, AssetRecord>* fresh) {
+  if (hud.member.empty() || costumes.empty() || !hud.length || hud.length > kMaxAssetBytes) return 0;
+  std::vector<uint8_t> pack;
+  std::map<int, SelectPortrait> icons;
+  int reserved = 0, stride = 0;
+  if (!read_range(hud.file, hud.offset, hud.length, &pack) || !mex_stock_icons(pack, &icons, &reserved, &stride)) return 0;
+  size_t stored = 0;
+  for (auto& item : *fresh) {
+    AssetRecord& asset = item.second;
+    SlotName slot;
+    if (asset.info.kind != "character_costume" || !find_slot(asset.info.target_path, &slot)) continue;
+    const auto origin = costumes.find(lower(asset.source_member));
+    if (origin == costumes.end() || origin->second.family != slot.family->file_code ||
+        origin->second.internal >= (uint32_t)stride) continue;
+    const auto picture = icons.find(reserved + stride * (int)origin->second.costume + (int)origin->second.internal);
+    if (picture == icons.end()) continue;
+    const std::vector<uint8_t> png =
+        rgba_png(decode_portrait(pack.data() + 0x20, picture->second), picture->second.width, picture->second.height);
+    AssetRecord::Companion companion;
+    companion.kind = "stock";
+    companion.sha256 = sha256(png);
+    companion.source_member = hud.member;
+    companion.stored_path = (fs::path(L"assets") / fs::u8path(asset.info.id) / L"companions" / L"stock.png").generic_u8string();
     std::string write_error;
     if (companion.sha256.empty() ||
         !write_atomic(g_root / fs::u8path(companion.stored_path), png.data(), png.size(), &write_error)) continue;
@@ -3878,8 +4179,18 @@ ImportResult scan_disc_skins(const std::string& iso_path, const std::string& pac
       }
   std::vector<DiscCandidate> candidates;
   DiscCandidate select_screen;   // the pack's character select file, when it has one
-  if (folder) folder_costume_files(root, &candidates, &select_screen);
-  else if (!disc_costume_files(root, &candidates, &select_screen, error)) { result.message = *error; return result; }
+  DiscCandidate hud;             // and its match HUD file (m-ex keeps every stock icon there)
+  DiscCandidate metadata;
+  if (folder) folder_costume_files(root, &candidates, &select_screen, &metadata, &hud);
+  else if (!disc_costume_files(root, &candidates, &select_screen, &metadata, &hud, error)) { result.message = *error; return result; }
+  disc_metadata::MexCostumes mex_costumes;
+  if (!metadata.member.empty()) {
+    std::vector<uint8_t> bytes;
+    const bool mapped = read_range(metadata.file, metadata.offset, metadata.length, &bytes) &&
+                        disc_metadata::mex_costumes(bytes, &mex_costumes);
+    host::log("cosmetics: %s m-ex costume metadata from %s (%zu mapped files)",
+              mapped ? "read" : "unsupported", key.c_str(), mex_costumes.size());
+  }
   // The plain .dat of a slot first, then its English .usd: when both differ from the game's and from
   // each other, the English one is the one this game loads, so it is the one listed.
   std::stable_sort(candidates.begin(), candidates.end(), [](const DiscCandidate& a, const DiscCandidate& b) {
@@ -3894,18 +4205,31 @@ ImportResult scan_disc_skins(const std::string& iso_path, const std::string& pac
     const bool stage = disc_stage_member(candidate.member, &stage_path, &stage_label, &variant);
     size_t sound_kind = 0; const char* sound_character = nullptr;
     const bool sound_file = fighter_sound_identity(candidate.member, &sound_kind, &sound_character);
-    if (!stage && !sound_file && !disc_skin_member(candidate.member, &variant)) { ++skipped; continue; }
+    const bool ordinary_costume = disc_skin_member(candidate.member, &variant);
+    const auto mex = mex_costumes.find(lower(candidate.member));
+    const bool added_costume = !stage && !sound_file && !ordinary_costume && mex != mex_costumes.end();
+    if (!stage && !sound_file && !ordinary_costume && !added_costume) continue;
+    if (!read_range(candidate.file, candidate.offset, candidate.length, &bytes)) { ++skipped; continue; }
+    testing::DatInspection added;
+    std::map<std::string, std::string> aliases;
+    std::string source_digest;
+    if (added_costume) {
+      source_digest = sha256(bytes);
+      if (!prepare_mex_costume(mex->second, &bytes, &added, &aliases)) { ++skipped; continue; }
+      variant = "m-ex costume " + std::to_string(mex->second.costume + 1);
+    }
     // An alternate costume is compared with the slot's own costume on the game disc: that is the
     // file it replaces when chosen, and the skeleton it must keep. An alternate stage likewise.
     const std::string retail_name = stage ? stage_path : sound_file ? candidate.member :
+                                    added_costume ? added.target_path :
                                     variant.empty() ? candidate.member : candidate.member.substr(0, 6) + ".dat";
     if (!host::disc_find_file(retail_name, &retail_offset, &retail_size) || !retail_size ||
-        retail_size > kMaxAssetBytes || !read_range(candidate.file, candidate.offset, candidate.length, &bytes)) {
+        retail_size > kMaxAssetBytes) {
       ++skipped; continue;
     }
     retail.resize(retail_size);
     if (!host::disc_read(retail_offset, retail.data(), retail_size)) { ++skipped; continue; }
-    if (bytes == retail) { ++same; continue; }
+    if (bytes == retail && !added_costume) { ++same; continue; }
     if (sound_file) {
       std::vector<uint8_t> safe;
       std::string detail;
@@ -3946,6 +4270,11 @@ ImportResult scan_disc_skins(const std::string& iso_path, const std::string& pac
       std::string detail;
       if (!parse_visual_layout(bytes, &layout, &detail) ||
           std::find(layout.roots.begin(), layout.roots.end(), "map_head") == layout.roots.end()) { ++skipped; continue; }
+      // An m-ex stage stub is not a stage: it keeps its code (grFunction) and tables in the stage's file,
+      // has no collision data, and loads the real stage from a folder of alternates. Served as it is,
+      // nothing stands on it.
+      if (std::find(layout.roots.begin(), layout.roots.end(), "grFunction") != layout.roots.end() &&
+          std::find(layout.roots.begin(), layout.roots.end(), "coll_data") == layout.roots.end()) { ++skipped; continue; }
       const std::string digest = sha256(bytes);
       if (digest.empty()) { ++skipped; continue; }
       const std::string fresh_key = stage_path + "\n" + variant;
@@ -3981,10 +4310,10 @@ ImportResult scan_disc_skins(const std::string& iso_path, const std::string& pac
       fresh[fresh_key] = std::move(asset);
       continue;
     }
-    const auto dat = inspect_dat_impl(bytes);
-    const std::string slot_name = candidate.member.substr(0, 6) + ".dat";
+    const auto dat = added_costume ? added : inspect_dat_impl(bytes);
+    const std::string slot_name = added_costume ? added.target_path : candidate.member.substr(0, 6) + ".dat";
     if (!dat.ok || lower(dat.target_path) != lower(slot_name)) { ++skipped; continue; }
-    const std::string digest = sha256(bytes);
+    const std::string digest = source_digest.empty() ? sha256(bytes) : source_digest;
     if (digest.empty()) { ++skipped; continue; }
     const std::string fresh_key = dat.target_path + "\n" + variant;
     const auto have = fresh.find(fresh_key);
@@ -3995,6 +4324,7 @@ ImportResult scan_disc_skins(const std::string& iso_path, const std::string& pac
     asset.info.id = "disc-" + sha256_text(key + "\n" + lower(candidate.member));
     asset.info.name = dat.character + " " + dat.costume + ": from " + pack_name + (variant.empty() ? "" : " (" + variant + ")");
     asset.info.variant = variant;
+    asset.costume_aliases = std::move(aliases);
     {
       std::string detail;
       asset.online_known = true;
@@ -4027,7 +4357,12 @@ ImportResult scan_disc_skins(const std::string& iso_path, const std::string& pac
     if (!file_stamp(candidate.file, &asset.disc_size, &asset.disc_mtime)) { ++skipped; continue; }
     fresh[fresh_key] = std::move(asset);
   }
-  const size_t portraits = pack_portraits_locked(select_screen, &fresh);
+  const size_t portraits = pack_portraits_locked(select_screen, mex_costumes, &fresh);
+  const size_t stocks = pack_stock_icons_locked(hud, mex_costumes, &fresh);
+  if (stocks) host::log("cosmetics: %zu stock icons taken from the %s of %s", stocks, hud.member.c_str(), key.c_str());
+  const size_t costumes = std::count_if(fresh.begin(), fresh.end(), [](const auto& item) {
+    return item.second.info.kind == "character_costume";
+  });  // count before moving the records; portraits are costume companions, not entries to subtract
   // Replace this disc's earlier records: files that no longer differ go away, changed ones are
   // updated, and a name the player gave an entry is kept. Records of a disc that no longer exists
   // go too; they hold no data and a new scan brings them back.
@@ -4077,7 +4412,6 @@ ImportResult scan_disc_skins(const std::string& iso_path, const std::string& pac
     result.message = *error; return result;
   }
   result.ok = true;
-  const size_t costumes = fresh.size() - stages - fighter_sounds - portraits;
   result.message = std::to_string(costumes) + " skins" +
                    (stages ? " and " + std::to_string(stages) + " stage skins" : std::string()) +
                    (fighter_sounds ? " and " + std::to_string(fighter_sounds) + " fighter sound mods" : std::string()) + " from " + pack_name +
@@ -4128,7 +4462,16 @@ std::vector<PackInfo> packs() {
   }
   for (auto& pack : out) {
     pack.slots = (uint32_t)slots[pack.key].size();
-    std::sort(pack.variants.begin(), pack.variants.end());   // "" first, then "alt L", "alt R"
+    std::sort(pack.variants.begin(), pack.variants.end(), [](const std::string& a, const std::string& b) {
+      // Costume 10 follows 9, rather than preceding 2 in a large m-ex pack.
+      constexpr const char* prefix = "m-ex costume ";
+      if (a.rfind(prefix, 0) == 0 && b.rfind(prefix, 0) == 0) {
+        const auto left = std::strtoul(a.c_str() + 13, nullptr, 10);
+        const auto right = std::strtoul(b.c_str() + 13, nullptr, 10);
+        if (left != right) return left < right;
+      }
+      return a < b;
+    });
   }
   // Imports first, then the packs by name.
   std::stable_sort(out.begin(), out.end(), [](const PackInfo& a, const PackInfo& b) {
@@ -4356,6 +4699,13 @@ ImportResult import_file(const std::string& path_text) {
   }
   if (extension == ".dat" || extension == ".usd") {
     if (!read_bounded(path, kMaxAssetBytes, &bytes, &error)) return {false, false, {}, error};
+    if (pause_filename(path_filename_utf8(path))) {
+      VaultResourcePlan pause;
+      if (!pause_resource(path, {}, std::move(bytes), &pause, &error)) return {false, false, {}, error};
+      VaultPlan plan; plan.resources.push_back(std::move(pause));
+      std::lock_guard<std::mutex> lock(g_mutex);
+      return install_vault_locked(path, std::move(plan), "pause_screen");
+    }
     size_t sound_kind = 0; const char* sound_character = nullptr;
     if (fighter_sound_identity(path_filename_utf8(path), &sound_kind, &sound_character)) {
       std::lock_guard<std::mutex> lock(g_mutex);
@@ -4381,6 +4731,33 @@ ImportResult import_file(const std::string& path_text) {
   } else if (extension == ".zip") {
     std::vector<ZipEntry> entries;
     if (!parse_zip(path, &entries, &error)) return {false, false, {}, error};
+    const auto pause_files = std::count_if(entries.begin(), entries.end(), [](const auto& file) { return pause_filename(file.name); });
+    if (pause_files) {
+      if (pause_files > 2) return {false, false, {}, "A pause-screen pack can contain at most two styles."};
+      VaultPlan plan;
+      std::vector<uint8_t> hd_text;
+      std::string hd_name;
+      for (const auto& entry : entries) {
+        const std::string filename = lower(path_filename_utf8(fs::u8path(entry.name)));
+        if (filename == "tex1_108x20_c68e0bb8472069de_14.png") {
+          if (!hd_text.empty() || !extract_zip_member(path, entry, &hd_text, &error) || !png_companion(hd_text, &error))
+            return {false, false, {}, "The pause text texture is duplicated or invalid: " + error};
+          hd_name = entry.name;
+        } else if (dat_extension(entry.name) && !pause_filename(entry.name))
+          return {false, false, {}, "Import pause screens separately from character, stage or gameplay archives."};
+      }
+      for (const auto& entry : entries) {
+        if (!pause_filename(entry.name)) continue;
+        std::vector<uint8_t> data;
+        VaultResourcePlan pause;
+        if (!extract_zip_member(path, entry, &data, &error) || !pause_resource(path, entry.name, std::move(data), &pause, &error))
+          return {false, false, {}, "Pause screen rejected: " + error};
+        if (!hd_text.empty()) pause.companions.push_back({"pause_text", hd_name, hd_text});
+        plan.resources.push_back(std::move(pause));
+      }
+      std::lock_guard<std::mutex> lock(g_mutex);
+      return install_vault_locked(path, std::move(plan), "pause_screen");
+    }
     auto metadata = std::find_if(entries.begin(), entries.end(), [](const ZipEntry& entry) {
       return lower(entry.name) == "metadata.json";
     });
@@ -5197,6 +5574,14 @@ static void publish_voices_locked(uint8_t* fst, const std::vector<FstFile>& file
     host::log("cosmetics: %zu sound bank files can be served by a skin's voice", next->voice_files.size());
 }
 
+// An alternate stage of the disc whose alternates are this session's stages (set_session_stage_pack):
+// one of its named sets ("surfshop(L)"). The disc's plain stage files are not alternates: a mod
+// session already serves them, and a look serves them as its own files.
+static bool session_stage_record(const AssetRecord& asset) {
+  return !g_session_stage_pack.empty() && asset.source_kind == kDiscSource && asset.source_id == g_session_stage_pack &&
+         asset.info.kind == "stage_visual" && asset.info.available && !asset.info.variant.empty();
+}
+
 // The length every form of a stage is served at while random stage skins are on (g_stage_extent):
 // the longest of the disc's own file(s) and every installed skin of that stage, offline and in its
 // online form. `files` carries the disc's own lengths. 0 when the stage is not on this disc.
@@ -5534,11 +5919,12 @@ static void publish_locked(uint8_t* fst, uint32_t fst_size, const std::string* o
   // The whole set at once (startup, a changed profile) with random stage skins on: every stage with
   // installed skins gets its shared length now, before the game can read any of them ahead of a
   // match, and before the skins below are padded to it.
-  if (!only_slot && g_profile.enabled && g_profile.random_stage_skins) {
+  if (!only_slot && g_profile.enabled && (g_profile.random_stage_skins || !g_session_stage_pack.empty())) {
     std::map<std::string, bool> stages;
     for (const auto& asset : g_assets)
       if (asset.info.available && asset.info.kind == "stage_visual" &&
-          !(asset.source_kind == kDiscSource && g_profile.stage_packs_off.count(asset.source_id)))
+          (g_profile.random_stage_skins ? !(asset.source_kind == kDiscSource && g_profile.stage_packs_off.count(asset.source_id))
+                                        : session_stage_record(asset)))
         stages[selection_key(asset)] = true;
     for (const auto& stage : stages) {
       const size_t extent = stage_extent_locked(stage.first, files);
@@ -5631,12 +6017,22 @@ static void publish_locked(uint8_t* fst, uint32_t fst_size, const std::string* o
       bool online_allowed = true;
       std::string online_reason;   // kept for the Mods tab: the verdict is never only in the log
       if (asset->info.kind == "stage_visual") {
+        // A selected skin needs readable gameplay tables offline too. An old explicit selection
+        // bypassed the random picker check and reached Ground's missing-lightset assertion.
         std::vector<uint8_t> clean(disc_file.size);
+        const bool clean_read = host::disc_read(disc_file.start, clean.data(), disc_file.size);
+        stage_safety::Archive original{clean}, readable{served};
+        if (clean_read && original.parse() && !readable.parse()) {
+          host::log("cosmetics: stage %s rejected: malformed stage tables; using the standard stage",
+                    disc_file.path.c_str());
+          runtime_errors.push_back(asset->info.name + ": malformed stage tables; using the standard stage.");
+          continue;
+        }
         std::string validation_error;
         // A skin that does not match the original as it is: offline it is served as it is, and
         // online (and in replays) its meshes drawn over the original stage (stage_online_form). The
         // two are given one length, the longer one's, since the game is told one length per file.
-        online_allowed = host::disc_read(disc_file.start, clean.data(), disc_file.size) &&
+        online_allowed = clean_read &&
                          stage_online_form(clean, served, &online_form, &validation_error, disc_file.path);
         // The English twin of a skin made from the .dat: the skin carries the Japanese text (the two
         // files differ only in their SIS text, the Stadium jumbotron's). When the skin drawn over the
@@ -5768,7 +6164,7 @@ static void publish_locked(uint8_t* fst, uint32_t fst_size, const std::string* o
   // a skin be cut short (its symbols are at the end: "Cannot find symbol map_head"), and a skin's
   // length kept for the standard file made the read run past its buffer into the fighter file loaded
   // after it ("Cannot find symbol ftDataNess", lbarchive.c:112).
-  if (g_profile.enabled && g_profile.random_stage_skins) {
+  if (g_profile.enabled && (g_profile.random_stage_skins || !g_session_stage_pack.empty())) {
     for (const auto& shared : g_stage_extent) {
       if (only_slot && lower(shared.first) != lower(*only_slot)) continue;
       const std::string wanted = lower(shared.first);
@@ -6107,6 +6503,29 @@ void set_session_pack(const std::string& iso_path) {
   g_session_pack = key;
 }
 
+void set_session_stage_pack(const std::string& iso_path) {
+  std::error_code ec;
+  const std::string key = iso_path.empty() ? std::string() : fs::absolute(fs::u8path(iso_path), ec).u8string();
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_session_stage_pack = key;
+}
+void set_stage_button_probe(StageButtonProbe probe) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_stage_buttons = probe;
+}
+void set_lockstep_probe(LockstepProbe probe) {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_lockstep = probe;
+}
+std::string disc_pack_name(const std::string& iso_path) {
+  std::error_code ec;
+  const std::string key = fs::absolute(fs::u8path(iso_path), ec).u8string();
+  std::lock_guard<std::mutex> lock(g_mutex);
+  for (const auto& asset : g_assets)
+    if (asset.source_kind == kDiscSource && asset.source_id == key) return asset.source_name;
+  return {};
+}
+
 bool session_pack_skin(const std::string& asset_id) {
   if (asset_id.empty()) return false;
   std::lock_guard<std::mutex> lock(g_mutex);
@@ -6153,6 +6572,65 @@ LiveCycle cycle_slot_live(const std::string& slot, int direction) {
   return result;
 }
 
+CharacterCycle cycle_character_live(int character, int costume, int direction, uint32_t allowed_costumes) {
+  CharacterCycle result;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!ready_locked(&result.pick.message)) return result;
+  if (online_active()) {
+    result.pick.message = "Online skins cycle within the selected color.";
+    return result;
+  }
+  if (costume < 0 || costume_slot_file(character, 0).empty()) return result;
+  struct Choice { int costume; std::string target, id, name; };
+  std::vector<Choice> choices;
+  size_t current = 0;
+  bool any_skin = false;
+  for (int color = 0; color < 32; ++color) {
+    const std::string slot = costume_slot_file(character, color);
+    if (slot.empty()) break;
+    if (!(allowed_costumes & (1u << color))) continue;
+    SlotName known;
+    find_slot(slot, &known);
+    const auto selected = g_profile.selections.find(slot);
+    const std::string selected_id = g_profile.enabled && selected != g_profile.selections.end() &&
+        selected->second != kVanillaSelection ? selected->second : std::string();
+    if (color == costume) current = choices.size();
+    choices.push_back({color, slot, {}, std::string("Standard ") + known.color->label});
+    for (const auto& asset : g_assets) {
+      if (asset.info.kind != "character_costume" || !asset.info.available || selection_key(asset) != slot ||
+          (asset.info.variant.empty() && session_pack_record(asset))) continue;
+      if (color == costume && selected_id == asset.info.id) current = choices.size();
+      choices.push_back({color, slot, asset.info.id, asset.source_kind == kDiscSource ?
+          asset.source_name + (asset.info.variant.empty() ? "" : " (" + asset.info.variant + ")") : asset.info.name});
+      any_skin = true;
+    }
+  }
+  result.pick.ok = true;
+  if (!any_skin || choices.empty()) {
+    result.pick.message = "No other skin is installed for this fighter.";
+    return result;
+  }
+  for (size_t step = 1; step < choices.size(); ++step) {
+    const auto& next = choices[direction > 0 ? (current + step) % choices.size() :
+        (current + choices.size() - step) % choices.size()];
+    std::string error;
+    const auto before = g_profile.selections.find(next.target);
+    const std::string previous = g_profile.enabled && before != g_profile.selections.end() &&
+        before->second != kVanillaSelection ? before->second : std::string();
+    if (!select_live_locked(next.target, next.id, &error)) { result.pick.message = error; continue; }
+    result.target = next.target;
+    result.costume = next.costume;
+    result.pick.changed = true;
+    result.pick.previous_id = previous;
+    result.pick.asset_id = next.id;
+    result.pick.name = next.name;
+    result.pick.message.clear();
+    pair_climbers_locked(next.target, &result.pick);
+    break;
+  }
+  return result;
+}
+
 // ---- stage select skin cycling ----
 // The profile's key for a stage file: the target path of the stage skins installed for it, as the
 // catalog spells it. Empty when no stage skin is installed for that file. The game names a stage
@@ -6181,6 +6659,14 @@ LiveCycle cycle_stage_live(const std::string& stage_file, int direction) {
   }
   const std::string target = stage_target_locked(stage_file);
   if (target.empty()) { result.message = "No skin is installed for this stage."; return result; }
+  // A stage whose alternates the session disc picks by the button held as it loads (L, R, Z, B, X, Y):
+  // those buttons pick the alternate here, as on that disc, and do not step this stage's skin. A step
+  // now would also load its pick before the match's own, and the game would keep that one.
+  if (std::any_of(g_assets.begin(), g_assets.end(), [&](const AssetRecord& asset) {
+        return session_stage_record(asset) && selection_key(asset) == target;
+      })) {
+    result.message = "This stage's alternates are picked by the button held as it loads."; return result;
+  }
   std::vector<std::string> ids{std::string()}, names{"Standard"};
   for (const auto& asset : g_assets) {
     if (asset.info.kind != "stage_visual" || !asset.info.available || selection_key(asset) != target) continue;
@@ -6344,12 +6830,23 @@ RepublishResult plan_stage_skin(uint8_t* fst, uint32_t fst_size, const std::stri
   if (!current->initialized || !fst || target.empty() || !g_profile.enabled) return result;
   const auto previous = current->stage_matches.find(target);
   if (previous != current->stage_matches.end() && previous->second.first == match_token) return result;
-  if (!g_profile.random_stage_skins && previous == current->stage_matches.end()) return result;
+  // The session disc's own alternates of this stage: picked for every match, as the disc's stage code
+  // does (a held button names one, otherwise any of them), whatever the random setting says.
+  const bool session = std::any_of(g_assets.begin(), g_assets.end(), [&](const AssetRecord& asset) {
+    return session_stage_record(asset) && selection_key(asset) == target;
+  });
+  // In a lockstep session (Friends) the two games must load the same stage file, and each game's own
+  // pick (a saved stage skin, a random draw, the disc's alternates by held button) can differ: every
+  // stage is the game's own there, published even for a first match, as a saved skin may be applied.
+  const bool lockstep = g_lockstep && g_lockstep();
+  const bool pick_any = !lockstep && (g_profile.random_stage_skins || session);
+  if (!lockstep && !pick_any && previous == current->stage_matches.end()) return result;
 
   std::vector<std::string> eligible;
+  std::vector<uint32_t> eligible_buttons;
   size_t extent = 0;
   const auto started = std::chrono::steady_clock::now();
-  if (g_profile.random_stage_skins) {
+  if (pick_any) {
     std::vector<FstFile> files;
     if (!parse_fst(fst, fst_size, &files, &result.message)) return result;
     const std::string wanted = lower(target);
@@ -6367,12 +6864,33 @@ RepublishResult plan_stage_skin(uint8_t* fst, uint32_t fst_size, const std::stri
     }
     if (originals.empty() || originals.size() > 2) return result;
     for (const auto& original : originals) extent = std::max(extent, original.size());
+    bool original_reads = true;   // every retail stage file does (all 76 of melee 1.02)
+    for (const auto& original : originals) {
+      stage_safety::Archive archive{original};
+      if (!archive.parse()) original_reads = false;
+    }
     for (const auto& asset : g_assets) {
       if (!asset.info.available || asset.info.kind != "stage_visual" || selection_key(asset) != target) continue;
-      if (asset.source_kind == kDiscSource && g_profile.stage_packs_off.count(asset.source_id)) continue;
+      if (session ? !session_stage_record(asset)
+                  : asset.source_kind == kDiscSource && g_profile.stage_packs_off.count(asset.source_id) != 0) continue;
       std::string error;
       const auto bytes = load_runtime_asset_locked(asset, &error);
       if (bytes.empty()) continue;
+      // A file whose stage tables do not even read (relocations past its data, pointers into
+      // nothing) is never a random pick, offline either: one such Yoshi's Story file on a player's
+      // disc stopped the game at its Shy Guys and at the stage's load (0.9.97 reports). Online it
+      // was already refused below. Still served when the player picks it themselves.
+      // Only when the original reads: a file this reader does not know at all is not judged.
+      if (original_reads) {
+        stage_safety::Archive readable{bytes};
+        if (!readable.parse()) {
+          static std::set<std::string> told;
+          if (told.insert(asset.info.id).second)
+            host::log("cosmetics: %s stays out of the random pick for %s: its stage tables are malformed",
+                      asset.info.id.c_str(), target.c_str());
+          continue;
+        }
+      }
       bool allowed = true;
       size_t longest = bytes.size();
       for (const auto& original : originals) {
@@ -6380,11 +6898,28 @@ RepublishResult plan_stage_skin(uint8_t* fst, uint32_t fst_size, const std::stri
         if (!stage_online_form(original, bytes, &form, &error, target)) { if (online_active()) { allowed = false; break; } continue; }
         longest = std::max(longest, form.size());
       }
-      if (allowed) { eligible.push_back(asset.info.id); extent = std::max(extent, longest); }
+      if (allowed) {
+        eligible.push_back(asset.info.id);
+        eligible_buttons.push_back(session ? stage_alternate_button(asset.info.variant) : 0);
+        extent = std::max(extent, longest);
+      }
     }
   }
   std::string chosen;
-  if (!g_profile.random_stage_skins) {
+  bool by_button = false;
+  if (session && g_stage_buttons && !eligible.empty()) {
+    // The disc's rule: L, R, Z, B, X, Y in that order, the first one held that an alternate is named for.
+    const uint32_t held = g_stage_buttons();
+    for (const uint32_t bit : {0x40u, 0x20u, 0x10u, 0x200u, 0x400u, 0x800u}) {
+      if (!(held & bit)) continue;
+      for (size_t i = 0; i < eligible.size() && !by_button; ++i)
+        if (eligible_buttons[i] == bit) { chosen = eligible[i]; by_button = true; }
+      if (by_button) break;
+    }
+  }
+  if (by_button) {
+  } else if (lockstep) {
+  } else if (!pick_any) {
     const auto fixed = g_profile.selections.find(target);
     if (fixed != g_profile.selections.end() && fixed->second != kVanillaSelection) chosen = fixed->second;
   } else if (!eligible.empty()) {
@@ -6399,14 +6934,14 @@ RepublishResult plan_stage_skin(uint8_t* fst, uint32_t fst_size, const std::stri
     } while (random < threshold);
     chosen = eligible[random % count];
   }
-  if (g_profile.random_stage_skins && extent) g_stage_extent[target] = std::max(g_stage_extent[target], extent);
+  if (pick_any && extent) g_stage_extent[target] = std::max(g_stage_extent[target], extent);
   publish_locked(fst, fst_size, &target, &result, &chosen);
   if (!result.ok) return result;
   auto next = std::make_shared<RuntimeState>(*std::atomic_load(&g_runtime));
   next->stage_matches[target] = {match_token, chosen};
   std::atomic_store(&g_runtime, std::shared_ptr<const RuntimeState>(next));
   host::log("cosmetics: match %llu %s skin for %s: %s (%zu eligible, %lld ms)",
-            (unsigned long long)match_token, g_profile.random_stage_skins ? "random" : "fixed",
+            (unsigned long long)match_token, by_button ? "held button" : pick_any ? "random" : "fixed",
             target.c_str(), chosen.empty() ? "Standard" : chosen.c_str(), eligible.size(),
             (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
   return result;
@@ -6770,20 +7305,43 @@ bool file_matches(const fs::path& file, uint64_t size, const char* sha) {
 }
 
 #ifdef _WIN32
+fs::path prepare_xdelta(const fs::path& preferred, bool recover, std::string* error);
 // xdelta3 -d -f -s <source> <patch> <out>, hidden, waited for (up to 10 minutes: the discs are big).
 bool run_xdelta(const fs::path& xdelta, const fs::path& source, const fs::path& patch, const fs::path& out, std::string* error) {
-  std::wstring command = quote_windows_arg(xdelta.wstring()) + L" -d -f -s " + quote_windows_arg(source.wstring()) + L" " +
-                         quote_windows_arg(patch.wstring()) + L" " + quote_windows_arg(out.wstring());
+  fs::path tool = prepare_xdelta(xdelta, false, error);
+  if (tool.empty()) return false;
   STARTUPINFOW startup{}; startup.cb = sizeof startup;
   PROCESS_INFORMATION process{};
-  if (!CreateProcessW(xdelta.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
-    *error = "The patch tool could not be started."; return false;
+  const auto start = [&] {
+    std::wstring command = quote_windows_arg(tool.wstring()) + L" -d -f -s " + quote_windows_arg(source.wstring()) + L" " +
+                           quote_windows_arg(patch.wstring()) + L" " + quote_windows_arg(out.wstring());
+    return CreateProcessW(tool.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                          nullptr, nullptr, &startup, &process) != FALSE;
+  };
+  if (!start()) {
+    // A partially extracted install, removed dependency or wrong executable should repair itself
+    // in the user's writable catalog, without asking them to find a tool or replace the game.
+    tool = prepare_xdelta(xdelta, true, error);
+    if (tool.empty()) return false;
+    if (!start()) {
+      *error = "The repaired patch tool could not start (Windows error " + std::to_string(GetLastError()) + ").";
+      return false;
+    }
   }
   const DWORD wait = WaitForSingleObject(process.hProcess, 600000);
   if (wait == WAIT_TIMEOUT) { TerminateProcess(process.hProcess, 1); WaitForSingleObject(process.hProcess, 5000); }
   DWORD code = 1; GetExitCodeProcess(process.hProcess, &code);
   CloseHandle(process.hThread); CloseHandle(process.hProcess);
-  if (wait != WAIT_OBJECT_0 || code != 0) { *error = "The patch did not apply to this disc."; return false; }
+  const bool loader_failed = code == 0xC0000135u || code == 0xC000007Bu || code == 0xC0000142u;
+  if (wait == WAIT_OBJECT_0 && loader_failed) {
+    const fs::path repaired = prepare_xdelta(xdelta, true, error);
+    if (!repaired.empty() && repaired != tool) return run_xdelta(repaired, source, patch, out, error);
+  }
+  if (wait != WAIT_OBJECT_0 || code != 0) {
+    *error = wait == WAIT_TIMEOUT ? "Building the patch timed out." :
+        "The patch tool failed (exit code " + std::to_string(code) + ").";
+    return false;
+  }
   return true;
 }
 #endif
@@ -6827,6 +7385,9 @@ std::string active_look_pack() {
   return g_look_pack;
 }
 
+std::atomic<bool> g_tool_recovery{true};   // set_tool_recovery: the host turns it off in the YouGame app
+void set_tool_recovery(bool allowed) { g_tool_recovery = allowed; }
+
 bool build_look_packs(const std::string& patcher_folder, const std::string& retail_disc, const std::string& xdelta_tool,
                       std::string* message) {
   std::string local; if (!message) message = &local;
@@ -6836,10 +7397,11 @@ bool build_look_packs(const std::string& patcher_folder, const std::string& reta
 #else
   fs::path dir;
   { std::lock_guard<std::mutex> lock(g_mutex); if (!g_configured) { *message = "The skin catalog is not running."; return false; } dir = looks_dir_locked(); }
-  const fs::path folder = fs::u8path(patcher_folder), retail = fs::u8path(retail_disc), xdelta = fs::u8path(xdelta_tool);
+  const fs::path folder = fs::u8path(patcher_folder), retail = fs::u8path(retail_disc);
   std::error_code ec;
-  if (!fs::is_regular_file(xdelta, ec)) { *message = "The patch tool is missing from the game folder (tools" + std::string(1, '\\') + "xdelta3.exe)."; return false; }
   if (const std::string problem = retail_disc_problem(retail); !problem.empty()) { *message = problem; return false; }
+  const fs::path xdelta = prepare_xdelta(fs::u8path(xdelta_tool), false, message);
+  if (xdelta.empty()) return false;
   const fs::path classic_patch = find_named(folder, kLookClassicPatch);
   if (classic_patch.empty() || !file_matches(classic_patch, kLookClassicPatchSize, kLookClassicPatchSha)) {
     *message = "That folder does not hold the patch files these looks need (version 1.0.2)."; return false;
@@ -6970,6 +7532,42 @@ bool https_get(const std::string& url, const fs::path* out, std::string* text, u
   return ok;
 }
 
+fs::path prepare_xdelta(const fs::path& preferred, bool recover, std::string* error) {
+  std::error_code ec;
+  if (!recover && !preferred.empty() && fs::is_regular_file(preferred, ec)) return preferred;
+  if (!g_tool_recovery.load()) { *error = "The patch tool that comes with the game could not be used."; return {}; }
+  fs::path root;
+  { std::lock_guard<std::mutex> lock(g_mutex); root = g_root; }
+  if (root.empty()) { *error = "The cosmetic catalog is not ready to prepare the patch tool."; return {}; }
+  const fs::path cached = root / L"tools" / L"xdelta3.exe";
+  constexpr uint64_t size = 624463;
+  constexpr const char* sha = "6855c01cf4a1662ba421e6f95370cf9afa2b3ab6c148473c63efe60d634dfb9a";
+  if (file_matches(cached, size, sha)) return cached;
+  fs::create_directories(cached.parent_path(), ec);
+  if (ec) { *error = "The patch-tool cache could not be created."; return {}; }
+  const fs::path archive = cached.parent_path() / L"xdelta-download.zip";
+  const fs::path part = cached.parent_path() / L"xdelta3-3.1.0-x86_64.exe";
+  std::string why;
+  constexpr uint64_t archive_size = 217891;
+  const bool fetched = https_get("https://github.com/jmacd/xdelta-gpl/releases/download/v3.1.0/xdelta3-3.1.0-x86_64.exe.zip",
+                                 &archive, nullptr, archive_size, &why);
+  const bool verified = fetched && file_matches(archive, archive_size,
+      "b10e0d1df3e212e5a2d37d5c088d2f72ecec760bc3c26caeca51499c3118b93a");
+  const bool unpacked = verified && host::updater::unpack_download(archive.u8string(), cached.parent_path().u8string());
+  fs::remove(archive, ec);
+  if (!unpacked || !file_matches(part, size, sha)) {
+    if (unpacked) fs::remove(part, ec);
+    *error = fetched ? "The patch tool download did not match its verified release; nothing was run." :
+                      "The patch tool could not be prepared: " + why;
+    return {};
+  }
+  fs::remove(cached, ec); ec.clear();
+  fs::rename(part, cached, ec);
+  if (ec) { *error = "The verified patch tool could not be saved."; return {}; }
+  host::log("looks: recovered the verified patch tool in the cosmetic catalog");
+  return cached;
+}
+
 // The authors' Mediafire page names the file's current download address; only that address is
 // followed, and only on Mediafire's own download hosts. The file must then match its pin exactly.
 bool fetch_official(const OfficialFile& f, const fs::path& out, std::string* error) {
@@ -6992,7 +7590,10 @@ bool fetch_official(const OfficialFile& f, const fs::path& out, std::string* err
 // against its pin anyway.
 bool unpack_download(const fs::path& archive, const fs::path& dest, std::string* error) {
   if (host::updater::unpack_download(archive.u8string(), dest.u8string())) return true;
-  *error = "The download could not be unpacked."; return false;
+  const std::string file = host::updater::last_unpack_write_error();
+  *error = file.empty() ? "The download is damaged; try again."
+                        : "The unpacked files could not be written (" + file + "). Check the free space on that drive.";
+  return false;
 }
 
 bool install_official(int which, const fs::path& retail, const fs::path& xdelta, const std::string& mods_folder, std::string* message) {
@@ -7024,9 +7625,9 @@ bool install_official(int which, const fs::path& retail, const fs::path& xdelta,
     else if (!run_xdelta(xdelta, retail, patch, part, message)) ok = false;
     else if (!file_matches(part, kAnimeleeDiscs[variant].size, kAnimeleeDiscs[variant].sha)) { fs::remove(part, ec); *message = "The built disc did not come out as expected."; ok = false; }
     else {
-      fs::rename(part, out, ec);
-      ok = !ec;
-      *message = ok ? "Installed. It is turned on in Game mods; restart to play with it." : "The built disc could not be put in the Mods folder.";
+      ok = host::updater::place_file(part, out, ec);
+      *message = ok ? "Installed. It is turned on in Game mods; restart to play with it."
+                    : host::updater::place_error("The built disc could not be put", out.parent_path(), ec);
     }
   }
   fs::remove_all(work, ec);
@@ -7034,6 +7635,12 @@ bool install_official(int which, const fs::path& retail, const fs::path& xdelta,
 }
 #endif
 }  // namespace
+
+bool official_cosmetic_disc(const std::string& disc_path) {
+  for (const auto& pin : kAnimeleeDiscs)
+    if (file_matches(fs::u8path(disc_path), pin.size, pin.sha)) return true;
+  return false;
+}
 
 OfficialLookState official_look_state(int which, const std::string& mods_folder) {
   OfficialLookState s;
@@ -7079,6 +7686,15 @@ void install_official_look(int which, const std::string& retail_disc, const std:
 }
 
 namespace testing {
+bool apply_look_patch(const std::string& tool, const std::string& source, const std::string& patch,
+                     const std::string& output, std::string* error) {
+#ifdef _WIN32
+  return run_xdelta(fs::u8path(tool), fs::u8path(source), fs::u8path(patch), fs::u8path(output), error);
+#else
+  (void)tool; (void)source; (void)patch; (void)output;
+  *error = "The Windows patch-tool diagnostic is not available on this host."; return false;
+#endif
+}
 DatInspection inspect_dat(const std::vector<uint8_t>& bytes) { return inspect_dat_impl(bytes); }
 bool visual_dat_only(const std::vector<uint8_t>& clean, const std::vector<uint8_t>& candidate,
                      std::string* error) {

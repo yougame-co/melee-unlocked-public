@@ -1,3 +1,5 @@
+#include <chrono>
+#include <string>
 #include "test_env.h"
 #include "render_observer.h"
 // GX command processor: FIFO -> register state -> captured frames.
@@ -15,6 +17,9 @@ namespace gx { void settings_guest_options_frame(uint8_t menu, uint16_t selectio
 #include "audio.h"
 #include "native_pose_bridge.h"
 #include "replay_control.h"
+#include "yougame_parity.h"   // yg {"match":1|0} for the app, with or without Slippi
+#include "rtx_semantics.h"
+#include "../abi/mu_rtx_tokens.h"
 #ifdef MELEE_NO_SLIPPI
 #include "netplay_state.h"   // the same names, answered from the neutral netplay state
 #else
@@ -25,9 +30,13 @@ namespace gx { void settings_guest_options_frame(uint8_t menu, uint16_t selectio
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
+#include <mutex>
 #include <new>
+#include <thread>
 #include <vector>
 #include <unordered_map>
+#include "frame_table.h"
 
 namespace gx {
 
@@ -58,6 +67,7 @@ int latency_test_fill() {
 
 BPMemory g_bp;
 CPMemory g_cp;
+uint64_t g_cp_generation = 1;   // bumped whenever a CP register changes: cached vertex formats stay valid until then
 XFMemory g_xf;
 uint8_t g_tmem[1024 * 1024];
 uint64_t g_tmem_generation = 1;
@@ -173,9 +183,14 @@ inline size_t incomplete(size_t need) { g_parse_need = need; return 0; }
 // Draw identity bookkeeping (reset per frame).
 uint32_t g_dl_addr = 0, g_dl_draw_ordinal = 0, g_dl_call_ordinal = 0;
 bool g_merge_next_primitive = false;
-std::unordered_map<uint32_t, uint32_t> g_dl_calls;        // display list address -> calls this frame
-std::unordered_map<uint64_t, uint32_t> g_immediate_draws;  // (tex0, count, prim) -> ordinal this frame
+// The per-frame tables below are emptied at every frame end and refilled with about as many keys
+// (one per display list call, immediate draw kind and drawn PObj, ~1500 a frame), so they take their
+// nodes from a pool (frame_table.h). Only the simulation thread touches them.
+FramePool g_frame_table_pool;
+FrameTable<uint32_t, uint32_t> g_dl_calls = frame_table<FrameTable<uint32_t, uint32_t>>(g_frame_table_pool);        // display list address -> calls this frame
+FrameTable<uint64_t, uint32_t> g_immediate_draws = frame_table<FrameTable<uint64_t, uint32_t>>(g_frame_table_pool);  // (tex0, count, prim) -> ordinal this frame
 uint64_t g_commands = 0, g_draws = 0, g_vertices = 0;
+uint64_t g_dl_draws = 0, g_dl_vertices = 0;   // the part of g_draws / g_vertices that came from display lists
 uint32_t g_efb_copies = 0;
 NativeDrawAudit g_native_draw_audit;
 std::atomic<bool> g_native_pose_capture_enabled{false};
@@ -190,12 +205,15 @@ std::vector<uint32_t> g_native_pose_scope_ids;
 // with the outgoing ones and flew in between two frames.
 struct NativeDrawScope { uint32_t object, piece, ordinal, draws; };
 std::vector<NativeDrawScope> g_native_draw_scopes;
-std::unordered_map<uint32_t, uint32_t> g_native_object_scopes;   // PObj -> scopes begun this frame
+FrameTable<uint32_t, uint32_t> g_native_object_scopes = frame_table<FrameTable<uint32_t, uint32_t>>(g_frame_table_pool);   // PObj -> scopes begun this frame
 NativePoseBridgeStats g_native_pose_stats{};
 // Native game: draw owners arrive in the stream (token 0xF1), not from the render observer.
 bool g_native_owner_source = false;
 uint8_t g_native_owner = 0xFF;
 bool g_native_skinned = false;   // token 0xF2: the current native PObj is an envelope draw
+// Render semantics (tokens 0xF3-0xF6, rtx_semantics.h): the material, light set, camera and pass the
+// draws recorded now belong to. Indices into g_frame.rtx, so it is reset whenever a frame is handed on.
+RtxDecodeState g_rtx_state;
 
 uint32_t active_native_pose_scope_id() {
   return g_native_pose_scope_ids.empty() ? 0 : g_native_pose_scope_ids.back();
@@ -298,12 +316,15 @@ const uint8_t* array_ptr(uint32_t array, uint32_t index) {
 // register reads and an out-of-line host::ptr range check each, ~47,000 calls a frame in a match).
 // An index inside the region reads base + stride * index directly; anything else takes array_ptr,
 // which wraps and fails exactly as before, so the bytes read are the same either way.
-struct ArrayView { const uint8_t* base = nullptr; uint64_t avail = 0; uint32_t stride = 0, array = 0; };
+// The view keeps the array's base register too: an index outside the region is resolved the way
+// array_ptr resolves it, from the registers as they were when the draw was parsed.
+struct ArrayView { const uint8_t* base = nullptr; uint64_t avail = 0; uint32_t stride = 0, array = 0, base_reg = 0; };
 ArrayView array_view(uint32_t array) {
   ArrayView v;
   v.array = array;
   v.stride = g_cp.array_stride(array);
-  const uint32_t off = g_cp.array_base(array) & 0x3FFFFFFFu;
+  v.base_reg = g_cp.array_base(array);
+  const uint32_t off = v.base_reg & 0x3FFFFFFFu;
   if (const uint8_t* p = host::try_ptr(0x80000000u | off, 1)) {
     v.base = p;
     if (p >= host::ram && p < host::ram + host::ram_size) v.avail = (uint64_t)(host::ram + host::ram_size - p);
@@ -316,34 +337,57 @@ ArrayView array_view(uint32_t array) {
 inline const uint8_t* array_at(const ArrayView& v, uint32_t index, uint32_t bytes) {
   const uint64_t at = (uint64_t)v.stride * index;
   if (v.base && at + bytes <= v.avail) return v.base + at;
-  return array_ptr(v.array, index);
+  return host::ptr(0x80000000u | ((v.base_reg + v.stride * index) & 0x3FFFFFFFu));   // array_ptr's arithmetic
 }
 
-// Decodes `count` vertices of format `fmt` from `src` into the frame. Returns components mask.
-uint32_t decode_vertices(const VertexDesc& d, const uint8_t* src, uint32_t count, uint32_t fmt) {
-  uint32_t components = 0;
-  uint32_t mia = g_cp.matrix_index_a(), mib = g_cp.matrix_index_b();
-  static const uint32_t csize[] = {2, 3, 4, 2, 3, 4, 4, 4};
-  // Arrays and the bytes each attribute reads from them, resolved once for the whole call.
+// Everything a decode reads besides the vertex bytes and the arrays' contents, taken when the draw
+// is parsed: the format, the matrix indices a vertex without its own takes from the CP registers,
+// and where each array lives.
+struct DecodeState {
+  VertexDesc d;
+  uint32_t mia, mib;
   ArrayView pos_view, nrm_view, col_view[2], tex_view[8];
-  const uint32_t pos_bytes = comp_bytes(d.pos.format) * (d.pos.count ? 3 : 2);
-  const uint32_t nrm_bytes = comp_bytes(d.nrm.format) * 3;
-  if (d.pos.type >= 2) pos_view = array_view(d.pos.array);
-  if (d.nrm.type >= 2) nrm_view = array_view(1);
-  for (int i = 0; i < 2; ++i) if (d.col[i].type >= 2) col_view[i] = array_view(d.col[i].array);
-  for (int i = 0; i < 8; ++i) if (d.tex[i].type >= 2) tex_view[i] = array_view(d.tex[i].array);
-  // Everything that depends only on the format is worked out once per call: the components mask,
-  // the matrix indices a vertex without its own takes from the CP registers, and the texture
-  // coordinate sets that are present. Vertices are decoded straight into the frame's storage
-  // (value-initialised, as `Vertex out{}` was), not built on the stack and copied in.
+};
+DecodeState capture_decode(const VertexDesc& d) {
+  DecodeState s;
+  s.d = d;
+  s.mia = g_cp.matrix_index_a(); s.mib = g_cp.matrix_index_b();
+  if (d.pos.type >= 2) s.pos_view = array_view(d.pos.array);
+  if (d.nrm.type >= 2) s.nrm_view = array_view(1);
+  for (int i = 0; i < 2; ++i) if (d.col[i].type >= 2) s.col_view[i] = array_view(d.col[i].array);
+  for (int i = 0; i < 8; ++i) if (d.tex[i].type >= 2) s.tex_view[i] = array_view(d.tex[i].array);
+  return s;
+}
+
+// The components mask of format `d`: which attributes its vertices carry (not their values).
+uint32_t vertex_components(const VertexDesc& d) {
+  uint32_t components = 0;
   if (d.posmtx) components |= VB_HAS_POSMTXIDX;
-  uint8_t default_texmtx[8];
-  for (int i = 0; i < 8; ++i) {
-    default_texmtx[i] = (uint8_t)(i < 4 ? bits(mia, 6 + 6 * i, 6) : bits(mib, 6 * (i - 4), 6));
-    if (d.texmtx[i]) components |= VB_HAS_TEXMTXIDX0 << i;
-  }
+  for (int i = 0; i < 8; ++i) if (d.texmtx[i]) components |= VB_HAS_TEXMTXIDX0 << i;
   if (d.nrm.type) components |= VB_HAS_NRM0;
   for (int i = 0; i < 2; ++i) if (d.col[i].type) components |= i ? VB_HAS_COL1 : VB_HAS_COL0;
+  for (int i = 0; i < 8; ++i) if (d.tex[i].type) components |= VB_HAS_UV0 << i;
+  return components;
+}
+
+// Decodes `count` vertices from `src` into `outv` (value-initialised storage). Reads only `s`, `src`
+// and the arrays' memory, so it gives the same vertices on any thread.
+void decode_run(const DecodeState& s, const uint8_t* src, uint32_t count, Vertex* outv) {
+  const VertexDesc& d = s.d;
+  const uint32_t mia = s.mia, mib = s.mib;
+  const ArrayView &pos_view = s.pos_view, &nrm_view = s.nrm_view;
+  const ArrayView* col_view = s.col_view;
+  const ArrayView* tex_view = s.tex_view;
+  static const uint32_t csize[] = {2, 3, 4, 2, 3, 4, 4, 4};
+  const uint32_t pos_bytes = comp_bytes(d.pos.format) * (d.pos.count ? 3 : 2);
+  const uint32_t nrm_bytes = comp_bytes(d.nrm.format) * 3;
+  // Everything that depends only on the format is worked out once per call: the matrix indices a
+  // vertex without its own takes from the CP registers, and the texture coordinate sets that are
+  // present. Vertices are decoded straight into the frame's storage (value-initialised, as
+  // `Vertex out{}` was), not built on the stack and copied in.
+  uint8_t default_texmtx[8];
+  for (int i = 0; i < 8; ++i)
+    default_texmtx[i] = (uint8_t)(i < 4 ? bits(mia, 6 + 6 * i, 6) : bits(mib, 6 * (i - 4), 6));
   struct TexSet { int index; uint32_t n, cb, bytes; };
   TexSet tex_sets[8];
   int tex_count = 0;
@@ -351,16 +395,15 @@ uint32_t decode_vertices(const VertexDesc& d, const uint8_t* src, uint32_t count
     if (!d.tex[i].type) continue;
     const uint32_t n = d.tex[i].count ? 2 : 1, cb = comp_bytes(d.tex[i].format);
     tex_sets[tex_count++] = {i, n, cb, cb * n};
-    components |= VB_HAS_UV0 << i;
   }
   const uint32_t pos_n = d.pos.count ? 3 : 2, pos_cb = comp_bytes(d.pos.format);
   const uint32_t nrm_cb = comp_bytes(d.nrm.format);
   const uint32_t nrm_frac = d.nrm.format == 1 ? 6 : d.nrm.format == 3 ? 14 : d.nrm.format == 0 ? 7 : d.nrm.format == 2 ? 15 : 0;
   const uint32_t nrm_direct = nrm_cb * 3 * (d.nrm.count ? 3 : 1);
   const uint32_t nrm_skip8 = (d.nrm.count && d.nrm_index3) ? 3 : 1, nrm_skip16 = (d.nrm.count && d.nrm_index3) ? 6 : 2;
-  const size_t base = g_frame.vertices.size();
-  g_frame.vertices.resize(base + count);
-  Vertex* const outv = g_frame.vertices.data() + base;
+  // The frame's storage is not zeroed on resize (VertexVector): every field a format leaves out
+  // stays zero, as before, from here.
+  std::memset((void*)outv, 0, (size_t)count * sizeof(Vertex));
   for (uint32_t v = 0; v < count; ++v) {
     Vertex& out = outv[v];
     const uint8_t* p = src + (size_t)v * d.size;
@@ -407,7 +450,160 @@ uint32_t decode_vertices(const VertexDesc& d, const uint8_t* src, uint32_t count
       if (q) for (uint32_t k = 0; k < set.n; ++k) out.uv[set.index][k] = read_component(q + k * set.cb, x.format, x.frac);
     }
   }
-  return components;
+}
+
+// Vertex decoding beside the simulation (Source Port only). A draw's vertices are not read by the
+// simulation thread after they are recorded: the renderer reads them once the frame is handed over.
+// So the draw's state is captured, its stream bytes are copied, and one worker thread decodes it
+// into the frame's storage while the game goes on, the way the console's GPU reads vertex data
+// after the CPU has moved on. The simulation thread waits for the worker (join) before the frame
+// is handed over, before the vertex storage could move, when a failed allocation trims the frame,
+// and when the game is told the GPU is done (draw-done and token interrupts), after which it may
+// rewrite vertex data. Four-vertex quads still decode in place: record_draw reads them
+// (frustum_backdrop). MELEE_TEST_DECODE_VERIFY=1 (tests) also decodes each job in place and
+// compares the worker's result byte for byte at the join.
+class VertexDecodeWorker {
+  struct Job { DecodeState state; size_t bytes_at; uint32_t count; Vertex* out; size_t verify_at; uint64_t key; };
+  std::thread thread_;
+  std::mutex mutex_;
+  std::condition_variable wake_, done_;
+  std::vector<Job> jobs_;            // appended by the simulation thread; never reallocated while queued
+  std::vector<uint8_t> bytes_;       // the jobs' copied stream bytes, same rule
+  std::vector<Vertex> verify_;       // MELEE_TEST_DECODE_VERIFY: the in-place results
+  size_t published_ = 0, taken_ = 0, finished_ = 0;   // guarded by mutex_
+  size_t unpublished_vertices_ = 0;
+  bool stop_ = false, started_ = false;
+  bool verify_on_ = false;
+  uint64_t verified_jobs_ = 0, verify_mismatches_ = 0;
+
+  void run() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    for (;;) {
+      wake_.wait(lock, [&] { return stop_ || taken_ < published_; });
+      if (taken_ == published_) return;   // stop_ with nothing left
+      const size_t begin = taken_, end = published_;
+      taken_ = end;
+      Job* const jobs = jobs_.data();
+      const uint8_t* const bytes = bytes_.data();
+      lock.unlock();
+      for (size_t i = begin; i < end; ++i) decode_run(jobs[i].state, bytes + jobs[i].bytes_at, jobs[i].count, jobs[i].out);
+      lock.lock();
+      finished_ = end;
+      done_.notify_all();
+    }
+  }
+  void publish_locked() {
+    if (published_ != jobs_.size()) { published_ = jobs_.size(); wake_.notify_one(); }
+    unpublished_vertices_ = 0;
+  }
+
+ public:
+  ~VertexDecodeWorker() {
+    if (!started_) return;
+    { std::lock_guard<std::mutex> lock(mutex_); stop_ = true; publish_locked(); }
+    thread_.join();
+  }
+  static bool wanted() { return host::game_image != nullptr; }
+  bool pending() const { return !jobs_.empty(); }
+  // Room for `count` more vertices in `frame` without moving its storage (else join first).
+  static bool fits(const Frame& frame, size_t count) { return frame.vertices.size() + count <= frame.vertices.capacity(); }
+  void submit(const DecodeState& state, uint64_t key, const uint8_t* src, uint32_t count, Vertex* out) {
+    const size_t n = (size_t)count * state.d.size;
+    // The same format right after the previous job, still unpublished, its vertices and bytes
+    // contiguous: one longer job (Animelee CE sends thousands of four-vertex quads a frame).
+    if (key && started_ && jobs_.size() > published_ && jobs_.back().key == key &&
+        jobs_.back().out + jobs_.back().count == out && bytes_.size() + n <= bytes_.capacity()) {
+      if (verify_on_) {
+        const size_t at = verify_.size();
+        verify_.resize(at + count);
+        decode_run(state, src, count, verify_.data() + at);
+      }
+      bytes_.insert(bytes_.end(), src, src + n);
+      jobs_.back().count += count;
+      unpublished_vertices_ += count;
+      if (unpublished_vertices_ >= 4096) { std::lock_guard<std::mutex> lock(mutex_); publish_locked(); }
+      return;
+    }
+    if (jobs_.size() == jobs_.capacity() || bytes_.size() + n > bytes_.capacity()) {
+      join();   // the worker reads both vectors: grow them only while it is idle
+      jobs_.reserve(std::max<size_t>(4096, jobs_.capacity() * 2));
+      bytes_.reserve(std::max(bytes_.capacity() * 2, std::max<size_t>(1 << 20, n)));
+    }
+    if (!started_) {
+      started_ = true;
+      static const bool verify = [] { const char* v = host::test_env::getenv("MELEE_TEST_DECODE_VERIFY"); return v && *v == '1'; }();
+      verify_on_ = verify;
+      thread_ = std::thread([this] { run(); });
+    }
+    Job job{state, bytes_.size(), count, out, verify_.size(), key};
+    bytes_.insert(bytes_.end(), src, src + n);
+    if (verify_on_) {
+      verify_.resize(verify_.size() + count);
+      decode_run(state, src, count, verify_.data() + job.verify_at);
+    }
+    jobs_.push_back(job);
+    unpublished_vertices_ += count;
+    // Hand work over in batches: waking a sleeping worker is a kernel call, so not one per draw.
+    if (jobs_.size() - published_ >= 32 || unpublished_vertices_ >= 4096) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      publish_locked();
+    }
+  }
+  // Waits until every submitted job is decoded; afterwards the frame's vertices are complete.
+  void join() {
+    if (jobs_.empty()) return;
+    {
+      host::SimCostScope cost(host::SIM_DECODE);
+      std::unique_lock<std::mutex> lock(mutex_);
+      publish_locked();
+      done_.wait(lock, [&] { return finished_ == published_; });
+    }
+    if (verify_on_) {
+      for (const Job& job : jobs_) {
+        ++verified_jobs_;
+        if (std::memcmp(job.out, verify_.data() + job.verify_at, job.count * sizeof(Vertex)) == 0) continue;
+        if (verify_mismatches_++ < 20)
+          host::log("decode verify: job of %u vertices (format size %u) differs from the in-place decode", job.count, job.state.d.size);
+      }
+      static uint64_t reported = 0;
+      if (verified_jobs_ - reported >= 100000) {
+        reported = verified_jobs_;
+        host::log("decode verify: %llu jobs compared, %llu differed", (unsigned long long)verified_jobs_, (unsigned long long)verify_mismatches_);
+      }
+      verify_.clear();
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    jobs_.clear(); bytes_.clear();
+    published_ = taken_ = finished_ = 0;
+    unpublished_vertices_ = 0;
+  }
+};
+VertexDecodeWorker g_vertex_decoder;
+
+// Decodes `count` vertices of format `fmt` from `src` into the frame. Returns components mask.
+// The vertex format of each of the eight formats, worked out once per CP register change instead of
+// for every primitive (Animelee CE: 13,000 primitives a frame).
+struct FormatCache { uint64_t generation = 0; VertexDesc desc; DecodeState state; uint32_t components = 0; };
+FormatCache g_format_cache[8];
+const FormatCache& format_for(uint32_t fmt) {
+  FormatCache& c = g_format_cache[fmt & 7];
+  if (c.generation != g_cp_generation) {
+    c.desc = build_desc(fmt);
+    c.state = capture_decode(c.desc);
+    c.components = vertex_components(c.desc);
+    c.generation = g_cp_generation;
+  }
+  return c;
+}
+
+uint32_t decode_vertices(const FormatCache& f, uint32_t fmt, const uint8_t* src, uint32_t count, bool in_place) {
+  if (g_vertex_decoder.pending() && !VertexDecodeWorker::fits(g_frame, count)) g_vertex_decoder.join();
+  const size_t base = g_frame.vertices.size();
+  g_frame.vertices.resize(base + count);
+  Vertex* const outv = g_frame.vertices.data() + base;
+  if (!in_place && VertexDecodeWorker::wanted()) g_vertex_decoder.submit(f.state, (f.generation << 3) | (fmt & 7), src, count, outv);
+  else decode_run(f.state, src, count, outv);
+  return f.components;
 }
 
 // ---------------- draw snapshot ----------------
@@ -518,8 +714,30 @@ static bool frustum_backdrop(const DrawCall& dc, const Frame& f) {
   return true;
 }
 
+// Coverage of the render semantics, logged every 600 frames that carried any: how many draws the
+// game described (material, camera) and what it sent. The F1 gate reads this line.
+static void note_rtx_semantics_frame(const Frame& frame) {
+  if (!frame.rtx.present) return;
+  RtxSemanticsStats& s = rtx_semantics_stats();
+  ++s.frames;
+  for (const DrawCall& dc : frame.draws) {
+    ++s.draws;
+    if (dc.rtx.material >= 0) ++s.draws_with_material;
+    if (dc.rtx.camera >= 0) ++s.draws_with_camera;
+    if (dc.rtx.pass == MU_RTX_PASS_PARTICLES) ++s.particle_draws;
+  }
+  if (s.frames % 600 != 0) return;
+  const double draws = s.draws ? (double)s.draws : 1.0;
+  host::log("rtx: semantics over %llu frames: %llu draws, %.1f%% with a material, %.1f%% with a camera, "
+            "%llu particle draws; %llu materials, %llu lights, %llu cameras, %llu malformed",
+            (unsigned long long)s.frames, (unsigned long long)s.draws, 100.0 * s.draws_with_material / draws,
+            100.0 * s.draws_with_camera / draws, (unsigned long long)s.particle_draws,
+            (unsigned long long)s.materials, (unsigned long long)s.lights, (unsigned long long)s.cameras,
+            (unsigned long long)s.malformed);
+  s = RtxSemanticsStats{};
+}
+
 void record_draw(uint32_t primitive, uint32_t first, uint32_t count, uint32_t components) {
-  host::SimCostScope record_cost(host::SIM_RECORD);
   const bool line = primitive == 0xA8 || primitive == 0xB0;
   if (g_merge_next_primitive && !g_frame.commands.empty() &&
       g_frame.commands.back().kind == FrameCommand::Draw) {
@@ -534,9 +752,13 @@ void record_draw(uint32_t primitive, uint32_t first, uint32_t count, uint32_t co
       previous.frustum_backdrop = false;
       ++g_draws;
       g_vertices += count;
+      if (g_dl_addr) { ++g_dl_draws; g_dl_vertices += count; }
       return;
     }
   }
+  // Timed from here: a primitive merged above costs less than reading the clock twice (Animelee CE
+  // sends 13,000 a frame).
+  host::SimCostScope record_cost(host::SIM_RECORD);
   // Built on the stack (hot in cache), then moved in: filling the vector element directly measured
   // worse, because each field write lands in cold memory instead of one sequential copy.
   DrawCall dc{DrawCall::SkipInit{}};
@@ -592,11 +814,13 @@ void record_draw(uint32_t primitive, uint32_t first, uint32_t count, uint32_t co
       if (dc.authored_pose->envelope) ++authored_stats().posed_draws_envelope;
     } }
   dc.frustum_backdrop = frustum_backdrop(dc, g_frame);   // SkipInit: written every draw
+  dc.rtx = rtx_draw_info(g_rtx_state);
   g_frame.draws.push_back(std::move(dc));
   g_frame.segments.push_back({first, count, primitive});
   g_frame.commands.push_back({FrameCommand::Draw, (uint32_t)g_frame.draws.size() - 1});
   ++g_draws;
   g_vertices += count;
+  if (g_dl_addr) { ++g_dl_draws; g_dl_vertices += count; }
 }
 
 // ---------------- BP side effects ----------------
@@ -618,9 +842,12 @@ void bp_write(uint32_t value) {
   }
   switch (r) {
     case BP_SETDRAWDONE:
-      if (masked & 2) host::set_pe_finish_pending();
+      // The game learns the GPU is done and may then rewrite vertex data: every queued draw is
+      // decoded first, as the console's GPU had read it.
+      if (masked & 2) { g_vertex_decoder.join(); host::set_pe_finish_pending(); }
       break;
     case BP_PE_TOKEN_INT_ID:
+      g_vertex_decoder.join();   // as for draw done: past the token the game may reuse vertex data
       host::set_pe_token_pending((uint16_t)masked);
       break;
     case BP_LOADTLUT1: {
@@ -698,6 +925,13 @@ void bp_write(uint32_t value) {
           static uint16_t last_scene = 0xFFFF;
           const uint16_t scene = (uint16_t)(g_frame.scene_major << 8 | g_frame.scene_minor);
           if (scene != last_scene) { host::log("scene: major %02X minor %02X (frame %llu)", g_frame.scene_major, g_frame.scene_minor, (unsigned long long)g_frame.sequence); host::note_scene_memory(); last_scene = scene; }
+          static int last_match = -1;
+          const int in_match = frame_in_app_match(g_frame) ? 1 : 0;
+          if (in_match != last_match) {
+            last_match = in_match;
+            const int sent = yougame::parity::signals.sync_match(in_match);
+            if (sent >= 0) host::log("yougame: match %d", sent);
+          }
         }
         g_frame.time = host::now_seconds(); // completed snapshot availability anchors presentation
         g_frame.tick = host::tick_timing();
@@ -708,7 +942,9 @@ void bp_write(uint32_t value) {
         g_frame.test_fill = latency_test_fill();
         // A replay viewer on the way to a jump's target simulates frames nobody sees: they are not
         // handed to the renderer, and the next frame that is shown is not the last shown one's neighbour.
+        note_rtx_semantics_frame(g_frame);
         const bool unseen = replay_control::skip_render();
+        g_vertex_decoder.join();   // the frame's vertices are complete before anyone else sees them
         if (g_backend && !unseen) {
           host::perf::Scope submit_cost(host::perf::Stage::Submit);
           g_backend->submit_and_recycle(g_frame);
@@ -717,6 +953,7 @@ void bp_write(uint32_t value) {
         if (unseen) g_discontinuity = g_hard_cut = true;
         g_texture_snapshots.end_frame();
         g_dl_calls.clear(); g_immediate_draws.clear(); g_native_object_scopes.clear(); g_native_draw_scopes.clear(); native_pose_bridge_frame_reset(); finish_observed_frame();
+        g_rtx_state.reset();   // its indices pointed into the frame just handed on
         host::note_frame_submitted();   // the game now only waits for the retrace (audio pacing, host.cpp)
       }
       break;
@@ -765,10 +1002,62 @@ void run_display_list(uint32_t addr, uint32_t size) {
   g_dl_addr = saved_addr; g_dl_draw_ordinal = saved_draw; g_dl_call_ordinal = saved_call;
 }
 
+// The state half of frustum_backdrop, before the draw is recorded: a perspective camera, no depth
+// write, no per-vertex matrix and an identity model-view at the current matrix index.
+static bool quad_may_be_backdrop(const VertexDesc& desc) {
+  if (desc.posmtx || g_xf.raw[0x1026] != 0 || (g_bp.zmode() & 0x10)) return false;
+  const uint32_t row = g_cp.matrix_index_a() & 63;
+  if (row + 3 > 64) return false;
+  static const float identity[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+  for (int i = 0; i < 12; ++i) if (std::fabs(g_xf.posMatrices[row * 4 + i] - identity[i]) > 1e-5f) return false;
+  return true;
+}
+
+static size_t parse_command_inner(const uint8_t* d, size_t len);
+// Tests (MELEE_TEST_GX_OPSTATS=1): time and count per opcode, logged every 600 frames' worth of commands.
 size_t parse_command(const uint8_t* d, size_t len) {
+  static const bool stats = [] { const char* v = host::test_env::getenv("MELEE_TEST_GX_OPSTATS"); return v && *v == '1'; }();
+  if (!stats) return parse_command_inner(d, len);
+  static double ns[256] = {};
+  static uint64_t n[256] = {}, total = 0;
+  static int depth = 0;
+  const uint8_t op = d[0] >= 0x80 && d[0] < 0xC0 ? 0x80 : d[0];
+  const auto t0 = std::chrono::steady_clock::now();
+  ++depth;
+  const size_t r = parse_command_inner(d, len);
+  --depth;
+  const double dt = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
+  ns[op] += op == 0x40 ? 0.0 : dt;   // display lists: their commands are counted themselves
+  ++n[op];
+  static double bp_ns[256] = {};
+  static uint64_t bp_n[256] = {};
+  if (op == 0x61 && len >= 2) { bp_ns[d[1]] += dt; ++bp_n[d[1]]; }
+  static uint64_t next_log = 2000000;
+  ++total;
+  if (depth == 0 && total >= next_log) {
+    next_log = total + 2000000;
+    std::string line;
+    char buf[64];
+    for (int i = 0; i < 256; ++i)
+      if (n[i]) { std::snprintf(buf, sizeof buf, " %02X:%llu/%.0fms", i, (unsigned long long)n[i], ns[i] / 1e6); line += buf; }
+    host::log("gx opstats:%s", line.c_str());
+    line.clear();
+    for (int i = 0; i < 256; ++i)
+      if (bp_ns[i] > 50e6) { std::snprintf(buf, sizeof buf, " %02X:%llu/%.0fms", i, (unsigned long long)bp_n[i], bp_ns[i] / 1e6); line += buf; }
+    host::log("gx opstats bp:%s", line.c_str());
+  }
+  return r;
+}
+
+static size_t parse_command_inner(const uint8_t* d, size_t len) {
   uint8_t op = d[0];
   if (op == 0x00) return 1;
-  if (op == 0x08) { if (len < 6) return incomplete(6); g_cp.reg[d[1]] = be32(d + 2); return 6; }
+  if (op == 0x08) {
+    if (len < 6) return incomplete(6);
+    const uint32_t value = be32(d + 2);
+    if (g_cp.reg[d[1]] != value) { g_cp.reg[d[1]] = value; ++g_cp_generation; }
+    return 6;
+  }
   if (op == 0x10) {
     if (len < 5) return incomplete(5);
     uint32_t count = (be16(d + 1) & 0xF) + 1, address = be16(d + 3);
@@ -827,13 +1116,31 @@ size_t parse_command(const uint8_t* d, size_t len) {
     g_native_skinned = d[1] != 0;
     return 2;
   }
+  // Render semantics from the native game (0xF3 material, 0xF4 lights, 0xF5 camera, 0xF6 pass).
+  // Sent only while rtx_semantics_enabled(); consumed here and kept in g_frame.rtx.
+  if (is_rtx_token(op)) {
+    size_t need = 0;
+    const size_t used = parse_rtx_token(d, len, g_rtx_state, g_frame.rtx, &need);
+    if (used == 0) return incomplete(need);
+    if (used == 1) {
+      static int reported = 0;
+      if (reported++ < 10) host::log("gx: malformed render-semantics token %02X %02X", op, len > 1 ? d[1] : 0);
+    }
+    return used;
+  }
   if (op == 0x61) { if (len < 5) return incomplete(5); bp_write(be32(d + 1)); return 5; }
   if (op >= 0x80 && op < 0xC0) {
     if (len < 3) return incomplete(3);
     uint32_t fmt = op & 7, count = be16(d + 1);
-    VertexDesc desc = build_desc(fmt);
+    const FormatCache& format = format_for(fmt);
+    const VertexDesc& desc = format.desc;
     size_t need = 3 + (size_t)count * desc.size;
     if (len < need) return incomplete(need);
+    // Nothing will draw this frame: no renderer (--headless), or a replay jump's unseen frame (the
+    // same test the frame's hand-off makes below). Its vertices are not decoded and no draw is
+    // recorded; register loads, display lists and the frame end still run, so the next frame that is
+    // shown starts from the same GX state. Nothing here reaches the simulation.
+    if (count && (!g_backend || replay_control::skip_render())) return need;
     if (count) {
       g_native_draw_audit.note_decoded_draw();
       uint32_t first = (uint32_t)g_frame.vertices.size();
@@ -843,9 +1150,15 @@ size_t parse_command(const uint8_t* d, size_t len) {
       // never allocates) and the game goes on; the next frame tries again.
       const size_t draws = g_frame.draws.size(), segments = g_frame.segments.size(), commands = g_frame.commands.size();
       try {
-        uint32_t components = decode_vertices(desc, d + 3, count, fmt);
+        // A four-vertex quad that could be a frustum backdrop decodes in place: record_draw reads it
+        // (frustum_backdrop). Only quads that pass the draw-state half of that test do: Animelee CE's
+        // stages and fighters send thousands of small quads a frame, and decoding all of them on the
+        // simulation thread held a GTX 1650 laptop under 60 Hz (11-09 report). Same result either way.
+        const bool in_place = (op & 0xF8) == 0x80 && count == 4 && quad_may_be_backdrop(desc);
+        uint32_t components = decode_vertices(format, fmt, d + 3, count, in_place);
         record_draw(op & 0xF8, first, count, components);
       } catch (const std::bad_alloc&) {
+        g_vertex_decoder.join();   // its jobs write into the vertices about to be trimmed
         auto cut = [](auto& v, size_t n) { if (v.size() > n) v.erase(v.begin() + (ptrdiff_t)n, v.end()); };
         cut(g_frame.vertices, first);
         cut(g_frame.draws, draws);
@@ -869,9 +1182,7 @@ size_t parse_command(const uint8_t* d, size_t len) {
 }  // namespace
 
 void mark_discontinuity(bool rollback) { g_discontinuity = true; if (!rollback) g_hard_cut = true; }
-static std::atomic<bool> g_subframe_suspended{false}, g_subframes_active{false};
-void set_subframe_suspended(bool suspended) { g_subframe_suspended.store(suspended, std::memory_order_relaxed); }
-bool subframe_suspended() { return g_subframe_suspended.load(std::memory_order_relaxed); }
+static std::atomic<bool> g_subframes_active{false};
 void set_subframes_active(bool active) { g_subframes_active.store(active, std::memory_order_relaxed); }
 bool subframes_active() { return g_subframes_active.load(std::memory_order_relaxed); }
 
@@ -1025,6 +1336,13 @@ void set_native_hud_player(int slot, bool present, int damage, int stocks, float
                     tag_x >= 0 && tag_x <= 640 && tag_y >= 0 && tag_y <= 480;
 }
 
+void set_native_hud_extras(int slot, int nana_damage, int team) {
+  if (slot < 0 || slot >= 4) return;
+  auto& out = g_native_hud[slot];
+  out.nana_damage = nana_damage >= 0 && nana_damage <= 999 ? nana_damage : -1;
+  out.team = team >= 0 && team <= 3 ? team : -1;
+}
+
 void set_native_hud_combo(int slot, int link, float percent, bool stunned) {
   if (slot < 0 || slot >= 4) return;
   auto& out = g_native_hud[slot];
@@ -1039,10 +1357,43 @@ uint32_t hud_scales_packed() {
          clamp_percent(g_damage_hud_scale.load(std::memory_order_relaxed)) << 8;
 }
 
+bool supports_game_reset() { return !g_backend || g_backend->supports_game_reset(); }
+
+std::function<void()> capture_boot_state() {
+  // Capture the command processor, not decoded resources keyed by old host addresses.
+  const auto bp = g_bp; const auto cp = g_cp; const auto xf = g_xf;
+  const std::vector<uint8_t> tmem(g_tmem, g_tmem + sizeof g_tmem);
+  const auto frame = g_frame; const auto fifo = g_buf;
+  const auto pos = g_buf_pos, need = g_parse_need;
+  const auto mask = g_bp_mask;
+  const auto sequence = g_frame_sequence, tmem_generation = g_tmem_generation, fifo_batch = g_fifo_batch;
+  std::array<int32_t,16> colors{}, kcolors{};
+  std::memcpy(colors.data(), g_tev_colors, sizeof g_tev_colors);
+  std::memcpy(kcolors.data(), g_tev_kcolors, sizeof g_tev_kcolors);
+  return [=] {
+    if (g_backend) g_backend->reset_game_state();
+    g_bp = bp; g_cp = cp; g_xf = xf;
+    std::memcpy(g_tmem, tmem.data(), sizeof g_tmem);
+    std::memcpy(g_tev_colors, colors.data(), sizeof g_tev_colors);
+    std::memcpy(g_tev_kcolors, kcolors.data(), sizeof g_tev_kcolors);
+    g_bp_mask = mask; g_buf = fifo; g_buf_pos = pos; g_parse_need = need;
+    g_tmem_generation = tmem_generation; g_fifo_batch = fifo_batch; g_frame_sequence = sequence;
+    g_frame = frame; g_texture_snapshots.clear();
+    g_stock_roots = {}; g_damage_roots = {}; g_native_hud = {};
+    g_native_pose_scopes.clear(); g_native_pose_skinned_scopes.clear(); g_native_pose_scope_ids.clear();
+    g_native_draw_scopes.clear(); g_native_object_scopes.clear();
+    g_native_owner = 0xFF; g_native_skinned = false;
+    g_native_draw_audit.reset(false);
+    mark_discontinuity();
+  };
+}
+
 void init(Backend* backend) {
+  g_vertex_decoder.join();
   g_backend = backend;
   std::memset(&g_bp, 0, sizeof g_bp);
   std::memset(&g_cp, 0, sizeof g_cp);
+  ++g_cp_generation;
   std::memset(&g_xf, 0, sizeof g_xf);
   std::memset(g_tmem, 0, sizeof g_tmem);
   g_frame.clear();
@@ -1092,6 +1443,11 @@ void stats(uint64_t* commands, uint64_t* draws, uint64_t* vertices, uint32_t* ef
   if (draws) *draws = g_draws;
   if (vertices) *vertices = g_vertices;
   if (efb_copies) *efb_copies = g_efb_copies;
+}
+
+void display_list_stats(uint64_t* draws, uint64_t* vertices) {
+  if (draws) *draws = g_dl_draws;
+  if (vertices) *vertices = g_dl_vertices;
 }
 
 void set_native_draw_audit(bool enabled) { g_native_draw_audit.reset(enabled); }

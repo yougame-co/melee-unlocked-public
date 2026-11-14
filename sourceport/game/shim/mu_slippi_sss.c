@@ -19,6 +19,10 @@
 #include <melee/mn/types.h>
 #include <mu_native.h>
 #include <mu_ranked.h>
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+#include "mu_squad.h"
+#endif
 
 extern char mnNameNew_CurrentNameText[];
 
@@ -59,8 +63,11 @@ static CSSData* online_css_data(void)
     return NULL;
 }
 
-/* FN_TX_LOCK_IN. stage_behavior: -2 random, -1 unset (use the opponent's), 0+ that stage id. */
-void mu_slippi_sss_lock_in(int stage_behavior)
+/* FN_TX_LOCK_IN. stage_behavior: -2 random, -1 unset (use the opponent's), 0+ that stage id.
+ * Returns 1 once the selections went to the host, 0 when Squad Strike refused the lock-in (its
+ * reason is on screen): then there is nothing to search with. -1: a friend room's lock-in held
+ * until the friend's game is heard from (nonzero, so whatever follows runs as it always did). */
+int mu_slippi_sss_lock_in(int stage_behavior)
 {
     MuSlippiMenuState* s = mu_slippi_state();
     MuSlippiSelections sel;
@@ -93,7 +100,19 @@ void mu_slippi_sss_lock_in(int stage_behavior)
     }
     sel.alt_stage_mode = s->frozen_toggle;
     sel.online_mode = s->mode;
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+    /* A friend room: never locked in before the friend's game said whether it plays Squad Strike. */
+    if (s->mode == MU_SLP_MODE_DIRECT && !gmSquad_OnlineFriendLockIn())
+        return gmSquad_OnlineFriendHeld() ? -1 : 0;
+    if (gmSquad_OnlineLive(s->mode)) {
+        if (!gmSquad_OnlineSelect(sel.char_id, sel.char_color)) return 0;
+        /* A friend room has no search to check the memory floors and disc identity: lock-in does. */
+        if (gmSquad_OnlineFriend() && !gmSquad_OnlineBudget()) return 0;
+    }
+#endif
     mu_slippi_set_selections(&sel);
+    return 1;
 }
 
 /* FN_TX_FIND_MATCH: 2 of every 3 bytes of the typed name, 9 slots (the ninth reads past the eighth
@@ -115,8 +134,7 @@ void mu_slippi_sss_run_callback(int stage_behavior)
 {
     switch (mu_slippi_state()->callback) {
     case MU_SLP_CB_CODE_LOCK_IN:
-        mu_slippi_sss_lock_in(stage_behavior);
-        mu_slippi_sss_find_match();
+        if (mu_slippi_sss_lock_in(stage_behavior)) mu_slippi_sss_find_match();
         break;
     case MU_SLP_CB_SSS_LOCK_IN:
         mu_slippi_sss_lock_in(stage_behavior);

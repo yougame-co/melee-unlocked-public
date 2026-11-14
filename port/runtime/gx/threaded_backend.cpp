@@ -43,9 +43,19 @@ class ThreadedBackend final : public Backend {
   FrameQueue queue;
   std::thread worker;
   RenderOptions options_;
+  std::mutex reset_mutex_;
+  std::shared_ptr<std::promise<void>> reset_;
+  std::atomic<bool> reset_pending_{false};
+  std::atomic<bool> reset_supported_{false};
 
   // Runs on the render thread.
   void present_loop(Backend* renderer) {
+    static const bool diag_logged = [] {
+      if (subframe_menu_hold_diag_enabled())
+        host::log("subframe: MELEE_SUBFRAME_DIAG 64 on (menu draws hold their current frame, the behaviour before build 47)");
+      return true;
+    }();
+    (void)diag_logged;
     SubFrameSolver solver;
     std::vector<DrawMatrices> overrides;
     Frame frames[2];             // ring: previous and current simulation frames
@@ -66,12 +76,11 @@ class ThreadedBackend final : public Backend {
     bool stats_were_readable = false;
     bool reflex_slept = false;    // Reflex has already waited for the frame about to be drawn
     double render_budget = 0.004;
-    // "Uncapped" used to present as fast as this thread could go. Against a GPU that cannot keep
-    // up that keeps the GPU's queue full, and a full queue is input latency; it also ran this
-    // thread and the solver workers flat out against the simulation and input threads. Uncapped
-    // is now held at twice the display's refresh rate, which still shows every sub-frame a monitor
-    // can use. MELEE_PRESENT_UNCAPPED=1 restores the old behaviour for comparison runs.
-    static const bool present_uncapped = [] { const char* v = std::getenv("MELEE_PRESENT_UNCAPPED"); return v && *v == '1'; }();
+    // "Frame cap off" presents as fast as this thread can go: the game never lowers the frame rate the
+    // player chose on its own (owner, 11-10). It was held at twice the display's refresh since an earlier
+    // release, so "unlocked" showed 120 on a 60 Hz screen (a report, 11-10). MELEE_UNCAPPED_HOLD=1
+    // (tests): the old hold at twice the refresh.
+    static const bool present_uncapped = [] { const char* v = std::getenv("MELEE_UNCAPPED_HOLD"); return !(v && *v == '1'); }();
     struct Trace {
       FILE* file = nullptr;
       explicit Trace(const std::string& path) {
@@ -146,6 +155,23 @@ class ThreadedBackend final : public Backend {
     host::log("presentation: phase timeline %s, keyframe %s", phase_timeline ? "tick" : "hand-over",
               keyframe_mode == KF_OFF ? "off" : keyframe_mode == KF_ANCHOR_ALL ? "anchor (all modes)" : keyframe_mode == KF_SNAP ? "snap" : "off");
     for (;;) {
+      std::shared_ptr<std::promise<void>> reset;
+      if (reset_pending_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(reset_mutex_);
+        reset.swap(reset_);
+        reset_pending_.store(false, std::memory_order_relaxed);
+      }
+      if (reset) {
+        try {
+          queue.discard_pending();
+          solver = SubFrameSolver{};
+          for (auto& f : frames) f.clear();
+          overrides.clear(); cur = -1; have_prev = false;
+          renderer->reset_game_state();
+          next_present = host::now_seconds();
+          reset->set_value();
+        } catch (...) { reset->set_exception(std::current_exception()); throw; }
+      }
       host::window_pump();
       const auto& live_options = render_options(renderer);
       // A fixed cap the monitor's rate is not a whole multiple of (60 on 144 or 175 Hz) shows each
@@ -175,9 +201,9 @@ class ThreadedBackend final : public Backend {
                     : live_options.fps_cap < 0 ? last_refresh
                     : present_uncapped ? 0.0 : 2.0 * last_refresh;
       // A display that follows the frames (G-Sync, FreeSync, read by the renderer from the display's
-      // own counts) is fed just under its refresh and synced, whatever the cap and V-Sync say: above
-      // the refresh it stops following and tears, under it syncing costs nothing. A 0.8.99 player on
-      // a 240 Hz G-Sync screen saw tearing with V-Sync off, and again after turning it on and off.
+      // own counts) is fed just under its refresh: at the ceiling it stops following the frames.
+      // Detection controls the cap, never the player's V-Sync choice. Windows' VRR presentation
+      // path uses interval 0 with ALLOW_TEARING; forcing interval 1 can add display queueing.
       int vrr = renderer->variable_refresh();
       // Measurement only: hidden test windows read as fixed refresh; MELEE_ASSUME_VRR=1 treats the
       // display as variable refresh so the hand-over present path can be timed there.
@@ -219,7 +245,7 @@ class ThreadedBackend final : public Backend {
           host::log("pacing: frame generation %dx, rendering %.0f frames a second for %.0f shown", fg_mult, wanted, wanted * fg_mult);
         }
       } else fg_logged = 1;
-      renderer->set_display_refresh(last_refresh, vrr == 1);
+      renderer->set_display_refresh(last_refresh, false);
       cap_period = wanted > 0.0 ? 1.0 / wanted : 0.0;
       // With Reflex on, its own limiter holds the rate (in its sleep, at the start of each frame) and
       // this thread's timer stands aside, so the two never wait on each other. "Follow the monitor"
@@ -255,7 +281,7 @@ class ThreadedBackend final : public Backend {
         // costs delay and accuracy, which is what the stage glitch reports at 60 were.
         const double presented_rate = cap_period > 0.0 ? 1.0 / cap_period : 0.0;
         const bool rate_worth_it = presented_rate <= 0.0 || presented_rate > 60.5;
-        bool now_sub = live_options.subframe != SubFrameMode::Off && rate_worth_it && !subframe_suspended();
+        bool now_sub = live_options.subframe != SubFrameMode::Off && rate_worth_it;
         set_subframes_active(now_sub);
         if (now_sub != subframes) {
           subframes = now_sub;
@@ -294,7 +320,7 @@ class ThreadedBackend final : public Backend {
           scanline_why = why; scanline_logged_on = false;
         }
       }
-      renderer->set_display_refresh(last_refresh, vrr == 1 || scanline_active);
+      renderer->set_display_refresh(last_refresh, scanline_active);
       authored = live_options.subframe == SubFrameMode::Authored || live_options.subframe == SubFrameMode::AuthoredInterpolate;
       interpolate = live_options.subframe == SubFrameMode::Interpolate || live_options.subframe == SubFrameMode::AuthoredInterpolate;
       set_authored_capture_wanted(subframes && authored);
@@ -351,8 +377,9 @@ class ThreadedBackend final : public Backend {
       }
       // Backlog (the renderer fell behind, or a compile burst): execute older frames without
       // the solver or a present so their EFB copies exist, then catch up to the newest one. The
-      // simulation never waits on this.
-      if (got_new && queue.size() > 0) {
+      // simulation never waits on this. Check again after a Reflex sleep too: got_new is false
+      // on that pass, but a newer frame may have arrived while the driver waited.
+      if (frames[cur].sequence != rendered_sequence && queue.size() > 0) {
         renderer->set_skip_present(true);
         renderer->submit_frame(frames[cur]);
         renderer->set_skip_present(false);
@@ -465,10 +492,6 @@ class ThreadedBackend final : public Backend {
         should_render = true;
         if (queue.drained() && current.sequence == rendered_sequence) break;
       }
-      if (options_.capture_burst && options_.capture_sim_frame && current.sequence >= options_.capture_sim_frame && burst_logged < options_.capture_burst) {
-        host::log("present %llu: sim frame %llu phase %.3f", presented + 1, (unsigned long long)current.sequence, t);
-        ++burst_logged;
-      }
       // A hand-over present goes out now: the grid slot it replaces is no deadline for it, only half
       // a period after the last present, so two presents never queue back to back.
       renderer->set_present_deadline(!(subframes && cap_period > 0 && !reflex_pacing) || scanline_active ? 0
@@ -498,6 +521,11 @@ class ThreadedBackend final : public Backend {
         submit_seconds += host::now_seconds() - t1; ++cost_presented;
       }
       const double render_end = host::now_seconds();
+      // Logged after the submit: a re-pose dropped for a newer frame (above) never reached the display.
+      if (options_.capture_burst && options_.capture_sim_frame && current.sequence >= options_.capture_sim_frame && burst_logged < options_.capture_burst) {
+        host::log("present %llu: sim frame %llu phase %.3f", presented + 1, (unsigned long long)current.sequence, t);
+        ++burst_logged;
+      }
       // CPU-side intervals between presentation returns, including repeated/subframes.
       // A sequence change catches an entire catch-up between two presents.
       rollback_present.present(host::rollback::presentation, host::rollback::now_ns());
@@ -613,8 +641,8 @@ class ThreadedBackend final : public Backend {
           else std::snprintf(cap_text, sizeof cap_text, "cap %.0f%s", 1.0 / cap_period, live_options.fps_cap == 0 ? " = 2x refresh" : live_options.fps_cap < 0 ? " = monitor" : "");
           host::log("display: %.0f fps (%s, sim %.0f Hz, %s, %u draws, %u paired, %u cuts)", stats_presented / (now - stats_time), cap_text, stats_sim / (now - stats_time),
                     !subframes ? "locked" : authored ? "authored" : interpolate ? "interpolate" : "extrapolate", s.draws, s.paired, s.cuts);
-          if (subframes) host::log("pair rejection: missing %u, HUD %u, geometry %u, state %u (last BP %02X), projection %u, rollback %u, authored %u, camera-only %u, vertex-blended %u, FLIPS %u | phases <.25:%u <.5:%u <.75:%u <1:%u =1:%u",
-                                   s.missing, s.hud, s.geometry, s.state, s.state_register, s.projection, s.discontinuity, s.authored, s.carried, s.vertex_blended, s.pair_flips, phase_bins[0], phase_bins[1], phase_bins[2], phase_bins[3], phase_bins[4]);
+          if (subframes) host::log("pair rejection: missing %u, HUD %u, geometry %u, state %u (last BP %02X), projection %u, rollback %u, authored %u, camera-only %u, vertex-blended %u, FLIPS %u | phases <.25:%u <.5:%u <.75:%u <1:%u =1:%u, menu route-6 held %u advanced %u",
+                                   s.missing, s.hud, s.geometry, s.state, s.state_register, s.projection, s.discontinuity, s.authored, s.carried, s.vertex_blended, s.pair_flips, phase_bins[0], phase_bins[1], phase_bins[2], phase_bins[3], phase_bins[4], s.menu_held, s.menu_advanced);
           if (subframes) {
             // What the solver got wrong at the one phase where there is a right answer to compare
             // against. Anything other than zero here is geometry that jumps once per simulation
@@ -668,6 +696,10 @@ class ThreadedBackend final : public Backend {
             host::log("%s", line.c_str());
           }
         }
+        {
+          // The frame rate is the player's: nothing here lowers it when the game falls behind.
+          host::set_game_rate(stats_sim / (now - stats_time));
+        }
         stats_time = now; stats_presented = 0; stats_sim = 0;
       }
     }
@@ -683,7 +715,7 @@ class ThreadedBackend final : public Backend {
   // fullscreen is left for runs without the overlay.
   static RenderOptions without_exclusive_under_overlay(RenderOptions options) {
 #ifdef _WIN32
-    if (yougame::embed_toplevel()) options.exclusive_fullscreen = false;
+    if (yougame::embedded()) options.exclusive_fullscreen = false;
 #endif
     if (options.fullscreen && options.exclusive_fullscreen && GetModuleHandleW(L"GameOverlayRenderer64.dll")) {
       options.exclusive_fullscreen = false;
@@ -716,6 +748,7 @@ class ThreadedBackend final : public Backend {
         host::window_client_size(&client_w, &client_h);
         std::unique_ptr<Backend> renderer(create_render_backend(window, std::max(client_w, 1), std::max(client_h, 1), options));
         host::window_set_resize_callback([&renderer](int w, int h) { render_resize(renderer.get(), w, h); });
+        reset_supported_ = renderer->supports_game_reset();
         init.set_value(); started = true;
         present_loop(renderer.get());
         host::window_set_resize_callback({});
@@ -735,6 +768,20 @@ class ThreadedBackend final : public Backend {
     });
     try { ready.get(); }
     catch (...) { queue.finish(true); worker.join(); throw; }
+  }
+  bool supports_game_reset() const override { return reset_supported_; }
+  void reset_game_state() override {
+    auto request = std::make_shared<std::promise<void>>();
+    auto done = request->get_future();
+    {
+      std::lock_guard<std::mutex> lock(reset_mutex_);
+      reset_ = request;
+      reset_pending_.store(true, std::memory_order_release);
+    }
+    while (done.wait_for(std::chrono::milliseconds(5)) != std::future_status::ready) {
+      if (queue.drained()) throw ExitRequested{host::exit_code()};
+    }
+    done.get();
   }
   ~ThreadedBackend() override { queue.finish(); worker.join(); }
   void submit_frame(const Frame& frame) override {

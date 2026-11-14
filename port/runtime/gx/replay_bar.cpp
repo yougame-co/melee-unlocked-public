@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cfloat>
 #include <cstdio>
@@ -30,10 +31,12 @@ void clock_text(int frames, char* out, size_t size) {
 
 // H (here) or B on the controller (gx/replay_hud.cpp) flips it; "Clean replays" flips the start.
 std::atomic<bool> g_hidden{false};
+std::atomic<bool> g_shown{false};   // drawn this frame: the controller layer keeps the bottom clear for it
 std::atomic<double> g_hidden_note{0.0};
 
 }  // namespace
 
+bool shown() { return g_shown.load(std::memory_order_relaxed); }
 bool all_hidden() {
   return g_hidden.load(std::memory_order_relaxed) != gx::RenderOptions::live_clean_replays().load(std::memory_order_relaxed);
 }
@@ -82,6 +85,7 @@ void draw(float width, float height, bool menu_open) {
   const double hidden_note = g_hidden_note.load(std::memory_order_relaxed);
   if (all_hidden()) {
     g_cursor.store(false, std::memory_order_relaxed);
+    g_shown.store(false, std::memory_order_relaxed);
     if (hidden_note > 0.0 && now - hidden_note < 2.0) {
       // Said once, briefly, so the key that brings it back is not a secret.
       const char* note = "Replay controls hidden. H or B: show them again";
@@ -99,6 +103,7 @@ void draw(float width, float height, bool menu_open) {
   const bool visible = !menu_open && (mouse_recent || (!replay_control::pad_layer() &&
                                       (st.paused || st.seeking || (st.last_input > 0.0 && now - st.last_input < kShowSeconds))));
   g_cursor.store(visible && mouse_recent, std::memory_order_relaxed);
+  g_shown.store(visible, std::memory_order_relaxed);
   if (!visible) return;
 
   const float text_h = ImGui::GetTextLineHeight();
@@ -153,7 +158,7 @@ void draw(float width, float height, bool menu_open) {
   }
   dl->AddText(ImVec2(line_x0, line_y + 10.0f), dim,
               "Space: pause     Left, Right: 5 seconds (Shift: 30)     Right or . while paused: one frame     "
-              "[ ] or Down, Up: speed     Tab or R: fast forward     Home: restart     H: hide this bar");
+              "[ ] or Down, Up: speed     Tab or R: fast forward     Home: restart     H: hide everything");
   dl->PopClipRect();
 
   if (over) {
@@ -177,6 +182,12 @@ namespace {
 std::mutex g_lock;
 std::string g_text;
 double g_until = 0.0;
+// UI thread: where the corner hint box ended, and the ImGui frame that drew it (it is not drawn every frame).
+float g_hint_bottom = 0.0f;
+int g_hint_frame = -2;
+// UI thread: top of the row that sits on the picture's bottom edge (the Friends waiting row), and its frame.
+float g_row_top = 0.0f;
+int g_row_frame = -2;
 }  // namespace
 
 void show(const char* text, double seconds) {
@@ -203,13 +214,47 @@ CornerHint corner_hint(float width, float height, float aspect, bool local_frien
   const ImVec2 at(left+pw-size.x-2*margin,top+(compact ? ph*0.003f : std::min(10.0f,ph*0.02f)));
   return {fs,at,size,ImVec2(at.x-margin,at.y-3*pad),ImVec2(at.x+size.x+margin,at.y+fs+4*pad)};
 }
+// The console menu notice, under the compact "Friends" heading. Sized in picture lines (u = 1/480 of the
+// picture) so its gap to the retail "UCF" label (from line ~26) holds at page size as well as full screen:
+// pixel padding put it over the label in a small picture. It keeps its row and makes room for the corner hint
+// sideways: it slides left, then narrows (scale). Only a picture too narrow for both drops it under the hint.
+struct MenuNotice { ImVec2 at, min, max; float scale; };
+MenuNotice menu_notice(float width, float height, float aspect, ImVec2 size) {
+  const float ph = std::min(height,width/std::max(aspect,0.1f)), pw = ph*std::max(aspect,0.1f);
+  const float left = (width-pw)*0.5f, top = (height-ph)*0.5f, u = ph/480.0f;
+  ImVec2 at((width-size.x)*0.5f,top+12.4f*u);
+  float scale = 1.0f;
+  const auto corner = corner_hint(width,height,aspect);
+  if (at.y-u < corner.max.y && at.x+size.x+2*u > corner.min.x-u) {
+    const float room = corner.min.x-u-2*u-(left+4*u);
+    if (room >= size.x*0.6f) {
+      scale = std::min(1.0f,room/std::max(size.x,0.1f));
+      at.x = std::max(left+4*u,std::min(at.x,corner.min.x-3*u-size.x*scale));
+    } else {
+      at.y = corner.max.y+2*u;
+    }
+  }
+  const ImVec2 drawn(size.x*scale,size.y*scale);
+  return {at,ImVec2(at.x-2*u,at.y-u),ImVec2(at.x+drawn.x+2*u,at.y+drawn.y+u),scale};
+}
 }
 void draw_corner_hint(float width, float height, float aspect) {
+  static yougame::parity::CornerHintFade fade;
+  const auto ms = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  const auto toast = yougame::friends::events.toast(ms), message = yougame::friends::events.message(ms);
+  const float alpha = fade.alpha(toast.empty() && message.empty() ? std::string() : toast + "\n" + message,
+                                 host::now_seconds());
+  g_hint_bottom = 0.0f;
+  if (alpha <= 0) return;
   const auto h = corner_hint(width,height,aspect,yougame::friends::lobby.host());
+  g_hint_bottom = h.max.y; g_hint_frame = ImGui::GetFrameCount();
   auto* dl = ImGui::GetForegroundDrawList();
-  dl->AddRectFilled(h.min,h.max,IM_COL32(9,11,22,190),5);
-  dl->AddText(ImGui::GetFont(),h.font,h.at,IM_COL32(236,238,246,235),yougame::parity::kMenuHint);
+  dl->AddRectFilled(h.min,h.max,IM_COL32(9,11,22,int(190*alpha)),5);
+  dl->AddText(ImGui::GetFont(),h.font,h.at,IM_COL32(236,238,246,int(235*alpha)),yougame::parity::kMenuHint);
 }
+void reserve_bottom(float top) { g_row_top = top; g_row_frame = ImGui::GetFrameCount(); }
+float corner_hint_bottom() { return ImGui::GetFrameCount() - g_hint_frame <= 1 ? g_hint_bottom : 0.0f; }
 
 void draw(float width, float height, float game_aspect) {
   static yougame::console::MenuHintAnimation animation;
@@ -225,16 +270,13 @@ void draw(float width, float height, float game_aspect) {
     ImFont* font = ImGui::GetFont();
     ImVec2 size = font->CalcTextSizeA(font_size,FLT_MAX,0,hint);
     if (size.x > width*0.96f) { font_size *= width*0.96f/size.x; size = font->CalcTextSizeA(font_size,FLT_MAX,0,hint); }
-    // Both draws use the same measured rectangle, independent of their submission order.
-    // Reserve the corner hint's full background plus a scaled margin.
-    const auto corner = corner_hint(width,height,game_aspect);
-    const ImVec2 at((width-size.x)*0.5f,std::max(top+picture_height*0.027f,corner.max.y+2+picture_height/480.0f));
+    const auto notice = menu_notice(width,height,game_aspect,size);
     ImDrawList* dl = ImGui::GetForegroundDrawList();
     const ImVec2 heading = font->CalcTextSizeA(font_size,FLT_MAX,0,"Friends");
     dl->AddText(font,font_size,ImVec2((width-heading.x)*0.5f,top+picture_height*0.003f),
                 IM_COL32(236,240,246,int(255*alpha)),"Friends");
-    dl->AddRectFilled(ImVec2(at.x-5,at.y-2),ImVec2(at.x+size.x+5,at.y+size.y+2),IM_COL32(10,12,18,int(170*alpha)),3);
-    dl->AddText(font,font_size,at,IM_COL32(255,239,170,int(255*alpha)),hint);
+    dl->AddRectFilled(notice.min,notice.max,IM_COL32(10,12,18,int(170*alpha)),picture_height/400.0f);
+    dl->AddText(font,font_size*notice.scale,notice.at,IM_COL32(255,239,170,int(255*alpha)),hint);
   }
   // With the app's lobby-lines cap the page draws this line outside the picture.
   const auto friends_line = yougame::friends::page_lobby_lines.load(std::memory_order_acquire) ? std::string() :
@@ -258,7 +300,10 @@ void draw(float width, float height, float game_aspect) {
     text = g_text;
   }
   const ImVec2 size = ImGui::CalcTextSize(text.c_str());
-  const ImVec2 at((width - size.x) * 0.5f, height - size.y - 28.0f);
+  // Above the bottom-edge row while it shows, so a toast never covers "Waiting for your friend...".
+  float bottom = height - 28.0f;
+  if (ImGui::GetFrameCount() - g_row_frame <= 1) bottom = std::min(bottom, g_row_top - 8.0f);
+  const ImVec2 at((width - size.x) * 0.5f, bottom - size.y);
   ImDrawList* dl = ImGui::GetForegroundDrawList();
   dl->AddRectFilled(ImVec2(at.x - 10.0f, at.y - 6.0f), ImVec2(at.x + size.x + 10.0f, at.y + size.y + 6.0f),
                     IM_COL32(10, 12, 18, 200), 6.0f);

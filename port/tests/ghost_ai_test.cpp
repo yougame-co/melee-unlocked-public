@@ -1,5 +1,6 @@
 // Model-file integrity and recurrent memory boundaries for offline pro practice.
 #include "../runtime/hle/ghost_ai.cpp"
+#include "../runtime/hle/phillip_ai.cpp"
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -7,13 +8,154 @@
 namespace host {
 void log(const char*, ...) {}
 double now_seconds() { return 0; }
+namespace updater {
+bool fetch_verified(const std::string&, const std::string&, const std::string&, std::string* why) {
+  if (why) *why = "no network in tests";
+  return false;
 }
+}  // namespace updater
+}
+namespace yougame { bool active() { return false; } }
 
 static int failures = 0;
 #define CHECK(x) do { if (!(x)) { std::printf("FAIL line %d: %s\n", __LINE__, #x); ++failures; } } while (0)
 
+static void check_stronger_downloads() {
+  using namespace phillip_ai;
+  const auto dir = std::filesystem::temp_directory_path() / ("mu-pro-consent-" + std::to_string(GetCurrentProcessId()));
+  std::filesystem::create_directories(dir);
+  _putenv_s("MELEE_PRO_AI_DIR", dir.string().c_str());
+  auto entry = [](const char* file, int rank, bool heavy) {
+    Entry e;
+    e.file = file; e.priority = rank; e.heavy = heavy; e.character = 18;
+    e.sha256 = std::string(64, 'a');
+    e.source = "https://huggingface.co/vladfi/phillip-models/resolve/pinned/" + e.file;
+    std::fill(std::begin(e.name), std::end(e.name), -1);
+    e.name[1] = 0;
+    return e;
+  };
+  g_catalog = {entry("included.onnx", 1, false), entry("light.onnx", 3, false),
+               entry("heavy.onnx", 4, true), entry("heavy2.onnx", 2, true)};
+  g_catalog_state = 1;
+  std::ofstream(dir / "included.onnx").put('x');
+  g_large_ok = 1;
+  CHECK(stronger_choice() == kStrongerAsk);
+  CHECK(choose(1, 0, 18, 1) == &g_catalog[0]);
+  g_fetch_thread.join();
+  CHECK(g_fetch_tried.count("light.onnx") == 1);
+  CHECK(g_fetch_tried.count("heavy.onnx") == 0 && g_fetch_tried.count("heavy2.onnx") == 0);
+  CHECK(stronger_status(1).missing == 2 && stronger_status(3).total == 0);
+  set_stronger_choice(kStrongerAlways);
+  CHECK(choose(1, 0, 18, 1) == &g_catalog[0]);
+  g_fetch_thread.join();
+  CHECK(g_fetch_tried.count("heavy.onnx") == 1);
+  std::ofstream(dir / "heavy.onnx").put('x');
+  set_stronger_choice(kStrongerAsk);
+  CHECK(choose(1, 0, 18, 1) == &g_catalog[2]);
+  set_stronger_choice(kStrongerNever);
+  CHECK(choose(1, 0, 18, 1) == &g_catalog[0]);
+  CHECK(g_fetch_tried.count("heavy2.onnx") == 0);
+  // An explicit download remains available after Never and queues every missing stronger file.
+  std::filesystem::remove(dir / "heavy.onnx");
+  download_stronger(1);
+  g_fetch_thread.join();
+  CHECK(g_fetch_tried.count("heavy2.onnx") == 1 && g_fetch_pending.empty());
+  CHECK(stronger_choice() == kStrongerNever);
+  g_catalog.clear(); g_catalog_state = 0; g_large_ok = 0;
+  g_fetch_tried.clear();
+  set_stronger_choice(kStrongerAsk);
+  _putenv_s("MELEE_PRO_AI_DIR", "__no_pro_ai__");
+  std::filesystem::remove_all(dir);
+}
+
+// Like the pro first: a policy trained as other players never beats one trained as the pro, whatever
+// its generation, unless the likeness table cleared it; the catalog carries sizes and temperatures.
+static void check_like_the_pro() {
+  using namespace phillip_ai;
+  const auto dir = std::filesystem::temp_directory_path() / ("mu-pro-like-" + std::to_string(GetCurrentProcessId()));
+  std::filesystem::create_directories(dir);
+  _putenv_s("MELEE_PRO_AI_DIR", dir.string().c_str());
+  // No sha256 or source: nothing is ever fetched for these.
+  auto entry = [](const char* file, int rank, bool heavy, bool trained) {
+    Entry e;
+    e.file = file; e.priority = rank; e.heavy = heavy; e.character = 18; e.delay = 18;
+    e.name[1] = 0;
+    e.pro_trained[1] = trained;
+    return e;
+  };
+  g_catalog = {entry("imitation.onnx", 1, false, true), entry("kodorin.onnx", 3, false, false),
+               entry("zain_heavy.onnx", 4, true, true), entry("kodorin_heavy.onnx", 4, true, false)};
+  g_catalog_state = 1;
+  for (const Entry& e : g_catalog) std::ofstream(dir / e.file).put('x');
+  g_large_ok = -1;   // a PC too slow for the heavy policies
+  CHECK(choose(1, 0, 18, 1) == &g_catalog[0]);   // imitation (the pro's) over the Kodorin-trained matchup policy
+  g_catalog[1].likeness_ok = true;
+  CHECK(choose(1, 0, 18, 1) == &g_catalog[1]);   // cleared by the likeness table: its generation counts again
+  g_catalog[1].likeness_ok = false;
+  g_large_ok = 1;
+  CHECK(choose(1, 0, 18, 1) == &g_catalog[2]);   // the heavy policy trained as the pro
+  g_catalog[2].pro_trained[1] = false;
+  CHECK(choose(1, 0, 18, 1) == &g_catalog[0]);   // no heavy policy trained as the pro: imitation again
+  // Sizes come from the catalog; an older catalog without them counts 90 MB each.
+  g_catalog[2].size = 82800000;
+  std::filesystem::remove(dir / "zain_heavy.onnx");
+  std::filesystem::remove(dir / "kodorin_heavy.onnx");
+  const StrongerStatus st = stronger_status(1);
+  CHECK(st.missing == 2 && std::fabs(st.missing_mb - 172.8) < 0.01);
+  // The catalog file: pro_trained per pro, likeness_ok, temperature (clamped) and size are read; an
+  // entry without them is trained as everyone at temperature 1.0.
+  {
+    std::ofstream f(dir / "catalog.json");
+    f << R"({"version": 1, "models": [
+      {"file": "a.onnx", "kind": "rl", "character": 18, "delay": 18, "names": {"1": 5, "3": 6}, "priority": 3,
+       "pro_trained": {"1": false, "3": true}, "likeness_ok": true, "temperature": 0.7, "size": 21244744,
+       "trained_as": ["Kodorin", "Master Player"]},
+      {"file": "b.onnx", "kind": "imitation", "character": 18, "delay": 18, "names": {"1": 5}, "temperature": 9}]})";
+  }
+  g_catalog.clear(); g_catalog_state = 0;
+  read_catalog();
+  CHECK(g_catalog.size() == 2);
+  if (g_catalog.size() == 2) {
+    CHECK(!g_catalog[0].pro_trained[1] && g_catalog[0].pro_trained[3] && g_catalog[0].likeness_ok);
+    CHECK(std::fabs(g_catalog[0].temperature - 0.7f) < 1e-6f && g_catalog[0].size == 21244744);
+    CHECK(g_catalog[0].trained_as == "Kodorin, Master Player");
+    CHECK(g_catalog[1].pro_trained[1] && g_catalog[1].pro_trained[0] && !g_catalog[1].likeness_ok);
+    CHECK(g_catalog[1].temperature == 2.f && g_catalog[1].size == 0 && g_catalog[1].trained_as.empty());
+  }
+  g_catalog.clear(); g_catalog_state = 0; g_large_ok = 0;
+  _putenv_s("MELEE_PRO_AI_DIR", "__no_pro_ai__");
+  std::filesystem::remove_all(dir);
+}
+
 int main(int argc, char** argv) {
   using namespace ghost_ai;
+  // Phillip's policies (ProAI beside the game) must not answer for the injected test models.
+  // Parity with slippi-ai's Python (tools/ghost_ai/phillip_parity.py): step one Phillip policy over
+  // recorded observations and write the controllers it chose.
+  if (argc == 6 && std::string(argv[1]) == "--phillip") {
+    _putenv_s("MELEE_PRO_AI_DIR", argv[2]);
+    using namespace phillip_ai;
+    if (!runtime_ready()) return 2;
+    const Policy* pol = load_policy(argv[3]);
+    if (!pol) return 3;
+    std::ifstream in(argv[4], std::ios::binary);
+    std::ofstream out(argv[5], std::ios::binary);
+    Buffers b;
+    start(*pol, b);
+    std::mt19937 rng(1);
+    MuGhostObs obs{};
+    Memory mem;
+    for (int i = 0; in.read(reinterpret_cast<char*>(&obs), sizeof obs); ++i) {
+      observe(*pol, b, obs, obs.pad, i == 0, rng, mem);   // pad carries the name code here
+      if (!run(*pol, b)) return 4;
+      const MuGhostAct a = decode(*pol, b);
+      const float row[6] = {a.lx, a.ly, a.cx, a.cy, a.l, (float)a.buttons};
+      out.write(reinterpret_cast<const char*>(row), sizeof row);
+    }
+    return 0;
+  }
+  _putenv("MELEE_PRO_AI_DIR=__no_pro_ai__");
+  if (argc == 1) { check_stronger_downloads(); check_like_the_pro(); }
   // This test injects its own model; installed specialist files must not change its evidence.
   std::fill(std::begin(g_specialist_status), std::end(g_specialist_status), -1);
   if (argc == 2) {

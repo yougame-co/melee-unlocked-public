@@ -70,7 +70,7 @@ void capabilities() {
   using namespace yougame::parity;
   CHECK(std::string(caps(false)) == kCaps);
   CHECK(std::string(caps(false)).find("toplevel") == std::string::npos);
-  CHECK(std::string(caps(true)) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\",\"toplevel\"]}");
+  CHECK(std::string(caps(true)) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\",\"toplevel\",\"match\",\"fullscreen\"]}");
   Signals top;
   top.start(false, write_line, true);
   CHECK(lines.empty());

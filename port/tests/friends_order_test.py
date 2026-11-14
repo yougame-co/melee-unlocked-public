@@ -17,7 +17,7 @@ class FriendsOrderTest(unittest.TestCase):
 #include <cstdio>
 #define CHECK(x) do {if(!(x))std::abort();++checks;}while(0)
 int main(){int checks=0;using namespace yougame::friends;
- lobby.begin(true);lobby.opened("room123");CHECK(!lobby.shown() && !lobby.take_invite());
+ lobby.begin(true,true);lobby.opened("room123");CHECK(!lobby.shown() && !lobby.take_invite());
  lobby.report_ready();lobby.shown({18,3,2});CHECK(lobby.ready() && lobby.take_invite());
  auto q=picker(lobby.room());CHECK(q["room"]=="room123" && q["type"]=="mpFriend" && !q.count("nativeBuild"));
  try{throw std::runtime_error("Cancelled");}catch(const std::exception&){}
@@ -38,6 +38,33 @@ int main(){int checks=0;using namespace yougame::friends;
  CHECK(closed_line({{"t","roomClosed"},{"reason","other"}}).empty());
  printf("friends state: %d checks passed\n",checks);
 }''')
+
+    def test_launch_room_waits_on_css_without_opening_friends(self):
+        self.compile('39-launch-room', r'''
+#include "yougame_console_entry.h"
+#include <cstdlib>
+#include <cstdio>
+#define CHECK(x) do {if(!(x))std::abort();++checks;}while(0)
+using yougame::friends::Lobby;using yougame::friends::json;
+json welcome(const char* me){return {{"t","welcome"},{"me",me},{"host","host"}};}
+int main(){int checks=0;
+ // The page handed this room in at launch; welcome makes us host. CSS waits for the guest.
+ for(bool start:{false,true}){Lobby h;h.begin(start);h.opened("room123");h.observe(welcome("host"));h.report_ready();
+  h.shown({18,3,0});CHECK(h.host() && h.shown() && !h.take_invite());h.shown({18,3,1});CHECK(!h.take_invite());
+  h.invite();CHECK(h.take_invite()); // Z still opens the friends list by hand
+ }
+ // In-game Friends: the first CSS opens the friends list once; reopening after the guest left does not.
+ Lobby h;h.begin(true,true);h.opened("room123");h.report_ready();h.shown({18,3,0});CHECK(h.take_invite());
+ h.session_stopped();CHECK(h.take_reenter()=="room123" && h.resume());h.report_ready();
+ h.shown({18,3,0});CHECK(!h.take_invite());h.invite();CHECK(h.take_invite());
+ Lobby g;g.begin(false,true);g.opened("room123");g.shown({18,3,0});CHECK(!g.take_invite()); // never for a guest
+ printf("launch room: %d checks passed\n",checks);
+}''')
+
+    def test_friends_entry_opens_the_list_only_for_new(self):
+        entry=body(read('port/runtime/hle/yougame_link.cpp'),'friends_entry')
+        self.assertIn('friends::lobby.begin(room == "new" || host_reenter, room == "new");',entry)
+        self.assertIn('friends::lobby.begin(false);',read('port/runtime/hle/yougame_link.cpp'))
 
     def test_css_read_and_restore_execute_real_c_helpers(self):
         patch=read('sourceport/patches/melee-native.patch')
@@ -79,9 +106,9 @@ int main(){int a[3];mu_friends_css_frames=0;if(mu_friends_css_pick(a)!=-1)std::a
 int main(){if(host::test_env::agent_copy())std::abort();host::test_env::agent_run=true;if(!host::test_env::agent_copy() || !slippi::account::launcher_roots().empty() || slippi::account::resolve("must-not-read"))std::abort();puts("agent discovery: 4 checks passed");}
 ''','-DYOUGAME_AGENT_TEST_HOOK')
         net=read('port/runtime/hle/slippi_net.cpp')
-        self.assertIn('if (host::test_env::agent_copy()) return;',body(net,'RefreshFromServer'))
+        self.assertIn('if (agent_lock::blocked(agent_lock::Operation::Refresh)) return;',body(net,'RefreshFromServer'))
         login=body(net,'AttemptLogin')
-        self.assertLess(login.index('if (host::test_env::agent_copy()) return false;'),login.index('account::resolve'))
+        self.assertLess(login.index('if (agent_lock::blocked(agent_lock::Operation::Login)) return false;'),login.index('account::resolve'))
 
     def test_room_css_picker_and_leave_wiring(self):
         native=body(read('port/runtime/hle/native_practice.cpp'),'tick')
@@ -89,7 +116,10 @@ int main(){if(host::test_env::agent_copy())std::abort();host::test_env::agent_ru
         self.assertLess(native.index('request_major(2)'),native.index('yougame::pick_friend_room'))
         self.assertIn('current_major() == 2 && current_minor() == 0',native)
         self.assertIn('friends_lobby.reported()',native)
+        # The shared-menu host room stays compiled but Friends uses local menus.
         self.assertIn('yougame::console::friends_entry("new")',native)
+        new=native.index('yougame::console::friends_entry("new")')
+        self.assertIn('yougame::mode_policy::friends_shared_menus && g_bridge && host_friend',native[native.rindex('if (',0,new):new])
         self.assertIn('friends_lobby.take_return(leave_line)',native)
         link=read('port/runtime/hle/yougame_link.cpp')
         self.assertIn('push.value("cmd",json()) == "leave"',link)
@@ -130,7 +160,8 @@ int main(){if(host::test_env::agent_copy())std::abort();host::test_env::agent_ru
         self.assertIn('(type == "back" || type == "join" || type == "welcome")',link)
         self.assertIn('closed_line(m)',body(read('port/runtime/hle/yougame_friends_lobby.h'),'observe'))
         self.assertIn('mu_slippi_return_to_friends();',read('sourceport/game/shim/mu_practice.c'))
-        self.assertIn('MU_SLP_OPT_FRIENDS',body(read('sourceport/game/shim/mu_slippi_menu.c'),'mu_slippi_return_to_friends'))
+        # 52b: the bridge never switches menus itself (50m host leave crash, gobjplink.c:109).
+        self.assertNotIn('mn_80229894',body(read('sourceport/game/shim/mu_slippi_menu.c'),'mu_slippi_return_to_friends'))
         self.assertIn('yougame::friends::lobby.line()',read('port/runtime/gx/replay_bar.cpp'))
         self.assertIn('if (friends::lobby.host()) return {};',body(read('port/runtime/hle/yougame_console_entry.h'),'waiting_status'))
 
@@ -139,10 +170,23 @@ int main(){if(host::test_env::agent_copy())std::abort();host::test_env::agent_ru
         # pending Friends return ran from the main menu's OnEnter. It now sets the menu state at entry.
         shim = read('sourceport/game/shim/mu_slippi_menu.c')
         enter = body(shim, 'mu_slippi_menu_enter')
-        self.assertIn('if (friends_return) {', enter)
+        self.assertIn('if (friends_return || from_friends_css) {', enter)
         self.assertIn('MU_SLP_OPT_FRIENDS', enter)
         self.assertNotIn('mu_slippi_return_to_friends()', body(shim, 'mu_slippi_main_menu_loaded'))
         self.assertLess(shim.index('static int friends_return;'), shim.index('mu_slippi_menu_enter('))
+
+    def test_host_leaving_friends_css_opens_online_on_friends(self):
+        # Build 50m host crash: B out of the Friends CSS reached the menu, then the bridge's
+        # return called mn_80229894 outside a menu proc. Now the menu entry itself opens Friends.
+        shim = read('sourceport/game/shim/mu_slippi_menu.c')
+        practice = read('sourceport/game/shim/mu_practice.c')
+        enter = body(shim, 'mu_slippi_menu_enter')
+        self.assertIn('int from_friends_css = previous_mode == GM_VS && friends_css_host;', enter)
+        self.assertIn('if (friends_return || from_friends_css) {', enter)
+        self.assertLess(enter.index('friends_css_host = 0;'), enter.index('if (!mu_slippi_menus_enabled())'))
+        self.assertIn('if (mu_friends_css_pick(a) != 0) return -1;\n        mu_slippi_note_friends_css();', practice)
+        ret = body(shim, 'mu_slippi_return_to_friends')
+        self.assertLess(ret.index('if (gm_GetCurrentGameMode() == GM_MENU)'), ret.index('friends_return = 1;'))
 
     def test_leave_blocks_late_manual_launch_and_handoff(self):
         self.compile('39-cancel-load', r'''
@@ -178,7 +222,7 @@ int main() {
  const json host={{"id","host"},{"connectionId","host"},{"name","Peach"},{"user","u-peach"}};
  const json guest={{"id","guest"},{"connectionId","guest"},{"name","Mario"}};
  auto welcome=[&](const char* me){return json{{"t","welcome"},{"me",me},{"host","host"},{"players",{host,guest}}};};
- Lobby h; h.begin(true);h.opened("room123");h.observe(welcome("host"));h.shown({18,3,0});h.freeze("Mario");
+ Lobby h; h.begin(true,true);h.opened("room123");h.observe(welcome("host"));h.shown({18,3,0});h.freeze("Mario");
  h.observe({{"t","leave"},{"player",guest},{"players",{host}},{"host","host"}});
  h.session_stopped();CHECK(h.host() && h.held());CHECK(h.take_reenter()=="room123");
  h.shown({18,3,0});CHECK(h.line()==kRoomOpen);CHECK(h.take_invite());h.invite();CHECK(h.take_invite());
@@ -212,6 +256,7 @@ int main() {
         native=body(read('port/runtime/hle/native_practice.cpp'),'tick')
         self.assertIn('g_shared_was_active && !shared_active',native)
         self.assertIn('friends_entry(held_room,friends_lobby.host(),true)',native)
+        self.assertIn('if (yougame::mode_policy::friends_shared_menus && !shared_active && yougame::console::entry.available())',native)
         link=read('port/runtime/hle/yougame_link.cpp')
         self.assertIn('std::shared_ptr<ConsoleBackend> friends_backend',link)
         self.assertIn('io.previous_session_active = [b]',link)

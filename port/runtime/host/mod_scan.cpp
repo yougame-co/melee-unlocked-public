@@ -10,6 +10,7 @@
 #include <bcrypt.h>
 #include <shellapi.h>
 #include <algorithm>
+#include <iterator>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -412,7 +413,13 @@ const KnownDisc kMexSha256[] = {
 const KnownDisc kMexFingerprint[] = {
   {"9a1a48b999a2f8f4deaee2554e5f177cb265666b95676a508406db80b181246b", "Akaneia", "1.0.1", "akaneia"},
 };
-constexpr const char kTmceSupported[] = "v1.4 d1";   // the Training Mode CE compiled into the game (tmce/src/events.h)
+// The Training Mode CE compiled into the game is v1.4 d2 (tmce/src/events.h). Its code runs natively and
+// only the disc's TM files (menus, models) are read, so a disc whose TM files carry the same public
+// symbols plays too: v1.4 d1 (identical symbols; no Laser Land file, which the event does not need) and
+// v1.4.1, the stable CE-v1.4 release (the same symbols, a few extra models). Each checked through the Lab
+// and its menus in a hidden run before it was listed here.
+constexpr const char kTmceSupported[] = "v1.4 d2";
+constexpr const char* const kTmceAlsoSupported[] = {"v1.4 d1", "v1.4.1"};
 
 struct DiscFile { uint32_t offset = 0, length = 0; bool dir = false; };
 struct DiscInfo {
@@ -919,14 +926,15 @@ Detected identify_disc(const fs::path& file, Detected d, const ScanOptions& opti
   if (info.id == "GTME01" && info.has("/tm/eventmenu.dat")) {
     const std::string text = tmce_version(in, info);                     // "v1.4 d1"
     d.kind = Kind::TmCe; d.name = "Training Mode CE"; d.version = text; d.key = "tmce"; d.catalog_id = "tmce"; d.restart = true;
-    if (text == kTmceSupported) {
+    if (text == kTmceSupported || std::any_of(std::begin(kTmceAlsoSupported), std::end(kTmceAlsoSupported),
+                                              [&](const char* v) { return text == v; })) {
       set_support(d, Engine::Source, Support::Supported, true);
       d.message = "Detected: Training Mode CE " + text;
     } else {
       set_support(d, Engine::Source, Support::NotSupportedYet, false);
       d.key = content_key(d.hash);
       d.message = std::string("Found Training Mode CE") + (text.empty() ? "" : " " + text) +
-                  ", but this version is not supported. Supported: " + kTmceSupported + ".";
+                  ", but this version is not supported. Supported: " + kTmceSupported + ", v1.4 d1 and v1.4.1.";
     }
     return d;
   }
@@ -957,17 +965,33 @@ Detected identify_disc(const fs::path& file, Detected d, const ScanOptions& opti
     if (known) { d.name = known->name; d.version = known->version; d.catalog_id = known->id; }
     if (known && d.hash == known->hash && used_base) *used_base = false;   // a known build by its own bytes
     // Akaneia 1.0.1 and ACE 2.0.0 have their fighters and stages in the Source Port's own C
-    // (sourceport/game/akaneia, ace, mexstages), checked against those builds' files; any other m-ex
-    // build runs its code on the Static Recomp.
+    // (sourceport/game/akaneia, ace, mexstages), checked against those builds' files. Any other m-ex
+    // build plays on both engines too: the Static Recomp runs its code, the Source Port loads its
+    // files (costumes, stages, sounds, menus) over the native game and runs none of its code.
     const bool native = known && (std::string(known->id) == "akaneia" || std::string(known->id) == "ace");
-    set_support(d, native ? Engine::Either : Engine::Recomp, native ? Support::Supported : Support::Untested, true);
-#ifdef MELEE_NO_SLIPPI   // as for the Hack Pack above
+    // Chaos Eternal's added fighters run on its own code: with only its files, the Source Port stops
+    // loading them (ftdata.c 1944 and 2479, then a full heap at lbmemory.c 233, reports from 0.9.114).
+    // It plays on the Static Recomp, which runs that code. Matched by the disc's own title.
+    std::string lower_title = info.title;
+    for (auto& ch : lower_title) ch = (char)std::tolower((unsigned char)ch);
+    if (!native && lower_title.find("chaos eternal") != std::string::npos) {
+      set_support(d, Engine::Recomp, Support::Untested, true);
+#ifdef MELEE_NO_SLIPPI
+      d.message = "Detected: " + d.name + ". Its fighters need its own code, which this build cannot run.";
+#else
+      d.message = "Detected: " + d.name + ". Plays on the Static Recomp (its fighters need its own code): launcher > Mods > Play.";
+#endif
+      return d;
+    }
+    set_support(d, Engine::Either, native ? Support::Supported : Support::Untested, true);
+#ifdef MELEE_NO_SLIPPI   // one engine in this build: the Source Port
     d.message = "Detected: " + d.name + (d.version.empty() ? "" : " " + d.version) +
-                (native ? ". Plays on the Source Port: launcher > Mods > Play." : ". This build cannot play it.");
+                (native ? ". Plays on the Source Port: launcher > Mods > Play."
+                        : ". Plays with its files (costumes, stages, sounds, menus); its code does not run.");
 #else
     d.message = "Detected: " + d.name + (d.version.empty() ? "" : " " + d.version) +
                 (native ? ". Plays on either engine: launcher > Mods > Play."
-                        : ". Plays on the Static Recomp: launcher > Mods > Play.");
+                        : ". Plays on either engine: the Static Recomp runs its code, the Source Port loads its files.");
 #endif
     return d;
   }
@@ -992,9 +1016,16 @@ Detected identify_disc(const fs::path& file, Detected d, const ScanOptions& opti
     }
   }
   if (!dol_retail || has_codes) {
+    // Its code runs on the Static Recomp as the disc wrote it, the way Slippi Dolphin runs it; the
+    // Source Port loads its files and runs none of its code (as for m-ex above). Like m-ex it loads
+    // only when played from the launcher's Mods page (source_port_layers takes no code mod).
     d.kind = Kind::CodeMod; d.name = title;
-    set_support(d, Engine::Recomp, Support::NotSupportedYet, false);
-    d.message = "Code mod found, not supported yet.";
+    set_support(d, Engine::Either, Support::Untested, true);
+#ifdef MELEE_NO_SLIPPI
+    d.message = "Detected: " + title + ". Plays with its files; its code does not run.";
+#else
+    d.message = "Detected: " + title + ". Plays on either engine: the Static Recomp runs its code, the Source Port loads its files.";
+#endif
     return d;
   }
   // The retail game's code: a data-only mod, or the retail game in another layout.
@@ -1042,7 +1073,9 @@ Detected identify_file(const fs::path& file, const ScanOptions& options, std::st
   if (size >= 0x440 && be32(head + 0x1C) == kDiscMagic) return identify_disc(file, d, options, log, used_base);
   if (compressed_disc(head, (size_t)std::min<uint64_t>(sizeof head, size))) {
     d.kind = Kind::Unsupported; d.name = file.filename().u8string();
-    d.message = "Compressed disc image: convert it to .iso in Dolphin (right-click, Convert File) to use it.";
+    d.message = head[0] == 'R' || head[0] == 'W'
+                    ? "Dolphin RVZ or WIA image: add it on the launcher's Mods page, which unpacks it to an .iso."
+                    : "Compressed disc image: convert it to .iso in Dolphin (right-click, Convert File) to use it.";
     return d;
   }
   return d;
@@ -1057,7 +1090,7 @@ Detected identify(const fs::path& file, const ScanOptions& options, std::string*
 // The scan cache: Mods/.cache/scan.txt, one line per file keyed by path, size and time (and, for
 // discs, the retail disc they were compared with), so a boot never reads an unchanged disc again.
 namespace {
-constexpr const char kCacheHeader[] = "mu-scan 14";   // 14: retail content identity independent of disc padding
+constexpr const char kCacheHeader[] = "mu-scan 17";   // 17: Chaos Eternal plays on the Static Recomp; 16: unknown m-ex builds and code mods play on either engine; 15: Training Mode CE v1.4 d2 and v1.4.1 discs play natively; 14: retail content identity independent of disc padding
 struct CacheEntry { std::string key, base; Detected d; };
 
 std::string cache_key(const fs::path& file) {
@@ -1675,7 +1708,9 @@ void import_async(const fs::path& picked) {
       message = "Could not read " + picked.filename().u8string() + ".";
     } else if (!gci && !disc) {
       message = compressed_disc(head, sizeof head)
-                    ? "That is a compressed disc image. Convert it to .iso in Dolphin (right-click, Convert File), then add it."
+                    ? (head[0] == 'R' || head[0] == 'W'
+                           ? "That is a Dolphin RVZ or WIA image. Add it on the launcher's Mods page, which unpacks it to an .iso."
+                           : "That is a compressed disc image. Convert it to .iso in Dolphin (right-click, Convert File), then add it.")
                     : "That is not a disc image (.iso) or a memory card save (.gci). Nothing was copied.";
     } else {
       const fs::path mods = fs::absolute(options.mods_dir, ec);

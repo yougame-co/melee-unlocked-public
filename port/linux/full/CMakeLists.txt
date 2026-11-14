@@ -103,23 +103,42 @@ file(GLOB FULL_RUNTIME_SOURCES "${PORT}/runtime/ppc/*.cpp" "${PORT}/runtime/hle/
 foreach(removed
     runtime/ppc/leaf_stencils.cpp runtime/ppc/leaf_translator.cpp runtime/ppc/ram_translator.cpp
     runtime/gx/gx_d3d11.cpp runtime/gx/gx_d3d12.cpp runtime/gx/gx_dlss5.cpp runtime/gx/gx_dlss5_scaling.cpp
-    runtime/gx/gx_dxr_gpu_scene.cpp runtime/gx/gx_dxr_path_tracer.cpp runtime/gx/gx_streamline.cpp runtime/gx/gx_xess.cpp
-    runtime/gx/gx_backend.cpp runtime/gx/pc_settings_dx11.cpp runtime/host/audio.cpp)
+    runtime/gx/gx_dxr_gpu_scene.cpp runtime/gx/gx_dxr_path_tracer.cpp runtime/gx/gx_streamline.cpp runtime/gx/gx_xess.cpp runtime/gx/gx_fsr.cpp runtime/gx/gx_fsr_vk.cpp
+    runtime/gx/rtx_scene.cpp runtime/gx/rtx_tracer.cpp runtime/gx/rtx_melee_integrator.cpp
+    runtime/gx/gx_backend.cpp runtime/gx/pc_settings_dx11.cpp runtime/host/audio.cpp
+    runtime/gx/gx_dxc_linux.cpp)
   list(REMOVE_ITEM FULL_RUNTIME_SOURCES "${PORT}/${removed}")
 endforeach()
-add_library(full_runtime STATIC ${FULL_RUNTIME_SOURCES} "${PORT}/third_party/slippilib/SlippiGame.cpp"
+# DXC's loader (gx_dxc_linux.cpp) without the Win32 compatibility preinclude: DXC's own header defines
+# those types.
+add_library(full_dxc OBJECT "${PORT}/runtime/gx/gx_dxc_linux.cpp")
+target_include_directories(full_dxc PRIVATE "${PORT}/third_party")
+target_compile_features(full_dxc PRIVATE cxx_std_17)
+set_target_properties(full_dxc PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_library(full_runtime STATIC ${FULL_RUNTIME_SOURCES} $<TARGET_OBJECTS:full_dxc> "${PORT}/third_party/slippilib/SlippiGame.cpp"
   "${COMPAT}/compat.cpp" "${COMPAT}/winhttp_ws.cpp" ../xinput_sdl.cpp ../hid_linux.cpp ../renderer_gl.cpp ../renderer_presenter.cpp
   gx_backend_linux.cpp pc_settings_gl.cpp audio_sdl.cpp linux_media.cpp gpu_features_linux.cpp)
 target_compile_definitions(full_runtime PUBLIC MELEE_LINUX GX_PC_SETTINGS MELEE_LINUX_X11_EMBED
   PRIVATE YOUGAME_COMPAT_TAG="${YOUGAME_COMPAT_TAG}" MELEE_PORT_VERSION="${MELEE_PORT_VERSION}" MELEE_PLAYBACK_GCT_BASE=0u MELEE_PLAYBACK_GCT_SIZE=0u
   GX_SHADER_CACHE_VERSION="linux-gl-1")
+# Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+include("${PORT}/cmake/squad.cmake")
+mu_squad_target(full_runtime)
 target_include_directories(full_runtime PUBLIC "${COMPAT}" "${PORT}/runtime/ppc" "${PORT}/runtime/host" "${PORT}/runtime/hle"
   "${PORT}/runtime/gx" "${PORT}/runtime/mu_net" "${PORT}/runtime/abi" "${MELEE_PORT_GEN}" "${PROJECT_SOURCE_DIR}/native"
-  "${PORT}/third_party" "${CMAKE_CURRENT_SOURCE_DIR}/.." ${LIBUSB_INCLUDE_DIRS})
+  "${PORT}/third_party" "${PORT}/third_party/onnxruntime/include" "${CMAKE_CURRENT_SOURCE_DIR}/.." ${LIBUSB_INCLUDE_DIRS})
 target_compile_features(full_runtime PUBLIC cxx_std_17)
 target_compile_options(full_runtime PRIVATE ${MELEE_LINUX_COMMON_FLAGS})
 target_link_libraries(full_runtime PUBLIC full_native_animation full_enet full_imgui PkgConfig::LIBUSB SDL2::SDL2 OpenGL::GL
   GLEW::GLEW CURL::libcurl OpenSSL::Crypto PkgConfig::FFMPEG Threads::Threads X11::X11 X11::Xext ${CMAKE_DL_LIBS} m)
+
+# The Vulkan renderer's DXC path (gx_dxc_linux.cpp) against the shipped libdxcompiler.so.
+add_executable(linux_dxc_spirv_test "${PORT}/tests/linux_dxc_spirv_test.cpp" "${PORT}/runtime/gx/gx_dxc_linux.cpp")
+target_include_directories(linux_dxc_spirv_test PRIVATE "${PORT}/third_party")
+target_compile_features(linux_dxc_spirv_test PRIVATE cxx_std_17)
+target_link_libraries(linux_dxc_spirv_test PRIVATE ${CMAKE_DL_LIBS})
+add_test(NAME linux_dxc_spirv COMMAND linux_dxc_spirv_test)
+set_tests_properties(linux_dxc_spirv PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${PORT}/third_party/dxc/linux")
 
 add_executable(linux_ws_frame_test "${COMPAT}/tests/ws_frame_test.cpp")
 target_compile_features(linux_ws_frame_test PRIVATE cxx_std_17)
@@ -145,7 +164,9 @@ set_target_properties(melee_source PROPERTIES OUTPUT_NAME ${MELEE_SOURCE_NAME})
 # The shared Win32 compatibility preinclude is C++; never force it into the C99 helper.
 target_compile_options(melee_source PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${MELEE_LINUX_COMMON_FLAGS}>")
 target_compile_features(melee_source PRIVATE c_std_99)
-target_link_libraries(melee_source PRIVATE full_runtime full_mu_net)
+# .slpz replays given to --replay (app/main.cpp playable_replay).
+include("${PORT}/app/disc_rvz.cmake")
+target_link_libraries(melee_source PRIVATE full_runtime full_mu_net port_disc_rvz)
 if(YOUGAME_RANKED_BRANCH)
   target_compile_definitions(melee_source PRIVATE YOUGAME_RANKED_BRANCH=1)
   target_compile_definitions(full_runtime PRIVATE YOUGAME_RANKED_BRANCH=1)

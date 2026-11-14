@@ -1,5 +1,45 @@
 [
   {
+    "before": "  int dlss5_defaults_version = 0;   // 2 from 0.9.60: NVIDIA's own DLSS 5 defaults\n  while (file >> key) {\n",
+    "after": "  int dlss5_defaults_version = 0;   // 2 from 0.9.60: NVIDIA's own DLSS 5 defaults\n  bool saved_true_widescreen = false, truewsfit_seen = false;\n  int saved_truewsaspect = -1;\n  while (file >> key) {\n"
+  },
+  {
+    "before": "    while (!value.empty() && (value.back() == '\\r' || value.back() == ' ' || value.back() == '\\t')) value.pop_back();\n    if (value.empty()) continue;\n",
+    "after": "    while (!value.empty() && (value.back() == '\\r' || value.back() == ' ' || value.back() == '\\t')) value.pop_back();\n    if (key == \"truewsfit\") { truewsfit_seen = true; continue; }\n    if (value.empty()) continue;\n"
+  },
+  {
+    "before": "      else if (key == \"cssbackgroundfree\") options.css_background_free = value == \"1\";\n      else if (key == \"truewidescreen\") options.true_widescreen = value == \"1\";\n      else if (key == \"truewsaspect\") { int n = std::stoi(value); if (n >= 0 && n <= 3) options.true_aspect = (TrueAspect)n; }\n      else if (key == \"truewscustomw\") { int n = std::stoi(value); if (n >= 1 && n <= 100) options.true_custom_w = n; }\n",
+    "after": "      else if (key == \"cssbackgroundfree\") options.css_background_free = value == \"1\";\n      else if (key == \"truewidescreen\") options.true_widescreen = saved_true_widescreen = value == \"1\";\n      else if (key == \"truewsaspect\") { int n = std::stoi(value); if (n >= 0 && n <= 3) { options.true_aspect = (TrueAspect)n; saved_truewsaspect = n; } }\n      else if (key == \"truewscustomw\") { int n = std::stoi(value); if (n >= 1 && n <= 100) options.true_custom_w = n; }\n"
+  },
+  {
+    "before": "  (void)dlss5_defaults_version;\n  // Widescreen is True widescreen only (0.9.63). The Slippi code was a choice beside it that players\n  // took for the widescreen they knew from Slippi Dolphin, and in fullscreen it left the picture\n  // boxed in on wide screens; a saved Slippi code choice becomes True 16:9. --widescreen still runs\n  // the code for test runs, after this.\n  if (options.widescreen) {\n",
+    "after": "  (void)dlss5_defaults_version;\n  // Move the old True widescreen 16:9 default to the window's shape once. Every save writes\n  // truewsfit, so choosing 16:9 again after this preserves that explicit choice.\n  if (saved_true_widescreen && saved_truewsaspect == (int)TrueAspect::Wide16_9 && !truewsfit_seen)\n    options.true_aspect = TrueAspect::FitWindow;\n  // Widescreen is True widescreen only (0.9.63). The Slippi code was a choice beside it that players\n  // took for the widescreen they knew from Slippi Dolphin, and in fullscreen it left the picture\n  // boxed in on wide screens; a saved Slippi code choice now fills the screen. --widescreen still\n  // runs the code for test runs, after this.\n  if (options.widescreen) {\n"
+  },
+  {
+    "before": "    options.true_widescreen = true;\n    options.true_aspect = TrueAspect::Wide16_9;\n  }\n",
+    "after": "    options.true_widescreen = true;\n    options.true_aspect = TrueAspect::FitWindow;\n  }\n"
+  },
+  {
+    "before": "       << \"\\nfodreflections \" << options.fod_reflections << \"\\ncssbackgroundfree \" << options.css_background_free\n       << \"\\ntruewidescreen \" << options.true_widescreen << \"\\ntruewsaspect \" << (int)options.true_aspect\n       << \"\\ntruewscustomw \" << options.true_custom_w << \"\\ntruewscustomh \" << options.true_custom_h << \"\\naspect \" << (int)options.aspect\n",
+    "after": "       << \"\\nfodreflections \" << options.fod_reflections << \"\\ncssbackgroundfree \" << options.css_background_free\n       << \"\\ntruewidescreen \" << options.true_widescreen << \"\\ntruewsaspect \" << (int)options.true_aspect << \"\\ntruewsfit 1\"\n       << \"\\ntruewscustomw \" << options.true_custom_w << \"\\ntruewscustomh \" << options.true_custom_h << \"\\naspect \" << (int)options.aspect\n"
+  },
+  {
+    "before": "    // Widescreen: True widescreen only. The Slippi code was offered here too until 0.9.63 (a saved\n    // choice of it loads as True 16:9, load_pc_settings); --widescreen still runs it for test runs.\n    // True 16:9 widens the frustum here in the renderer instead of running the Gecko code. The one\n    // thing the game does differently is draw a fighter who is in the added sides (the Source Port\n    // puts the fighter's state back afterwards, the Static Recomp uses the Slippi code's own\n",
+    "after": "    // Widescreen: True widescreen only. The Slippi code was offered here too until 0.9.63 (a saved\n    // choice of it fills the screen, load_pc_settings); --widescreen still runs it for test runs.\n    // True widescreen widens the frustum here in the renderer instead of running the Gecko code.\n    // The one thing the game does differently is draw a fighter who is in the added sides (the Source Port\n    // puts the fighter's state back afterwards, the Static Recomp uses the Slippi code's own\n"
+  },
+  {
+    "before": "    {\n      const char* widescreen_modes[] = {\"Off\", \"16:9 (experimental)\", \"16:10 (experimental)\",\n                                        \"Custom (experimental)\", \"Fit my screen (experimental)\"};\n      // Modes 1..4 are True widescreen at 16:9, 16:10, the player's W:H and the window's shape.\n      int widescreen_mode = options.true_widescreen ? 1 + std::clamp((int)options.true_aspect, 0, 3) : 0;\n      if (settings_combo(\"Widescreen\", &widescreen_mode, widescreen_modes, 5)) {\n",
+    "after": "    {\n      const char* widescreen_modes[] = {\"Off\", \"Fill my screen (experimental)\", \"16:9 (experimental)\",\n                                        \"16:10 (experimental)\", \"Custom (experimental)\"};\n      // UI order is independent of the saved TrueAspect enum values.\n      constexpr TrueAspect true_aspects[] = {TrueAspect::FitWindow, TrueAspect::Wide16_9,\n                                            TrueAspect::Wide16_10, TrueAspect::Custom};\n      int widescreen_mode = 0;\n      if (options.true_widescreen) {\n        switch (options.true_aspect) {\n          case TrueAspect::FitWindow: widescreen_mode = 1; break;\n          case TrueAspect::Wide16_9: widescreen_mode = 2; break;\n          case TrueAspect::Wide16_10: widescreen_mode = 3; break;\n          case TrueAspect::Custom: widescreen_mode = 4; break;\n        }\n      }\n      if (settings_combo(\"Widescreen\", &widescreen_mode, widescreen_modes, 5)) {\n"
+  },
+  {
+    "before": "        options.true_widescreen = widescreen_mode >= 1;\n        if (widescreen_mode >= 1) options.true_aspect = (TrueAspect)(widescreen_mode - 1);\n        changed = true;\n",
+    "after": "        options.true_widescreen = widescreen_mode >= 1;\n        if (widescreen_mode >= 1) options.true_aspect = true_aspects[widescreen_mode - 1];\n        changed = true;\n"
+  },
+  {
+    "before": "      if (options.true_widescreen && !options.widescreen && options.true_aspect == TrueAspect::FitWindow)\n        settings_hint(\"Widens to the window's shape; a window wider than True widescreen draws gets side bars.\");\n      if (ImGui::IsItemHovered())\n",
+    "after": "      if (options.true_widescreen && !options.widescreen && options.true_aspect == TrueAspect::FitWindow)\n        settings_hint(\"Widens to the window's shape; a screen wider than 64:27 still gets side bars.\");\n      if (ImGui::IsItemHovered())\n"
+  },
+  {
     "before": "#include \"test_env.h\"\n#include \"pc_settings.h\"\n#include \"settings_imgui_input.h\"\n#ifdef __APPLE__\n#include \"../../mac/platform_paths.h\"\n#endif\n",
     "after": "#include \"test_env.h\"\n#include \"pc_settings.h\"\n#include \"settings_imgui_input.h\"\n#include \"settings_page_navigation.h\"\n#ifdef __APPLE__\n#include \"../../mac/platform_paths.h\"\n#endif\n"
   },

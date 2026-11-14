@@ -39,9 +39,11 @@ inline std::string closed_line(const json& m) {
 }
 class Lobby {
  public:
-  void begin(bool host) {
+  // pick_friend: the player chose Friends in the game, so the first CSS opens the friends list.
+  // A room handed in at launch, or reopened after a guest left, waits on CSS instead (Z invites).
+  void begin(bool host, bool pick_friend = false) {
     std::lock_guard<std::mutex> l(mutex_);
-    host_ = host; held_ = true; reported_ = false; return_ = false; loading_ = shown_ = invite_ = leave_ = false; room_.clear(); line_.clear(); pick_ = {}; me_.clear(); host_id_.clear(); host_name_.clear(); host_user_.clear(); reenter_ = false;
+    host_ = host; pick_friend_ = host && pick_friend; held_ = true; reported_ = false; return_ = false; loading_ = shown_ = invite_ = leave_ = false; room_.clear(); line_.clear(); pick_ = {}; me_.clear(); host_id_.clear(); host_name_.clear(); host_user_.clear(); reenter_ = false;
   }
   void opened(const std::string& code) { std::lock_guard<std::mutex> l(mutex_); if (!leave_) room_ = code; }
   void report_ready() { std::lock_guard<std::mutex> l(mutex_); reported_ = true; }
@@ -54,7 +56,7 @@ class Lobby {
   void shown(CssPick p) {
     std::lock_guard<std::mutex> l(mutex_);
     if (!held_ || leave_) return;
-    if (!shown_) invite_ = host_;
+    if (!shown_ && host_ && std::exchange(pick_friend_,false)) invite_ = true;
     shown_ = true; if (!loading_ && p.valid()) pick_ = p;
   }
   std::string freeze(const std::string& name) {
@@ -133,10 +135,10 @@ class Lobby {
   }
  private:
   void close_locked(std::string line) {
-    leave_ = return_ = true; held_ = invite_ = reenter_ = false; room_.clear(); line_ = std::move(line);
+    leave_ = return_ = true; held_ = invite_ = reenter_ = pick_friend_ = false; room_.clear(); line_ = std::move(line);
   }
   mutable std::mutex mutex_;
-  bool reenter_ = false;
+  bool reenter_ = false, pick_friend_ = false;
   std::string me_, host_id_, host_name_, host_user_;
   bool reported_ = false;
   bool host_ = false, held_ = false, shown_ = false, loading_ = false, invite_ = false, leave_ = false, return_ = false;

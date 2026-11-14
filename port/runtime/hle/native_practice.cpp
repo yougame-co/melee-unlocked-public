@@ -11,6 +11,8 @@
 #include "yougame_unranked.h"
 #include "yougame_ux.h"
 #include "yougame_friends.h"
+#include "yougame_lobby_wire.h"
+#include "yougame_mode_policy.h"
 #include "../abi/mu_tourney.h"
 #include "slippi_playback.h"
 #include "../gx/render_options.h"
@@ -104,6 +106,8 @@ std::shared_ptr<std::atomic<bool>> g_friend_picker_stop;
 // After an online session (the other player left, the connection dropped, the player left): back
 // into a Training match with the same character, then "search again?". g_enter_* presses through
 // Training's character and stage select for the player; g_offer_* is the prompt.
+int g_last_opponent = -1;            // the last online opponent's character (Training's CPU after the session)
+uint8_t g_last_opponent_costume = 0;
 bool g_enter_training = false;
 bool g_enter_seen_select = false;   // Training's character select was reached (a restart starts in the match)
 int g_enter_port = 0;
@@ -120,6 +124,8 @@ ContentBridge g_content_bridge = nullptr;
 enum { OP_SCENE, OP_GET_PLAYER, OP_SET_PLAYER, OP_GET_STAGE, OP_SET_STAGE, OP_SET_EVENT_BACKUP,
        OP_REQUEST_MAJOR, OP_SET_ONLINE_MODE, OP_GET_ONLINE_MODE, OP_DIRECT_FIRST_MATCH, OP_FRAME_PAUSE, OP_CPU_MOVE,
        OP_TRAINING_PICK, OP_TRAINING_STAGE, OP_UNLOCKED, OP_PAGE_PAUSE, OP_CSS_PICK, OP_FRIENDS_RETURN };
+static_assert(OP_FRAME_PAUSE == 10 && OP_UNLOCKED == 14 && OP_PAGE_PAUSE == 15 && OP_CSS_PICK == 16 &&
+              OP_FRIENDS_RETURN == 17, "practice op numbering (mu_host.h)");
 std::atomic<uint32_t> g_unlocked{0xFFFFFFFFu};   // tick(): the card's unlocked characters, read in Training
 
 uint8_t current_major() {
@@ -501,23 +507,30 @@ void process_command(Command command) {
       // A ghost picked in a Training match: the CPU becomes that player's character. Training starts
       // again with the same fighter and stage, pressed through its menus (Source Port).
       const int character = std::atoi(command.text.c_str());
+      const size_t comma = command.text.find(',');
+      int costume = comma == std::string::npos ? 0 : std::atoi(command.text.c_str() + comma + 1);
+      // The offered pros use Fox (4), Marth (5), and Yoshi (6) costumes.
+      const int costumes = character == 9 ? 5 : character == 17 ? 6 : 4;
+      if (costume < 0 || costume >= costumes) costume = 0;
       if (!g_bridge || !is_training() || current_minor() != 2 || g_lifecycle.phase() != Phase::Idle) return;
       const PracticeConfig now = capture_practice();
       if (!now.valid) return;
-      for (const SavedPlayer& p : now.players)
-        if (p.active && p.player_kind == 1 && (int)p.character == character) return;   // already that character
       const SavedPlayer& me = now.players[now.local_slot];
+      // Two players cannot wear the same colours of one character: the next costume then.
+      if ((int)me.character == character && (int)me.costume == costume) costume = (costume + 1) % costumes;
+      for (const SavedPlayer& p : now.players)
+        if (p.active && p.player_kind == 1 && (int)p.character == character && (int)p.costume == costume) return;   // already that character, in those colours
       g_practice = now;
       g_offer_shown = false;   // a prompt from an online session goes with the match it was shown in
       g_offer_mode = MatchMode::None;
       set_training_pick(0, (int)me.character, me.costume);
-      set_training_pick(1, character, 0);
+      set_training_pick(1, character, costume);
       g_enter_training = true;
       g_enter_port = now.controller_port;
       g_enter_ticks = 0;
   g_enter_seen_select = false;
       request_major(kTrainingMajor);
-      host::log("native practice: Training again with the CPU as character %d", character);
+      host::log("native practice: Training again with the CPU as character %d, costume %d", character, costume);
       break;
     }
     case CommandKind::AcknowledgeFailure:
@@ -599,6 +612,8 @@ void enter_training_after_session(MatchMode mode, int local_index = -1, int test
     g_practice.stage = css.stage;   // the online match's stage, kept for Training when it is a legal one
     write_event_backup();
     set_training_pick(0, character, costume);
+    // The CPU is the player just faced, not whatever Training's character select was left on.
+    if (g_last_opponent >= 0) set_training_pick(1, g_last_opponent, g_last_opponent_costume);
   }
   g_offer_mode = mode == MatchMode::Unranked || mode == MatchMode::Direct || mode == MatchMode::Teams ? mode : MatchMode::None;
   g_offer_code.clear();
@@ -645,9 +660,9 @@ void submit_start_unranked() {
   g_commands.push_back({CommandKind::StartUnranked, {}});
 }
 
-void submit_train_against(int character) {
+void submit_train_against(int character, int costume) {
   std::lock_guard<std::mutex> lock(g_mutex);
-  g_commands.push_back({CommandKind::TrainAgainst, std::to_string(character)});
+  g_commands.push_back({CommandKind::TrainAgainst, std::to_string(character) + "," + std::to_string(costume)});
 }
 
 void submit_cancel() {
@@ -662,6 +677,16 @@ void submit_acknowledge_failure() {
 
 void tick() {
   if (g_bridge && yougame::tournament_active()) g_bridge(MU_TOURNEY_TICK_OP, nullptr, 0);
+#ifdef MELEE_DOUBLES
+  if (g_bridge && current_major()==1) {
+    std::string room; bool search=false; int humans=1;
+    { std::lock_guard<std::mutex> lock(yougame::doubles::ui.mutex);
+      room=std::exchange(yougame::doubles::ui.pending_room,{});
+      search=yougame::doubles::ui.auto_search; humans=yougame::doubles::ui.auto_humans;
+    }
+    if (room.size()>0) { yougame::doubles::entry(room,search,humans); return; }
+  }
+#endif
   // Room and picker workers publish state; only this simulation thread touches scenes/CSS.
   auto& friends_lobby = yougame::friends::lobby;
   const bool shared_active = yougame::console::console_active();
@@ -670,7 +695,7 @@ void tick() {
     g_shared_css_seen = false;
   }
   g_shared_was_active = shared_active;
-  if (!shared_active && yougame::console::entry.available()) {
+  if (yougame::mode_policy::friends_shared_menus && !shared_active && yougame::console::entry.available()) {
     const auto held_room = friends_lobby.take_reenter();
     if (!held_room.empty()) {
       g_friend_css_requested = g_shared_css_seen = false;
@@ -682,8 +707,14 @@ void tick() {
     friends_lobby.leave(); g_shared_css_seen = false;
   }
   if (friends_lobby.host() && !friends_lobby.room().empty() && !g_friend_css_requested) {
-    g_friend_css_requested = true;
-    request_major(2); // room FIRST, ordinary local VS CSS SECOND
+    // A room/invite never interrupts VS stage select, fight, sudden death or results.
+    // The join worker holds the guest until the ordinary scene path returns to CSS.
+    if (current_major() == 2) {
+      if (current_minor() == 0) g_friend_css_requested = true;
+    } else {
+      g_friend_css_requested = true;
+      request_major(2); // room FIRST, ordinary local VS CSS SECOND
+    }
   }
   if (friends_lobby.loading() && g_friend_picker_stop) *g_friend_picker_stop = true;
   if (friends_lobby.host() && current_major() == 2 && current_minor() == 0 && g_bridge) {
@@ -699,6 +730,10 @@ void tick() {
     }
     if (g_friend_picker.valid() && g_friend_picker.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
       try { g_friend_picker.get(); }
+      catch (const yougame::friends::RoomFull& e) {   // the site's own words, or "This room is full."
+        yougame::friends::events.notice(e.what(),
+          uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
+      }
       catch (const std::exception& e) {
         // Cancel only closes the picker: the room and local CSS stay open. Z invites again.
         if (std::string(e.what()) != "Cancelled") yougame::friends::events.notice("Couldn't open your friends list. Press Z to try again.",
@@ -721,6 +756,18 @@ void tick() {
     if (!leave_line.empty() && !yougame::friends::page_lobby_lines.load(std::memory_order_acquire)) yougame::friends::events.notice(leave_line,
       uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
   }
+  // The friend room filled before this player got a seat (a final refusal): its line is on screen,
+  // and the online character select goes back to the Friends menu.
+  if (yougame::friends::events.take_full_return(current_major() == kOnlineMajor,
+      uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()))) {
+    host::log("friends: room full; back to the Friends menu");
+    slippi::online::native_cleanup_match();
+    if (g_bridge) { int32_t a[1] = {}; g_bridge(OP_FRIENDS_RETURN,a,1); }
+    else request_major(1);
+  }
+  // The Doubles row's press (menu value 16) is taken every tick, before any early return, and used this
+  // tick or dropped: one made while signing in, or anywhere the home can't open yet, never opens one later.
+  bool doubles_press = slippi::online::take_doubles_lobby_request();
   if (yougame::console::console_active()) return;
   if (friends_lobby.held()) return; // local CSS remains interactive; the room worker owns preparation
   // This tick runs at retrace even while the scene is frozen. No game state is
@@ -794,6 +841,7 @@ void tick() {
     if (g_friend_picker.valid() && (!picker_scene || !safe || !yougame::friends::events.picker_context())) {
       *g_friend_picker_stop = true;
       g_friend_picker = {};
+      slippi::online::squad_friend_picker_closed();
     }
     yougame::friends::events.picker_open(g_friend_picker.valid());
     const uint64_t friends_now = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -802,21 +850,82 @@ void tick() {
       // A Friends press the host can't act on yet says why on screen; it used to do nothing.
       const auto id = yougame::identity();
       if (!id.ok && yougame::friends::events.take_host()) {
+        slippi::online::squad_friend_picker_closed();
         host::log("friends: entry refused (%s)", id.error.empty() ? "not signed in" : id.error.c_str());
         yougame::friends::events.notice(id.error.empty() ? "Signing in to YouGame..." : id.error, friends_now);
       }
     }
+    if (doubles_press && picker_scene) {   // the Doubles row says the same as the Friends row
+      const auto id = yougame::identity();
+      if (!id.ok) {
+        host::log("doubles: entry refused (%s)", id.error.empty() ? "not signed in" : id.error.c_str());
+        yougame::friends::events.notice(id.error.empty() ? "Signing in to YouGame..." : id.error, friends_now);
+        doubles_press = false;
+      }
+    }
     if (safe && yougame::identity().ok && yougame::console::entry.available()) {
+#ifdef MELEE_DOUBLES
+      // A join the page marked md:1 opens the Doubles home directly; a plain Friends ticket would be refused.
+      if (yougame::friends::events.doubles_join_pending()) {
+        auto room=yougame::friends::events.take_join(true);
+        if (room.size()>0) { yougame::doubles::entry(room); return; }
+      }
+#endif
       auto room = yougame::friends::events.take_join(true);
+      // A room from an invite (in the menu, the character select or the results screen) is never
+      // the "Play a friend" room: only the picker below can return that one.
+      bool picked = false;
       const bool host_friend = yougame::friends::events.take_host();
-      if (g_bridge && host_friend && picker_scene && !yougame::console::entry.active()) {
+      // Shared menus are off for Friends (mode_policy::friends_shared_menus): the host's press opens
+      // the page picker below, and both players meet as known peers from their own CSS.
+      if (yougame::mode_policy::friends_shared_menus && g_bridge && host_friend && picker_scene &&
+          !yougame::console::entry.active()) {
         slippi::online::native_cleanup_match();
         g_friend_css_requested = false;
         yougame::friends::events.online_menu(false);
         yougame::console::friends_entry("new");
         return;
       }
-      // Static recomp retains its existing online entry.
+      // The 4-player Friends lobby (mode_policy::friends_lobby4): the Friends row opens Melee's 4-door select
+      // and holds a room there (the select's Invite doors open the page's picker); an accepted invite joins
+      // that select. Squad Strike's "Play a friend", an invite into a 1v1 room and the static recomp (no
+      // 4-door select) keep the friend room below.
+      if (yougame::mode_policy::friends_lobby4 && g_bridge && !yougame::console::entry.active() &&
+          !slippi::online::squad_friend_intent() && !g_friend_picker.valid()) {
+        // The Doubles home (G2) is the same lobby on its 2-seat profile: the Doubles row (menu value 16) holds
+        // a new home; an invite into a Doubles home joins one.
+        const bool doubles_host = picker_scene && room.empty() && std::exchange(doubles_press, false);
+        // The room decides (friends::Events::room_kind): once joined, a lobby room's first frames carry
+        // welcome.muLobby or a yg.mu.lobby state (2 seats and `searching`: the Doubles home) and a 1v1 room's
+        // neither; a room of another kind refuses the ticket. The search that joined it the wrong way queues
+        // the join again the next way (room_retry, room_decided). Until a room has said, the invite picks the
+        // first try: a Teams invite (no md) or a push naming nothing the Doubles home, a size or compatibility
+        // key the Friends lobby or 1v1.
+        const int kind = room.empty() ? -1 : yougame::friends::events.room_kind(room);
+        const bool doubles_guest = !room.empty() && (kind >= 0 ? kind == 2 : yougame::friends::events.join_doubles());
+        const bool lobby_host = !doubles_host && picker_scene && host_friend && room.empty();
+        const bool lobby_guest = !doubles_guest && !room.empty() && (kind >= 0 ? kind == 1 : yougame::friends::events.join_players() == 4);
+        const bool doubles = doubles_host || doubles_guest;
+        if (doubles || lobby_host || lobby_guest) {
+          host::log("%s: %s (%s)", doubles ? "doubles" : "friends lobby",
+                    doubles_host || lobby_host ? "entry opened" : "invite accepted", yougame::friends::events.trigger().c_str());
+          yougame::friends::events.online_menu(false);
+          slippi::online::native_cleanup_match();
+          g_lifecycle = Lifecycle{};
+          clear_search_metadata();
+          set_online_mode(2);
+          g_practice = {};
+          g_practice.valid = true;
+          g_practice.players[0].active = true;
+          g_practice.players[0].character = 0;
+          write_event_backup();
+          if (g_content_bridge) g_content_bridge(2, true);
+          slippi::online::arm_friends_lobby(room, doubles ? yougame::lobby::Profile::Doubles : yougame::lobby::Profile::Friends4);
+          request_major(kOnlineMajor);   // the online major opens the 4-door select for an armed lobby
+          return;
+        }
+      }
+      // Local menus: the page picks or makes the room; static recomp uses the same entry.
       if (picker_scene && host_friend && !g_friend_picker.valid() && room.empty() && !yougame::console::entry.active()) {
         host::log("friends: entry opened (%s)", yougame::friends::events.trigger().c_str());
         g_friend_picker_stop = std::make_shared<std::atomic<bool>>(false);
@@ -830,9 +939,16 @@ void tick() {
         if (!room.empty() || !yougame::friends::events.picker_context()) {
           *g_friend_picker_stop = true;
           g_friend_picker = {};
+          if (room.empty()) slippi::online::squad_friend_picker_closed();
         } else if (g_friend_picker.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-          try { room = g_friend_picker.get(); }
+          try { room = g_friend_picker.get(); picked = !room.empty(); }
+          catch (const yougame::friends::RoomFull& e) {   // the site's own words, or "This room is full."
+            slippi::online::squad_friend_picker_closed();
+            yougame::friends::events.picker_error(e.what());
+            yougame::friends::events.notice(e.what(), friends_now);
+          }
           catch (const std::exception& e) {
+            slippi::online::squad_friend_picker_closed();   // cancelled or failed: Squad Strike off
             yougame::friends::events.picker_error(e.what());
             const std::string why = e.what();
             if (why != "Cancelled" && why != yougame::friends::kVersion)  // a version refusal has its own toast
@@ -842,14 +958,21 @@ void tick() {
       }
       yougame::friends::events.picker_open(g_friend_picker.valid());
       if (!room.empty()) {
+        slippi::online::squad_friend_room(room, picked);
         yougame::friends::events.online_menu(false);
+        // An armed Friends lobby (this invite accepted on its select) is let go first: its select's unload
+        // then sends no LEAVE into the new 1v1 connection (mu_slippi_menu.c lobby_close, view.arm).
+        slippi::online::disarm_friends_lobby();
         slippi::online::native_cleanup_match();
         g_lifecycle = Lifecycle{};
         clear_search_metadata();
-        if (g_bridge) {
+        if (yougame::mode_policy::friends_shared_menus && g_bridge) {
           yougame::console::friends_entry(room);
           room.clear();
         } else {
+          // Known-peer rollback in the friend room: each player keeps their own CSS, picks go as
+          // 0x82 (a Squad lineup as 0xE3 just before it), and the Direct winner/loser flow runs the
+          // rematch in the same room. Both start as winners, so game 1 takes a random stage.
           set_online_mode(2);
           g_practice = {};
           g_practice.valid = true;
@@ -1064,16 +1187,30 @@ void tick() {
   // dropped) and the player is still on the online screens, Training's character select. Only once
   // the session is over, so nothing changes during a match or between a pair's games.
   {
-    static bool session_seen = false, played = false;
+    static yougame::unranked::SessionWatch session_watch;
     static int session_mode_seen = -1, local_index_seen = -1;
     static std::string session_code;
     const bool session = slippi::online::session_mode() >= 0;
+    const bool match_running = slippi::online::is_online_match();
     if (session) {
-      session_seen = true;
       session_mode_seen = slippi::online::session_mode();
-      if (slippi::online::is_online_match()) { played = true; local_index_seen = slippi::online::local_player_index(); }
-    } else if (session_seen) {
-      session_seen = false;
+      if (match_running) {
+        local_index_seen = slippi::online::local_player_index();
+        // The opponent's character, for Training's CPU afterwards (once a second; the slots are
+        // cleared when the next match starts).
+        static uint32_t seen_ticks = 0;
+        if (++seen_ticks % 60 == 0) {
+          const PracticeConfig match = capture_practice();
+          for (int i = 0; i < 4; ++i)
+            if (i != local_index_seen && match.players[i].active && match.players[i].character < 26) {
+              g_last_opponent = (int)match.players[i].character;
+              g_last_opponent_costume = match.players[i].costume;
+              break;
+            }
+        }
+      }
+    }
+    if (session_watch.tick(session, match_running, slippi::online::friends_lobby_armed())) {
       // The guest mode also covers local Ranked practice, which has no real
       // matchmaking session and must not inherit an earlier session's return.
       const bool allow_training = yougame::unranked::allow_training_return(yougame::active(), session_mode_seen) &&
@@ -1081,17 +1218,16 @@ void tick() {
       // Unranked ends its session after every game, so there it would leave the online screens after
       // each one (two reports); the player stays on Unranked's character select, as on Slippi.
       const bool unranked = session_mode_seen == (int)MatchMode::Unranked;
-      if (played && allow_training && gx::RenderOptions::live_online_back_to_training() && !unranked && g_lifecycle.phase() == Phase::Idle &&
+      if (allow_training && gx::RenderOptions::live_online_back_to_training() && !unranked && g_lifecycle.phase() == Phase::Idle &&
           is_online_scene() && !slippi::playback::enabled()) {
         enter_training_after_session((MatchMode)session_mode_seen, local_index_seen);
-      } else if (played && allow_training && gx::RenderOptions::live_online_return_training() && g_lifecycle.phase() == Phase::Idle &&
+      } else if (allow_training && gx::RenderOptions::live_online_return_training() && g_lifecycle.phase() == Phase::Idle &&
           is_online_scene()) {
         g_origin_major = kTrainingMajor;
         g_restore_training = false;
         host::log("native practice: online session over; going to Training (setting on)");
         run_decision(g_lifecycle.return_after_session());
       }
-      played = false;
     }
   }
 
@@ -1110,7 +1246,8 @@ void tick() {
 
   if (g_lifecycle.phase() == Phase::Searching) {
     ++g_search_ticks;
-    if (g_search_ticks > kSearchTimeoutTicks) {
+    // Teams waits for three other players: ten minutes, where Unranked and Direct give up after 90 s.
+    if (g_search_ticks > (g_match_mode == MatchMode::Teams ? 60u * 600u : kSearchTimeoutTicks)) {
       fail(std::string("The ") + match_mode_name(g_match_mode) + " search timed out", true);
     } else {
       const slippi::online::NativeMatchPoll poll = slippi::online::native_poll_match();
@@ -1189,7 +1326,7 @@ void apply_pads(host::PadState* pads) {
     static uint16_t held_at_entry[4];
     static bool entry_seen = false;
     bool touched = false;
-    if (major == kTrainingMajor && minor < 2) {
+    if (major == kTrainingMajor && minor == 0) {   // the character select (the stage is picked at once)
       for (int i = 0; i < 4; ++i) {
         const host::PadState& p = pads[i];
         if (p.err != 0) continue;

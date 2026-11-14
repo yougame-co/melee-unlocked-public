@@ -26,7 +26,7 @@ constexpr MatchmakingRoute matchmaking_route(int mode, bool yougame_mode, bool s
 }
 
 // Whether the Online menu offers Ranked in YouGame mode. Off until Ranked plays like Slippi's
-// (rank shown, best of 3, stage striking, rating change) (2026-10-29). The site's ladder
+// (rank shown, best of 3, stage striking, rating change): 2026-10-29. The site's ladder
 // switch is off for these listings too, and the page turns a ranked request into a casual one.
 #if defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH
 constexpr bool yougame_ranked_offered = true;
@@ -38,6 +38,19 @@ constexpr bool yougame_ranked_offered = false;
 #define YOUGAME_FRIENDS_ROW 1
 #endif
 constexpr bool friends_offered(bool yougame_mode) { return YOUGAME_FRIENDS_ROW != 0 && yougame_mode; }
+// Friends keeps its menus local and sends picks as messages: each player stays on their own CSS
+// and stage select, and the pair meets as known peers in the friend room (native_start_match with
+// the room, the same rollback a Direct match uses), with rollback only inside the match. The
+// shared-menu console session (console::friends_entry/start_session, synced CSS pads, mid-CSS join)
+// stays compiled for agent and app-requested console launches but is not reachable from Friends.
+constexpr bool friends_shared_menus = false;
+// The Friends row opens the 4-player Friends lobby (yougame_lobby.h) on Melee's 4-door VS select, and an
+// accepted lobby invite joins it there. 0 keeps the 1v1 friend room (the picker, then the 1-door select).
+// The Squad Strike row's "Play a friend" keeps the 1v1 friend room either way.
+#ifndef YOUGAME_FRIENDS_LOBBY4
+#define YOUGAME_FRIENDS_LOBBY4 1
+#endif
+constexpr bool friends_lobby4 = YOUGAME_FRIENDS_LOBBY4 != 0;
 
 constexpr bool spectator_allowed(bool yougame_mode, bool setting_on) {
   return !yougame_mode && setting_on;

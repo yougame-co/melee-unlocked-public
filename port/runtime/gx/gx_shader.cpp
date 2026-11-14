@@ -227,6 +227,12 @@ std::string generate_vertex_shader(const VSUid& uid) {
   for (uint32_t i = 0; i < numTexGens; ++i) o.w("float3 tex%d : TEXCOORD%d;\n", i, i);
   o.w("float4 clipPos : TEXCOORD%d;\n", numTexGens);
   if (uid.motion_vectors) o.w("float4 curPos : TEXCOORD%d;\nfloat4 prevPos : TEXCOORD%d;\n", numTexGens + 1, numTexGens + 2);
+  // The path tracer's G-buffer variant (motion_vectors bit 2, only while path tracing): view-space
+  // position and normal, and the colours GX lighting multiplies (rtx_* below).
+  const bool gbuffer = (uid.motion_vectors & 2) != 0;
+  if (gbuffer)
+    o.w("float3 rtxViewPos : TEXCOORD%d;\nfloat3 rtxViewNrm : TEXCOORD%d;\nfloat4 rtxUnlit0 : TEXCOORD%d;\nfloat4 rtxUnlit1 : TEXCOORD%d;\n",
+        numTexGens + 3, numTexGens + 4, numTexGens + 5, numTexGens + 6);
   o.w("};\n");
   o.w("VS_OUTPUT main(float3 rawpos : POSITION, float3 rawnorm0 : NORMAL0, float4 color0 : COLOR0, float4 color1 : COLOR1,\n");
   for (int i = 0; i < 8; ++i) o.w("  float2 rawtex%d : TEXCOORD%d,\n", i, i);
@@ -270,6 +276,31 @@ std::string generate_vertex_shader(const VSUid& uid) {
     gen_lighting(o, numColorChans, lu, components);
     if (numColorChans < 2) {
       if (components & VB_HAS_COL1) o.w("o.colors_1 = color1;\n"); else o.w("o.colors_1 = o.colors_0;\n");
+    }
+  }
+  if (gbuffer) {
+    o.w("o.rtxViewPos = pos.xyz;\no.rtxViewNrm = _norm0;\n");
+    if (!lightingEnabled) {
+      o.w("o.rtxUnlit0 = o.colors_0;\no.rtxUnlit1 = o.colors_1;\n");
+    } else {
+      // A lit channel's material source (the vertex colour or the material register) is what the
+      // light multiplies: the path tracer lights it itself. A specular channel adds light, not
+      // surface colour (XF attenuation function 1: GX_AF_SPEC), so its unlit value is nothing.
+      for (uint32_t j = 0; j < 2; ++j) {
+        if (j >= numColorChans) { o.w("o.rtxUnlit1 = o.colors_1;\n"); continue; }
+        const uint32_t cc = uid.xf_regs[0x0E + j], ac = uid.xf_regs[0x10 + j];
+        auto source = [&](uint32_t ctrl) -> std::string {
+          if (lit_matsource(ctrl)) {
+            if (components & (VB_HAS_COL0 << j)) return j ? "color1" : "color0";
+            if (components & VB_HAS_COL0) return "color0";
+            return "float4(1.0, 1.0, 1.0, 1.0)";
+          }
+          return j ? "(materials[3] / 255.0)" : "(materials[2] / 255.0)";
+        };
+        const std::string rgb = lit_enable(cc) && lit_attnfunc(cc) == 1 ? std::string("float3(0.0, 0.0, 0.0)") : source(cc) + ".rgb";
+        const std::string a = lit_enable(ac) && lit_attnfunc(ac) == 1 ? std::string("0.0") : source(ac) + ".a";
+        o.w("o.rtxUnlit%u = float4(%s, %s);\n", j, rgb.c_str(), a.c_str());
+      }
     }
   }
   o.w("float4 coord = float4(0.0, 0.0, 1.0, 1.0);\n");
@@ -450,12 +481,25 @@ std::string generate_pixel_shader(const PSUid& uid) {
   o.w("cbuffer PSBlock : register(b1) {\nint4 colors[4];\nint4 kcolors[4];\nint4 alpharef;\nfloat4 texdims[8];\nint4 zbias[2];\n"
       "int4 indtexscale[2];\nint4 indtexmtx[6];\nint4 fogcolor;\nint4 fogi;\nfloat4 fogf[2];\nfloat4 zslope;\nint4 flags;\nfloat4 efbscale;\nfloat4 mvscale;\nfloat4 tint;\n};\n");
   if (forced_early_z) o.w("[earlydepthstencil]\n");
+  // The path tracer's G-buffer variant (motion_vectors bit 2): albedo, view normal + linear depth and
+  // the draw's id as three more targets. Off, the shader is exactly what it was.
+  const bool gbuffer = (uid.motion_vectors & 2) != 0;
   if (uid.motion_vectors) o.w("void main(out float4 ocol0 : SV_Target0, out float2 omv : SV_Target1, out float ohud : SV_Target2, in float4 rawpos : SV_Position, in float4 colors_0 : COLOR0, in float4 colors_1 : COLOR1");
   else o.w("void main(out float4 ocol0 : SV_Target0, in float4 rawpos : SV_Position, in float4 colors_0 : COLOR0, in float4 colors_1 : COLOR1");
+  if (gbuffer) o.w(", out float4 oalbedo : SV_Target3, out float4 onormal : SV_Target4, out uint oid : SV_Target5"
+                   ", out float4 oover : SV_Target6, out float4 otrans : SV_Target7");
+  // The RTX Remix bridge's effects layer (motion_vectors bit 4, never with the G-buffer): the same
+  // overlay and transmittance as the G-buffer's, as targets 3 and 4.
+  const bool remix_layer = (uid.motion_vectors & 4) != 0 && !gbuffer;
+  if (remix_layer) o.w(", out float4 oover : SV_Target3, out float4 otrans : SV_Target4");
   if (texture_depth) o.w(", out float odepth : SV_Depth");
   for (uint32_t i = 0; i < numTexgen; ++i) o.w(", in float3 uv%d : TEXCOORD%d", i, i);
-  if (uid.motion_vectors) o.w(", in float4 clipPos : TEXCOORD%d, in float4 curPos : TEXCOORD%d, in float4 prevPos : TEXCOORD%d) {\n", numTexgen, numTexgen + 1, numTexgen + 2);
-  else o.w(", in float4 clipPos : TEXCOORD%d) {\n", numTexgen);
+  if (uid.motion_vectors) o.w(", in float4 clipPos : TEXCOORD%d, in float4 curPos : TEXCOORD%d, in float4 prevPos : TEXCOORD%d", numTexgen, numTexgen + 1, numTexgen + 2);
+  else o.w(", in float4 clipPos : TEXCOORD%d", numTexgen);
+  if (gbuffer)
+    o.w(", in float3 rtxViewPos : TEXCOORD%d, in float3 rtxViewNrm : TEXCOORD%d, in float4 rtxUnlit0 : TEXCOORD%d, in float4 rtxUnlit1 : TEXCOORD%d",
+        numTexgen + 3, numTexgen + 4, numTexgen + 5, numTexgen + 6);
+  o.w(") {\n");
   o.w("int2 ditherindex = int2(rawpos.xy) & 3;\n");
   o.w("wu4 c0 = colors[1], c1 = colors[2], c2 = colors[3], prev = colors[0];\n"
       "wu4 tex_ta[%d], tex_t = wu4(0,0,0,0), ras_t = wu4(0,0,0,0), konst_t = wu4(0,0,0,0);\n"
@@ -558,7 +602,9 @@ std::string generate_pixel_shader(const PSUid& uid) {
   o.w("float4 col0 = colors_0;\nfloat4 col1 = colors_1;\n");
   o.w("clipPos = float4(rawpos.x, rawpos.y, clipPos.z, clipPos.w);\n");
 
-  RegState rs;
+  // The TEV stages over the rasterized colours col0/col1: emitted once for the picture and, in the
+  // path tracer's G-buffer variant, once more over GX lighting's material colours (the albedo).
+  auto emit_tev_stages = [&](RegState& rs) {
   for (uint32_t n = 0; n < numStages; ++n) {
     uint32_t cc = bp.tev_color(n), ac = bp.tev_alpha(n);
     uint32_t cd = bits(cc, 0, 4), ccc = bits(cc, 4, 4), cb = bits(cc, 8, 4), ca = bits(cc, 12, 4);
@@ -609,6 +655,9 @@ std::string generate_pixel_shader(const PSUid& uid) {
   if (lastC != 0) o.w("prev.rgb = %s;\n", cOut[lastC]);
   if (lastA != 0) o.w("prev.a = %s;\n", aOut[lastA]);
   if (rs.overflow[cOutSource[lastC]] || rs.overflow[aOutSource[lastA]]) o.w("prev = CHK_O_U8(prev);\n");
+  };
+  RegState rs;
+  emit_tev_stages(rs);
 
   if (pretest != 2) {
     static const char* funcs[] = {"(false)", "(prev.a <  %s)", "(prev.a == %s)", "(prev.a <= %s)", "(prev.a >  %s)", "(prev.a != %s)", "(prev.a >= %s)", "(true)"};
@@ -649,7 +698,49 @@ std::string generate_pixel_shader(const PSUid& uid) {
   // brightness kept so the stage's light and shade still read.
   o.w("ocol0.rgb = tint.w < 0.0 ? tint.rgb * (0.45 + 0.55 * dot(ocol0.rgb, float3(0.299, 0.587, 0.114)))"
       " : lerp(ocol0.rgb, ocol0.rgb * tint.rgb + tint.rgb * 0.35, tint.w);\n");
-  if (uid.motion_vectors) o.w("omv = (prevPos.xy / prevPos.w - curPos.xy / curPos.w) * mvscale.xy;\nohud = mvscale.z * saturate(ocol0.a);\n");
+  if (uid.motion_vectors) o.w("omv = (prevPos.xy / prevPos.w - curPos.xy / curPos.w) * mvscale.xy;\nohud = mvscale.z > 1.5 ? 1.0 : mvscale.z * saturate(ocol0.a);\n");
+  if (gbuffer) {
+    // The path tracer's G-buffer. Albedo: the same TEV over GX lighting's material colours (the
+    // textures were sampled once, above), before fog. Normal: the vertex normal in view space, or
+    // the triangle's own where the draw has none, facing the camera; w the linear view depth. The id
+    // is the draw's (flags.x = draw index + 1, set by the renderer only in this variant), and the
+    // albedo's alpha its material's roughness (flags.y, float bits), so last present's surfaces carry
+    // their material too.
+    o.w("col0 = rtxUnlit0;\ncol1 = rtxUnlit1;\nc0 = colors[1]; c1 = colors[2]; c2 = colors[3]; prev = colors[0];\n");
+    // The game's painted shadows (flags.w: texmaps whose texture is a shadow) read white here, so
+    // only the ray-traced shadow darkens the surface.
+    for (uint32_t n = 0; n < numStages; ++n) {
+      if (!bp.order_enable(n)) continue;
+      o.w("if (((uint)flags.w >> %d) & 1u) tex_ta[%u] = wu4(255,255,255,255);\n", bp.order_texmap(n), n);
+    }
+    RegState albedo_rs;
+    emit_tev_stages(albedo_rs);
+    o.w("oalbedo = float4(saturate(float3(prev.rgb) / 255.0), saturate(asfloat(flags.y)));\n");
+    // The normal GX lit the surface with, as the model has it (a few face away from the camera on
+    // purpose: Mario's shoes are dark that way); only one made from the triangle faces the camera.
+    o.w("float3 rtx_n = rtxViewNrm;\n"
+        "const bool rtx_derived = dot(rtx_n, rtx_n) < 1e-8;\n"
+        "if (rtx_derived) rtx_n = cross(ddx(rtxViewPos), ddy(rtxViewPos));\n"
+        "rtx_n = dot(rtx_n, rtx_n) > 1e-20 ? normalize(rtx_n) : float3(0.0, 0.0, 1.0);\n"
+        "if (rtx_derived && dot(rtx_n, rtxViewPos) > 0.0) rtx_n = -rtx_n;\n"
+        "onormal = float4(rtx_n, -rtxViewPos.z);\noid = uint(flags.x);\n"
+        // A blended piece that also writes depth (flags.z 3) is the surface where it is opaque; where
+        // the game lets what is behind show through, the pixel is marked and stays as the game drew it.
+        "if (flags.z == 3 && ocol0.a < 0.98) oid |= 0x80000000u;\n");
+    // The overlay over the G-buffer's surface (flags.z, the renderer's RtxLayer): the surface itself
+    // clears it (overlay 0, transmittance 1); a blended draw gives its colour to both targets, whose
+    // blend states compose it (gx_d3d12.cpp); any other draw replaces the pixel (overlay its colour,
+    // transmittance 0).
+    o.w("if (flags.z == 0 || flags.z == 3) { oover = float4(0.0, 0.0, 0.0, 0.0); otrans = float4(1.0, 1.0, 1.0, 1.0); }\n"
+        "else if (flags.z == 1) { oover = ocol0; otrans = ocol0; }\n"
+        "else { oover = ocol0; otrans = float4(0.0, 0.0, 0.0, 0.0); }\n");
+  }
+  // Remix's layer (flags.z from the renderer): an effect blends into it (1) or replaces it (2); any
+  // other draw that reaches these targets is a surface in front, which empties it.
+  if (remix_layer)
+    o.w("if (flags.z == 1) { oover = ocol0; otrans = ocol0; }\n"
+        "else if (flags.z == 2) { oover = ocol0; otrans = float4(0.0, 0.0, 0.0, 0.0); }\n"
+        "else { oover = float4(0.0, 0.0, 0.0, 0.0); otrans = float4(1.0, 1.0, 1.0, 1.0); }\n");
   o.w("}\n");
   return o.s;
 }
@@ -729,6 +820,7 @@ float true_widescreen_factor() { return g_true_widen.load(std::memory_order_rela
 
 static uint32_t g_main_proj[7];
 static bool g_main_proj_valid = false;
+bool g_hud_solid_coverage = false;
 void set_main_projection(const DrawCall* scene) {
   g_main_proj_valid = scene != nullptr;
   if (scene) std::memcpy(g_main_proj, &scene->xf_regs[0x20], sizeof g_main_proj);
@@ -968,7 +1060,15 @@ void fill_ps_constants(const DrawCall& dc, PSConstants& c, int efb_scale) {
   }
   c.efbscale[0] = 1.0f / efb_scale; c.efbscale[1] = 1.0f / efb_scale;
   { const float* vp = (const float*)&dc.xf_regs[0x1A]; c.mvscale[0] = vp[0] * efb_scale; c.mvscale[1] = vp[1] * efb_scale;
-    c.mvscale[2] = is_scene_draw(dc) ? 0.0f : 1.0f; }   // not the 3D scene (HUD, tags): shown as rendered, not from DLSS
+    c.mvscale[2] = is_scene_draw(dc) ? 0.0f : 1.0f;   // not the 3D scene (HUD, tags): shown as rendered, not from DLSS
+    // Solid HUD coverage (the Remix bridge's HUD layer): a HUD draw that is not alpha-blended covers
+    // its pixels whatever alpha it writes (the P1/P2 letters are drawn with alpha 0).
+    if (g_hud_solid_coverage && c.mvscale[2] > 0.0f && dc.xf_regs[0x26] != 0) {   // 2D (orthographic) HUD only, not backdrops
+      const uint32_t bm = dc.bp.blendmode(), src = (bm >> 8) & 7;
+      if (!((bm >> 3) & 1)) c.mvscale[2] = 0.0f;   // writes no colour (an invisible box): covers nothing
+      else if (!(bm & 1) || (src != 4 && src != 5)) c.mvscale[2] = 2.0f;
+    }
+  }
   c.tint[0] = c.tint[1] = c.tint[2] = 1.0f; c.tint[3] = 0.0f;
   // The model only, as the Gecko code does. Tinting every draw the player owns also caught the
   // shadow and the effects around the fighter, which is the tint appearing where it should not.

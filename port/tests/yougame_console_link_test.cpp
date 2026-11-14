@@ -1561,7 +1561,7 @@ static void card_transfers() {
 // Exercise the actual broker close envelope through Stream and console startup.
 static void room_upgrade_refusals() {
   const std::string mismatch = "the rooms server answered 403: This room uses a different lobby protocol or configuration";
-  CHECK(std::string(kMixedBuilds) == "Your friend is on a different version of Melee Unlocked. Both of you need the latest update to play together.");
+  CHECK(std::string(kMixedBuilds) == "Different Melee Unlocked versions: update from YouGame, or play someone on the same version.");
   CHECK(session_notice(kMixedBuilds) == std::string(kMixedBuilds));
   for (int mode = 0; mode < 6; ++mode) {
     ++cases; Fixture f(2,1); auto io = f.io();
@@ -1776,6 +1776,78 @@ static void friends_order_phase_a() {
   CHECK(!start_session(bad.input(),c,error,std::move(badio))); CHECK(error == "invalid console session start");
 }
 
+static void friends_css_match_hold() {
+  ++cases;
+  Fixture f; auto io=f.io(); io.friends_lobby=true;
+  std::vector<bool> locks; bool noticed=false, prepared=false;
+  io.css_scene=[&] { return f.now < 90001 ? 2 : 1; };
+  io.css_lock=[&](bool on) { locks.push_back(on); };
+  io.css_hold=[&](const std::string&) { CHECK(locks.empty()); noticed=true; };
+  io.prepared=[&](const SessionConfig&) {
+    CHECK(f.now >= 90001 && locks==std::vector<bool>{true}); prepared=true;
+  };
+  f.on_wait=[&] {
+    if (f.now < 90001) {
+      CHECK(locks.empty());
+      CHECK(std::none_of(f.messages.begin(),f.messages.end(),[](const json& m) { return str(m,"t")=="begin"; }));
+    }
+  };
+  SessionConfig c; std::string error;
+  CHECK(!start_session(f.input(),c,error,std::move(io)) && error.empty());
+  CHECK(noticed && prepared && locks==(std::vector<bool>{true,false}));
+  CHECK(std::count(f.logs.begin(),f.logs.end(),"css-join hold: host in match")==1);
+  int holds=0;
+  for (const auto& m:f.messages) if (str(m,"t")=="msg" && str(m["d"],"kind")=="mu-css-join") {
+    auto received=m; received["from"]="c0"; css_join::Message out;
+    CHECK(css_join::receive(received,"room:"+new_room_code(UINT64_C(0xfedcba9876543210))+":7","c0",out));
+    CHECK(out.kind==css_join::Kind::Hold); ++holds;
+  }
+  CHECK(holds==1);
+}
+
+static void friends_css_offer_peer_end() {
+  for (bool session_end:{false,true}) {
+    ++cases;
+    Fixture f; auto io=f.io(); io.friends_lobby=true;
+    bool locked=false, began=false, prepared=false; int off=0; uint64_t offer_when=0;
+    io.css_lock=[&](bool on) { if (locked && !on) ++off; locked=on; };
+    io.css_begin=[&] { began=true; return std::make_shared<css_join::Channel>(); };
+    io.prepared=[&](const SessionConfig&) { prepared=true; };
+    const auto send=io.send_room;
+    io.send_room=[&](const json& m) {
+      const bool ok=send(m);
+      if (str(m,"t")=="msg" && str(m["d"],"kind")=="mu-css-join") {
+        css_join::Message out; auto received=m; received["from"]="c0";
+        if (css_join::receive(received,str(m["d"],"match"),"c0",out) && out.kind==css_join::Kind::Offer) {
+          offer_when=f.now;
+          if (session_end) f.push({{"t","sessionEnded"},{"sessionId",m["d"]["match"]},{"reason","left"}});
+          else f.push({{"t","msg"},{"from","c1"},{"d",{{"kind","mu-console-end"},{"v",1},{"sessionId",m["d"]["match"]},{"reason","left"}}}});
+        }
+      }
+      return ok;
+    };
+    SessionConfig c; std::string error;
+    CHECK(!start_session(f.input(),c,error,std::move(io)));
+    CHECK(!locked && off==1 && !began && !prepared && offer_when && f.now-offer_when<50);
+  }
+}
+
+static void css_abort_after_release() {
+  for (int variant : {0,1,2,3}) {
+    ++cases;
+    Fixture f; SessionConfig c; std::string error;
+    auto link=start_session(f.input(),c,error,f.io()); CHECK(link);
+    auto msg=css_join::envelope({css_join::Kind::Abort,0,{}},variant==1?"other":c.session_id,"c0");
+    msg["from"]=variant==2?"stranger":"c1";
+    if (variant==3) msg["d"]["v"]=1;
+    link->css_join_release();
+    // Same method main uses for queued controls; pump uses this handler too.
+    link->css_join_message(msg);
+    CHECK(bool(link->lost())==(variant==0));
+    if (variant==0) CHECK(*link->lost()=="your friend disconnected");
+  }
+}
+
 static void friends_reenter_held_room() {
   ++cases;
   Fixture f; auto io = f.io(); io.friends_lobby = io.held_reenter = true;
@@ -1837,7 +1909,7 @@ int main(int argc,char** argv) {
   }
   friends_guest_waits_for_next_start();
   friends_reenter_held_room();
-  friends_order_phase_a();
+  friends_order_phase_a(); friends_css_match_hold(); friends_css_offer_peer_end(); css_abort_after_release();
   if (argc > 1 && std::string(argv[1]) == "--blocked-card-io") {
     blocked_card_io();
     std::printf("blocked card IO: %d cases, %d checks passed\n",cases,checks.load()); return 0;

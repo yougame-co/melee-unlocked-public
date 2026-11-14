@@ -5,6 +5,7 @@
 #include "yougame_console_card.h"
 #include "yougame_console_io.h"
 #include "yougame_update.h"
+#include "yougame_doubles.h"
 #include <array>
 #include <iomanip>
 #include <sstream>
@@ -132,16 +133,27 @@ class Link final : public SessionLink {
   std::map<int,uint64_t> reports;
   std::set<int> delay_acks;
   explicit Link(SessionIO i) : io(std::move(i)) { frame_zero_barrier = true; }
-  void service() {
-    running_ = true;
-    if (!io.background_service) return;
+  void prepare_service() {
+    if (!io.background_service || worker_.joinable()) return;
+    // Reserve the only fallible service resource before CSS PLUG_IN. The worker cannot
+    // consume room controls until both installations have been acknowledged.
     worker_ = std::thread([this] {
       while (!stop_) {
-        try { pump(0); }
-        catch (...) { std::lock_guard<std::mutex> lock(mutex_); end("your friend disconnected"); }
+        if (service_enabled_.load(std::memory_order_acquire)) {
+          try { pump(0); }
+          catch (...) { std::lock_guard<std::mutex> lock(mutex_); end("your friend disconnected"); }
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
       }
     });
+  }
+  void activate_service() noexcept {
+    running_ = true;
+    service_enabled_.store(true,std::memory_order_release);
+  }
+  void service() {
+    prepare_service();
+    activate_service();
   }
   ~Link() override {
     stop_ = true;
@@ -159,6 +171,9 @@ class Link final : public SessionLink {
   }
   void room_message(const json& m) {
     const auto t = str(m,"t");
+#ifdef MELEE_DOUBLES
+    if (io.doubles && doubles::terminal(m)) { end("doubles: match dissolved",false); return; }
+#endif
     const auto closed = friends::closed_line(m);
     if (!closed.empty()) { end(closed,false); return; }
     if (t == "sessionEnded") {
@@ -173,12 +188,24 @@ class Link final : public SessionLink {
     if (running_) presence(m);
     if (t == "msg" && m.count("d") && m["d"].is_object()) {
       const auto& d = m["d"];
+      css_join::Message join;
+      if (css_join::receive(m,config.session_id,str(m,"from"),join) && join.kind==css_join::Kind::Abort &&
+          std::any_of(frozen.begin(),frozen.end(),[&](const json& p) { return str(p,"connectionId")==str(m,"from") && p["port"]!=config.my_port; })) {
+        end("your friend disconnected"); return;
+      }
       if (std::none_of(frozen.begin(), frozen.end(), [&](const json& p) { return str(p,"connectionId") == str(m,"from"); })) return;
       if (str(d,"kind") == "mu-console-end" && d.value("v",json()) == 1 && str(d,"sessionId") == config.session_id) {
         const auto why = str(d,"reason");
         if (!friends::text(d,"reason",160).empty()) end(why == kSelfLeft ? "left" : why);
       }
     }
+  }
+  void css_join_message(const json& m) override {
+    std::lock_guard<std::mutex> lock(mutex_); room_message(m);
+  }
+  void css_join_release() override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    handoff_preparation = false; activate_service();
   }
   void send_pad(uint32_t frame, const MuPadStatus& pad) override {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -363,6 +390,7 @@ class Link final : public SessionLink {
   mutable std::mutex mutex_;
   std::atomic<bool> stop_{false};
   std::thread worker_;
+  std::atomic<bool> service_enabled_{false};
   bool armed_ = false;
   bool running_ = false;
   uint64_t relink_total_ = 0;
@@ -603,12 +631,27 @@ std::string new_room_code(uint64_t r) {
 std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& config, std::string& error, SessionIO io) {
   error.clear();
   auto link = std::make_unique<Link>(std::move(io));
-  auto& i = link->io;
+  auto i = link->io; // Own callbacks through provisional engine teardown and fallback.
   // Which stage a throw came from, for the log below (never the exception's text: it can carry a ticket).
   const char* step = "request";
   std::shared_ptr<handoff_join::Channel> live;
   SessionConfig fallback_config;
+  std::shared_ptr<css_join::Channel> css_live;
+  std::shared_ptr<css_join::Launch> css_launch;
+  bool css_lock_owned = false;
+  struct CssRelease {
+    SessionIO& io; bool& owned; std::shared_ptr<css_join::Channel>& channel;
+    ~CssRelease() {
+      if (channel) channel->cancelled.store(true,std::memory_order_release);
+      if (owned && !css_join::relaunching.load(std::memory_order_acquire) && io.css_lock) io.css_lock(false);
+    }
+  } css_release{i,css_lock_owned,css_live};
   auto relaunch = [&]() -> std::unique_ptr<SessionLink> {
+    if (i.css_relaunch) i.css_relaunch();
+    if (css_live) {
+      css_live->cancelled.store(true,std::memory_order_release);
+      while (css_live->working.load(std::memory_order_acquire)) i.wait(1);
+    }
     if (live) {
       live->cancelled.store(true,std::memory_order_release);
       // Main restores B before publishing paused=false. Never race prepared() with imported memory.
@@ -619,6 +662,26 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
     error.clear(); i.prepared(fallback_config); return nullptr;
   };
   auto fail = [&](const char* why) -> std::unique_ptr<SessionLink> {
+    if (css_live) {
+      i.log("css-join abort: link preparation");
+      if (link) for (const auto& p : link->frozen) if (p["port"] != fallback_config.my_port) {
+        try { i.send_room(css_join::envelope({css_join::Kind::Abort,0,{}},
+            fallback_config.session_id,str(p,"connectionId"))); } catch (...) {}
+      }
+      try { if (i.flush_room && !i.room_closed()) i.flush_room(1000); } catch (...) {}
+      if (i.css_lock) i.css_lock(false);
+      // Adoption can have moved the original link into a provisional engine. Stop main
+      // before reclaiming it; the established relaunch routine below is unchanged.
+      if (!link) {
+        css_live->cancelled.store(true,std::memory_order_release);
+        while (css_live->working.load(std::memory_order_acquire)) i.wait(1);
+        std::lock_guard<std::recursive_mutex> ownership(css_live->main_mutex);
+        if (css_launch && css_launch->link) link.reset(static_cast<Link*>(css_launch->link.release()));
+        else link = std::make_unique<Link>(i);
+        std::atomic_store(&css_join::launch,std::shared_ptr<css_join::Launch>{});
+      }
+      return relaunch();
+    }
     if (live) {
       i.log(std::string("handoff-join: refuse ") + (i.cancelled() ? "cancelled" : "link-setup-failed"));
       for (const auto& p : link->frozen) if (p["port"] != fallback_config.my_port) {
@@ -641,6 +704,9 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
     json ticket_request = {{"type","mpTicket"},{"room",code},{"players",players},{"mode","console"},{"ranked",false},
       {"lobby",{{"version",1},{"minPlayers",players},{"maxLocalPlayers",1},{"compatibility",i.compatibility}}}};
     if (i.friends_lobby) ticket_request["queue"] = "private";
+#ifdef MELEE_DOUBLES
+    if (i.doubles) ticket_request = doubles::ticket(i.compatibility,code,4);
+#endif
     step = "ticket";
     const auto ticket = i.request(ticket_request,10000);
     const auto room = friends::room(ticket);
@@ -648,6 +714,11 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
       i.log("console: ticket for room " + code + " came back " + (room.empty() ? std::string("without a room") : "for room " + room));
       return fail("couldn't open your friend's room");
     }
+#ifdef MELEE_DOUBLES
+    if (!host_new && !i.doubles && i.doubles_home && doubles::home_profile(ticket)) {
+      i.doubles_home(room); return fail("doubles: joining retained home");
+    }
+#endif
     step = "room";
     if (!i.open_room(str(ticket,"ticket"),room,10000)) {
       i.log("console: room " + room + " socket didn't open");
@@ -658,9 +729,12 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
 #endif
     if (i.opened) i.opened(room);
     Roster r; r.size = players; json start;
-    bool seat_logged = false;
+    bool seat_logged = false, css_held = false;
     uint64_t next_begin = 0, ping = i.clock();
-    // A friend has to accept the invite, launch and boot (quality's run: the joiner opened the room 114 s after the
+#ifdef MELEE_DOUBLES
+    doubles::Consent consent;
+#endif
+    // A friend has to accept the invite, launch and boot (a test run: the joiner opened the room 114 s after the
     // host, after the old 30 s wait had closed it). A human host can cancel from the waiting panel sooner.
     const uint64_t seats_until = i.clock() + 300000;
     const bool rejoin = request.count("sessionId");
@@ -673,20 +747,39 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
       json m;
       if (i.next_room(m,i.friends_lobby ? 50 : int(std::min<uint64_t>(50,seats_until-i.clock())))) {
         const auto t = str(m,"t");
+#ifdef MELEE_DOUBLES
+        if (!host_new && !i.doubles && i.doubles_home && t=="welcome" && doubles::home_profile(m)) {
+          i.doubles_home(room); return fail("doubles: joining retained home");
+        }
+#endif
         if (t == "welcome") r.me = str(m,"me");
         transport::read_roster(r,m);
+#ifdef MELEE_DOUBLES
+        if (i.doubles) {
+          consent.observe(m);
+          if (doubles::terminal(m)) return fail("doubles: match dissolved");
+          if (auto ready = consent.ready(valid_roster(r.participants,players,true,true)))
+            if (!i.send_room(*ready)) return fail("doubles: ready failed");
+        }
+#endif
         const auto closed = friends::closed_line(m);
         if (!closed.empty()) return fail(closed.c_str());
         if (i.roster && !r.me.empty()) i.roster(room,r.participants,r.me,r.revision);
         if (t == "command-error" && str(m,"action") == "begin" && str(m,"code") == "console_mixed_builds") {
           i.log("console: command-error console_mixed_builds"); return fail(kMixedBuilds);
         }
+#ifdef MELEE_DOUBLES
+        if (i.doubles && t == "command-error" && (str(m,"action")=="begin" || str(m,"action")=="ready")) continue;
+#endif
         if (t == "error" || t == "ended" || t == "kicked" || t == "command-error") return fail("couldn't start your friend's room");
         if (t == "sessionEnded" && !i.held_reenter && (!rejoin || str(m,"sessionId") == str(request,"sessionId"))) {
           const auto why = friends::text(m,"reason",160);
           i.log("console: session ended: " + why);
           return fail(why.empty() ? "your friend disconnected" : why.c_str());
         }
+        css_join::Message held;
+        if (i.friends_lobby && css_join::receive(m,"room:"+room+":"+std::to_string(r.revision),r.host_connection,held) &&
+            held.kind == css_join::Kind::Hold && i.waiting) i.waiting("Waiting for the host's match to end",false);
         if (!m.count("console") && m.count("room") && m["room"].is_object() && m["room"].count("console")) m["console"] = m["room"]["console"];
         if (!i.previous_session_active() && m.count("console") && m["console"].is_object()) { start = m; break; }
       }
@@ -695,8 +788,30 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
       if (!seat_logged && seat >= 0) { i.log("console: room " + room + " seat " + std::to_string(seat) + " of " + std::to_string(players)); seat_logged = true; }
       const bool full = valid_roster(r.participants,players,true,true), host = r.me == r.host_connection;
       if (!i.friends_lobby && i.waiting) i.waiting(full ? (host ? "Press START to play together" : "Waiting for the host") : friends::kWaiting, full && host);
+      if (!full) css_held = false;
+      if (i.friends_lobby && !rejoin && full && host && i.css_scene() != 1) {
+        if (!css_held) {
+          css_held = true;
+          if (i.css_scene() == 2) {
+            i.log("css-join hold: host in match");
+            std::string name;
+            for (const auto& p : r.participants) if (str(p,"connectionId") != r.me) name = friends::text(p,"name",40);
+            if (i.css_hold) i.css_hold(name);
+            i.send_room(css_join::envelope({css_join::Kind::Hold,0,{}},"room:"+room+":"+std::to_string(r.revision),
+                str(*std::find_if(r.participants.begin(),r.participants.end(),[&](const json& p) { return str(p,"connectionId") != r.me; }),"connectionId")));
+          }
+        }
+        continue; // Keep pumping the room, never request a scene change during fight/results.
+      }
       if (!rejoin && !i.previous_session_active() && full && host && (i.friends_lobby ? i.css_ready() : i.confirm_start()) && i.clock() >= next_begin) {
+        if (i.friends_lobby && i.css_lock && !css_lock_owned) { i.css_lock(true); css_lock_owned = true; }
         json begin = {{"t","begin"},{"revision",r.revision},{"console",true},{"inputDelay",delay},{"settingsDigest",""}};
+#ifdef MELEE_DOUBLES
+        if (i.doubles) {
+          if (!consent.have_epoch || consent.revision != r.revision) continue;
+          begin = consent.begin(delay);
+        }
+#endif
         if (i.freeze_pick) {
           std::string name;
           for (const auto& p : r.participants) if (str(p,"connectionId") != r.me) { name = friends::text(p,"name",40); break; }
@@ -738,6 +853,12 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
     SessionConfig c; c.room = room; c.my_port = my_port; c.session_id = s["sessionId"]; c.seed = start_seed;
     c.epoch_ms = s["startedAt"].get<int64_t>(); c.input_delay = s["inputDelay"].get<int>();
     c.settings_digest = s["settingsDigest"].get<std::string>();
+#ifdef MELEE_DOUBLES
+    if (i.doubles) {
+      std::string rejection;
+      if (!doubles::freeze(s,c,rejection)) return fail(rejection.c_str());
+    }
+#endif
     c.card_digest = str(s,"cardDigest");
     if (!c.card_digest.empty() && !card_hash(c.card_digest)) return fail(kCardFailure);
     if (sync_card && c.card_digest.empty()) i.log("console: no shared save in the start; this seat starts with default unlocks");
@@ -956,9 +1077,42 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
     link->config = c;
     if (i.friends_lobby && i.prepared && i.handoff_join && players != 2)
       i.log("handoff-join: refuse requires-one-guest");
+    // The small-state protocol is versioned and opt-in at both ends. Legacy peers retain
+    // the ordinary relaunch path. No native span bytes are transferred on this route.
+    if (i.css_begin && i.friends_lobby && i.prepared && !rejoin && players == 2) {
+      std::string peer;
+      for (const auto& p : link->frozen) if (p["port"] != c.my_port) peer = str(p,"connectionId");
+      bool accepted = false, offered = false, acked = false;
+      uint64_t offer_at = 0;
+      const auto css_until = i.clock()+3000;
+      while (!accepted && i.clock()<css_until && !i.cancelled() && !i.room_closed()) {
+        if (i.clock() >= offer_at) {
+          i.send_room(css_join::envelope({css_join::Kind::Offer,0,{}},c.session_id,peer));
+          offer_at = i.clock()+250;
+        }
+        json m; css_join::Message msg; std::string rejection;
+        if (!i.next_room(m,10)) continue;
+        if (!css_join::receive(m,c.session_id,peer,msg,&rejection)) {
+          if (!rejection.empty()) i.log(rejection);
+          link->room_message(m);
+          if (link->lost()) { if (i.css_lock) i.css_lock(false); return fail(link->lost()->c_str()); }
+          continue;
+        }
+        if (msg.kind == css_join::Kind::Offer) {
+          offered = true;
+          i.send_room(css_join::envelope({css_join::Kind::Accept,0,{}},c.session_id,peer));
+        } else if (msg.kind == css_join::Kind::Accept) acked = true;
+        else break;
+        accepted = offered && acked;
+      }
+      if (accepted) {
+        css_live = i.css_begin();
+        if (css_live) { fallback_config = c; link->handoff_preparation = true; }
+      }
+    }
     // Finish card choice first: negotiation must never consume its deadlines or change its result.
     // No game body is paused here. Only accepted live preparations proceed through the existing mesh setup.
-    if (hj && (i.handoff_join || hj->engaged())) {
+    if (!css_live && hj && (i.handoff_join || hj->engaged())) {
       try {
         if (hj_host && i.handoff_join) hj->begin(i.clock(),i.handoff_css(),!c.card_digest.empty());
         if (!hj_host && i.handoff_join && !hj->engaged()) hj->refuse("peer-not-offering");
@@ -976,7 +1130,7 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
       } catch (...) { hj->refuse("protocol-error"); }
     }
     if (hj && hj->accepted() && (c.default_card || !card_bytes_ok(c))) hj->refuse("shared-card-required");
-    if (hj && hj->accepted() && i.handoff_begin) {
+    if (!css_live && hj && hj->accepted() && i.handoff_begin) {
       live = i.handoff_begin();
       if (live) {
         fallback_config = c; link->handoff_preparation = true;
@@ -988,8 +1142,9 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
         }
       }
     }
-    if (i.prepared && !live) {
+    if (i.prepared && !live && !css_live) {
       if (hj && hj->accepted()) hj->refuse("start-at-N-unavailable");
+      if (i.css_relaunch) i.css_relaunch();
       i.prepared(c); return nullptr;
     }
     i.log("console: start session " + c.session_id + " seed " + hex(c.seed) + " delay " + std::to_string(c.input_delay));
@@ -1071,7 +1226,10 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
     };
     // The app may take seconds to map the helper's ring (Friends waits 10 s); every step logs why it stopped.
     step = "attach";
-    if (!i.attach(std::min(10000,budget()))) { i.log("console: link helper attach failed"); return fail("couldn't connect to your friend"); }
+    if (!i.attach(std::min(10000,budget()))) {
+      i.log("console: link helper attach failed");
+      return fail(i.helper_missing() ? kHelperMissing : "couldn't connect to your friend");
+    }
     step = "open";
     for (const auto& p : link->frozen) {
       const auto conn = str(p,"connectionId"); if (conn == r.me) continue;
@@ -1132,6 +1290,36 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
         if (!link->agree_delay()) {
           if (link->lost()) return fail(link->lost()->c_str());
           return fail(i.cancelled() ? "cancelled" : "couldn't agree on a delay");
+        }
+        if (css_live) {
+          link->prepare_service();
+          const int other_port = link->peers.front().port;
+          const std::string peer = link->peers.front().connection;
+          auto launch = css_launch = std::make_shared<css_join::Launch>();
+          launch->config = link->config;
+          launch->config.settings_digest.clear(); link->config = launch->config;
+          launch->link = std::move(link);
+          std::atomic_store(&css_join::launch,launch);
+          const bool joined = css_join::synchronize(i,hj_host,other_port,peer,launch->config,css_live);
+          if (!joined) {
+            css_live->cancelled.store(true,std::memory_order_release);
+            while (css_live->working.load(std::memory_order_acquire)) i.wait(1);
+            // Main has ended any provisional engine. Only an unadopted link can remain.
+            // Recover ownership before entering the unchanged relaunch fallback.
+            {
+              std::lock_guard<std::recursive_mutex> ownership(css_live->main_mutex);
+              if (launch->link) link.reset(static_cast<Link*>(launch->link.release()));
+              else link = std::make_unique<Link>(i);
+              std::atomic_store(&css_join::launch,std::shared_ptr<css_join::Launch>{});
+            }
+            return relaunch();
+          }
+          config = launch->config;
+          // Main has acknowledged installation and released the lock. fallback_config
+          // retains friends1's relaunch pick; the live config cleared it before adoption.
+          css_lock_owned = false; css_live.reset();
+          if (i.css_adopted) i.css_adopted();
+          return nullptr;
         }
         if (live) {
           handoff_join::transfer(i,hj_host,link->peers.front().connection,link->config,live);

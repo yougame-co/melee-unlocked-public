@@ -126,6 +126,15 @@ int main() {
     CHECK(!h.press()); CHECK(h.sends == 0);
   }
   {
+    // A sign-in that already works (the next start after linking) offers no link and sends nothing.
+    Harness h; h.p.linked = true;
+    CHECK(h.p.line(Screen::Search) == kSearching); CHECK(h.p.line(Screen::Refusal) == kRefusal);
+    CHECK(!h.press()); CHECK(!h.press(Screen::Refusal, 0x10000)); CHECK(h.sends == 0);
+    h.p.linked = false; CHECK(h.p.line(Screen::Search) == kSearchCta);
+    h.p.linked = true; h.p.now = true;   // linked during this run keeps its own wording
+    CHECK(h.p.line(Screen::Search) == yougame::blend::kSearchBoth); CHECK(h.p.line(Screen::Refusal) == kLinkedMenu);
+  }
+  {
     Harness h; CHECK(h.p.line(Screen::None).empty()); CHECK(!h.press(Screen::None));
     CHECK(h.p.line(Screen::Search) == kSearchCta); CHECK(h.p.line(Screen::Refusal) == kRefusalCta);
     CHECK(h.press()); h.wait_send(); CHECK(h.p.line(Screen::Search) == kOpen);

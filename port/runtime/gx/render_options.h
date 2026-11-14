@@ -38,6 +38,7 @@ constexpr float kTrueAspectMax = 64.0f / 27.0f;
 constexpr float kTrueAspectMin = 4.0f / 3.0f;
 
 struct RenderOptions {
+  bool prewarm_only = false;   // device and startup caches only; never present or start the game
   // The decompiled Source Port shares the host UI and renderers with Legacy, but it does not run
   // the translated guest's Slippi/Gecko patch hooks. Keep that distinction explicit in the UI and
   // in presentation defaults without changing the user's saved Legacy settings.
@@ -52,7 +53,10 @@ struct RenderOptions {
   // loop holds at twice the display's refresh rate (MELEE_PRESENT_UNCAPPED=1 removes that limit for
   // tests). With a SubFrameMode other than Off the renderer presents new sub-frames between 60 Hz
   // simulation frames.
-  double fps_cap = 60; // -1 follows the active monitor
+  // The defaults are the port's whole point: the monitor's rate (a 144 Hz display gets 144; not
+  // uncapped, which spun fans up on the menus for frames nobody sees) with sub-frame animation
+  // predicting ahead. Automated runs set 60 Hz and Off (app/main.cpp); a saved setting wins.
+  double fps_cap = -1; // -1 follows the active monitor, 0 = uncapped
   bool fullscreen = false;
   bool exclusive_fullscreen = false;
   // Off by default: Slippi's Lagless FoD, as the Source Port always runs it. A player's report found
@@ -185,9 +189,9 @@ struct RenderOptions {
   // switch and the kept values are saved in port-settings.ini, so the state survives a restart.
   struct LowSpecPrevious {
     RenderApi api = RenderApi::D3D12;
-    double fps_cap = 60;
+    double fps_cap = -1;   // the defaults above: the monitor's rate, Predict ahead
     int efb_scale = 0, ssaa = 1, anisotropy = 16, effects_level = 0, dlss_mode = 0;
-    SubFrameMode subframe = SubFrameMode::AuthoredInterpolate;
+    SubFrameMode subframe = SubFrameMode::Authored;
   };
   bool low_spec = false;
   LowSpecPrevious low_spec_previous;
@@ -208,10 +212,9 @@ struct RenderOptions {
   // Source Port mod profiles and offline 20XX TE options are available under Mods in 0.8.5.
   static constexpr bool kModFeaturesAvailable = true;
   static bool mod_features_available() { return kModFeaturesAvailable && !host::gameplay::vanilla_only(); }
-  // DXR path tracing and Ray Reconstruction: not offered in 0.8. They rebuild the whole stage's
-  // ray tracing geometry every frame, which dropped the picture to a few frames per second in
-  // matches. Hidden and forced off (saved values ignored) until that is reworked.
-  static constexpr bool kPathTracingAvailable = false;
+  // Path tracing (Video > Ray tracing): the rtx_* path tracer on the GPU scene. The 0.7 pass that
+  // rebuilt the stage on the CPU every frame is retired (MELEE_DXR_LEGACY=1 for comparison).
+  static constexpr bool kPathTracingAvailable = true;
   // Content views (source_host.cpp): with a mod profile, Direct uses the mod when this is on (the
   // default), the retail game otherwise; Unranked, Teams and Party always use the retail game.
   bool mods_in_direct = true;
@@ -238,6 +241,15 @@ struct RenderOptions {
   // explosion runs out of sight, so the match is unchanged (host::g_hide_ko_explosions). The player's
   // own, online and in replays too.
   bool hide_ko_explosions = false;
+  // "Hide emblems behind percents" (Video tab, ini key hide_hud_emblems, both engines): the character
+  // emblem behind each damage percent is not drawn (host::g_hide_hud_emblems). Picture only.
+  bool hide_hud_emblems = false;
+  // "Community codes" (HUD tab, ini key community_codes, Source Port): MU_DISPLAY_OPTION_CODES_ALL
+  // bits, the native versions of players' Gecko codes (host::g_community_codes). Picture and sound.
+  uint32_t community_codes = 0;
+  // "Stronger Pro AI (Requires additional download)" (Practice menu > Fight a pro, ini key
+  // proaistronger): 0 ask, 1 always, 2 never (phillip_ai::StrongerChoice).
+  int pro_ai_stronger = 0;
   // "Unlock everything" (Game tab, ini key unlock_all, on unless the file says 0): Slippi's "Unlock
   // All Characters and Stages". Off, the save file decides what is unlocked, offline only: a network
   // session always has everything. Static Recomp: gecko::option_unlock_all (host.cpp); Source Port:
@@ -329,10 +341,7 @@ struct RenderOptions {
   double pin_phase = -1;
   std::string settings_path = "port-settings.ini";
   std::string frame_times; // optional buffered CSV of CPU presentation timing
-  SubFrameMode subframe = SubFrameMode::Off;
-  // Online: protect match speed (slippi_online.cpp budget_watch). On by default.
-  bool online_frame_protection = true;
-  static std::atomic<bool>& live_online_frame_protection() { static std::atomic<bool> value{true}; return value; }
+  SubFrameMode subframe = SubFrameMode::Authored;   // Predict ahead
   static std::atomic<bool>& live_clean_replays() { static std::atomic<bool> value{false}; return value; }
   int efb_scale = 0;          // internal resolution multiplier; 0 = auto (integer scale covering the window, like Dolphin "Auto (Window Size)")
   int window_w = 1280, window_h = 960;  // initial client size
@@ -340,15 +349,15 @@ struct RenderOptions {
   // the window at it. Off = the window is whatever size it has been dragged to.
   bool window_pinned = false;
   AspectMode aspect = AspectMode::Auto;   // --aspect, or "aspect" in port-settings.ini
-  bool vsync = true;  // Fresh installs synchronize scanout; a saved explicit choice still wins.
+  bool vsync = false; // Avoid display queueing by default; preserve an explicit saved choice.
   bool widescreen = false;    // Slippi Widescreen 16:9 code on (present at 16:9 and tell the game)
   // EXPERIMENTAL: widen the frustum in the renderer rather than running the Gecko code, so the HUD
   // and the 2D layer keep their authored size and nothing is written to guest memory. Mutually
   // exclusive with `widescreen`: both together would widen twice. See gx_shader.h.
   bool true_widescreen = false;
   // The aspect True widescreen widens to: 16:9, 16:10, the player's own W:H, or the window's shape.
-  // Presentation only. "truewsaspect" and "truewscustom W H" in the ini; files without them keep 16:9.
-  TrueAspect true_aspect = TrueAspect::Wide16_9;
+  // Presentation only. "truewsaspect" and custom W:H in the ini; default to the window's shape.
+  TrueAspect true_aspect = TrueAspect::FitWindow;
   int true_custom_w = 21, true_custom_h = 9;
   // Custom texture packs: replace game textures with PNGs from Load/Textures/GALE01, using
   // Dolphin's filenames and hashes so existing packs work unchanged. Off by default, and while it
@@ -370,8 +379,35 @@ struct RenderOptions {
   float crt_curve = 1.0f;     // the home television's screen curve, 1 as designed, 0 flat to 3 (crt_look)
   float sharpness = 0.0f;     // 0..1 contrast-adaptive sharpening in the present pass (works with or without DLSS)
   float screen_space_ao = 0.0f; // 0..1 depth-based contact shading; display-only, not ray traced
-  bool path_tracing = false;       // D3D12 DXR diffuse indirect bounce, display-only and off by default
-  bool ray_reconstruction = false; // DLSS-RR denoising of the path-traced HDR input; needs NVIDIA runtime
+  bool path_tracing = false;       // Video > Ray tracing: the path tracer, matches only, display-only, off by default
+  bool ray_reconstruction = true;  // DLSS-RR denoising of the path-traced HDR input (on with path tracing); needs NVIDIA runtime
+  int rtx_look = 100;              // 0 Faithful (the game's own lighting, ray-traced visibility) .. 100 Remastered
+  bool rtx_shadows = true;         // ray-traced shadows from the game's lights
+  bool rtx_ao = true;              // ray-traced ambient occlusion
+  bool rtx_fighter_shadows = true; // fighters' shadows on stages whose light is baked in
+  bool rtx_bounce = true;          // bounce light: light reflected off the stage onto everything lit
+  bool rtx_reflections = true;     // traced reflections on glossy and mirror-like surfaces
+  bool rtx_skin = true;            // soft skin: light scattering under fighters' matte surfaces
+  bool rtx_stage_shade = true;     // the stage's own sun shadows and contact shade where its light is painted in
+  int rtx_mod_floors = 2;          // Shiny floors on stage mods: 0 off (0.9.107), 1 sheen, 2 mirror (before 0.9.106)
+  bool rtx_modded_stages = true;   // path tracing on stages whose files come from a mod (off: the mod as drawn)
+  bool rtx_effect_light = true;    // bright effects (fire, sparks, flashes) light the stage and fighters
+  bool rtx_glow_light = false;     // the stage's glowing art (Battlefield's neon edges) lights the fighters (1.0 test, off until approved)
+  int rtx_brightness = 115;        // relit picture brightness, percent (50..200)
+  bool rtx_glossy_floors = true;   // the stage's floors reflect the scene (fighters, effects, its own lights)
+  // Ray tracing preset (0 Custom, 1 Faithful, 2 Balanced, 3 Remastered, 4 Showcase) and the strengths it
+  // sets, percent (100 = Remastered): traced reflections, glossy floors, shadow depth, bounce light.
+  int rtx_preset = 3;
+  int rtx_reflection_strength = 100;
+  int rtx_floor_strength = 100;
+  int rtx_shadow_strength = 100;
+  int rtx_bounce_strength = 100;
+  bool rtx_photo_mode = true;      // a still (paused) scene keeps refining to a clean, converged picture
+  bool rtx_radiance_cache = true;  // multi-bounce light from a world-space radiance cache (NVIDIA build: SHaRC)
+  bool hdr_output = false;         // HDR10 output when Windows HDR is on (Direct3D 12)
+  int hdr_paper_white = 200;       // nits of the game's white in HDR (80..500)
+  int hdr_peak = 0;                // the display's peak nits for highlights; 0 = what Windows reports
+  int rtx_integrator = 0;          // 0 Melee Unlocked's, 1 NVIDIA RTXDI (local builds that have it)
   float brightness = 1.0f, contrast = 1.0f, vibrance = 1.0f;
   int anisotropy = 4;         // texture anisotropic filtering 1..16 (4: the High preset, the default)
   int msaa = 1;               // multisampling: 1 off, 2/4/8 samples (EFB drawn multisampled, resolved before every read)
@@ -382,6 +418,8 @@ struct RenderOptions {
   uint32_t capture_burst = 0;  // if set, capture this many consecutive presented frames from capture_frame
   uint64_t capture_sim_frame = 0;  // if set, the burst starts at the first presented frame whose simulation sequence >= this
   std::string shader_cache = "shadercache";   // directory for compiled shader blobs and the D3D12 pipeline library
+  bool shader_cache_shared = false;  // --shader-cache named it: another build (YouGame's copies) may use it too, so
+                                     // the other builds' shader folders are never pruned from it
   std::string dump_path;      // write a text dump of draw state + shaders at dump_frame
   uint32_t dump_frame = 0;
 };

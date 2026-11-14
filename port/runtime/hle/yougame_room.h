@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include "yougame_transport.h"
+#include "yougame_doubles_teams.h"
+#include "yougame_lobby_setup.h"
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include "yougame_agent_input.h"
 #include <cstdlib>
@@ -46,15 +48,28 @@ template<class Socket> struct RoomState {
   // Four-seat Teams only. Singles rosters also carry team numbers; they do not enable Teams.
   // Room slot n is Slippi player_idx n / controller port n+1, independent of roster order.
   std::array<int, 4> port_teams = {{-1, -1, -1, -1}};
+  // A Doubles match room's lobby (nativeTeams, muDoubles) names every seat's team; it outranks rosters.
+  doubles_teams::Seats doubles;
+  // The match the host's console begin froze (the start frame), which outranks the lobby; settled once
+  // its result came or Rooms reset the room after it: the room plays one match, then closes (4004).
+  doubles_teams::Setup setup;
+  bool settled = false;
   int seat_team(int player_idx) const {
-    return size == 4 && player_idx >= 0 && player_idx < 4 ? port_teams[player_idx] : -1;
+    if (size != 4 || player_idx < 0 || player_idx >= 4) return -1;
+    if (setup.known) return setup.team[player_idx];
+    return doubles.known ? doubles.team[player_idx] : port_teams[player_idx];
   }
+  // The room teams a result is checked against: the start's when known, else the roster's.
+  const int* result_teams() const { return setup.known ? setup.team.data() : port_teams.data(); }
   json pending_team_result;             // legacy socket's complete Teams finish outcome
   bool pending_begin = false;
   uint64_t begin_at = 0;               // when a refused begin may be tried again
   bool in_game = false;                // between game_started and its one game_ended
   Games games;
   int pending_winner = -2;             // -2 none, -1 no single winner, else 0-based port
+  // A Friends lobby match (yougame_lobby_setup.h): the plan from the room's frozen setup. Its result is
+  // the full ranking by setup id with the setup echoed (lobby::finish_report), as pending_team_result.
+  std::shared_ptr<const lobby::Plan> lobby;
 };
 
 struct RoomIO {
@@ -66,7 +81,22 @@ struct RoomIO {
   std::function<void(const char*)> log = [](const char*) {};
   std::function<void(const json&)> result = [](const json&) {};
   std::function<void(const std::string&)> started = [](const std::string&) {};
+  std::function<void()> settled = [] {};  // a Doubles match room's one match is over (called once, unlocked)
+  // Every room message, under the room mutex: a Friends lobby room keeps its lobby current through the
+  // match and between matches (yougame_lobby.h Session::receive), so the next select starts from it.
+  std::function<void(const json&)> message = [](const json&) {};
+  // Each turn, under the room mutex: frames the room's own lobby session owes (appended to the turn's sends).
+  std::function<void(std::vector<json>&)> tick = [](std::vector<json>&) {};
+  // When the pump stops: true hands the links on (the Friends lobby's next search adopts the room) instead
+  // of closing them.
+  std::function<bool()> keep_links = [] { return false; };
 };
+// A Doubles match room's one match is over: its result, or Rooms ending the room after the start.
+template<class Room> bool settles(const Room& r, const json& m) {
+  if (!r.setup.known || r.settled) return false;
+  const auto t = str(m, "t");
+  return (t == "result" && str(m, "matchId") == r.setup.match) || (t == "teams-dissolved" && str(m, "reason") == "reset");
+}
 // What the room is waiting for: a begin (the host, once a game starts) and the finish. Decided
 // under the room mutex, sent after it is released (a stalled socket must not hold up the game thread).
 template<class Room> std::vector<json> due_messages(Room& r, uint64_t now) {
@@ -121,6 +151,7 @@ template<class Room> void read_participants(Room& r, const json& m) {
 template<class Room> void read_roster(Room& r, const json& m) {
   read_participants(r, m);
   read_seat_teams(r, m);
+  if (r.size == 4) doubles_teams::read(m, r.doubles);
   if (m.count("host") && m["host"].is_string()) r.host_connection = m["host"].get<std::string>();
   if (m.count("revision") && m["revision"].is_number_integer()) r.revision = m["revision"].get<int>();
 }
@@ -226,9 +257,11 @@ template<class Room> void pump_room(Room* r, std::mutex& mutex, const RoomIO& io
       if (r->socket->closed() && left && !r->stop) io.pause((int)std::min<uint64_t>(100, left));
     }
     std::vector<json> out;
-    bool stop_links = false;
+    bool stop_links = false, settled_now = false;
     {
       std::lock_guard<std::mutex> lock(mutex);
+      if (got && settles(*r, m)) { r->settled = settled_now = true; }
+      if (got) io.message(m);
       if (got) {
         const auto t = str(m, "t");
         if (broker && (t == "ended" || t == "end" || t == "kick" || t == "kicked" || t == "error" || m.count("setOver"))) stop_links = true;
@@ -275,6 +308,9 @@ template<class Room> void pump_room(Room* r, std::mutex& mutex, const RoomIO& io
             if (!r->ranked) r->games.receive(m);
             if (str(m, "matchId") == r->match_id) { r->match_id.clear(); r->recovery.result(); }
           }
+        } else if (t == "command-error" && r->setup.known && str(m, "action") == "begin") {
+          // A Doubles begin sent just before the start ("A match is already active or complete"): the match
+          // the start froze is the one being played, so the refusal is expected and nothing is retried.
         } else if (t == "command-error") {
           const auto action = str(m, "action");
           // Human text is bounded plain ASCII for logs only; never a protocol decision.
@@ -298,8 +334,12 @@ template<class Room> void pump_room(Room* r, std::mutex& mutex, const RoomIO& io
         if (!awaiting_welcome) { r->recovery.cancel_wait(); r->ticket_retry = {}; reopen_at = 0; }
       }
       if (broker && r->recovery.expired(io.clock())) room_closed = true;
-      if (!room_closed && !r->recovery.pending() && !awaiting_welcome && !r->socket->closed()) out = due_messages(*r, io.clock());
+      if (!room_closed && !r->recovery.pending() && !awaiting_welcome && !r->socket->closed()) {
+        out = due_messages(*r, io.clock());
+        io.tick(out);
+      }
     }
+    if (settled_now) { io.log("yougame: the Doubles match is over; the room closes behind it"); io.settled(); }
     if (stop_links) end_links(*r, io);
     if (room_closed) break;
     if (!r->socket->closed() && io.clock() - last_ping > 5000) {
@@ -317,7 +357,12 @@ template<class Room> void pump_room(Room* r, std::mutex& mutex, const RoomIO& io
       }
     }
   }
-  end_links(*r, io);
+  bool settled;
+  { std::lock_guard<std::mutex> lock(mutex); settled = r->settled; }
+  // After a Doubles match's result Rooms closes the room (4004): a normal end. The links stay up for the
+  // game's own exit from its results, so no seat sees its partners drop first.
+  if (room_closed && settled) io.log("yougame: the Doubles room closed after its match (a normal end)");
+  else if (room_closed || !io.keep_links()) end_links(*r, io);
   if (room_closed) {
     std::lock_guard<std::mutex> lock(mutex);
     r->participants = json::array();

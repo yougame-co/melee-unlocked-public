@@ -2,10 +2,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <string>
+#include <vector>
+#include <cstdint>
 
 namespace source_port {
 // Maps the game's memory where the console had it. Call first in main, before other allocations.
 bool reserve_memory();
+// Simulation thread only, before run() enters game startup. Opt in to checkpoint memory and
+// native-allocation tracking; phase 1 calls this only for the offline agent proof.
+void css_origin_arm();
+// Simulation thread only. Queues a same-process reset; disc/callback busy retries next body.
+bool request_css_origin_reset(const std::vector<uint8_t>& card_bytes);
 // Loads melee_game.dll and runs the game. `shutdown` runs the application's exit sequence when the
 // game ends from inside (it cannot unwind through the game's frames), then the process exits.
 int run(void (*shutdown)(int code));
@@ -39,6 +46,10 @@ bool set_replay(const char* path);
 // the whole best-of-3 set, locking the same character in for each game, then ends the run.
 // Returns false for a malformed spec.
 bool set_online_test(const char* spec);
+#if MU_SQUAD
+// Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+bool check_squad_test(bool local_peer, bool invalid_lineup, bool net_delay = false);
+#endif
 // --slippi-menus on|off (default on): Slippi's online menus in the native game. The host serves the
 // patched menu files and sets MU_GAME_OPT_SLIPPI_MENUS; forced off with --replay, --online-test,
 // --vanilla-game or when the system files cannot be built.

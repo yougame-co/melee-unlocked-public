@@ -51,9 +51,9 @@ void diagnose_first_s8(size_t index, size_t chain_size, int matrix_index, double
   for (const auto& track : current.tracks) {
     std::fprintf(stderr, "[M8-S8-TRACK] channel=%u start=%d value_format=%u slope_format=%u bytes=%zu data=",
                  track.channel, track.start_frame, track.value_format, track.slope_format,
-                 track.bytes.size());
-    const size_t bytes = std::min<size_t>(track.bytes.size(), 16);
-    for (size_t k = 0; k < bytes; ++k) std::fprintf(stderr, "%02X", track.bytes[k]);
+                 track.size());
+    const size_t bytes = std::min<size_t>(track.size(), 16);
+    for (size_t k = 0; k < bytes; ++k) std::fprintf(stderr, "%02X", track.data()[k]);
     std::fputc('\n', stderr);
   }
   std::fflush(stderr);
@@ -70,7 +70,7 @@ bool inverse(const Matrix& m,Matrix& o) {
   return true;
 }
 bool same_track(const NativeMelee::PackedTrack& a,const NativeMelee::PackedTrack& b) {
-  return a.start_frame==b.start_frame&&a.channel==b.channel&&a.value_format==b.value_format&&a.slope_format==b.slope_format&&a.bytes==b.bytes;
+  return a.start_frame==b.start_frame&&a.channel==b.channel&&a.value_format==b.value_format&&a.slope_format==b.slope_format&&NativeMelee::SameBytes(a,b);
 }
 // Inverse-transpose of the 3x3 part (the GX normal matrix), row-major 3x3 output.
 bool normal_matrix(const Matrix& m, float out[9]) {
@@ -158,7 +158,7 @@ bool camera_motion(const AuthoredPose& previous,const AuthoredPose& current,doub
   // A view that did not change is drawn as it is. That includes every camera other than the game's
   // own during a quake: the shake flag and offset are global, and the HUD's camera, which never
   // moves, would otherwise have the stage camera's shake taken out of it (the timer bobbed).
-  if(!previous.has_view||previous.view==current.view) return true;
+  if(!previous.has_view||(previous.view==current.view&&!previous.model_shift&&!current.model_shift)) return true;
   Matrix prev=from12(previous.view.data());
   // A quake jolts the view back and forth every tick. Advancing along the jolt overshoots it (an
   // alternating offset of a is drawn as up to 3a), and blending it shows camera positions the game
@@ -303,8 +303,9 @@ static bool sample_chain(const AuthoredPose& previous,const AuthoredPose& curren
           else if(t.channel>=8&&t.channel<=10)component=&ts[t.channel-8];
           else { ++authored_stats().sample[5]; sampled=false; break; }
           float at_current, value;
-          if(!NativeMelee::SamplePacked(t,j.frame,at_current)||!near(at_current,*component)){ ++authored_stats().sample[6]; sampled=false; break; }
-          if(!NativeMelee::SamplePacked(t,sample_frame,value)){ ++authored_stats().sample[7]; sampled=false; break; }
+          NativeMelee::PackedSampleCursor cursor;
+          if(!NativeMelee::SamplePacked(t,j.frame,at_current,&cursor)||!near(at_current,*component)){ ++authored_stats().sample[6]; sampled=false; break; }
+          if(!NativeMelee::SamplePackedFromCursor(t,sample_frame,value,cursor)){ ++authored_stats().sample[7]; sampled=false; break; }
           *component=value;
         }
         if(sampled){ scale=ts; rot=tr; pos=tp; animated=true; } else partial=true;

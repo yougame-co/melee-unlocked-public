@@ -60,6 +60,8 @@ class Socket {
  }
  int connection() const {return opens.load();}
  bool lobby_mismatch() const {return false;}
+ bool busy() const {return false;}
+ bool room_full() const {return false;}
  int close_code() const {return code;}
  bool recoverable() const {return gone && code==1006;}
  bool rejoinable() const {return gone && (code==1006 || code==4002);}

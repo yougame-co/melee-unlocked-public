@@ -11,3 +11,9 @@ add_executable(port_yougame_embed_volume_test "${PROJECT_SOURCE_DIR}/port/tests/
 target_include_directories(port_yougame_embed_volume_test PRIVATE "${PROJECT_SOURCE_DIR}/port/runtime/hle")
 target_compile_features(port_yougame_embed_volume_test PRIVATE cxx_std_17)
 add_test(NAME port_yougame_embed_volume COMMAND port_yougame_embed_volume_test)
+add_executable(port_yougame_embed_fullscreen_test "${PROJECT_SOURCE_DIR}/port/tests/yougame_embed_fullscreen_test.cpp")
+target_include_directories(port_yougame_embed_fullscreen_test PRIVATE "${PROJECT_SOURCE_DIR}/port/runtime/hle")
+target_compile_features(port_yougame_embed_fullscreen_test PRIVATE cxx_std_17)
+add_test(NAME port_yougame_embed_fullscreen COMMAND port_yougame_embed_fullscreen_test)
+add_test(NAME port_embed_fullscreen_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${PROJECT_SOURCE_DIR}/port/tests/embed_fullscreen_wiring_test.py")

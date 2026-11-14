@@ -3,7 +3,9 @@
 // game exits and relaunches. Everything network-side runs on a background thread.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace host::updater {
@@ -29,6 +31,12 @@ bool archive_inside(const std::string& zip_path_utf8, const std::string& root);
 bool unpack_archive(const std::string& zip_path_utf8, const std::string& dest_utf8);
 // Unpacks a downloaded .zip or .tar.gz in process, refusing any entry that would land outside `dest`.
 bool unpack_download(const std::string& archive_utf8, const std::string& dest_utf8);
+// After a failed unpack on this thread: the file it could not write (empty: the archive was damaged).
+std::string last_unpack_write_error();
+// A downloaded file into place beside the game (rename, else copy), tried for about 5 s while antivirus
+// holds it; and the plain message for a failed write there (Windows' reason, what to do about it).
+bool place_file(const std::filesystem::path& from, const std::filesystem::path& to, std::error_code& ec);
+std::string place_error(const std::string& what, const std::filesystem::path& dir, const std::error_code& ec);
 // The batch script an update hands over to (exposed for the unit test): `self` and `others` are
 // the processes it waits for, `relaunch` the command line it starts when the files are in place.
 // `show_failure` opens a console window with the reason when the update cannot be put in place.
@@ -36,6 +44,11 @@ std::string install_script(const std::string& batch_dir, unsigned long self, con
                            const std::string& relaunch, bool show_failure);
 // Game processes from this installation that must close before replacement.
 std::vector<unsigned long> install_processes(const std::string& install_root_utf8);
+
+// Downloads one file (redirects followed, never HTTPS to HTTP), refuses it unless its SHA-256 is
+// `sha256` (lowercase hex), and only then puts it at `dest` (written beside it first). Blocking: call
+// it from a worker thread. Fight a pro fetches Phillip's matchup policies with it.
+bool fetch_verified(const std::string& url, const std::string& sha256, const std::string& dest_utf8, std::string* why);
 
 // DLSS 5: NVIDIA's model is its own download (it would more than double every update). One click
 // fetches it from the release, checks NVIDIA's file against its known SHA-256 and puts it beside the
@@ -47,4 +60,42 @@ void dlss5_model_download(const std::string& game_dir_utf8);
 ModelState dlss5_model_state(const std::string& game_dir_utf8);
 std::string dlss5_model_message();
 constexpr const char* kDlss5ModelSize = "about 180 MB";
+
+// The build for processors without AVX2 (the _compat programs), its own download since 0.9.98, so
+// nobody else downloads it: the main package names its file and SHA-256 in compat.sha256, and the
+// launcher fetches it on a PC that needs it, again after each update (compat.installed records which
+// one is beside the game). Background thread.
+bool compat_build_needed(const std::string& game_dir_utf8);
+void compat_build_download(const std::string& game_dir_utf8);
+ModelState compat_build_state(const std::string& game_dir_utf8);
+std::string compat_build_message();
+
+// Intel XeSS (libxess.dll), its own download since 0.9.98: PC settings > Video has the button. The
+// file is checked against Intel's build before it goes beside the game; the game loads it at its
+// next start. Background thread.
+bool xess_present(const std::string& game_dir_utf8);
+void xess_download(const std::string& game_dir_utf8);
+ModelState xess_state(const std::string& game_dir_utf8);
+std::string xess_message();
+constexpr const char* kXessSize = "about 60 MB";
+
+// The RTX Pack (MeleeUnlocked-<version>-RTX-Pack.zip): NVIDIA's renderer (RTX folder, built from
+// NVIDIA's RTX SDKs, which cannot be part of the open-source game) and the RTX Remix runtime (Remix
+// folder). Offered when the release has one (rtxpack.sha256 beside the game); checked against that
+// hash before it is unpacked; the game loads it at its next start. Background thread.
+bool rtx_pack_offered(const std::string& game_dir_utf8);
+bool rtx_pack_present(const std::string& game_dir_utf8);
+void rtx_pack_download(const std::string& game_dir_utf8);
+ModelState rtx_pack_state(const std::string& game_dir_utf8);
+std::string rtx_pack_message();
+constexpr const char* kRtxPackSize = "about 500 MB";
+
+// AMD FSR (amd_fidelityfx_loader_dx12/vk.dll and amd_fidelityfx_upscaler_dx12/vk.dll), its own download:
+// AMD's signed files from their FSR SDK repository at a pinned tag (nothing re-hosted), each checked
+// against its SHA-256 before it goes beside the game; the game loads them at its next start.
+bool fsr_present(const std::string& game_dir_utf8);
+void fsr_download(const std::string& game_dir_utf8);
+ModelState fsr_state(const std::string& game_dir_utf8);
+std::string fsr_message();
+constexpr const char* kFsrSize = "about 160 MB";
 }  // namespace host::updater

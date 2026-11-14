@@ -377,6 +377,11 @@ void apply_client_size(int w, int h) {
 }
 }  // namespace
 
+void window_prefer_background(bool on) {
+#ifdef __APPLE__
+  SDL_SetHintWithPriority(SDL_HINT_MAC_BACKGROUND_APP, on ? "1" : "0", SDL_HINT_OVERRIDE);
+#endif
+}
 bool g_vulkan_window = false;
 void window_prefer_vulkan(bool on) { g_vulkan_window = on; }
 
@@ -499,7 +504,7 @@ bool window_is_fullscreen() {
   return w && mac_window_is_fullscreen(w);
 }
 // A YouGame full-screen start uses SDL's non-Spaces full screen (a borderless window over the display, no separate
-// macOS Space): AppKit's Space titlebar asks for remote-view services the app's sandbox denies on every frame
+// macOS Space): AppKit's Space titlebar asks for remote-view services the app's sandbox denies on every frame.
 // SDL reads the hint when the window is created, so call this before window_create.
 void window_prefer_simple_fullscreen() { SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0"); }
 void window_defer_fullscreen_show() {
@@ -618,6 +623,9 @@ void window_set_dpi_callback(DpiCallback cb) { g_on_dpi = std::move(cb); }
 bool window_take_fullscreen_toggle() { return g_fullscreen_toggle.exchange(false); }
 #ifdef __APPLE__
 bool window_take_activation() { return g_activated.exchange(false); }
+#else
+// Linux has no exclusive fullscreen to enter again when the window comes back.
+bool window_take_activation() { return false; }
 #endif
 bool window_take_settings_toggle() { return g_settings_toggle.exchange(false); }
 int window_take_trace_mark() { return g_trace_mark.exchange(0); }

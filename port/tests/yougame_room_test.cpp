@@ -196,6 +196,26 @@ static void lobby_start_links() {
   f.b.at(8,[&]{CHECK(f.b.disabled==1 && f.r.links.ids.empty());f.r.games.report(1);f.tick();});
   f.stop_at(9); f.run(); CHECK(f.b.count("directClose")==1);
 }
+// A Doubles begin answered after the start ("A match is already active or complete") is expected: no
+// refusal in the log, no begin retried, and the match the start froze plays on. Before a start it is logged.
+static void late_doubles_begin_is_quiet() {
+  const json late={{"t","command-error"},{"action","begin"},{"error","A match is already active or complete"}};
+  const auto refusals=[](const Fixture& f) {
+    return std::count_if(f.logs.begin(),f.logs.end(),[](const std::string& l){return l.find("refused a command")!=std::string::npos;});
+  };
+  {
+    Fixture f; const int opens=f.b.count("netOpen"); f.b.push(welcome("sess1"));
+    f.r.setup.known=true; f.r.setup.match="sess1"; f.r.match_id="sess1"; f.r.in_game=true; f.r.games.start_game(f.r.match_id);
+    f.b.at(2,[&]{f.b.push(late);});
+    f.b.at(3,[&]{CHECK(f.r.match_id=="sess1" && !f.r.pending_begin && !f.r.settled); f.tick();});
+    f.stop_at(4); f.run();
+    CHECK(refusals(f)==0); CHECK(f.b.messages("begin")==0); CHECK(f.b.count("netOpen")==opens); // the socket the start came on stays open
+  }
+  {
+    Fixture f; f.b.push(welcome("")); f.b.at(2,[&]{f.b.push(late);}); f.stop_at(3); f.run();
+    CHECK(refusals(f)==1);
+  }
+}
 static void departure_keeps_ranked_pump() {
   // Owed game report -> receipt -> the room's result (a lost link claims nothing), after definitive
   // departure/link close.
@@ -419,6 +439,6 @@ int main() {
   failed_send_is_loss();timeout_and_late_open();recovery_closes_and_expiry();lobby_start_links();
   departure_keeps_ranked_pump();missed_receipts();ticket_allowance();internet_unchanged();flush_joins_open();
   ticket_renewal_recovers();ticket_renewal_deadline();ticket_renewal_validation();
-  quit_waiting_for_receipt_drains_concession();
+  quit_waiting_for_receipt_drains_concession();late_doubles_begin_is_quiet();
   std::puts("yougame_room: real pump send loss, late open, recovery expiry, lobby links, ranked drain, missed receipts, ticket budgets, internet compatibility and flush serialization passed");
 }

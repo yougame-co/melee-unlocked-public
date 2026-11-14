@@ -387,6 +387,20 @@ static void ImGui_ImplDX12_DestroyTexture(ImTextureData* tex)
     tex->SetStatus(ImTextureStatus_Destroyed);
 }
 
+// YouGame: a texture created this call whose first upload failed goes back to "not created", so the next call
+// creates it again from scratch (UpdateTexture asserts a WantCreate texture has no backend data yet).
+static void ImGui_ImplDX12_UndoCreate(ImTextureData* tex, ImGui_ImplDX12_Texture* backend_tex)
+{
+    if (tex->Status != ImTextureStatus_WantCreate || backend_tex == nullptr)
+        return;
+    ImGui_ImplDX12_Data* bd = ImGui_ImplDX12_GetBackendData();
+    SafeRelease(backend_tex->pTextureResource);
+    bd->InitInfo.SrvDescriptorFreeFn(&bd->InitInfo, backend_tex->hFontSrvCpuDescHandle, backend_tex->hFontSrvGpuDescHandle);
+    IM_DELETE(backend_tex);
+    tex->SetTexID(ImTextureID_Invalid);
+    tex->BackendUserData = nullptr;
+}
+
 void ImGui_ImplDX12_UpdateTexture(ImTextureData* tex)
 {
     ImGui_ImplDX12_Data* bd = ImGui_ImplDX12_GetBackendData();
@@ -421,8 +435,15 @@ void ImGui_ImplDX12_UpdateTexture(ImTextureData* tex)
         desc.Flags = D3D12_RESOURCE_FLAG_NONE;
 
         ID3D12Resource* pTexture = nullptr;
-        bd->pd3dDevice->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc,
-            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&pTexture));
+        // YouGame: a lost device (or out of memory) fails this; skip the upload instead of copying into a null
+        // texture. The texture stays WantCreate, and the renderer's own device check reports the loss.
+        if (FAILED(bd->pd3dDevice->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&pTexture))) || pTexture == nullptr)
+        {
+            bd->InitInfo.SrvDescriptorFreeFn(&bd->InitInfo, backend_tex->hFontSrvCpuDescHandle, backend_tex->hFontSrvGpuDescHandle);
+            IM_DELETE(backend_tex);
+            return;
+        }
 
         // Create SRV
         D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc;
@@ -493,13 +514,29 @@ void ImGui_ImplDX12_UpdateTexture(ImTextureData* tex)
             props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
             props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
 
+            // YouGame: these fail on a lost device. Unchecked, the Map below ran on a null buffer and crashed
+            // (builds 82 and 83 on an AMD 780M). Skip this upload and keep the texture's status, so it is retried;
+            // the renderer's own device check reports the loss and switches to Direct3D 11.
             HRESULT hr = bd->pd3dDevice->CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc,
                 D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&bd->pTexUploadBuffer));
-            IM_ASSERT(SUCCEEDED(hr));
+            if (FAILED(hr) || bd->pTexUploadBuffer == nullptr)
+            {
+                SafeRelease(bd->pTexUploadBuffer);
+                bd->pTexUploadBufferSize = 0;
+                ImGui_ImplDX12_UndoCreate(tex, backend_tex);
+                return;
+            }
 
             D3D12_RANGE range = {0, upload_size};
             hr = bd->pTexUploadBuffer->Map(0, &range, &bd->pTexUploadBufferMapped);
-            IM_ASSERT(SUCCEEDED(hr));
+            if (FAILED(hr) || bd->pTexUploadBufferMapped == nullptr)
+            {
+                bd->pTexUploadBufferMapped = nullptr;
+                SafeRelease(bd->pTexUploadBuffer);
+                bd->pTexUploadBufferSize = 0;
+                ImGui_ImplDX12_UndoCreate(tex, backend_tex);
+                return;
+            }
             bd->pTexUploadBufferSize = upload_size;
         }
 

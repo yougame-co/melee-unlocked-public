@@ -255,6 +255,7 @@ static void check_dma_block(const uint8_t* be, uint32_t len) {
 // The console time of the next AI DMA completion, 0 while audio is not running (the frame wait's
 // audio pacing, host.cpp).
 uint64_t audio_next_due() { return s_ai_dma_running && s_ai_dma_callback && s_ai_dma_len ? s_ai_next_tb : 0; }
+void audio_shift(uint64_t ticks) { if (s_ai_dma_running) s_ai_next_tb += ticks; }
 // longjmp cannot return through the host call stack; the setjmp caller catches this (ppc.h).
 void __longjmp(ppc::Context& c, uint8_t*) { throw ppc::GuestLongJmp{c.r[3], c.r[4]}; }
 // Called at interrupt-safe points (see host::pump_completions / host::retrace).

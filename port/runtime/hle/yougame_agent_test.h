@@ -1,5 +1,5 @@
 // Test-only startup defaults for app-launched native games. Read agent-test.json once, only
-// with an active YouGame bridge and nonempty YOUGAME_DATA. Missing files are silent. Optional
+// with an active YouGame bridge, nonempty YOUGAME_DATA and YOUGAME_AGENT_COPY=1 (an AGENT TEST app copy). Missing files are silent. Optional
 // keys: mute:true, online:"unranked"|"ranked"|"direct"|"teams", character:0..25 (with online),
 // consoleRollback:true|false (Source only, MELEE_CONSOLE_ROLLBACK),
 // code:1..12 ASCII [A-Z0-9#], timer:5..600 seconds, quitAfter:1..3, padBack:10..900 seconds, fight:true. Invalid/unknown keys
@@ -9,6 +9,9 @@
 // rng_seed:uint32 and time_base:uint64 (0 keeps the CLI's wall-clock default).
 // Source-only hook key: match:"<stage>:<kind>[/c<level>][/x<costume>][:...]" (1..6 players,
 // at most 128 ASCII [a-z0-9_:/] characters, numeric IDs; refused whenever online is present).
+// bootMatch:true (Source, needs match) starts that VS match from the main menu, skipping the
+// character and stage screens; results return to the main menu.
+// Bare hook-build runs (no YouGame session) get the same with the CLI flag --boot-match plus --match.
 // Both engines: frames:600..36000, stopAt:60..36000 (host::die at that frame: exit 3 and a last stderr
 // line "crash: agent test: stop at frame N", for the app's "stopped" notice). Static-only:
 // captureEvery:30..600 (agent-captures/cap.ppm).
@@ -26,8 +29,16 @@
 // Hook-only, both online engines: dropRoomAfter:330..900 seconds (agent-only rooms, never ranked).
 // Hook-only, Source Friends: dropRoomOnce:true closes the room socket client-side once, 5 s into VS
 // character select (agent-only rooms), so the held-seat rejoin runs without root or network tools.
+// openSettings:"video" opens the Video settings tab after boot (both engines).
+// uiClick:{"frame":1..36000,"x":0..16384,"y":0..16384} clicks window pixels after first present.
 // openMenu:"phob:<1-4>" opens Controls -> PhobGCC on the chosen socket at boot.
 // Source renderer hook: present_log:"<name>", present_frames:"<directory-name>:<1..600>".
+// Source Squad Strike builds: squadLineup:[[kind,colour],[kind,colour],[kind,colour],[kind,colour]]
+// (CSS kinds 0..25 except Sheik, 19, who has no portrait; a colour that fighter has; four different
+// fighters). Each time the online Squad Strike character select opens, the game fills its four
+// slots in that order and presses START, so lock-in runs the same path a player's picks do. An
+// invalid shape is ignored with a log line. squadRefuse:true makes this copy refuse every Friends Squad
+// Strike setup as if a fighter were over its budget (a guest's end-session, timed by a live pair).
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include <nlohmann/json.hpp>
@@ -37,10 +48,14 @@
 #include "yougame_agent_pad_trace.h"
 #include "yougame_agent_keys.h"
 #include "yougame_agent_friends.h"
+#include "yougame_doubles.h"
 #include "yougame_agent_present.h"
 #include "yougame_box_present.h"
 #include "yougame_net_test.h"
 #include "handoff_state.h"
+#if MU_SQUAD
+#include "../abi/mu_squad_wire.h"
+#endif
 #endif
 #include <algorithm>
 #include <array>
@@ -57,6 +72,9 @@ namespace yougame::agent_test {
 enum class Engine { Source, Static };
 #ifdef YOUGAME_AGENT_TEST_HOOK
 inline std::atomic<int> phob_menu_socket{0};
+inline std::atomic<bool> open_settings_video{false};
+inline std::atomic<int> ui_click_frame{0}, ui_click_x{0}, ui_click_y{0};
+struct UiClick { int frame = 0, x = 0, y = 0; };
 struct Handoff {
   std::string save, load, hash_log, diff_dump, error;
   uint32_t at = 0;
@@ -64,6 +82,31 @@ struct Handoff {
   bool enabled() const { return !save.empty() || !load.empty() || !error.empty(); }
 };
 inline Handoff handoff;
+inline std::atomic<bool> boot_match{false};
+#if MU_SQUAD
+// squadLineup for the game's MU_SQUAD_OP_AGENT_LINEUP query: one byte per fighter (kind 0..25 in
+// bits 0-4, colour 0..5 in bits 5-7) at bits 0..31, bit 48 set when a lineup was given. Read by the
+// host's command handler, never sent to a peer.
+inline constexpr size_t kSquadLineupBytes = 2 * MU_SQUAD_LINEUP; // kind, colour per fighter
+static_assert(MU_SQUAD_LINEUP <= 6, "one packed byte per fighter, below the flag bit");
+inline std::atomic<uint64_t> squad_lineup{0};
+inline uint64_t squad_lineup_pack(const std::array<uint8_t, kSquadLineupBytes>& bytes) {
+  uint64_t packed = uint64_t(1) << 48;
+  for (size_t i = 0; i < MU_SQUAD_LINEUP; ++i)
+    packed |= uint64_t((bytes[2 * i] & 0x1F) | (bytes[2 * i + 1] & 0x7) << 5) << (8 * i);
+  return packed;
+}
+inline bool squad_lineup_bytes(uint8_t out[kSquadLineupBytes]) {
+  const uint64_t packed = squad_lineup.load(std::memory_order_acquire);
+  if (!(packed >> 48)) return false;
+  for (size_t i = 0; i < MU_SQUAD_LINEUP; ++i) {
+    const uint8_t fighter = uint8_t(packed >> (8 * i));
+    out[2 * i] = fighter & 0x1F;
+    out[2 * i + 1] = fighter >> 5;
+  }
+  return true;
+}
+#endif
 #endif
 
 struct Settings {
@@ -86,9 +129,20 @@ struct Settings {
   agent_present::Config present;
   int stop_at_frame = 0;
   int phob_socket = 0;
+  bool open_settings_video = false;
+  UiClick ui_click;
   nlohmann::json console_request;
+#ifdef MELEE_DOUBLES
+  std::string doubles_room; bool doubles_search=false; int doubles_humans=1;
+#endif
   Handoff handoff;
   bool friends_handoff_join = false; // Source-only opt-in; independent of gate-1 save/load.
+  bool boot_match = false;           // Source-only, with match: VS straight from the main menu
+#if MU_SQUAD
+  std::array<uint8_t, kSquadLineupBytes> squad_lineup{}; // kind, colour per slot, in fight order
+  bool squad_lineup_set = false;
+  bool squad_refuse = false;   // squadRefuse: refuse every Friends Squad setup (hook builds)
+#endif
 #endif
 
   std::vector<std::string> prepend(int argc, char* const* argv) const {
@@ -197,6 +251,34 @@ inline bool unsigned_in(const nlohmann::json& value, uint64_t maximum) {
   return value.is_number_integer() && value.get<int64_t>() >= 0 &&
       static_cast<uint64_t>(value.get<int64_t>()) <= maximum;
 }
+
+#if MU_SQUAD
+// squadLineup: exactly MU_SQUAD_LINEUP [kind,colour] pairs that mu_squad_side_valid accepts, with
+// no fighter twice (character select refuses a repeat, so such a lineup could never lock in).
+static_assert(2 * MU_SQUAD_LINEUP == 8, "squadLineup is four kind/colour pairs");
+inline bool squad_lineup_value(const nlohmann::json& value, std::array<uint8_t, kSquadLineupBytes>& out) {
+  constexpr int sheik = 19; // a CSS kind with no portrait: no player can pick it
+  MuSquadSide side{};
+  if (!value.is_array() || value.size() != MU_SQUAD_LINEUP) return false;
+  side.count = MU_SQUAD_LINEUP;
+  for (size_t i = 0; i < value.size(); ++i) {
+    const auto& pair = value[i];
+    if (!pair.is_array() || pair.size() != 2 || !integer_in(pair[0], 0, 25) || !integer_in(pair[1], 0, 5) ||
+        pair[0].get<int>() == sheik)
+      return false;
+    side.members[i].kind = uint8_t(pair[0].get<int>());
+    side.members[i].color = uint8_t(pair[1].get<int>());
+    for (size_t j = 0; j < i; ++j)
+      if (side.members[j].kind == side.members[i].kind) return false;
+  }
+  if (!mu_squad_side_valid(&side)) return false;
+  for (size_t i = 0; i < MU_SQUAD_LINEUP; ++i) {
+    out[2 * i] = side.members[i].kind;
+    out[2 * i + 1] = side.members[i].color;
+  }
+  return true;
+}
+#endif
 #endif
 
 inline Settings map_keys(const nlohmann::json& object, Engine engine = Engine::Source,
@@ -232,11 +314,62 @@ inline Settings map_keys(const nlohmann::json& object, Engine engine = Engine::S
   for (auto it = object.begin(); it != object.end(); ++it) {
     const auto& key = it.key();
     const auto& value = it.value();
+#if defined(MELEE_DOUBLES) && defined(YOUGAME_AGENT_TEST_HOOK)
+    if (key=="doublesHost" || key=="doublesDuoHost" || key=="doublesJoin") {
+      if (engine==Engine::Source && !object.count("online") && !object.count("match") &&
+          (((key=="doublesHost" || key=="doublesDuoHost") && value==true) || (key=="doublesJoin" && !friends::room(nlohmann::json{{"room",value}}).empty()))) {
+        out.doubles_room=key!="doublesJoin"?"new":value.get<std::string>();
+        out.doubles_search=key!="doublesJoin"; out.doubles_humans=key=="doublesDuoHost"?2:1; applied(key.c_str());
+      } else ignored=true;
+      continue;
+    }
+#endif
+#if MU_SQUAD && defined(YOUGAME_AGENT_TEST_HOOK)
+    if (key == "squadLineup") {
+      if (engine == Engine::Source && squad_lineup_value(value, out.squad_lineup)) {
+        out.squad_lineup_set = true; applied("squadLineup");
+      } else {
+        out.squad_lineup = {};
+        diagnostics += engine == Engine::Source ? "\nagent-test: squadLineup invalid value; ignored"
+                                                : "\nagent-test: squadLineup not supported on the Static Recomp; ignored";
+      }
+      continue;
+    }
+    if (key == "squadRefuse") {
+      if (engine == Engine::Source && value.is_boolean()) { out.squad_refuse = value.get<bool>(); applied("squadRefuse"); }
+      else diagnostics += engine == Engine::Source ? "\nagent-test: squadRefuse needs true or false; ignored"
+                                                   : "\nagent-test: squadRefuse not supported on the Static Recomp; ignored";
+      continue;
+    }
+#endif
 #ifdef YOUGAME_AGENT_TEST_HOOK
     if (key == "friendsHandoffJoin") {
       if (engine == Engine::Source && value.is_boolean()) {
         out.friends_handoff_join = value.get<bool>(); applied(key.c_str());
       } else ignored = true;
+      continue;
+    }
+    if (key == "openSettings") {
+      if (value.is_string() && value == "video") {
+        out.open_settings_video = true; applied("openSettings");
+      } else diagnostics += "\nagent-test: openSettings invalid value; ignored";
+      continue;
+    }
+    if (key == "uiClick") {
+      if (value.is_object() && value.size() == 3 && value.count("frame") &&
+          value.count("x") && value.count("y") && integer_in(value["frame"], 1, 36000) &&
+          integer_in(value["x"], 0, 16384) && integer_in(value["y"], 0, 16384)) {
+        out.ui_click = {value["frame"].get<int>(), value["x"].get<int>(), value["y"].get<int>()};
+        applied("uiClick");
+      } else diagnostics += "\nagent-test: uiClick invalid value; ignored";
+      continue;
+    }
+    if (key == "bootMatch") {
+      auto invalid = [&](const char* reason) { diagnostics += std::string("\nagent-test: bootMatch ") + reason + "; ignored"; };
+      if (engine != Engine::Source) invalid("not supported on the Static Recomp");
+      else if (!value.is_boolean()) invalid("invalid value");
+      else if (!object.count("match") || object.count("online")) invalid("needs match, offline only");
+      else { out.boot_match = value.get<bool>(); applied("bootMatch"); }
       continue;
     }
     if (key.compare(0, 7, "handoff") == 0) {
@@ -452,7 +585,13 @@ inline Settings map_keys(const nlohmann::json& object, Engine engine = Engine::S
         continue;
       }
 #endif
-      if ((capture && engine != Engine::Static) || !integer_in(value, capture ? 30 : 600, capture ? 600 : 36000)) {
+      // The Mac Source Port's GL renderer writes --capture-every frames like the Static Recomp does.
+#ifdef __APPLE__
+      const bool capture_here = true;
+#else
+      const bool capture_here = engine == Engine::Static;
+#endif
+      if ((capture && !capture_here) || !integer_in(value, capture ? 30 : 600, capture ? 600 : 36000)) {
         if (!capture && engine == Engine::Source) diagnostics += "\nagent-test: frames invalid value; ignored";
         else diagnostic(key + (engine != Engine::Static ? " not supported on the Source Port" : " invalid value"));
       } else if (capture) {
@@ -546,12 +685,20 @@ inline Settings load(bool active, const char* data_dir, Engine engine = Engine::
   Settings out;
 #ifdef YOUGAME_AGENT_TEST_HOOK
   phob_menu_socket.store(0);
+  open_settings_video.store(false);
+  ui_click_frame.store(0);
+  ui_click_x.store(0);
+  ui_click_y.store(0);
   pad_trace.stop();
   agent_present::recorder().stop();
   agent_paths::policy = {};
   agent_paths::session.reset();
   handoff = {};
   console::friends_handoff_join_test.store(false, std::memory_order_release);
+#if MU_SQUAD
+  squad_lineup.store(0, std::memory_order_release);
+  net_test::squad_refuse.store(false, std::memory_order_release);
+#endif
   // All early returns and exceptions release the root unless mapping activated a session.
   struct LoadScope {
     bool active = false;
@@ -559,6 +706,16 @@ inline Settings load(bool active, const char* data_dir, Engine engine = Engine::
   } scope;
 #endif
   if (!active || !data_dir || !*data_dir) return out;
+  // Only an AGENT TEST copy of the app passes YOUGAME_AGENT_COPY=1 (desktop native-policy agentGameEnv; an installed
+  // app's game environment is an allowlist without it), so an agent-test.json copied into a player's data folder does
+  // nothing.
+  const char* agent_copy = std::getenv("YOUGAME_AGENT_COPY");
+  if (!agent_copy || agent_copy[0] != '1' || agent_copy[1] != '\0') {
+    std::error_code missing;
+    if (std::filesystem::exists(std::filesystem::u8path(data_dir) / "agent-test.json", missing))
+      out.log = "agent-test.json ignored: not an agent test copy";
+    return out;
+  }
   // Bound the actual read BEFORE parsing; the same handle is checked and read.
   std::array<char, 4097> bytes{};
 #ifdef YOUGAME_AGENT_TEST_HOOK
@@ -602,9 +759,19 @@ inline Settings load(bool active, const char* data_dir, Engine engine = Engine::
       );
   out.agent_file = true;
 #ifdef YOUGAME_AGENT_TEST_HOOK
+#ifdef MELEE_DOUBLES
+  if (!out.doubles_room.empty()) doubles::ui.open(out.doubles_room,out.doubles_search,out.doubles_humans);
+#endif
   if (!out.console_request.is_null()) console::requests.push(out.console_request);
-  const bool active_session = !out.console_request.is_null() || !out.arguments.empty() || !out.environment.empty() || !out.key_script.empty() ||
-      out.phob_socket > 0 || !out.pad_trace.empty() || out.rumble_test || out.box_present_compositor || out.static_online_test || out.pad_back_seconds > 0 || out.fight || out.net.delay_ms > 0 || out.present.enabled() || out.handoff.enabled() || out.friends_handoff_join;
+  const bool active_session =
+#ifdef MELEE_DOUBLES
+      !out.doubles_room.empty() ||
+#endif
+#if MU_SQUAD
+      out.squad_lineup_set ||
+#endif
+      !out.console_request.is_null() || !out.arguments.empty() || !out.environment.empty() || !out.key_script.empty() ||
+      out.phob_socket > 0 || !out.pad_trace.empty() || out.rumble_test || out.box_present_compositor || out.static_online_test || out.pad_back_seconds > 0 || out.fight || out.net.delay_ms > 0 || out.present.enabled() || out.handoff.enabled() || out.friends_handoff_join || out.boot_match || out.open_settings_video || out.ui_click.frame > 0;
   if (!active_session) return out;
   // Consumers must reopen through the capability, not through a checked pathname.
   agent_paths::policy = {};
@@ -629,8 +796,17 @@ inline Settings load(bool active, const char* data_dir, Engine engine = Engine::
     out.log += "agent-test: padTrace output capability refused; ignored";
   }
   phob_menu_socket.store(out.phob_socket);
+  open_settings_video.store(out.open_settings_video);
+  ui_click_x.store(out.ui_click.x);
+  ui_click_y.store(out.ui_click.y);
+  ui_click_frame.store(out.ui_click.frame, std::memory_order_release);
   handoff = out.handoff;
+  boot_match.store(out.boot_match, std::memory_order_release);
   console::friends_handoff_join_test.store(out.friends_handoff_join, std::memory_order_release);
+#if MU_SQUAD
+  if (out.squad_lineup_set) squad_lineup.store(squad_lineup_pack(out.squad_lineup), std::memory_order_release);
+  net_test::squad_refuse.store(out.squad_refuse, std::memory_order_release);
+#endif
   scope.active = true;
 #endif
   return out;

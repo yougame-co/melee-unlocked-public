@@ -50,7 +50,7 @@ int main() {
   CHECK(matchmaking_route(1, true, true, false, true, true) == MatchmakingRoute::YouGame);
   CHECK(matchmaking_route(1, true, true, true, false, true) == MatchmakingRoute::YouGame);
   CHECK(matchmaking_route(1, false, true, true, false, true) == MatchmakingRoute::YouGame);
-  // Ranked stays off the YouGame Online menu until it plays like Slippi's.
+  // Ranked stays off the YouGame Online menu until it plays like Slippi's (2026-10-29).
   CHECK(!yougame_ranked_offered);
   std::printf("yougame_mode_policy: %d matchmaking route cases passed\n", route_cases);
   CHECK(hle::card::file_filter == nullptr);  // Standalone card tests and mounts need no app filter.

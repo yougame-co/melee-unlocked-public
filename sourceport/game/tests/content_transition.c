@@ -81,6 +81,7 @@ void mu_mex_boot(void)
 void mu_tmce_boot(void) {}
 int mu_tmce_active(void) { return 0; }
 void mu_tmce_ev_scene_lists(int active) { (void) active; }
+int mu_css_origin_resume(int bit) { (void) bit; return 0; }
 
 static void old_load(void) { unload_done = 0; note('A'); }
 static void new_load(void) { unload_done = 0; note('B'); }

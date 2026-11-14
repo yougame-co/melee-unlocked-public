@@ -16,6 +16,7 @@
 #include "practice_cpu.h"
 #include "practice_ghosts.h"
 #include "ghost_ai.h"
+#include "phillip_ai.h"
 #include "native_practice.h"
 #include "slippi_online.h"
 
@@ -247,6 +248,15 @@ bool ghost_offered(int i, bool neural) {
   return neural ? ghost_ai::specialist_available((unsigned)i) : practice_ghosts::kGhosts[i].games > 0;
 }
 // The pro the CPU plays as now, or "".
+// "Stronger Pro AI": the setting as a menu byte, and the pro the question is about.
+uint8_t g_stronger_byte = 0;
+int g_stronger_pro = -1;
+// This pro (or any pro, -1) has stronger AIs, and one of them is not downloaded yet.
+bool stronger_offered(int pro) {
+  const phillip_ai::StrongerStatus s = phillip_ai::stronger_status(pro);
+  return pro < 0 ? s.total > 0 : s.missing > 0;
+}
+
 std::string active_pro(const MuPcConfig& c) {
   if (!(c.preset & 0x80) || c.preset == MU_PC_PRESET_AI || (c.preset & 0x7F) >= kGhostCount) return "";
   if (!practice_ghosts::kReleased[c.preset & 0x7F]) return "";   // YouGame: unreleased pros never show a name
@@ -255,7 +265,7 @@ std::string active_pro(const MuPcConfig& c) {
 
 enum class Page : int {
   Root, Queue, Code, Blocked, Cpu, Moves, Attacks, Defense, Oos, Hit, Di, Tech, Getup, After, Ledge, Tools,
-  Presets, Setups, Replay, ReplaySettings, Ghosts, Jumps, Throws, Count
+  Presets, Setups, Replay, ReplaySettings, Ghosts, Jumps, Throws, Stronger, Count
 };
 // The character select's number for a character name (a ghost's character), or -1.
 int css_kind_of(const char* name) {
@@ -290,6 +300,7 @@ const char* page_title(Page p) {
     case Page::Replay: return "Replay";
     case Page::ReplaySettings: return "Settings";
     case Page::Ghosts: return "Fight a pro";
+    case Page::Stronger: return "Stronger Pro AI";
     case Page::Jumps: return "Jumps";
     case Page::Throws: return "Throws";
     default: return "";
@@ -306,7 +317,10 @@ bool cpu_page(Page p) {
 enum class Kind { Page, Toggle, Percent, Number, Choice, Odds, Flag, Action, Info };
 enum Action : int {
   kActNone, kActUnranked, kActCancel, kActWindow, kActDefaults, kActPreset = 100, kActLoad = 200, kActSave = 300, kActGhost = 400,
-  kActTeams = 500, kActBlocked = 600
+  kActTeams = 500, kActBlocked = 600,
+  // "Stronger Pro AI (Requires additional download)": the question after picking a pro, and the
+  // Fight a pro page's own download row.
+  kActStrongerYes = 700, kActStrongerNotNow, kActStrongerAlways, kActStrongerNever, kActStrongerAll
 };
 
 struct Row {
@@ -339,12 +353,12 @@ std::vector<Level> g_stack{Level{}};
 double g_page_changed_at = -10.0;
 
 // The on-screen keyboard (Direct codes and the codes skipped in Unranked).
-const char kKeys[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#";
+const char kKeys[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#@";   // @: a Teams code with a teammate
 constexpr int kKeyCols = 13;
-constexpr int kKeyCount = (int)sizeof(kKeys) - 1;   // 37 characters, then Delete / Paste / OK
+constexpr int kKeyCount = (int)sizeof(kKeys) - 1;   // 38 characters, then Delete / Paste / OK
 int g_kb_target = 0;          // 0 Direct, 1..3 a skipped code, 4 Teams
 std::string g_kb_text;
-int g_kb_cursor = 0;          // 0..36 characters, 37 Delete, 38 Paste, 39 OK
+int g_kb_cursor = 0;          // 0..37 characters, 38 Delete, 39 Paste, 40 OK
 std::string g_last_direct, g_last_teams;
 
 int share_of(const uint8_t* group, int count, int index, const uint8_t* group2 = nullptr, int count2 = 0) {
@@ -468,9 +482,20 @@ std::vector<Row> rows_for(Page p) {
                                                                     : "Find a match while you train."));
       const practice_cpu::Status st = practice_cpu::status();
       std::string cpu = !c.enabled ? "Off" : (st.driving ? plan_text(st.plan) : "On");
-      // Fight a pro is not ready to ship: a row that says it is coming instead of the page.
-      rows.push_back(action_row("Fight a pro", kActNone, "Coming soon",
-                                "Play AIs that learned from top players' own games. Coming in a later update.", false));
+      {
+        // Fight a pro: Phillip's trained AIs (ProAI folder, Source Port). Without them the row says so.
+        const bool neural = neural_ghosts();
+        bool any = false;
+        for (int i = 0; neural && i < kGhostCount; ++i) any |= ghost_offered(i, neural);
+        if (any)
+          rows.push_back(page_row("Fight a pro", Page::Ghosts, active_pro(c), "Play Phillip's AI as a top player."));
+        else {
+          // Without AVX a timed check decides; the row says whether it is running or found the PC too slow.
+          const char* why = neural ? phillip_ai::unavailable_reason() : nullptr;
+          rows.push_back(action_row("Fight a pro", kActNone, why && why[0] == 'C' ? "Checking..." : "Not available",
+                                    why ? why : "Phillip's AI as a top player: Source Port.", false));
+        }
+      }
       rows.push_back(page_row("CPU", Page::Cpu, cpu, "How the Practice CPU moves and attacks."));
       rows.push_back(page_row("Defense", Page::Defense, top_name(kDefend, c.defend_odds, MU_PC_DEF_COUNT),
                               "What it does when you attack near it."));
@@ -518,6 +543,7 @@ std::vector<Row> rows_for(Page p) {
     case Page::Cpu:
       rows.push_back(toggle_row("Practice CPU", &c.enabled, "On: the CPU follows these pages. Never online."));
       rows.push_back(toggle_row("Only react", &c.freeze, "It stands still and only DIs, techs and recovers."));
+      rows.push_back(toggle_row("Moving target", &c.no_attacks, "It moves around, shields and dodges, but never attacks or grabs."));
       rows.push_back(page_row("Movement", Page::Moves, top_of_moves(c, kMoves, kMoves2), "What it does between attacks."));
       {
         const practice_cpu::Status st = practice_cpu::status();
@@ -534,6 +560,13 @@ std::vector<Row> rows_for(Page p) {
       rows.push_back(percent_row("Aggression", &c.aggression, "How often it attacks rather than moves when you are in range."));
       rows.push_back(number_row("Attack range", &c.attack_range, 10, 80, 5, "%d", "How close you must be before it attacks."));
       rows.push_back(number_row("Reaction", &c.reaction_frames, 0, 40, 1, "%df", "Frames before it answers. People take 15 to 25."));
+      rows.push_back(number_row("CPU delay", &c.act_delay, 0, 30, 1, "%df",
+                                "Frames it waits before it acts out of shield, getting up and leaving hitstun."));
+      {
+        static const char* const kRespawn[MU_PC_RESPAWN_COUNT] = {"Wait", "Get off", "Mix"};
+        rows.push_back(choice_row("Respawn platform", &c.respawn, kRespawn, MU_PC_RESPAWN_COUNT,
+                                  "Wait: it stays as long as the game lets it. Get off: it drops off at once."));
+      }
       rows.push_back(percent_row("L-cancel", &c.l_cancel, "Chance it L-cancels."));
       break;
     case Page::Moves:
@@ -547,6 +580,7 @@ std::vector<Row> rows_for(Page p) {
       break;
     case Page::Throws:
       for (int i = 0; i < MU_PC_THROW_COUNT; ++i) rows.push_back(odds_row(kThrows[i], c.throw_odds, MU_PC_THROW_COUNT, i));
+      rows.push_back(number_row("Throw wait", &c.throw_wait, 0, 60, 1, "%df", "Frames it holds you before it throws. 0: 4 to 12."));
       break;
     case Page::Jumps:
       rows.push_back(choice_row("Drift", &c.jump_drift, kDrift, MU_PC_DRIFT_COUNT,
@@ -565,12 +599,16 @@ std::vector<Row> rows_for(Page p) {
         labels[i] = kAttacks[i];
         if (i >= MU_PC_ATK_NEUTRAL_B && i < MU_PC_ATK_NEUTRAL_B + 4)
           if (const char* name = practice_cpu::special_name(st.kind, i - MU_PC_ATK_NEUTRAL_B)) labels[i] = name;
-        rows.push_back(odds_row(labels[i].c_str(), c.attack_odds, MU_PC_ATK_COUNT, i));
+        rows.push_back(odds_row(labels[i].c_str(), c.attack_odds, MU_PC_ATK_COUNT, i, &c.run_shine, 1));
       }
+      rows.push_back(odds_row("Run shine", &c.run_shine, 1, 0, c.attack_odds, MU_PC_ATK_COUNT));
+      rows.back().about += " A dash in, then its down special.";
       break;
     }
     case Page::Defense:
-      for (int i = 0; i < MU_PC_DEF_COUNT; ++i) rows.push_back(odds_row(kDefend[i], c.defend_odds, MU_PC_DEF_COUNT, i));
+      for (int i = 0; i < MU_PC_DEF_COUNT; ++i) rows.push_back(odds_row(kDefend[i], c.defend_odds, MU_PC_DEF_COUNT, i, c.def2_odds, MU_PC_SIDE_COUNT));
+      rows.push_back(odds_row("Roll to the ledge", c.def2_odds, MU_PC_SIDE_COUNT, MU_PC_SIDE_LEDGE, c.defend_odds, MU_PC_DEF_COUNT));
+      rows.push_back(odds_row("Roll to the middle", c.def2_odds, MU_PC_SIDE_COUNT, MU_PC_SIDE_MIDDLE, c.defend_odds, MU_PC_DEF_COUNT));
       rows.push_back(page_row("Out of shield", Page::Oos, top_of(kOos, c.oos_odds, MU_PC_OOS_COUNT), "Once shieldstun ends."));
       break;
     case Page::Oos:
@@ -588,10 +626,14 @@ std::vector<Row> rows_for(Page p) {
       for (int i = 0; i < MU_PC_DI_COUNT; ++i) rows.push_back(odds_row(kDi[i], c.di_odds, MU_PC_DI_COUNT, i));
       break;
     case Page::Tech:
-      for (int i = 0; i < MU_PC_TECH_COUNT; ++i) rows.push_back(odds_row(kTech[i], c.tech_odds, MU_PC_TECH_COUNT, i));
+      for (int i = 0; i < MU_PC_TECH_COUNT; ++i) rows.push_back(odds_row(kTech[i], c.tech_odds, MU_PC_TECH_COUNT, i, c.tech2_odds, MU_PC_SIDE_COUNT));
+      rows.push_back(odds_row("Roll to the ledge", c.tech2_odds, MU_PC_SIDE_COUNT, MU_PC_SIDE_LEDGE, c.tech_odds, MU_PC_TECH_COUNT));
+      rows.push_back(odds_row("Roll to the middle", c.tech2_odds, MU_PC_SIDE_COUNT, MU_PC_SIDE_MIDDLE, c.tech_odds, MU_PC_TECH_COUNT));
       break;
     case Page::Getup:
-      for (int i = 0; i < MU_PC_GETUP_COUNT; ++i) rows.push_back(odds_row(kGetup[i], c.getup_odds, MU_PC_GETUP_COUNT, i));
+      for (int i = 0; i < MU_PC_GETUP_COUNT; ++i) rows.push_back(odds_row(kGetup[i], c.getup_odds, MU_PC_GETUP_COUNT, i, c.getup2_odds, MU_PC_SIDE_COUNT));
+      rows.push_back(odds_row("Roll to the ledge", c.getup2_odds, MU_PC_SIDE_COUNT, MU_PC_SIDE_LEDGE, c.getup_odds, MU_PC_GETUP_COUNT));
+      rows.push_back(odds_row("Roll to the middle", c.getup2_odds, MU_PC_SIDE_COUNT, MU_PC_SIDE_MIDDLE, c.getup_odds, MU_PC_GETUP_COUNT));
       break;
     case Page::After:
       for (int i = 0; i < MU_PC_AFTER_COUNT; ++i) rows.push_back(odds_row(kAfter[i], c.after_odds, MU_PC_AFTER_COUNT, i));
@@ -647,7 +689,10 @@ std::vector<Row> rows_for(Page p) {
           rows.push_back(action_row(gh.name, kActGhost + i, "Locked", about, false));
           continue;
         }
-        if (neural)
+        if (neural && phillip_ai::available((unsigned)i))
+          std::snprintf(about, sizeof about, "Phillip's AI playing %s as %s, from %s's games and self-play. "
+                        "Training starts again with the CPU as %s.", gh.character, gh.name, gh.name, gh.character);
+        else if (neural)
           std::snprintf(about, sizeof about, "Plays %s the way %s does, learned from %s's own games. "
                         "Training starts again with the CPU as %s.", gh.character, gh.name, gh.name, gh.character);
         else
@@ -655,6 +700,36 @@ std::vector<Row> rows_for(Page p) {
                         "options. Training starts again with the CPU as %s.", gh.name, gh.character);
         rows.push_back(action_row(gh.name, kActGhost + i, gh.character, about));
       }
+      if (neural && stronger_offered(-1)) {
+        static const char* const kChoices[] = {"Ask", "Always", "Never"};
+        g_stronger_byte = (uint8_t)phillip_ai::stronger_choice();
+        rows.push_back(choice_row("Stronger Pro AI (Requires additional download)", &g_stronger_byte, kChoices, 3,
+                                  "Phillip's newest AIs for some matchups: stronger, about 90 MB each. Ask: the menu asks "
+                                  "when you pick a pro. Always: each downloads the first time you play its matchup. "
+                                  "Never: only the lighter AIs play."));
+        const phillip_ai::StrongerStatus s = phillip_ai::stronger_status(-1);
+        char size[48], about[200];
+        std::snprintf(size, sizeof size, s.downloading ? "Downloading..." : s.missing ? "about %.0f MB" : "Downloaded", s.missing_mb);
+        std::snprintf(about, sizeof about, "Downloads every pro's stronger AIs now (%d of %d still to get). They play from "
+                      "the next match on, on a PC fast enough for them.", s.missing, s.total);
+        rows.push_back(action_row("Download Stronger Pro AI", kActStrongerAll, size, about, s.missing > 0 && !s.downloading));
+      }
+      break;
+    }
+    case Page::Stronger: {
+      const phillip_ai::StrongerStatus s = phillip_ai::stronger_status(g_stronger_pro);
+      char label[64], about[240];
+      std::snprintf(label, sizeof label, "Download (about %.0f MB)", s.missing_mb);
+      std::snprintf(about, sizeof about, "%s has a stronger AI for %d matchup%s: Phillip's newest, trained longer. "
+                    "It downloads in the background and plays from the next match, on a PC fast enough for it.",
+                    g_stronger_pro >= 0 && g_stronger_pro < kGhostCount ? practice_ghosts::kGhosts[g_stronger_pro].name : "This pro",
+                    s.total, s.total == 1 ? "" : "s");
+      rows.push_back(action_row(label, kActStrongerYes, "", about));
+      rows.push_back(action_row("Not now", kActStrongerNotNow, "", "Play the included AI. The menu asks again next time."));
+      rows.push_back(action_row("Always download", kActStrongerAlways, "",
+                                "Download this one now, and every stronger AI the first time its matchup is played."));
+      rows.push_back(action_row("Never", kActStrongerNever, "",
+                                "Only the lighter AIs play. Fight a pro > Stronger Pro AI changes this any time."));
       break;
     }
     case Page::Presets:
@@ -694,18 +769,23 @@ Input read_input(const Frame& f) {
   if (f.stick_y < -52) b |= 0x0004;
   if (f.stick_x < -52) b |= 0x0001;
   if (f.stick_x > 52) b |= 0x0002;
-  if (!f.armed) { g_prev_buttons = 0xFFFF; return in; }
-  const uint16_t pressed = (uint16_t)(b & ~g_prev_buttons);
-  g_prev_buttons = b;
-  in.a = pressed & 0x0100; in.b = pressed & 0x0200; in.x = pressed & 0x0400; in.y = pressed & 0x0800;
-  in.start = pressed & 0x1000; in.l = pressed & 0x0040; in.r = pressed & 0x0020;
-  // Directions: first press, then after 0.32 s every 0.065 s while held.
-  int dir = -1;
-  if (b & 0x0008) dir = 0; else if (b & 0x0004) dir = 1; else if (b & 0x0001) dir = 2; else if (b & 0x0002) dir = 3;
-  bool fire = false;
-  if (dir != g_held_dir) { g_held_dir = dir; g_held_since = g_held_last = f.time; fire = dir >= 0; }
-  else if (dir >= 0 && f.time - g_held_since > 0.32 && f.time - g_held_last > 0.065) { g_held_last = f.time; fire = true; }
-  if (fire) { in.up = dir == 0; in.down = dir == 1; in.left = dir == 2; in.right = dir == 3; }
+  if (!f.armed) {
+    g_prev_buttons = 0xFFFF;
+  } else {
+    const uint16_t pressed = (uint16_t)(b & ~g_prev_buttons);
+    g_prev_buttons = b;
+    in.a = pressed & 0x0100; in.b = pressed & 0x0200; in.x = pressed & 0x0400; in.y = pressed & 0x0800;
+    in.start = pressed & 0x1000; in.l = pressed & 0x0040; in.r = pressed & 0x0020;
+    // Directions: first press, then after 0.32 s every 0.065 s while held.
+    int dir = -1;
+    if (b & 0x0008) dir = 0; else if (b & 0x0004) dir = 1; else if (b & 0x0001) dir = 2; else if (b & 0x0002) dir = 3;
+    bool fire = false;
+    if (dir != g_held_dir) { g_held_dir = dir; g_held_since = g_held_last = f.time; fire = dir >= 0; }
+    else if (dir >= 0 && f.time - g_held_since > 0.32 && f.time - g_held_last > 0.065) { g_held_last = f.time; fire = true; }
+    if (fire) { in.up = dir == 0; in.down = dir == 1; in.left = dir == 2; in.right = dir == 3; }
+  }
+  // The keyboard works whatever the controller is doing: it used to wait for the controller to be
+  // at rest too, so a pad reporting a held button left the menu with no way in at all (0.9.97).
   if (f.keyboard && !ImGui::GetIO().WantTextInput) {
     in.up |= ImGui::IsKeyPressed(ImGuiKey_UpArrow, true);
     in.down |= ImGui::IsKeyPressed(ImGuiKey_DownArrow, true);
@@ -783,13 +863,44 @@ void press(Page p, Row& r, Result& out) {
   }
   if (r.action >= kActPreset && r.action < kActPreset + 100) { apply_preset(r.action - kActPreset); return; }
   if (r.action >= kActGhost && r.action < kActGhost + 100) {
-    if (practice_cpu::ghost(r.action - kActGhost, g_c)) {
+    const int pro = r.action - kActGhost;
+    // Keep Training unchanged until the player answers the download question. Restarting here
+    // closes the Practice menu, so the question would disappear before it could be answered.
+    if (neural_ghosts() && phillip_ai::stronger_choice() == phillip_ai::kStrongerAsk && stronger_offered(pro)) {
+      g_stronger_pro = pro;
+      push(Page::Stronger);
+      return;
+    }
+    if (practice_cpu::ghost(pro, g_c)) {
       g_c.enabled = 1;
       g_c_changed = true;
       // The CPU takes the player's own character (Training starts again for it when it differs).
       const int css = css_kind_of(practice_ghosts::kGhosts[r.action - kActGhost].character);
-      if (css >= 0) slippi::native_practice::submit_train_against(css);
+      if (css >= 0) slippi::native_practice::submit_train_against(css, practice_ghosts::kPreferredCostume[pro]);
       out.close = true;   // Training starts again against that player: back to playing
+    }
+    return;
+  }
+  if (r.action >= kActStrongerYes && r.action <= kActStrongerAll) {
+    const int pro = r.action == kActStrongerAll ? -1 : g_stronger_pro;
+    if (r.action == kActStrongerAlways) phillip_ai::set_stronger_choice(phillip_ai::kStrongerAlways);
+    if (r.action == kActStrongerNever) phillip_ai::set_stronger_choice(phillip_ai::kStrongerNever);
+    if (r.action == kActStrongerAll && phillip_ai::stronger_choice() == phillip_ai::kStrongerNever) {
+      phillip_ai::set_stronger_choice(phillip_ai::kStrongerAsk);
+      g_stronger_byte = (uint8_t)phillip_ai::kStrongerAsk;
+      out.stronger_changed = true;
+    }
+    if (r.action == kActStrongerYes || r.action == kActStrongerAlways || r.action == kActStrongerAll)
+      phillip_ai::download_stronger(pro);
+    out.stronger_changed |= r.action == kActStrongerAlways || r.action == kActStrongerNever;
+    if (r.action != kActStrongerAll && pro >= 0 && pro < kGhostCount && practice_cpu::ghost(pro, g_c)) {
+      g_c.enabled = 1;
+      g_c_changed = true;
+      const int css = css_kind_of(practice_ghosts::kGhosts[pro].character);
+      if (css >= 0) slippi::native_practice::submit_train_against(css, practice_ghosts::kPreferredCostume[pro]);
+      pop();
+      g_stronger_byte = (uint8_t)phillip_ai::stronger_choice();
+      out.close = true;
     }
     return;
   }
@@ -1035,7 +1146,7 @@ void draw_bar(ImDrawList* dl, float left, float top, float right, float h, float
   // A label too long for the bar (beside its value and the cursor ring) is drawn smaller.
   const float value_w = value.empty() ? 0.0f : text_width(px * 0.84f, value.c_str()) + 24.0f * u;
   const float room = right - rim - 40.0f * u - value_w - (left + 18.0f * u), label_w = text_width(px, label);
-  const float lpx = label_w > room && room > 0 ? std::max(px * 0.7f, px * room / label_w) : px;
+  const float lpx = label_w > room && room > 0 ? px * room / label_w : px;
   const float vy = top + h * 0.5f - lpx * 0.56f;
   const float da = enabled ? a : a * 0.45f;
   if (lit) text(dl, left + 18.0f * u, vy, lpx, with_alpha(IM_COL32(18, 16, 10, 255), da), label, 0.0f, false);
@@ -1145,6 +1256,28 @@ const KeyColors kBlueKeys{IM_COL32(156, 200, 255, 255), IM_COL32(63, 111, 200, 2
 
 struct Anim { float x = 0, target = 0; };
 std::vector<Anim> g_bar_anim;
+// Where the bars were drawn last frame (row index and screen rectangle), for the mouse.
+struct BarHit { int index; ImVec2 a, b; };
+std::vector<BarHit> g_bar_hits;
+ImVec2 g_mouse_last{-1.0f, -1.0f};
+
+// The mouse on the bars: moving over a row puts the cursor there, a left click picks it (as A), a
+// right click goes back (as B), and the wheel steps through the rows.
+void mouse_input(Input& in, Level& lv, int count) {
+  if (!count) return;
+  const ImGuiIO& io = ImGui::GetIO();
+  const ImVec2 m = io.MousePos;
+  const bool moved = m.x != g_mouse_last.x || m.y != g_mouse_last.y;
+  g_mouse_last = m;
+  for (const BarHit& h : g_bar_hits) {
+    if (h.index >= count || m.x < h.a.x || m.x > h.b.x || m.y < h.a.y || m.y > h.b.y) continue;
+    if (moved) lv.cursor = h.index;
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) { lv.cursor = h.index; in.a = true; }
+  }
+  if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)) in.b = true;
+  if (io.MouseWheel > 0.0f) in.up = true;
+  if (io.MouseWheel < 0.0f) in.down = true;
+}
 
 void draw_bars(ImDrawList* dl, const Frame& f, std::vector<Row>& rows, float a) {
   const float gh = f.game_y1 - f.game_y0, u = gh / 720.0f;
@@ -1187,6 +1320,7 @@ void draw_bars(ImDrawList* dl, const Frame& f, std::vector<Row>& rows, float a) 
   // The bars step in and out like the Main Menu's.
   static const float kStagger[6] = {0.0f, -16.0f, -34.0f, -22.0f, -34.0f, -16.0f};
   g_bar_anim.resize((size_t)count);
+  g_bar_hits.clear();
   const float since = (float)(f.time - g_page_changed_at);
   for (int i = 0; i < shown; ++i) {
     const int index = lv.top + i;
@@ -1199,9 +1333,10 @@ void draw_bars(ImDrawList* dl, const Frame& f, std::vector<Row>& rows, float a) 
     const float top = block_top + i * pitch;
     const float l = right - w + an.x + slide, r = right + an.x - 16.0f * u + slide;
     const Row& row = rows[(size_t)index];
-    const float label_w = text_width(h * 0.5f, row.label.c_str());
-    const std::string shown_value = fit(value_of(row), h * 0.5f * 0.84f, (r - l) - label_w - 72.0f * u);
+    // Leave room for the value even with a long label; draw_bar scales the label to fit beside it.
+    const std::string shown_value = fit(value_of(row), h * 0.5f * 0.84f, (r - l) * 0.35f);
     draw_bar(dl, l, top, r, h, u, lit, row.label.c_str(), shown_value, row.enabled, ba, false);
+    g_bar_hits.push_back({index, ImVec2(l, top), ImVec2(r, top + h)});
     if (lit) draw_ring(dl, ImVec2(r - 6.0f * u, top + h * 0.5f), u, t, ba);
     if (lit && (row.kind == Kind::Odds || row.kind == Kind::Percent || row.kind == Kind::Number || row.kind == Kind::Choice) && row.enabled) {
       // Left and right change it: small arrows either side of the value.
@@ -1711,7 +1846,7 @@ void font_ensure() { font_ready(); }
 void opened() {
   if (g_stack.empty()) g_stack.push_back(Level{});
   // Back to the top level unless the player is mid-way through a page.
-  while (g_stack.size() > 1 && g_stack.back().page == Page::Code) g_stack.pop_back();
+  while (g_stack.size() > 1 && (g_stack.back().page == Page::Code || g_stack.back().page == Page::Stronger)) g_stack.pop_back();
   g_page_changed_at = ImGui::GetTime();
   g_prev_buttons = 0xFFFF;
   g_error.clear();
@@ -1849,7 +1984,8 @@ Result frame(int style, const Frame& f) {
   std::vector<Row> rows = rows_for(level().page);
   Level& lv = level();
   lv.cursor = rows.empty() ? 0 : std::clamp(lv.cursor, 0, (int)rows.size() - 1);
-  const Input in = read_input(f);
+  Input in = read_input(f);
+  if (style == kBars && lv.page != Page::Code) mouse_input(in, lv, (int)rows.size());
   if (lv.page == Page::Code) {
     keyboard_input(in, out);
   } else {
@@ -1868,10 +2004,24 @@ Result frame(int style, const Frame& f) {
     if (in.b) { if (g_stack.size() > 1) pop(); else out.close = true; }
     if (in.start) out.close = true;
   }
+  // "Stronger Pro AI" changed with left and right on the Fight a pro page.
+  if (level().page == Page::Ghosts && g_stronger_byte != (uint8_t)phillip_ai::stronger_choice()) {
+    phillip_ai::set_stronger_choice(g_stronger_byte);
+    out.stronger_changed = true;
+    g_c_changed = false;
+  }
   if (g_c_changed) { practice_cpu::set_config(g_c); out.changed = true; }
   // Draw what the input left.
   rows = rows_for(level().page);
   if (!rows.empty()) level().cursor = std::clamp(level().cursor, 0, (int)rows.size() - 1);
+  if (host::test_env::getenv("MELEE_UI_DIAG") && !rows.empty()) {
+    static int last_page = -1, last_cursor = -1;
+    const int page = (int)level().page, cursor = level().cursor;
+    if (page != last_page || cursor != last_cursor) {
+      host::log("practice menu: %s, row %d: %s", page_title(level().page), cursor, rows[(size_t)cursor].label.c_str());
+      last_page = page; last_cursor = cursor;
+    }
+  }
   const float a = ease((float)(f.time - g_page_changed_at) / 0.10f) * 0.25f + 0.75f;
   switch (style) {
     case kRails: draw_rails(dl, f, rows, a); break;

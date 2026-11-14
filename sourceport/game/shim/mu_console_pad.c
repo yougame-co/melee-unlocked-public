@@ -65,8 +65,20 @@ int mu_console_frame_begin(void)
 {
     /* The earlier rollback hook already injected this body's history, including on replay. */
     if (mu_console_rollback_active()) return 0;
-    if (!mu_console_host_frame_begin())
-        return 0;
+    {
+        int result = mu_console_host_frame_begin();
+#ifdef MELEE_DOUBLES
+        if (result == -51) {
+            void mu_doubles_restart(void);
+            mu_doubles_restart();
+        }
+#endif
+        if (result == -50) {
+            void mu_css_origin_restart(void);
+            mu_css_origin_restart();
+        }
+        if (!result) return 0;
+    }
     /* The host has composed this body's confirmed pads. Replace the ticket
      * before lb_800198E0 consumes it, including after a connection loss. */
     mu_console_replace_raw();

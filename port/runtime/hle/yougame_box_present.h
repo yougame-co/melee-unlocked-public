@@ -8,8 +8,8 @@ struct Choice { unsigned interval, flags; bool compositor = false, agent = false
 inline Choice choose(bool embedded, bool vsync, bool fullscreen, bool agent_override,
                      bool flip = true, bool paced = true, bool tearing = true, bool vrr_sync = false,
                      bool toplevel = false) {
-  // Verified in native platform performance review.
-  // 10-30, 144 Hz: p50 126 vs 135 fps, ~50% more repeated frames, same latency), so it is an agent-test
+  // In-box V-Sync presents at interval 1. The interval-0 compositor path measured worse on a Windows test PC
+  // (10-30, 144 Hz: p50 126 vs 135 fps, ~50% more repeated frames, same latency), so it is an agent-test
   // experiment only (agent-test.json "boxPresent":"compositor").
   if (embedded && !toplevel && vsync && !fullscreen && flip && paced && agent_override) return {0, 0, true, true};
   const bool synced = vsync || vrr_sync;

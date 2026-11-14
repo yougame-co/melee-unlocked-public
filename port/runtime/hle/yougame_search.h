@@ -67,11 +67,12 @@ inline bool no_show_expired(uint64_t deadline, bool arrived, uint64_t now) {
 }
 class BusyRetry {
  public:
-  // Three retries after the initial request, shared by every ticket in this search.
+  // Three retries after the initial request, shared by every ticket in this search. "busy" is the
+  // site's; "notHere" is the local channel host's (no page to ask yet, retryAfter 2).
   int delay(const nlohmann::json& answer) {
     const auto code = answer.is_object() ? answer.find("code") : answer.end();
     if (!answer.is_object() || answer.value("ok", false) || code == answer.end() ||
-        !code->is_string() || *code != "busy" || tries_ == 3) return 0;
+        !code->is_string() || (*code != "busy" && *code != "notHere") || tries_ == 3) return 0;
     ++tries_;
     const auto read = [](const nlohmann::json& value) -> int {
       if (value.is_number_integer() && value >= 1 && value <= 86400) return value.get<int>();

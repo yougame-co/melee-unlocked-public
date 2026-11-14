@@ -111,7 +111,7 @@ static bool intersects(const Box& a, const Box& b) {
   return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
 }
 static Box text_box(float x, float y, float sx, float sy, const std::string& value) {
-  // Measured on 2560x1440 CSS screenshot (10-31): "User" at scale .4 is ~8.2 units per
+  // Measured on a 2560x1440 CSS screenshot (10-31): "User" at scale .4 is ~8.2 units per
   // character, so the game's font advances ~20.5 units per character at scale 1.
   return {x, y, x + value.size()*20.5f*sx, y + 20*sy};
 }
@@ -219,7 +219,7 @@ static void layout_states() {
         };
         add(-112,20,.4f,"User"); add(-112,40,.5f,std::string(31,'N'));
         add(70,23,.5f,conn==MU_SLP_MM_ERROR ? "Error" : practice_mode ? "Practice - not rated" : "Ranked");
-        if (matched) { add(-130,-246,.5f,"Playing:"); add(-50,-246,.5f,std::string(31,'N')); }
+        if (matched) { add(-130,-256,.5f,"Playing:"); add(-50,-256,.5f,std::string(31,'N')); }
         if (conn>MU_SLP_MM_IDLE) add(70,132.5f,.4f,"Hold Z to disconnect");
         if (conn==MU_SLP_MM_CONNECTION_SUCCESS && !p2p && !practice_mode)
           add(70,152.5f,.4f,"Use D-Pad to Chat");

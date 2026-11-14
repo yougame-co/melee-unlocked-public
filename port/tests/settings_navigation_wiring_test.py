@@ -117,18 +117,23 @@ int main(int, char** argv) {
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include "''' + str(ROOT / 'port/runtime/gx/prewarm.h') + r'''"
+using gx::UnsupportedPrewarmBackend;
 struct Backend {} d11,d12,vk;
 enum class RenderApi { D3D11,D3D12,Vulkan };
-struct RenderOptions { RenderApi api; int dlss_mode=0,frame_generation_mode=0; };
+struct RenderOptions { RenderApi api; int dlss_mode=0,frame_generation_mode=0; bool prewarm_only=false; };
 struct VulkanWindow { void* window; std::function<void(int*,int*)> drawable_size; };
 using HWND=void*; struct RECT { int left,top,right,bottom; };
 void GetClientRect(HWND, RECT*) {}
-namespace host { void log(const char*,...) {} }
+namespace host { void log(const char*,...) {} namespace test_env { const char* getenv(const char*) { return nullptr; } } }
 bool vk_ok,d11_ok,usable;
 Backend* create_vulkan_backend(VulkanWindow,int,int,RenderOptions) { return vk_ok?&vk:nullptr; }
 Backend* create_d3d11_backend(void*,int,int,RenderOptions) { return d11_ok?&d11:nullptr; }
 Backend* create_d3d12_backend(void*,int,int,RenderOptions) { return &d12; }
 bool d3d12_usable() { return usable; }
+namespace fsr { bool is_fsr_mode(int mode) { return mode >= 11 && mode <= 15; } }   // gx_fsr.h (v0.9.104)
+bool d3d11_available() { return true; }   // a DirectX 11 GPU is present; its backend may still fail
+[[noreturn]] void no_directx11_gpu(void*) { std::abort(); }
 ''' + tracker + '\nBackend* create_render_backend(void* hwnd,int client_w,int client_h,const RenderOptions& options) {' + body(win, 'create_render_backend') + r'''
 }
 int main() {
@@ -142,7 +147,15 @@ int main() {
       const char* name=expected==&vk?"Vulkan":expected==&d11?"D3D11":"D3D12";
       if (std::string(started_render_backend())!=name) std::abort(); ++checks;
     }
-  printf("backend startup: %d checks across 24 actual/fallback combinations\n",checks);
+  // Graphics-only mode must not fall back into an unlocked backend cache.
+  vk_ok=false; usable=true;
+  if (create_render_backend(nullptr,640,480,{RenderApi::Vulkan,0,0,true})!=nullptr) std::abort();
+  for (auto api : {RenderApi::D3D11,RenderApi::D3D12}) {
+    usable=false;
+    try { create_render_backend(nullptr,640,480,{api,0,0,true}); std::abort(); }
+    catch (const UnsupportedPrewarmBackend&) {}
+  }
+  printf("backend startup: %d checks across 24 actual/fallback combinations; 3 prewarm refusal paths\n",checks);
 }
 ''')
         linux = (ROOT / 'port/linux/full/gx_backend_linux.cpp').read_text()
@@ -158,7 +171,10 @@ int main() {
         ui = (ROOT / 'port/runtime/gx/pc_settings.cpp').read_text()
         nav = 'const bool nav_active = state.open || state.menu_open || practice_nav || state.fill_window;'
         start = ui.index('  // The PhobGCC menu reads the controller itself:')
-        branch = ui[start:ui.index('  ImGui::NewFrame();', start)]
+        # v0.9.105 puts its panel-nav test driver (MELEE_TEST_PANEL_NAV) between this branch and NewFrame.
+        end = ui.index('  // Test runs (MELEE_TEST_PANEL_NAV', start)
+        self.assertLess(end, ui.index('  ImGui::NewFrame();', start))
+        branch = ui[start:end]
         from yougame_console_wiring_test import body
         helper = (ROOT / 'port/runtime/gx/settings_imgui_input.h').read_text()
         mapping = body(helper, 'gamepad')
@@ -208,7 +224,9 @@ int main() {
         start = frame.index('settings_input::navigation(io, state.open || state.menu_open || practice_nav || state.fill_window);')
         self.assertLess(start, frame.index('ImGui_ImplWin32_NewFrame();'))
         self.assertIn('const bool nav_active = state.open || state.menu_open || practice_nav || state.fill_window;', frame)
-        self.assertIn('int nav_port = practice_nav ? std::clamp(practice.controller_port, 0, 3) : followed;', frame)
+        # 0.9.98: Practice starts on the trainee's port, then follows the pad last picked up, like the panel.
+        self.assertIn('if (practice_nav && !state.practice_nav_was) state.settings_controller_port = std::clamp(practice.controller_port, 0, 3);', frame)
+        self.assertIn('int nav_port = followed;', frame)
         self.assertIn('else if (have_pad && nav_active && state.practice_pad_armed)', frame)
         self.assertIn('if (have_pad && nav_active && state.practice_pad_armed && phob_native_open())', frame)
         self.assertIn('settings_input::gamepad(io, navigation_pads[nav_port]);', frame)

@@ -4,7 +4,6 @@
 #include "gx_core.h"
 #include "render_options.h"
 #include "gx_retro.h"
-#include "hle/online_frame_budget.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -39,7 +38,7 @@ int main() {
   constexpr float kCamera = -300.0f;   // the fighters stand 300 units in front of the camera
   gx::Frame f;
   f.scene_major = 0x02; f.scene_minor = 0x02;   // a VS match
-  f.vertices.resize(12);
+  f.vertices.resize(12, gx::Vertex{});
   for (auto& v : f.vertices) { v.pos[0] = v.pos[1] = v.pos[2] = 0; v.posmtx = 0; }
   // Two vertices of the platform reach 10 units back; the backdrop is wholly 500 units back.
   f.vertices[1].pos[2] = -10.0f;
@@ -131,52 +130,6 @@ int main() {
     check(opaque && opaque->width == 1 && opaque->pixels == std::vector<uint8_t>({255, 255, 255, 255}), "an opaque texture is still one white texel");
   }
 
-  // Online match speed protection judges the frame pacer's deadlines, never single slow frames.
-  {
-    using Budget = slippi::online::FrameBudget;
-    const unsigned W = Budget::kWindow;
-    // A computer that keeps up, with a late frame after every rollback or hitch: never touched.
-    Budget keeps;
-    for (unsigned i = 0; i < 60 * 60 * 8; ++i) keeps.update(true, true, true, i % 4 == 0 || i % 7 == 0);
-    check(!keeps.suspended(), "rollback and hitch frames never pause sub-frames on a computer that keeps up");
-    Budget burst;
-    for (unsigned i = 0; i < 60 * 60; ++i) burst.update(true, true, true, (i % 600) < 120);
-    check(!burst.suspended(), "two seconds of lateness (a background task) does not pause sub-frames");
-    // Falling behind with sub-frames on, keeping up without them: paused for the rest of the match.
-    Budget slow;
-    Budget::Change c = Budget::Change::None;
-    for (unsigned i = 0; i < W - 1; ++i) c = slow.update(true, true, true, true);
-    check(c == Budget::Change::None && !slow.suspended(), "a window not yet full never pauses");
-    check(slow.update(true, true, true, true) == Budget::Change::Suspend, "a full window of late frames pauses sub-frames");
-    for (unsigned i = 0; i < 60 * 60 * 5; ++i) c = slow.update(true, true, false, i < 30);
-    check(slow.suspended() && slow.state() == Budget::State::Kept, "pausing fixed it: held for the match, no switching back and forth");
-    // Still behind without sub-frames: they were not the cause and come back on, once, for good.
-    Budget other;
-    for (unsigned i = 0; i < W; ++i) other.update(true, true, true, true);
-    unsigned resumes = 0, suspends = 0;
-    for (unsigned i = 0; i < 60 * 60 * 5; ++i) {
-      const bool sub = !other.suspended();
-      const auto r = other.update(true, true, sub, true);
-      resumes += r == Budget::Change::Resume; suspends += r == Budget::Change::Suspend;
-    }
-    check(resumes == 1 && suspends == 0 && !other.suspended() && other.state() == Budget::State::Done,
-          "pausing did not help: sub-frames return and stay on for the match");
-    // Off in settings, or the match ends: sub-frames are back at once.
-    Budget off;
-    for (unsigned i = 0; i < W; ++i) off.update(true, true, true, true);
-    check(off.update(false, true, false, true) == Budget::Change::Resume && !off.suspended(), "turning the setting off gives sub-frames back");
-    for (unsigned i = 0; i < W * 4; ++i) off.update(false, true, true, true);
-    check(!off.suspended(), "with the setting off nothing is ever paused");
-    Budget ends;
-    for (unsigned i = 0; i < W; ++i) ends.update(true, true, true, true);
-    check(ends.update(true, false, false, false) == Budget::Change::Resume && ends.state() == Budget::State::Watching, "the next match starts fresh");
-    Budget menus;
-    for (unsigned i = 0; i < W * 4; ++i) menus.update(true, false, true, true);
-    check(!menus.suspended(), "menus and results never pause sub-frames");
-    Budget capped;
-    for (unsigned i = 0; i < W * 4; ++i) capped.update(true, true, false, true);
-    check(!capped.suspended(), "with sub-frames already off (a 60 cap) there is nothing to pause");
-  }
 
   // Outside a match (the character select) nothing changes at any level.
   gx::Frame menu = f; menu.scene_minor = 0x00;
@@ -234,6 +187,11 @@ int main() {
   check(in_match(0x21, 0x01) && in_match(0x26, 0x01) && in_match(0x20, 0x01) && !in_match(0x21, 0x00), "Multi-Man and Home-Run: the stage");
   check(in_match(0x1F, 0x02) && !in_match(0x1F, 0x01), "Special Melee: match from minor 2");
   check(in_match(0x08, 0x02) && in_match(0x2B, 0x01) && !in_match(0x01, 0x00), "online, events and menus as before");
+  // What the app hears as a match (yg {"match":1}): the fight and sudden death, not VS results.
+  auto app_match = [](uint8_t major, uint8_t minor) { gx::Frame s; s.scene_major = major; s.scene_minor = minor; return gx::frame_in_app_match(s); };
+  check(app_match(0x02, 0x02) && app_match(0x02, 0x03) && !app_match(0x02, 0x04) && !app_match(0x02, 0x00), "app match: VS fight and sudden death, not results or CSS");
+  check(app_match(0x08, 0x02) && !app_match(0x08, 0x00) && app_match(0x03, 0x01) && app_match(0x2B, 0x01), "app match: online, 1P and events as frame_in_match");
+  check(!app_match(0x1F, 0x04) && app_match(0x1F, 0x02), "app match: Special Melee results are a menu");
 
   // Looks: texture treatments and presets.
   {

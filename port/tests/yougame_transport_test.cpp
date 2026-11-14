@@ -309,9 +309,128 @@ static void mixed_version_reasons() {
   CHECK(!lobby_protocol_mismatch({{"reason","the rooms server answered 403: ticket expired"}}));
   CHECK(!lobby_protocol_mismatch({{"reason","connection lost"}}));
   CHECK(!lobby_protocol_mismatch({{"reason",12}}));
+  // Rooms' Teams-mark refusals: a room of another kind (friends room-kind retries), not a lobby_mismatch.
+  using yougame::transport::room_kind_refusal;
+  CHECK(room_kind_refusal({{"reason","the rooms server answered 403: This room uses another Teams protocol"}}));
+  CHECK(room_kind_refusal({{"reason","the rooms server answered 403: This room uses another Doubles profile"}}));
+  CHECK(!lobby_protocol_mismatch({{"reason","the rooms server answered 403: This room uses another Teams protocol"}}));
+  CHECK(!room_kind_refusal({{"reason","the rooms server answered 410: Your friend isn't in that game any more"}}));
+  CHECK(!room_kind_refusal({{"reason","the rooms server answered 409: Your home hold expired. Open a new Teams home."}}));
+  CHECK(!room_kind_refusal({{"reason","the rooms server answered 403: This room uses a different lobby protocol or configuration"}}));
+  CHECK(!room_kind_refusal({{"reason",12}}));
+  // The app names rooms' refusal code as "answered <status> [<slug>]: <error>": the slug decides, read anchored at
+  // the start (brackets in the error words never count); without one the words decide.
+  using yougame::transport::rooms_refusal_slug;
+  CHECK(rooms_refusal_slug("the rooms server answered 403 [teams_protocol]: This room uses another Teams protocol") == "teams_protocol");
+  CHECK(rooms_refusal_slug("the rooms server answered 403 [doubles_profile]: This room uses another Doubles profile") == "doubles_profile");
+  CHECK(rooms_refusal_slug("the rooms server answered 403: This room uses another Teams protocol").empty());
+  CHECK(rooms_refusal_slug("the rooms server answered 403: bad [teams_protocol] words").empty());   // a bracket in the error
+  CHECK(rooms_refusal_slug("x the rooms server answered 403 [teams_protocol]: y").empty());          // anchored
+  CHECK(rooms_refusal_slug("the rooms server answered 40 [teams_protocol]: y").empty());
+  CHECK(rooms_refusal_slug("the rooms server answered 4031 [teams_protocol]: y").empty());
+  CHECK(rooms_refusal_slug("the rooms server answered 403 []: y").empty());
+  CHECK(rooms_refusal_slug("the rooms server answered 403 [Teams]: y").empty());
+  CHECK(rooms_refusal_slug("the rooms server answered 403 [teams-protocol]: y").empty());
+  CHECK(rooms_refusal_slug("the rooms server answered 403 [teams_protocol").empty());
+  CHECK(rooms_refusal_slug("the rooms server answered 403 [" + std::string(32, 'a') + "]: y") == std::string(32, 'a'));
+  CHECK(rooms_refusal_slug("the rooms server answered 403 [" + std::string(33, 'a') + "]: y").empty());
+  CHECK(room_kind_refusal({{"reason","the rooms server answered 403 [teams_protocol]: This room uses another Teams protocol"}}));
+  CHECK(room_kind_refusal({{"reason","the rooms server answered 403 [doubles_profile]: This room uses another Doubles profile"}}));
+  CHECK(room_kind_refusal({{"reason","the rooms server answered 403 [teams_protocol]: words [with] brackets"}}));
+  CHECK(room_kind_refusal({{"message","the rooms server answered 403 [doubles_profile]: changed words"}}));
+  CHECK(!room_kind_refusal({{"reason","the rooms server answered 410 [host_gone]: Your friend isn't in that game any more"}}));
+  // A slug that isn't a kind decides too, whatever the words say; a bracketed word inside the error is no slug.
+  CHECK(!room_kind_refusal({{"reason","the rooms server answered 403 [lobby_mismatch]: This room uses another Teams protocol"}}));
+  CHECK(room_kind_refusal({{"reason","the rooms server answered 403: [note] This room uses another Doubles profile"}}));
+  CHECK(!room_kind_refusal({{"reason","the rooms server answered 403: [teams_protocol] ticket expired"}}));
+  using yougame::transport::rooms_busy;
+  CHECK(rooms_busy({{"reason","the rooms server answered 503: Please try again shortly."}}));
+  CHECK(!rooms_busy({{"reason","the rooms server answered 503: Room metadata unavailable"}}));
+  CHECK(!rooms_busy({{"reason","the rooms server answered 401: Bad or expired ticket"}}));
+  CHECK(!rooms_busy({{"reason","connection lost"}}));
+  CHECK(!rooms_busy({{"reason",12}}));
+  using yougame::transport::rooms_full;
+  CHECK(rooms_full({{"reason","the rooms server answered 409: Room is full"}}));
+  CHECK(rooms_full({{"message","the rooms server answered 409: Room is full"}}));
+  CHECK(!rooms_full({{"reason","the rooms server answered 409: Build mismatch"}}));
+  CHECK(!rooms_full({{"reason",12}}) && !rooms_full(json::object()));
+}
+// The app's answer to netOpen can take the whole open timeout (a slow reply, a starved thread): the open
+// or refusal it already queued still decides, rather than a timeout that leaves the stream half open.
+static void answer_after_deadline() {
+  Events events; uint64_t t = 1000; bool refuse = false; int next = 1;
+  Stream s(events, [&](const json& q, int) -> json {
+    if (q["type"] != "netOpen") return json();
+    const int id = next++;
+    if (refuse) {
+      events.push({{"conn",id},{"event","error"},{"code","refused"},{"message","the rooms server answered 409: Room is full"}});
+      events.push({{"conn",id},{"event","close"},{"code",1006},{"reason","the rooms server answered 409: Room is full"}});
+    } else events.push({{"conn",id},{"event","open"}});
+    t += 500;
+    return json{{"conn",id}};
+  }, [&] { return t; });
+  CHECK(s.open("test-ticket","abcdef",100) && !s.closed());
+  s.close();
+  refuse = true;
+  CHECK(!s.open("test-ticket","abcdef",100) && s.closed() && s.full());
+}
+// The app's refusal of a full friend room: an error event, then a 1006 close with the same words.
+static void full_room_refusal() {
+  Events events; int next=1; bool refuse=true;
+  Stream s(events,[&](const json& q,int) {
+    if(q["type"]!="netOpen") return json();
+    const int id=next++;
+    if(refuse) {
+      events.push({{"type","net"},{"conn",id},{"event","error"},{"code","refused"},{"message","the rooms server answered 409: Room is full"}});
+      events.push({{"type","net"},{"conn",id},{"event","close"},{"code",1006},{"reason","the rooms server answered 409: Room is full"}});
+    } else events.push({{"conn",id},{"event","open"}});
+    return json{{"conn",id}};
+  });
+  CHECK(!s.open("test-ticket","abcdef",100) && s.closed() && s.close_code()==1006 && s.full() && !s.busy());
+  refuse=false;
+  CHECK(s.open("test-ticket","abcdef",100) && !s.full());   // a fresh open forgets it
+  events.push({{"conn",2},{"event","error"},{"code","refused"},{"message","the rooms server answered 409: Room is full"}});
+  events.push({{"conn",2},{"event","close"},{"code",1006},{"reason","connection lost"}});
+  json m; CHECK(!s.next(m,100) && s.closed() && s.full());
+  // Any other 1006 drop stays recoverable.
+  refuse=false; CHECK(s.open("test-ticket","abcdef",100));
+  events.push({{"conn",3},{"event","close"},{"code",1006},{"reason","connection lost"}});
+  CHECK(!s.next(m,100) && s.closed() && !s.full());
+  // Past the upgrade: the losing seat of a race (1008), or a recovery client's final refusal (4004).
+  CHECK(s.open("test-ticket","abcdef",100));
+  events.push({{"conn",4},{"event","close"},{"code",1008},{"reason","room full"}});
+  CHECK(!s.next(m,100) && s.full());
+  CHECK(s.open("test-ticket","abcdef",100));
+  events.push({{"conn",5},{"event","close"},{"code",4004},{"reason","rejoin-refused:room-full"}});
+  CHECK(!s.next(m,100) && s.full());
+  CHECK(s.open("test-ticket","abcdef",100));
+  events.push({{"conn",6},{"event","close"},{"code",1008},{"reason","too many messages"}});
+  CHECK(!s.next(m,100) && !s.full());
+}
+// A Teams-mark refusal named by its slug (error event and close, whatever the words), or only by the close's
+// words (an older app); any other 1006 is not one, and a fresh open forgets it.
+static void kind_code_refusal() {
+  Events events; int next=1; int how=0;
+  Stream s(events,[&](const json& q,int) {
+    if(q["type"]!="netOpen") return json();
+    const int id=next++;
+    if(how==0) {
+      events.push({{"type","net"},{"conn",id},{"event","error"},{"code","refused"},{"message","the rooms server answered 403 [doubles_profile]: changed words"}});
+      events.push({{"type","net"},{"conn",id},{"event","close"},{"code",1006},{"reason","the rooms server answered 403 [doubles_profile]: changed words"}});
+    } else if(how==1) {
+      events.push({{"type","net"},{"conn",id},{"event","close"},{"code",1006},{"reason","the rooms server answered 403: This room uses another Teams protocol"}});
+    } else if(how==2) {
+      events.push({{"type","net"},{"conn",id},{"event","close"},{"code",1006},{"reason","the rooms server answered 410: Your friend isn't in that game any more"}});
+    } else events.push({{"conn",id},{"event","open"}});
+    return json{{"conn",id}};
+  });
+  CHECK(!s.open("test-ticket","abcdef",100) && s.closed() && s.kind_refused() && !s.lobby_mismatch());
+  how=1; CHECK(!s.open("test-ticket","abcdef",100) && s.kind_refused());
+  how=2; CHECK(!s.open("test-ticket","abcdef",100) && !s.kind_refused());
+  how=3; CHECK(s.open("test-ticket","abcdef",100) && !s.kind_refused());
 }
 int main() {
-  mixed_version_reasons();
+  mixed_version_reasons(); answer_after_deadline(); full_room_refusal(); kind_code_refusal();
   closed_during_event_wait(); closed_state_transitions();
   mode_and_candidates(); broker_ordering(); unranked_recovery(); link_budget(); recovery_and_ranked(); leave_reasons(); lobby_match_links();
   std::puts("yougame_transport: mode, candidates, broker ordering, link timeout/retry, leave reasons, lobby/match links, seat recovery and ranked resume passed");

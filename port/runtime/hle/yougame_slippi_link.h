@@ -76,12 +76,14 @@ inline const char* log_line(Answer a) {
   }
 }
 struct Presentation {
-  std::atomic<bool> enabled{false}, open{false}, later{false}, now{false}, declined{false};
+  // linked: the sign-in the app granted already works, so there is nothing left to link.
+  std::atomic<bool> enabled{false}, open{false}, later{false}, now{false}, declined{false}, linked{false};
   std::string line(Screen screen) const {
     if (screen == Screen::None) return {};
     if (!enabled || declined) return screen == Screen::Search ? kSearching : kRefusal;
     if (later) return kLater;
     if (now) return screen == Screen::Search ? blend::kSearchBoth : kLinkedMenu;
+    if (linked) return screen == Screen::Search ? kSearching : kRefusal;
     if (open) return kOpen;
     return screen == Screen::Search ? kSearchCta : kRefusalCta;
   }
@@ -96,7 +98,8 @@ class Flow {
   bool pending() const { return future_.valid(); }
   template<class Send>
   bool press(Screen screen, uint32_t scene, Send send) {
-    if (!p_.enabled || p_.declined || p_.later || p_.now || screen == Screen::None || future_.valid()) return false;
+    if (!p_.enabled || p_.linked || p_.declined || p_.later || p_.now ||
+        screen == Screen::None || future_.valid()) return false;
     stop_ = std::make_shared<std::atomic<bool>>(false);
     scene_ = scene;
     cancelled_ = false;

@@ -93,8 +93,11 @@ class ShortcutsWiringTest(unittest.TestCase):
         apply = window.split('void apply_shortcuts() {', 1)[1].split('bool shortcut_swallowed(', 1)[0]
         self.assertIn('if (logged && config == last) return;', apply)
         self.assertIn('g_key_bindings.vk[i]', apply)
-        self.assertIn('vk == config.menu.key || vk == config.chat.key', apply)
-        self.assertIn('log("embed: shortcut overrides keyboard action %s (key %d)", actions[i], vk);', apply)
+        self.assertIn('for (const auto combo : {config.menu, config.chat})', apply)
+        self.assertIn('vk != combo.key', apply)
+        for modifier in ('Shift', 'Ctrl', 'Alt'):
+            self.assertIn(f'combo.modifiers & yougame::shortcuts::{modifier}', apply)
+        self.assertIn('embed: shortcut %s shares key %d with keyboard action %s (the plain key still goes to the game)', apply)
         create = window.split('void* window_create(', 1)[1].split('namespace {', 1)[0]
         self.assertIn('apply_shortcuts();', create)
 

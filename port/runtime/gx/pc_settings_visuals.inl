@@ -295,12 +295,8 @@ static bool settings_gd_combo(const char* label, int* value, const char* const i
       static constexpr const char* short_displays[]={"Window","Borderless","Exclusive"};
       if(*value>=0 && *value<3) text=short_displays[*value];
     } else if(std::strcmp(label,"Widescreen")==0) {
-#ifdef MELEE_NO_SLIPPI
-      static constexpr const char* short_widescreen[]={"Off","16:9 code","True 16:9"};
-#else
-      static constexpr const char* short_widescreen[]={"Off","Slippi code","True 16:9"};
-#endif
-      if(*value>=0 && *value<3) text=short_widescreen[*value];
+      static constexpr const char* short_widescreen[]={"Off","Fill screen","16:9","16:10","Custom"};
+      if(*value>=0 && *value<5) text=short_widescreen[*value];
     }
     return text;
   };

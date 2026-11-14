@@ -13,7 +13,10 @@
 #endif
 
 namespace yougame::update {
-inline constexpr const char* kMessage = "A new version is out. Restart to update";
+// The app moves the game to the latest build itself (desktop native.ts), so no "restart".
+inline constexpr const char* kMessage = "Updating to the latest version. Online opens when it's ready.";
+// Printed when the player opens Online: the app checks this game for a newer build at once (desktop native.ts).
+inline constexpr const char* kCheckLine = "yougame: update check";
 class Required : public std::runtime_error {
  public:
   Required() : std::runtime_error(kMessage) {}
@@ -57,6 +60,20 @@ inline const nlohmann::json& refusal(const nlohmann::json& reply) {
   if (required(reply)) return reply;
   const auto result = reply.is_object() ? reply.find("result") : reply.end();
   return result != reply.end() && required(*result) ? *result : reply;
+}
+// The words an update_required answer carries (its `error`, which the app may replace with its own line, desktop
+// PR 1145), shown as given; empty when there are none, they hold a control character or run past 200 bytes.
+inline std::string error_text(const nlohmann::json& reply) {
+  for (const auto* at : {&reply, &refusal(reply)}) {
+    const auto value = at->is_object() ? at->find("error") : at->end();
+    if (value == at->end() || !value->is_string()) continue;
+    const auto text = value->get<std::string>();
+    if (text.empty() || text.size() > 200) continue;
+    bool clean = true;
+    for (unsigned char c : text) if (c < 0x20 || c == 0x7f) clean = false;
+    if (clean) return text;
+  }
+  return {};
 }
 inline std::string current(const nlohmann::json& reply) {
   const auto value = reply.is_object() ? reply.find("current") : reply.end();
@@ -141,7 +158,7 @@ class Notice {
     if (!presenting_) { presenting_ = true; since_ = now; return {}; }
     if (now < since_ || now - since_ < 1000) return {};
     accepted_ = true;
-    // " online": the app relaunches with --resume online (native-experience 11-01).
+    // " online": the app relaunches with --resume online (11-01).
     const auto line = "yougame: update accept " + pending_ + (online_ ? " online" : "");
     pending_.clear();
     return line; // The caller writes one newline using the bridge stdout writer.

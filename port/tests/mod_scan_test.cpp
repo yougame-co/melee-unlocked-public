@@ -149,6 +149,7 @@ int main(int argc, char** argv) {
     std::ofstream(root / "Mods" / "Discs" / "tm.iso", std::ios::binary).write((const char*)disc.data(), (std::streamsize)disc.size());
   }
   write_disc(root / "Mods" / "Discs" / "akaneia-like.iso", "GALE01", 2, "Super Smash Bros Melee", {{"MxDt.dat", "mex data"}}, 0x11);
+  write_disc(root / "Mods" / "Discs" / "chaos.iso", "GALE01", 2, "Super Smash Bros. Chaos Eternal", {{"MxDt.dat", "chaos mex data"}}, 0x33);
   write_disc(root / "Mods" / "Discs" / "codes.iso", "GALE01", 2, "Code Mod Build", {{"codes.gct", "gecko"}}, 0x22);
   write_disc(root / "Mods" / "Discs" / "pal.iso", "GALP01", 0, "Melee PAL", {{"a.dat", "x"}});
 
@@ -164,13 +165,25 @@ int main(int argc, char** argv) {
   check(tm.enabled, "Training Mode CE is turned on the first time it is found");
   check(choices.count("tmce") && choices["tmce"] == 1, "that first-found choice is recorded");
   const Detected mex = find(first, Kind::Mex);
-  check(mex.kind == Kind::Mex && mex.needs == Engine::Recomp, "an m-ex disc (MxDt.dat) is recognized and needs the Static Recomp");
+  check(mex.kind == Kind::Mex && mex.needs == Engine::Either,
+        "an m-ex disc (MxDt.dat) is recognized and plays on either engine (Static runs its code, Source loads its files)");
   check(mex.name == "akaneia-like" && mex.enabled && mex.status == Support::Untested,
         "an unknown m-ex pack has its own name, turns on, and retains its untested status");
+  {
+    Detected chaos{};
+    for (const auto& d : first.items) if (d.path.filename() == "chaos.iso") chaos = d;
+    check(chaos.kind == Kind::Mex && chaos.needs == Engine::Recomp && chaos.status == Support::Untested,
+          "Chaos Eternal (its fighters need its own code) plays on the Static Recomp");
+  }
   const Detected code = find(first, Kind::CodeMod);
-  check(code.kind == Kind::CodeMod && code.needs == Engine::Recomp, "a disc with its own codes is a code mod for the Static Recomp");
-  check(code.status == Support::NotSupportedYet && !code.can_enable && !code.enabled,
-        "an unverified code mod is found but not offered as playable");
+  check(code.kind == Kind::CodeMod && code.needs == Engine::Either, "a disc with its own codes is a code mod for either engine");
+  check(code.status == Support::Untested && code.can_enable,
+        "an unverified code mod is offered as playable, marked untested");
+  {
+    bool auto_loaded = false;
+    for (const auto& layer : source_port_layers(first)) auto_loaded |= layer.path == mex.path || layer.path == code.path;
+    check(!auto_loaded, "m-ex and code mods never load by themselves on the Source Port: only from the launcher's Mods page");
+  }
   check(mex.catalog_id.empty(), "a named file does not give an unknown m-ex disc an official catalog ID");
   check(tm.catalog_id == "tmce", "a content-recognized pack has its stable catalog ID");
   bool pal_refused = false;
@@ -214,7 +227,7 @@ int main(int argc, char** argv) {
   check(retail.kind == Kind::Vanilla && !retail.can_enable,
         "an ISO with identical game files is retail even without the official whole-disc hash");
   check(runs_on(tm, true) && !runs_on(tm, false), "Training Mode CE is enabled only on the Source Port");
-  check(runs_on(mex, false) && !runs_on(mex, true), "m-ex mods are enabled only on the Static Recomp");
+  check(runs_on(mex, false) && runs_on(mex, true), "m-ex mods are enabled on both engines");
   check(hack_pack_version("d926ba5b39551f5245fd655bc1dfeb3f") == "5.0.2" &&
         hack_pack_version("17756217401a39227feea1ebb8542376") == "4.07++",
         "current and legacy official Hack Pack fingerprints are recognized");

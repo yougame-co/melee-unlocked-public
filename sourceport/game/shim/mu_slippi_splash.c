@@ -27,6 +27,9 @@
 #include <sysdolphin/baselib/sislib_font.h>
 #include <mu_native.h>
 #include <mu_ranked.h>
+#if MU_SQUAD
+#include "mu_squad.h"
+#endif
 
 /* MSRB game info (console StartMeleeData): rules 0x60 bytes, then 0x24 per player. */
 #define GI_IS_TEAMS 0x8
@@ -161,6 +164,32 @@ void mu_slippi_splash_text(void)
             create_subtext(t, &splash_colors[4], 0.5f, 250.0f, 45.0f, "%s", score);
         }
     }
+
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+     * The squads were trimmed to fit memory: both players see it here, before the first frame,
+     * centred in the black band above the names, split after the colon. */
+    if (gmSquad_OnlineReady() && gmSquad_OnlineTrimNotice()[0]) {
+        char first[80];
+        const char* notice = gmSquad_OnlineTrimNotice();
+        const char* rest = strchr(notice, ':');
+        size_t n = rest ? (size_t) (rest - notice + 1) : strlen(notice);
+        if (n >= sizeof first) n = sizeof first - 1;
+        memcpy(first, notice, n);
+        first[n] = 0;
+        t = HSD_SisLib_803A6754(0, 0);
+        t->default_kerning = 1;
+        t->default_alignment = 1; /* centred on x */
+        t->pos_z = 0.0f;
+        t->font_size.x = 1.0f;
+        t->font_size.y = 1.0f;
+        create_subtext(t, &splash_colors[2], 0.45f, 320.0f, 28.0f, "%s", first);
+        if (rest) {
+            while (*++rest == ' ') {}
+            create_subtext(t, &splash_colors[2], 0.45f, 320.0f, 50.0f, "%s", rest);
+        }
+    }
+#endif
 
     /* Stage name */
     t = HSD_SisLib_803A6754(0, 0);

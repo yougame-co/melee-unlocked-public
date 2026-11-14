@@ -1,6 +1,7 @@
 // Slippi spectator server (see slippi_spectate.h). Port of Dolphin's SlippiSpectateServer, same
 // ENet host, same messages (nlohmann's dump writes the keys in the same order), same cursors.
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "slippi_agent_lock.h"
 #include "slippi_spectate.h"
 #include "slippi_net.h"
 #include "host.h"
@@ -194,6 +195,7 @@ void handle_message(const uint8_t* buffer, size_t length, uint16_t peer_id) {
 
 // SlippiSpectateServer::SlippicommSocketThread
 void server_thread(uint16_t port) {
+  if (agent_lock::blocked(agent_lock::Operation::Spectator)) { g_running = false; return; }
   if (enet_initialize() != 0) {
     host::log("spectator: ENet did not start; no spectator server");
     g_running = false;
@@ -259,6 +261,7 @@ void server_thread(uint16_t port) {
 }  // namespace
 
 void start() {
+  if (agent_lock::blocked(agent_lock::Operation::Spectator)) return;
   std::call_once(g_started, [] {
     const bool yougame_mode = yougame::active();
     if (!yougame::mode_policy::spectator_allowed(yougame_mode, gx::RenderOptions::live_slippi_spectator())) {

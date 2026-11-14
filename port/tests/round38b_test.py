@@ -29,28 +29,45 @@ class Round38bTest(unittest.TestCase):
 #include <cstdlib>
 #include "yougame_parity.h"
 struct ImVec2 { float x,y; ImVec2(float a=0,float b=0):x(a),y(b){} };
+// em: the body font's average glyph width (Segoe/Source Sans ~.37, the ProggyClean fallback ~.54, wide .6).
+static float em=.6f;
 struct Font { ImVec2 CalcTextSizeA(float fs,float,float,const char* s) {
-  float n=0;while(*s++)++n;return {n*fs*.6f,fs}; } } font;
+  float n=0;while(*s++)++n;return {n*fs*em,fs}; } } font;
 namespace ImGui { Font* GetFont(){return &font;} }
 namespace yougame::console { bool compact=true; bool console_menu_visible(){return compact;} }
 ''' + helper + r'''
 int main() {
  int checks=0;
+ const char* text="Menus are delay-based for now. Matches use rollback.";
+ for(float width_em:{.37f,.54f,.6f}) { em=width_em;
  for(bool compact:{false,true}) { yougame::console::compact=compact;
  for(float w:{64.f,200.f,450.f,640.f,1920.f,5120.f})
  for(float h:{64.f,200.f,480.f,1080.f,2160.f})
  for(float aspect:{.2f,73.f/60.f,4.f/3.f,16.f/9.f,5.f}) {
    const auto c=corner_hint(w,h,aspect);
-   const float ph=std::min(h,w/aspect),top=(h-ph)*.5f;
-   const float line_y=std::max(top+ph*.027f,c.max.y+2+ph/480);
-   if(c.min.x<-.01f || c.max.x>w+.01f || line_y-2<c.max.y || c.font<=0)std::abort();
-   checks+=4;
+   const float ph=std::min(h,w/aspect),pw=ph*aspect,left=(w-pw)*.5f,top=(h-ph)*.5f,u=ph/480;
+   // The menu notice at its drawn size (9 picture lines, narrowed to fit), under the 9-line "Friends" heading.
+   float fs=9*u; ImVec2 size=font.CalcTextSizeA(fs,0,0,text);
+   if(size.x>w*.96f){fs*=w*.96f/size.x;size=font.CalcTextSizeA(fs,0,0,text);}
+   const auto n=menu_notice(w,h,aspect,size);
+   const bool beside=n.max.x<=c.min.x || n.min.x>=c.max.x;
+   const bool dropped=n.min.y>=c.max.y-.01f && !beside;
+   if(c.min.x<-.01f || c.max.x>w+.01f || c.font<=0)std::abort();
+   if(n.scale<.6f-1e-4f || n.scale>1)std::abort();
+   if(n.min.y<top+ph*.003f+fs-.01f)std::abort();                 // clear of the heading
+   if(!beside && n.min.y<c.max.y-.01f)std::abort();              // never under the corner hint
+   if(compact && !dropped && n.max.y>top+25*u+.01f)std::abort(); // clear of the retail "UCF" label (line ~26)
+   // The notice keeps its row at every real presentation aspect, whichever font the platform draws with.
+   if(compact && aspect>1 && aspect<2 && ph>=200 && dropped)std::abort();
+   if(compact && !dropped && n.min.x<left-.01f)std::abort();     // inside the picture
+   checks+=7;
+ }
  }
  }
  printf("hint rectangles: %d checks passed\n",checks);
 }
 ''')
-        self.assertIn('corner.max.y+2+picture_height/480.0f', source)
+        self.assertIn('const auto notice = menu_notice(width,height,game_aspect,size);', source)
         self.assertIn('screen_label::draw_corner_hint(', body(read('port/runtime/gx/pc_settings.cpp'),
                                                            'draw_back_to_yougame_hint'))
 
@@ -154,7 +171,7 @@ int main(){
     def test_sandboxed_windows_library_path_is_beside_the_program(self):
         # In the AppContainer the mapped image is not in the loader list and the working directory is
         # the data folder, so a bare g_dll must resolve beside the program, as map_game_image reads it
-        # (11-02: "handoff: refused: cannot open game library" in every phase).
+        # (Windows gate 1, 11-02: "handoff: refused: cannot open game library" in every phase).
         from yougame_0962_merge_test import conditional_source
         source = read('port/app/source_host.cpp')
         start = source.index('#ifdef __APPLE__\n  g_loaded_game_path = g_dll;')

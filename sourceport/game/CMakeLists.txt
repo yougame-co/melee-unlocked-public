@@ -50,7 +50,14 @@ endif()
 set(SDK "${D}/libs/dolphin/src/dolphin")
 # ---- how game code is compiled: one definition, shared by the game and by the parity library ----
 add_library(game_flags INTERFACE)
-option(YOUGAME_RANKED_BRANCH "Ranked: visible Ranked and local CPU practice" ON)   # ON in the main staging build (Friends + Ranked on the main build)
+option(MELEE_DOUBLES "Experimental console Doubles" OFF)
+if(MELEE_DOUBLES)
+  target_compile_definitions(game_flags INTERFACE MELEE_DOUBLES=1)
+  # Only this translation unit is renamed; the existing entry still calls main.
+  set_source_files_properties("${D}/src/melee/gm/gmmain.c" PROPERTIES
+    COMPILE_DEFINITIONS "main=mu_doubles_game_main")
+endif()
+option(YOUGAME_RANKED_BRANCH "Ranked: visible Ranked and local CPU practice" ON)   # ON in the main staging build (10-31: Friends + Ranked on the main build)
 if(YOUGAME_RANKED_BRANCH)
   target_compile_definitions(game_flags INTERFACE YOUGAME_RANKED_BRANCH=1)
 endif()
@@ -270,6 +277,11 @@ list(REMOVE_ITEM GAME_SOURCES "${MU_CPU_SOURCE}")
 list(APPEND GAME_SOURCES "${MU_CPU_FIXED}")
 set_source_files_properties("${MU_CPU_FIXED}" PROPERTIES
   INCLUDE_DIRECTORIES "${D}/src/melee/ft/kinds/ftCommon")
+# card.c builds each card command in a stack local, sets only the fields its type uses and copies the
+# whole struct into its ring (fn_803AC168). Zeroed locals keep the unset union bytes and padding free of
+# stack bytes, so two processes at the same frame hold the same ring (Friends join-in-progress).
+set_source_files_properties("${D}/src/sysdolphin/baselib/card.c" PROPERTIES
+  COMPILE_OPTIONS "-ftrivial-auto-var-init=zero")
 set(MU_CPU_HITLAG_FIXTURE "${CMAKE_CURRENT_BINARY_DIR}/native_cpu_hitlag_branch.h")
 add_custom_command(OUTPUT "${MU_CPU_HITLAG_FIXTURE}"
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/native_cpu_overlay.py"
@@ -289,6 +301,20 @@ list(APPEND SDK_SOURCES "${SDK}/os/OSAlloc.c" "${SDK}/os/OSArena.c" "${SDK}/pad/
 # Written for the hardware itself, or in its assembly; the native build has its own versions of these.
 list(REMOVE_ITEM SDK_SOURCES "${SDK}/gx/GXFifo.c" "${SDK}/mtx/psmtx.c")
 file(GLOB_RECURSE SHIM_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shim/*.c")
+if(NOT MELEE_DOUBLES)
+  list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_doubles.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_doubles_bootstrap.c")
+endif()
+# Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+option(MELEE_SQUAD_STRIKE "Build Squad Strike for offline VS and Friends" OFF)
+# CSS accesses mncharsel's private state through one include, never a second TU.
+list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_squad_css.c")
+if(MELEE_SQUAD_STRIKE)
+  target_compile_definitions(game_flags INTERFACE MU_SQUAD=1)
+else()
+  list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_squad.c")
+  list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_squad_online.c")
+endif()
 # A game library with no Slippi code in it (-DMU_NO_SLIPPI=ON, its own build directory): the online
 # menus, replay playback and recording, practice matchmaking and the online rule codes are left out.
 # Three small files stand in for them: the entry points the game sources call (shim/mu_noslippi.c),
@@ -476,6 +502,7 @@ add_library(melee_game SHARED ${GAME_SOURCES} ${LIBC_SOURCES} ${SDK_SOURCES} ${S
 add_dependencies(melee_game mu_rank_badge_assets)
 set_target_properties(melee_game PROPERTIES PREFIX "" C_STANDARD 11 C_EXTENSIONS ON EXCLUDE_FROM_ALL ON)
 target_link_libraries(melee_game PRIVATE game_flags)
+
 # Right after MEM1 (see port/app/source_host.cpp): the image's statics then have physical addresses
 # GX can hold. The debug information goes to melee_game.dbg so the loaded image stays small enough
 # to fit below 64 MB physical; addr2line reads the .dbg.
@@ -542,8 +569,70 @@ endif()
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/native-game-sources.txt"
   CONTENT "$<JOIN:$<TARGET_PROPERTY:melee_game,SOURCES>,\n>\n$<JOIN:$<TARGET_PROPERTY:sdk_math,SOURCES>,\n>\n")
 
-# Build every registered executable fixture, including the normally excluded
-# targets, before running CTest from a fresh Linux checkout.
+# Extract the actual Training exit routine, so an absent CPU exercises the same code that ships.
+set(MU_TRAINING_FIXTURE "${CMAKE_CURRENT_BINARY_DIR}/training_select_body.h")
+add_custom_command(OUTPUT "${MU_TRAINING_FIXTURE}"
+  COMMAND "${Python3_EXECUTABLE}" "${REPO}/tools/native_major_fixture.py"
+          "${D}/src/melee/gm/gmtrainingmode.c" "${MU_TRAINING_FIXTURE}" --function gm_801B1C24
+  DEPENDS "${D}/src/melee/gm/gmtrainingmode.c" "${REPO}/tools/native_major_fixture.py" VERBATIM)
+add_executable(mu_training_select_test EXCLUDE_FROM_ALL tests/training_select.c "${MU_TRAINING_FIXTURE}")
+target_include_directories(mu_training_select_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_options(mu_training_select_test PRIVATE -UNDEBUG)
+add_test(NAME native_training_select COMMAND mu_training_select_test)
+
+set(MU_FIGHTER_SCREEN_FIXTURE "${CMAKE_CURRENT_BINARY_DIR}/fighter_screen_position_body.h")
+add_custom_command(OUTPUT "${MU_FIGHTER_SCREEN_FIXTURE}"
+  COMMAND "${Python3_EXECUTABLE}" "${REPO}/tools/native_major_fixture.py"
+          "${D}/src/melee/if/ifnametag.c" "${MU_FIGHTER_SCREEN_FIXTURE}" --function mu_fighter_screen_position
+  DEPENDS "${D}/src/melee/if/ifnametag.c" "${REPO}/tools/native_major_fixture.py" VERBATIM)
+add_executable(mu_fighter_screen_position_test EXCLUDE_FROM_ALL tests/fighter_screen_position.c "${MU_FIGHTER_SCREEN_FIXTURE}")
+target_include_directories(mu_fighter_screen_position_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_options(mu_fighter_screen_position_test PRIVATE -UNDEBUG)
+add_test(NAME native_fighter_screen_position COMMAND mu_fighter_screen_position_test)
+
+set(MU_SIS_STACK_FIXTURES)
+foreach(MU_SIS_STACK_FUNCTION HSD_SisLib_803A7684 HSD_SisLib_803A7F0C sisRejectInvalidCursor)
+  set(MU_SIS_STACK_BODY "${CMAKE_CURRENT_BINARY_DIR}/${MU_SIS_STACK_FUNCTION}_body.h")
+  add_custom_command(OUTPUT "${MU_SIS_STACK_BODY}"
+    COMMAND "${Python3_EXECUTABLE}" "${REPO}/tools/native_major_fixture.py"
+            "${D}/src/sysdolphin/baselib/hsd_3A76.c" "${MU_SIS_STACK_BODY}" --function "${MU_SIS_STACK_FUNCTION}"
+    DEPENDS "${D}/src/sysdolphin/baselib/hsd_3A76.c" "${REPO}/tools/native_major_fixture.py" VERBATIM)
+  list(APPEND MU_SIS_STACK_FIXTURES "${MU_SIS_STACK_BODY}")
+endforeach()
+add_executable(mu_sis_state_stack_test EXCLUDE_FROM_ALL tests/sis_state_stack.c ${MU_SIS_STACK_FIXTURES})
+target_include_directories(mu_sis_state_stack_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_options(mu_sis_state_stack_test PRIVATE -UNDEBUG)
+add_test(NAME native_sis_state_stack COMMAND mu_sis_state_stack_test)
+
+function(mu_boundary_fixture name source)
+  set(bodies)
+  foreach(fn IN LISTS ARGN)
+    set(body "${CMAKE_CURRENT_BINARY_DIR}/${fn}_body.h")
+    add_custom_command(OUTPUT "${body}"
+      COMMAND "${Python3_EXECUTABLE}" "${REPO}/tools/native_major_fixture.py" "${source}" "${body}" --function "${fn}"
+      DEPENDS "${source}" "${REPO}/tools/native_major_fixture.py" VERBATIM)
+    list(APPEND bodies "${body}")
+  endforeach()
+  add_executable(mu_${name}_test EXCLUDE_FROM_ALL tests/${name}.c ${bodies})
+  target_include_directories(mu_${name}_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+  target_compile_options(mu_${name}_test PRIVATE -UNDEBUG)
+  add_test(NAME native_${name} COMMAND mu_${name}_test)
+endfunction()
+mu_boundary_fixture(hud_nana "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_hud_scale.c" mu_live_fighter mu_nana_damage)
+mu_boundary_fixture(practice_destination "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_practice.c"
+  mu_practice_resolve_pending_mode mu_practice_enter_mode)
+mu_boundary_fixture(boot_match_destination "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_boot_match.c" mu_boot_match_resolve)
+mu_boundary_fixture(skin_cycle_bridge "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_content.c" mu_skin_cycle)
+mu_boundary_fixture(costume_parts "${D}/src/melee/ft/ftparts.c" ftParts_80074D7C ftParts_80074CA0)
+mu_boundary_fixture(stage_item_link "${D}/src/melee/it/kinds/itwhitebea.c" mu_whitebea_block_alive mu_whitebea_validate_block)
+mu_boundary_fixture(envelope_ready "${D}/src/sysdolphin/baselib/pobj.c" PObjNativeEnvelopeReady)
+mu_boundary_fixture(fod_scenery "${D}/src/melee/gr/grizumi.c"
+  mu_fod_joint_uses_image mu_fod_scenery_plan mu_fod_draw_scenery mu_fod_render_reflection_scene)
+
+add_test(NAME native_collision_geometry
+  COMMAND "${Python3_EXECUTABLE}" "${REPO}/tools/check_collision_geometry.py" "${D}/src/melee/lb/lbcollision.c")
+
+# Build every registered executable fixture, including normally excluded targets, before CTest.
 get_property(MU_GAME_DIRECTORY_TARGETS DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 set(MU_GAME_TEST_TARGETS)
 foreach(mu_target IN LISTS MU_GAME_DIRECTORY_TARGETS)

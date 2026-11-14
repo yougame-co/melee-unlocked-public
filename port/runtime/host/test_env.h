@@ -12,6 +12,8 @@ inline bool yougame_session = false;
 inline bool agent_run = false;
 inline bool agent_copy() {
   if (agent_run) return true;
+  const char* copy = std::getenv("YOUGAME_AGENT_COPY");
+  if (copy && copy[0] == '1' && copy[1] == '\0') return true;
   const char* label = std::getenv("YOUGAME_TEST_LABEL");
   return label && *label;
 }

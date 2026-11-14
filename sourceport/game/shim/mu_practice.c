@@ -12,9 +12,14 @@
 #include <melee/gm/gmtrainingmode.h>
 #include <melee/mn/types.h>
 #include <melee/pl/player.h>
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+#include "mu_squad.h"
+#endif
 #include "mu_yougame_pause.h"
 #include "mu_tourney.h"
 #include "mu_tourney_game.h"
+#include "mu_doubles_game.h"
 #include <dolphin/os.h>
 #include <melee/ft/fighter.h>
 #include <melee/ft/types.h>
@@ -28,29 +33,39 @@ enum { MU_PR_SCENE, MU_PR_GET_PLAYER, MU_PR_SET_PLAYER, MU_PR_GET_STAGE, MU_PR_S
 
 extern StaticPlayer player_slots[];
 int mu_friends_css_pick(int* a);
+int mu_boot_match_boot(void);
+void mu_boot_match_enter_mode(int mode);
+enum { MU_PR_BOOT_MATCH = 35 };   /* MU_PRACTICE_BOOT_MATCH, checked in mu_entry.c */
 void mu_friends_css_reset(void);
 void mu_slippi_return_to_friends(void);
+void mu_slippi_note_friends_css(void);
 struct gm_80479D58_t* mu_gm_engine_state(void);
 
 /* An explicit practice handoff owns one pending destination while the origin scene runs
  * its ordinary decide/unload callbacks. TM-CE's event decide normally selects the menu;
- * that must not replace the accepted online destination. Clear on entering another mode.
+ * that must not replace the accepted online destination. Clear when the destination is entered.
+ * Re-entering the origin (Fight a pro restarts Training) completes the handoff too.
  * These are host handoff bookkeeping, never synchronized match state. */
 static int practice_pending_mode = -1;
 static int practice_origin_mode = -1;
 
+int mu_boot_match_resolve(int requested);
 int mu_practice_resolve_pending_mode(int requested)
 {
     if (practice_pending_mode >= 0 && gm_GetCurrentGameMode() == practice_origin_mode) {
         return practice_pending_mode;
     }
-    return requested;
+    return mu_boot_match_resolve(requested);   /* agent-test bootMatch's VS, else the caller's own */
 }
 
 void mu_practice_enter_mode(int mode)
 {
+#ifdef MELEE_DOUBLES
+    mu_doubles_enter_mode(mode);
+#endif
     mu_tourney_enter_mode(mode);
-    if (practice_pending_mode >= 0 && mode != practice_origin_mode) {
+    mu_boot_match_enter_mode(mode);
+    if (practice_pending_mode >= 0) {
         practice_pending_mode = practice_origin_mode = -1;
     }
 }
@@ -75,9 +90,16 @@ int mu_practice_bridge(int op, int* a, int n)
 {
     MuSlippiMenuState* slp = mu_slippi_state();
     switch (op) {
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+    case MU_SQUAD_TEST_SETUP:
+        return gmSquad_OnlineTest(a, n);
+#endif
     case MU_PR_CSS_PICK:
         if (n < 3 || gm_GetCurrentGameMode() != GM_VS || gm_GetCurrentSceneIndex() != 0) return -1;
-        return mu_friends_css_pick(a);
+        if (mu_friends_css_pick(a) != 0) return -1;
+        mu_slippi_note_friends_css();
+        return 0;
     case MU_PR_FRIENDS_RETURN:
         mu_slippi_return_to_friends();
         if (gm_GetCurrentGameMode() == GM_MENU) return 0;
@@ -97,6 +119,8 @@ int mu_practice_bridge(int op, int* a, int n)
     }
     case MU_PR_PAGE_PAUSE:
         return mu_yougame_page_pause(a, n);
+    case MU_PR_BOOT_MATCH:
+        return mu_boot_match_boot();
     case MU_PR_SCENE:
         if (n < 2) return -1;
         a[0] = gm_GetCurrentGameMode();
@@ -171,9 +195,15 @@ int mu_practice_bridge(int op, int* a, int n)
     case MU_PR_TRAINING_PICK: {
         /* Training's character select starts from its saved match: the player (slot 0) and the CPU (1). */
         VsModeData* vs = &gmMainLib_804D3EE0->modes.table[GmVsMode_Training];
+        int colors;
         if (n < 3 || a[0] < 0 || a[0] > 1 || a[1] < 0 || a[1] >= 26) return -1;
+        /* The online match's costume can be one this view does not have (a mod's extra costume):
+         * that CPU was not drawn on the select screen and Training's start divided by its 0
+         * costumes (0.9.98 report). Such a costume is the first one. */
+        colors = gm_GetNumCostumesForCKind((u8) a[1]);
+        if (colors <= 0) return -1;
         vs->start.players[a[0]].ckind = (s8) a[1];
-        vs->start.players[a[0]].color = (u8) a[2];
+        vs->start.players[a[0]].color = (u8) (a[2] >= 0 && a[2] < colors ? a[2] : 0);
         return 0;
     }
     case MU_PR_UNLOCKED: {

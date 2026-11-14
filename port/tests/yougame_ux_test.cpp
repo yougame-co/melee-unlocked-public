@@ -196,5 +196,17 @@ void pad_cases() {
 int main() {
   pause_cases(); pause_event_cases(); pad_cases();
   CHECK(std::string(yougame::parity::kMenuHint) == "Shift+Tab / YouGame menu (D-pad + Start)");
+  {
+    // Shown from the game's start, gone by 5 s; a new message or invite brings it back for 5 s.
+    yougame::parity::CornerHintFade fade;
+    CHECK(fade.alpha("", 10) == 1); CHECK(fade.alpha("", 14.4) == 1);
+    CHECK(fade.alpha("", 14.75) > 0 && fade.alpha("", 14.75) < 1); CHECK(fade.alpha("", 15) == 0);
+    CHECK(fade.alpha("", 60) == 0);
+    CHECK(fade.alpha("ada: hi", 61) == 1); CHECK(fade.alpha("ada: hi", 64) == 1);  // same notice: no restart
+    CHECK(fade.alpha("ada: hi", 66) == 0); CHECK(fade.alpha("", 67) == 0);
+    CHECK(fade.alpha("ada: hi", 70) == 1);  // the same text again after it cleared is a new notice
+    CHECK(fade.alpha("ada: hi\nbo: gg", 74) == 1); CHECK(fade.alpha("ada: hi\nbo: gg", 78.4) == 1);
+    CHECK(fade.alpha("ada: hi\nbo: gg", 79.1) == 0);
+  }
   std::puts("YouGame page pause and controller menu passed");
 }

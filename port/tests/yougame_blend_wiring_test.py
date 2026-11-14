@@ -73,10 +73,14 @@ class BlendWiringTest(unittest.TestCase):
         # The routing call is told about agents too.
         self.assertRegex(self.search, r"#ifdef YOUGAME_AGENT_TEST_HOOK\s+const bool agent = yougame::agent_test::agent_script;")
         # The blend and the Slippi ticket each refuse an agent before any socket or thread.
-        self.assertRegex(self.blend, r"^\s*using yougame::blend::Side;\s*#ifdef YOUGAME_AGENT_TEST_HOOK\s+"
+        self.assertRegex(self.blend, r"^\s*if \(host::test_env::agent_copy\(\)\) \{[^\n]*\n\s*slippi_user_.reset\(\);\s*"
+                                     r"yougame::slippi_link\(false, std::string\(\)\);\s*"
+                                     r"startYouGameMatchmaking\(yougame::blend::kSearchYouGameOnly\);\s*return;\s*\}\s*"
+                                     r"using yougame::blend::Side;\s*#ifdef YOUGAME_AGENT_TEST_HOOK\s+"
                                      r"if \(yougame::agent_test::agent_script\) \{ fail\(\s*\); return; \}")
         self.assertLess(self.blend.index("agent_script"), self.blend.index("std::async("))
-        self.assertRegex(self.ticket, r"^\s*#ifdef YOUGAME_AGENT_TEST_HOOK\s+if \(yougame::agent_test::agent_script\) return\s*;")
+        self.assertRegex(self.ticket, r"^\s*if \(agent_lock::blocked\(agent_lock::Operation::Matchmaking\)\) return agent_lock::refusal;\s*"
+                                      r"#ifdef YOUGAME_AGENT_TEST_HOOK\s+if \(yougame::agent_test::agent_script\) return\s*;")
         self.assertLess(self.ticket.index("agent_script"), self.ticket.index("enet_host_create("))
 
     def test_slippis_client_is_native_beside_youGames_links(self):
@@ -170,7 +174,7 @@ class BlendWiringTest(unittest.TestCase):
 
     def test_generation_reserved_before_helper_and_fences_global_state(self):
         self.assertLess(self.blend.index("search.epoch = yougame::begin_search();"), self.blend.index("std::async("))
-        self.assertIn("search.epoch ? search.epoch : begin_search()", self.find)
+        self.assertIn("search.epoch ? search.epoch : begin_search(search.friends_lobby)", self.find)
         self.assertIn("!g_search_generation.current(epoch) || cancel_requested()", self.find)
         self.assertIn("if (search_stopped()) return;", function(self.link, "set_status"))
         self.assertIn("if (search_stopped()) return m;", function(self.link, "fail"))
@@ -185,6 +189,21 @@ class BlendWiringTest(unittest.TestCase):
         self.assertIn("site busy, retrying the ticket in %d s (try %d/3)", self.raw_link)
         self.assertIn("search_policy::blend_port((uint16_t)forced_port, rng())", self.blend)
         self.assertNotIn("yg.result.wait();", self.blend.split("won_slippi = coord.matched", 1)[1])
+
+    def test_mac_granted_slippi_port_is_forced_and_never_random(self):
+        # The Mac app's sandbox grants one UDP port (YOUGAME_SLIPPI_UDP_PORT); --netplay-port wins.
+        env = function(self.net, "slippi_port_from_env")
+        in_order(self, env, ["std::getenv(", "n < 41000 || n > 50999", "return (uint16_t)n;"])
+        self.assertIn('std::getenv("YOUGAME_SLIPPI_UDP_PORT")', self.raw_net)
+        ctor = self.net[self.net.index("Matchmaking::Matchmaking(User* user)"):self.net.index("Matchmaking::~Matchmaking()")]
+        in_order(self, ctor, ["if (!forced_port && env_port)", "forced_port = env_port;"])
+        self.assertIn('"slippi: forced port %u from YOUGAME_SLIPPI_UDP_PORT"', self.raw_net)
+        ticket = function(self.net, "openSlippiTicket")
+        in_order(self, ticket, ["search_policy::native_port((uint16_t)forced_port", "if (forced_port && host_port_ == forced_port)",
+                                "if (!client_) return"])
+        self.assertIn('"slippi: forced port %d bound" : "slippi: forced port %d bind failed"', self.raw_net)
+        # A forced port is never swapped for a random one on the YouGame-only path either.
+        self.assertIn("host_port_ = forced_port ? forced_port : 41000 + (int)(rng() % 10000);", self.net)
 
     def test_coordinator_is_pure_and_logs_the_agreed_lines(self):
         header = source("port/runtime/hle/yougame_blend.h")
@@ -245,7 +264,11 @@ class BlendWiringTest(unittest.TestCase):
         self.assertEqual(len(known), 2)
         decided = block(known[1], 0)
         self.assertIn("yougame::slippi_link(login, login ? slippi_user_->GetUserInfo().connect_code : std::string());", decided)
-        self.assertEqual(self.net.count("yougame::slippi_link("), 2)
+        self.assertEqual(self.net.count("yougame::slippi_link("), 4)
+        # Agent copies send "not linked" only, on the base listing's Unranked (the blend is reached only there).
+        self.assertEqual(self.net.count("yougame::slippi_link(false, std::string());"), 2)
+        self.assertIn("if (vanilla_unranked) yougame::slippi_link(false, std::string());", self.search)
+        self.assertIn("search_settings_.friend_room.empty() && host::gameplay::vanilla_only();", self.search)
         # Also once when the online menu first asks, off the game thread, base listing only.
         announce = function(self.net, "announce_slippi_link")
         self.assertRegex(announce, r"if \(!yougame::active\(\) \|\| !host::gameplay::vanilla_only\(\) \|\| asked.exchange\(true\)\) return;")

@@ -1,0 +1,34 @@
+[
+  {
+    "before": "",
+    "after": "#include \"yougame_embed_fullscreen.h\"\n"
+  },
+  {
+    "before": "",
+    "after": "  const auto fullscreen_clock = [] {\n    return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(\n        std::chrono::steady_clock::now().time_since_epoch()).count());\n  };\n  const auto fullscreen_emit = [](int request) {\n    if (request < 0) return;\n    yougame::parity::signals.emit(request ? \"yg {\\\"fullscreen\\\":1}\" : \"yg {\\\"fullscreen\\\":0}\");\n    host::log(\"yougame: fullscreen request %d\", request);\n  };\n  // Runs with the overlay closed too, on every renderer and both engines.\n  fullscreen_emit(yougame::embed_fullscreen::state.flush(yougame::embedded(), fullscreen_clock()));\n"
+  },
+  {
+    "before": "",
+    "after": "  bool agent_open_video = false;\n  yougame::parity::Signals::Clock::time_point first_present;\n  if (!state.fill_window && yougame::parity::signals.first_present(first_present) &&\n      yougame::agent_test::open_settings_video.exchange(false)) {\n    state.open = true;\n    agent_open_video = true;\n    host::log(\"agent-test: openSettings video\");\n  }\n"
+  },
+  {
+    "before": "    if (!screenshot_tab_set) {\n",
+    "after": "    if (!screenshot_tab_set\n#ifdef YOUGAME_AGENT_TEST_HOOK\n        || agent_open_video\n#endif\n        ) {\n"
+  },
+  {
+    "before": "",
+    "after": "#ifdef YOUGAME_AGENT_TEST_HOOK\n      if (agent_open_video) requested = \"Video\";\n#endif\n"
+  },
+  {
+    "before": "      int display = options.exclusive_fullscreen ? 2 : options.fullscreen ? 1 : 0;\n",
+    "after": "      const int app_display = yougame::embed_fullscreen::state.shown(yougame::embedded(), fullscreen_clock());\n      int display = app_display >= 0 ? app_display : options.exclusive_fullscreen ? 2 : options.fullscreen ? 1 : 0;\n"
+  },
+  {
+    "before": "        options.fullscreen = display == 1;\n        options.exclusive_fullscreen = display == 2;\n        changed = true;\n",
+    "after": "        if (app_display >= 0) {\n          fullscreen_emit(yougame::embed_fullscreen::state.request(yougame::embedded(), display != 0, fullscreen_clock()));\n        } else {\n          options.fullscreen = display == 1;\n          options.exclusive_fullscreen = display == 2;\n          changed = true;\n        }\n"
+  },
+  {
+    "before": "      if (ImGui::IsItemHovered())\n        ImGui::SetTooltip(\"Borderless fullscreen: the game's window covers the whole screen.\\n\"\n                          \"Exclusive fullscreen: the game takes the display over, or falls back to\\n\"\n                          \"borderless when Windows does not allow it.\\n%s\", kExperimentalNote);\n",
+    "after": "      if (ImGui::IsItemHovered()) {\n        if (app_display >= 0) ImGui::SetTooltip(\"Full screen is the YouGame app's window. Shift+Esc leaves.\");\n        else ImGui::SetTooltip(\"Borderless fullscreen: the game's window covers the whole screen.\\n\"\n                               \"Exclusive fullscreen: the game takes the display over, or falls back to\\n\"\n                               \"borderless when Windows does not allow it.\\n%s\", kExperimentalNote);\n      }\n"
+  }
+]

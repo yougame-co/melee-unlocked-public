@@ -141,6 +141,7 @@ static void output(const fs::path& directory) {
   recorder.stop();
 }
 int main(int argc, char** argv) {
+  setenv("YOUGAME_AGENT_COPY", "1", 1);  // the AGENT TEST app's flag: agent_test::load ignores the file without it
   CHECK(argc == 2);
   const auto directory = fs::absolute(fs::u8path(argv[1]));
   fs::remove_all(directory); fs::create_directories(directory);

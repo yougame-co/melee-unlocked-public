@@ -2,10 +2,36 @@
 cmake_minimum_required(VERSION 3.15)
 include(tests/friends_retire.cmake)
 include(tests/handoff_state.cmake)
+include(cmake/squad.cmake)
 
 if(WIN32)
   include(tests/yougame_agent_root_win.cmake)
 endif()
+
+# The RTX Remix bridge (runtime/gx/remix_bridge.cpp), against NVIDIA's Remix C API headers (MIT,
+# third_party/remix). The runtime itself is not part of the game: it comes with the optional RTX Pack
+# (MeleeUnlocked-RTX-Pack.zip) and is loaded from the Remix folder beside the game when a player picks it.
+if(WIN32)
+  option(MELEE_REMIX_SPIKE "RTX Remix bridge (Windows)" ON)
+else()
+  set(MELEE_REMIX_SPIKE OFF)
+endif()
+set(MELEE_REMIX_SDK "${CMAKE_CURRENT_SOURCE_DIR}/third_party/remix" CACHE PATH "Folder holding include/remix/remix_c.h")
+if(MELEE_REMIX_SPIKE)
+  add_compile_definitions(MELEE_REMIX_SPIKE)
+  include_directories("${MELEE_REMIX_SDK}/include")
+endif()
+# Local builds only: a second path-tracing integrator (runtime/gx/rtx_integrator.h) built from
+# NVIDIA's RTXDI SDK, kept in a folder outside this repository because that SDK's licence does not
+# allow it here. -DMELEE_RTX_NVIDIA_DIR=<folder> includes <folder>/melee_integrator.cmake; empty (the
+# default, and every release) changes nothing.
+set(MELEE_RTX_NVIDIA_DIR "" CACHE PATH "Local-only NVIDIA RTXDI integrator module (never part of a release)")
+function(melee_add_local_nvidia_integrator runtime_target)
+  if(MELEE_RTX_NVIDIA_DIR)
+    set(melee_rtx_executables ${ARGN})
+    include("${MELEE_RTX_NVIDIA_DIR}/melee_integrator.cmake")
+  endif()
+endfunction()
 
 # A Source Port with no Slippi code compiled or linked: -DMELEE_NO_SLIPPI=ON in a build directory of
 # its own. Only melee_source is defined there, from the same runtime sources minus the Slippi layer
@@ -13,6 +39,8 @@ endif()
 # need that layer or the generated translation, are simply not part of that build directory.
 # Everything after this block is the normal build; the option being OFF changes nothing in it.
 # When a setting of the runtime or of melee_source changes below, change it here as well.
+# The launchers read Dolphin RVZ/WIA disc images through this (port/app/disc_rvz.cpp).
+include("${CMAKE_CURRENT_SOURCE_DIR}/app/disc_rvz.cmake")
 option(MELEE_NO_SLIPPI "Build only melee_source, without the Slippi layer" OFF)
 if(MELEE_NO_SLIPPI)
   message(STATUS "melee: CPU baseline ${MELEE_CPU_BASELINE}, Source Port without the Slippi layer")
@@ -72,6 +100,7 @@ if(MELEE_NO_SLIPPI)
 
   add_library(runtime_ns STATIC ${RUNTIME_NS_SOURCES} app/source_noslippi.cpp
     third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c)   # mu_net: keys, signatures, packet sealing
+  mu_squad_target(runtime_ns)
   target_include_directories(runtime_ns PUBLIC third_party/monocypher)
   target_compile_definitions(runtime_ns PRIVATE MELEE_NO_SLIPPI YOUGAME_COMPAT_TAG="${YOUGAME_COMPAT_TAG}" MELEE_PORT_VERSION="${MELEE_PORT_VERSION}"
     MELEE_PLAYBACK_GCT_BASE=0u MELEE_PLAYBACK_GCT_SIZE=0u)
@@ -81,12 +110,14 @@ if(MELEE_NO_SLIPPI)
     set_source_files_properties(${MELEE_ASIO_SOURCES} PROPERTIES COMPILE_OPTIONS "/UUNICODE;/U_UNICODE;/W0")
     target_link_libraries(runtime_ns PUBLIC advapi32)
   endif()
+  target_include_directories(runtime_ns PRIVATE third_party/onnxruntime/include)
   target_include_directories(runtime_ns PUBLIC runtime/ppc runtime/host runtime/hle runtime/gx runtime/mu_net
     "${PORT_GEN}" "${PROJECT_SOURCE_DIR}/native" third_party)
   target_compile_features(runtime_ns PUBLIC cxx_std_17)
   target_compile_options(runtime_ns PRIVATE /EHsc ${MELEE_ARCH_FLAG} /fp:precise /W3)
   target_compile_definitions(runtime_ns PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING)
-  target_link_libraries(runtime_ns PUBLIC native_animation port_enet port_libusb bcrypt comdlg32 d3d12 d3d11 dxgi d3dcompiler xinput9_1_0 winmm user32 gdi32 setupapi winusb hid mfplat mfreadwrite mfuuid ole32 shell32)
+  # advapi32 wintrust crypt32: the local channel's pipe, token and signer checks (runtime/hle/yougame_channel.cpp).
+  target_link_libraries(runtime_ns PUBLIC port_disc_rvz native_animation port_enet port_libusb bcrypt comdlg32 d3d12 d3d11 dxgi d3dcompiler xinput9_1_0 winmm user32 gdi32 setupapi winusb hid mfplat mfreadwrite mfuuid ole32 shell32 advapi32 wintrust crypt32)
 
   add_executable(melee_source WIN32 app/main.cpp app/settings_window.cpp app/source_host.cpp app/source_guest_boundary.cpp
     app/source_p2p.cpp   # the --p2p-* command line: one mu_net session on the game's command channel
@@ -103,11 +134,30 @@ if(MELEE_NO_SLIPPI)
     --card-self-test "${CMAKE_CURRENT_BINARY_DIR}/source-card-roundtrip")
 
   # The D3D12 ray-tracing library, beside the executable (the normal build copies it with melee_port).
+  # The newest Windows SDK's dxc.exe: the shaders use HLSL 2021 (-HV 2021), which an older SDK's DXC
+  # does not know ("Unknown HLSL version: 2021"). Its own SDK version first, then every installed one, newest first.
   set(MELEE_DXC_HINT "C:/Program Files (x86)/Windows Kits/10/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64")
-  find_program(MELEE_DXC_EXECUTABLE NAMES dxc.exe HINTS "${MELEE_DXC_HINT}")
+  file(GLOB melee_sdk_bins LIST_DIRECTORIES true "C:/Program Files (x86)/Windows Kits/10/bin/10.*")
+  list(SORT melee_sdk_bins COMPARE NATURAL ORDER DESCENDING)
+  set(melee_dxc_hints)
+  foreach(melee_bin IN LISTS melee_sdk_bins)
+    list(APPEND melee_dxc_hints "${melee_bin}/x64")
+  endforeach()
+  find_program(MELEE_DXC_EXECUTABLE NAMES dxc.exe HINTS ${melee_dxc_hints} "${MELEE_DXC_HINT}" NO_DEFAULT_PATH)
+  find_program(MELEE_DXC_EXECUTABLE NAMES dxc.exe)
   if(NOT MELEE_DXC_EXECUTABLE)
-    message(FATAL_ERROR "The Windows SDK DXC compiler (dxc.exe) is required to build the DXR path shader")
+    message(FATAL_ERROR "The Windows SDK DXC compiler (dxc.exe) is required to build the ray-tracing shaders: "
+                        "install the Windows 11 SDK (10.0.22621 or newer) with Visual Studio Installer.")
   endif()
+  execute_process(COMMAND "${MELEE_DXC_EXECUTABLE}" -T cs_6_0 -HV 2021 -E main -nologo -Vd -Fo NUL
+                  "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gx/shaders/hv2021_check.hlsl"
+                  RESULT_VARIABLE melee_dxc_hv OUTPUT_QUIET ERROR_VARIABLE melee_dxc_err)
+  if(NOT melee_dxc_hv EQUAL 0)
+    message(FATAL_ERROR "${MELEE_DXC_EXECUTABLE} is too old for these shaders (HLSL 2021): install the Windows 11 SDK "
+                        "(10.0.22621 or newer) with Visual Studio Installer, delete this build folder, and build again.
+${melee_dxc_err}")
+  endif()
+  message(STATUS "melee: DXC ${MELEE_DXC_EXECUTABLE}")
   set(MELEE_DXR_DXIL "${CMAKE_CURRENT_BINARY_DIR}/dxr_pathtrace.dxil")
   add_custom_command(OUTPUT "${MELEE_DXR_DXIL}"
     COMMAND "${MELEE_DXC_EXECUTABLE}" -T lib_6_3 -HV 2021 -O3
@@ -119,6 +169,37 @@ if(MELEE_NO_SLIPPI)
   add_custom_command(TARGET melee_source POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${MELEE_DXR_DXIL}"
             "$<TARGET_FILE_DIR:melee_source>/dxr_pathtrace.dxil"
+    VERBATIM)
+  # The path tracer's geometry pass (rtx_scene.cpp), beside the executable like the DXR library.
+  set(MELEE_RTX_TRANSFORM_DXIL "${CMAKE_CURRENT_BINARY_DIR}/rtx_transform.dxil")
+  add_custom_command(OUTPUT "${MELEE_RTX_TRANSFORM_DXIL}"
+    COMMAND "${MELEE_DXC_EXECUTABLE}" -T cs_6_0 -HV 2021 -O3
+            -Fo "${MELEE_RTX_TRANSFORM_DXIL}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gx/shaders/rtx_transform.hlsl"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gx/shaders/rtx_transform.hlsl"
+    VERBATIM)
+  # The path tracer's ray-traced passes (rtx_tracer.cpp): DXR 1.1 for GeometryIndex().
+  set(MELEE_RTX_TRACE_DXIL "${CMAKE_CURRENT_BINARY_DIR}/rtx_trace.dxil")
+  add_custom_command(OUTPUT "${MELEE_RTX_TRACE_DXIL}"
+    COMMAND "${MELEE_DXC_EXECUTABLE}" -T lib_6_5 -HV 2021 -O3
+            -Fo "${MELEE_RTX_TRACE_DXIL}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gx/shaders/rtx_trace.hlsl"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gx/shaders/rtx_trace.hlsl"
+    VERBATIM)
+  # The Melee integrator (rtx_melee_integrator.cpp): compute with inline ray queries, Shader Model 6.5.
+  set(MELEE_RTX_DIRECT_DXIL "${CMAKE_CURRENT_BINARY_DIR}/rtx_direct.dxil")
+  add_custom_command(OUTPUT "${MELEE_RTX_DIRECT_DXIL}"
+    COMMAND "${MELEE_DXC_EXECUTABLE}" -T cs_6_5 -HV 2021 -O3
+            -Fo "${MELEE_RTX_DIRECT_DXIL}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gx/shaders/rtx_direct.hlsl"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gx/shaders/rtx_direct.hlsl"
+    VERBATIM)
+  add_custom_target(melee_rtx_shaders DEPENDS "${MELEE_RTX_TRANSFORM_DXIL}" "${MELEE_RTX_TRACE_DXIL}" "${MELEE_RTX_DIRECT_DXIL}")
+  add_dependencies(melee_source melee_rtx_shaders)
+  add_custom_command(TARGET melee_source POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${MELEE_RTX_TRANSFORM_DXIL}"
+            "$<TARGET_FILE_DIR:melee_source>/rtx_transform.dxil"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${MELEE_RTX_TRACE_DXIL}"
+            "$<TARGET_FILE_DIR:melee_source>/rtx_trace.dxil"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${MELEE_RTX_DIRECT_DXIL}"
+            "$<TARGET_FILE_DIR:melee_source>/rtx_direct.dxil"
     VERBATIM)
 
   # Cache identity follows shader generation, constant layout and pipeline setup.
@@ -167,6 +248,10 @@ if(MELEE_NO_SLIPPI)
       add_custom_command(TARGET melee_source POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xess/bin/libxess.dll" "$<TARGET_FILE_DIR:melee_source>/libxess.dll")
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime/bin/onnxruntime.dll")
+      add_custom_command(TARGET melee_source POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime/bin/onnxruntime.dll" "$<TARGET_FILE_DIR:melee_source>/onnxruntime.dll")
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/librashader/bin/librashader.dll")
       add_custom_command(TARGET melee_source POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/librashader/bin/librashader.dll" "$<TARGET_FILE_DIR:melee_source>/librashader.dll")
@@ -203,7 +288,7 @@ if(MELEE_NO_SLIPPI)
   # further down, plus MELEE_NO_SLIPPI. With it the lobby needs no Slippi account, an accepted match
   # starts melee_source with --p2p-* (a peer-to-peer session), and automatic pairing is offered.
   # When the normal target's sources or settings change below, change them here as well.
-  add_executable(melee_unlocked WIN32 app/launcher_mod_catalog.cpp runtime/host/mod_scan.cpp runtime/host/mod_profile.cpp app/launcher.cpp app/launcher_replay_data.cpp app/launcher_lobby.cpp app/launcher_lobby_p2p.cpp
+  add_executable(melee_unlocked WIN32 app/launcher_mod_catalog.cpp runtime/host/mod_scan.cpp runtime/host/mod_profile.cpp app/launcher.cpp app/launcher_replay_data.cpp app/launcher_lobby.cpp app/launcher_lobby_p2p.cpp app/launcher_yougame.cpp
     third_party/dht/dht.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
     runtime/host/updater.cpp runtime/host/net_trace_read.cpp app/launcher_trace_view.cpp app/launcher.rc)
   set_target_properties(melee_unlocked PROPERTIES OUTPUT_NAME MeleeUnlockedLauncher)
@@ -212,7 +297,10 @@ if(MELEE_NO_SLIPPI)
   target_compile_options(melee_unlocked PRIVATE /EHsc)
   target_compile_definitions(melee_unlocked PRIVATE MELEE_NO_SLIPPI NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS MELEE_PORT_VERSION="${MELEE_PORT_VERSION}"
     MELEE_VERSION_COMMAS=${MELEE_VERSION_COMMAS})
-  target_link_libraries(melee_unlocked PRIVATE comctl32 winhttp ws2_32 bcrypt user32 gdi32 shell32 comdlg32 msimg32 uxtheme winmm)
+  target_link_libraries(melee_unlocked PRIVATE port_disc_rvz comctl32 winhttp ws2_32 bcrypt user32 gdi32 shell32 comdlg32 msimg32 uxtheme winmm)
+  if(MELEE_YOUGAME_NO_UPSTREAM_UPDATES)
+    target_compile_definitions(melee_unlocked PRIVATE MELEE_YOUGAME_NO_UPSTREAM_UPDATES=1)
+  endif()
 
   # The lobby's peer-to-peer match flow, as two (and three) peer lobbies in one process over
   # loopback: the match setup both launchers agree on, automatic pairing, the block list, and the
@@ -283,6 +371,7 @@ if(MELEE_NO_SLIPPI)
   target_compile_definitions(port_mu_net_ns_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
   target_link_libraries(port_mu_net_ns_test PRIVATE runtime_ns)
   add_test(NAME port_mu_net_ns COMMAND port_mu_net_ns_test)
+  melee_add_local_nvidia_integrator(runtime_ns melee_source)
   return()
 endif()
 add_executable(port_launch_process_test tests/launch_process_test.cpp)
@@ -313,6 +402,17 @@ target_compile_options(port_mod_scan_test PRIVATE /EHsc /utf-8)
 target_compile_definitions(port_mod_scan_test PRIVATE MU_REPO_ROOT="${CMAKE_SOURCE_DIR}" NOMINMAX)
 target_link_libraries(port_mod_scan_test PRIVATE bcrypt shell32)
 add_test(NAME port_mod_scan COMMAND port_mod_scan_test)
+add_executable(port_disc_rvz_test tests/disc_rvz_test.cpp)
+target_compile_features(port_disc_rvz_test PRIVATE cxx_std_17)
+target_compile_options(port_disc_rvz_test PRIVATE /EHsc)
+target_compile_definitions(port_disc_rvz_test PRIVATE MU_RVZ_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/data/rvz")
+target_link_libraries(port_disc_rvz_test PRIVATE port_disc_rvz)
+add_test(NAME port_disc_rvz COMMAND port_disc_rvz_test)
+add_executable(port_replay_slpz_test tests/replay_slpz_test.cpp)
+target_compile_features(port_replay_slpz_test PRIVATE cxx_std_17)
+target_compile_options(port_replay_slpz_test PRIVATE /EHsc /utf-8)
+target_link_libraries(port_replay_slpz_test PRIVATE port_disc_rvz)
+add_test(NAME port_replay_slpz COMMAND port_replay_slpz_test)
 add_executable(port_lcancel_policy_test tests/lcancel_policy_test.cpp)
 target_include_directories(port_lcancel_policy_test PRIVATE runtime/host)
 target_compile_features(port_lcancel_policy_test PRIVATE cxx_std_17)
@@ -376,6 +476,20 @@ add_test(NAME port_yougame_0971_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_C
 add_test(NAME port_yougame_0981_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/yougame_0981_merge_test.py")
 add_test(NAME port_yougame_0982_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/yougame_0982_merge_test.py")
 add_test(NAME port_yougame_0983_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/yougame_0983_merge_test.py")
+add_test(NAME port_yougame_1000_merge COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/yougame_1000_merge_test.py")
+# The online menu's split rows on a synthetic menu archive (no game data).
+add_executable(port_online_rows_test tests/online_rows_test.cpp runtime/hle/online_rows.cpp)
+target_include_directories(port_online_rows_test PRIVATE runtime/hle)
+target_compile_features(port_online_rows_test PRIVATE cxx_std_17)
+add_test(NAME port_online_rows COMMAND port_online_rows_test)
+set_tests_properties(port_online_rows PROPERTIES TIMEOUT 10)
+# The launcher's YouGame bridge: parsing, checks and answers, with a stand-in for YouGame's site.
+add_executable(port_launcher_yougame_test tests/launcher_yougame_test.cpp app/launcher_yougame.cpp)
+target_include_directories(port_launcher_yougame_test PRIVATE app third_party)
+target_compile_features(port_launcher_yougame_test PRIVATE cxx_std_17)
+target_compile_options(port_launcher_yougame_test PRIVATE /EHsc)
+add_test(NAME port_launcher_yougame COMMAND port_launcher_yougame_test)
+set_tests_properties(port_launcher_yougame PROPERTIES TIMEOUT 10)
 add_executable(port_yougame_mod_online_test tests/yougame_mod_online_test.cpp)
 target_include_directories(port_yougame_mod_online_test PRIVATE runtime/hle)
 target_compile_features(port_yougame_mod_online_test PRIVATE cxx_std_17)
@@ -428,6 +542,17 @@ add_executable(port_frame_queue_test tests/frame_queue_test.cpp)
 target_include_directories(port_frame_queue_test PRIVATE runtime/gx)
 target_compile_features(port_frame_queue_test PRIVATE cxx_std_17)
 add_test(NAME port_frame_queue COMMAND port_frame_queue_test)
+add_executable(port_prewarm_only_test tests/prewarm_only_test.cpp)
+target_include_directories(port_prewarm_only_test PRIVATE app)
+target_compile_features(port_prewarm_only_test PRIVATE cxx_std_17)
+add_test(NAME port_prewarm_only COMMAND port_prewarm_only_test)
+add_test(NAME port_prewarm_only_wiring COMMAND "${Python3_EXECUTABLE}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/prewarm_only_wiring_test.py")
+add_executable(port_pipeline_cache_store_test tests/pipeline_cache_store_test.cpp)
+target_include_directories(port_pipeline_cache_store_test PRIVATE runtime/gx)
+target_compile_features(port_pipeline_cache_store_test PRIVATE cxx_std_17)
+find_package(Threads REQUIRED)
+target_link_libraries(port_pipeline_cache_store_test PRIVATE Threads::Threads)
+add_test(NAME port_pipeline_cache_store COMMAND port_pipeline_cache_store_test "${CMAKE_CURRENT_BINARY_DIR}/pipeline_cache_store_test")
 add_executable(port_replay_coach_test tests/replay_coach_test.cpp runtime/host/replay_coach.cpp)
 target_include_directories(port_replay_coach_test PRIVATE runtime/host)
 target_compile_features(port_replay_coach_test PRIVATE cxx_std_17)
@@ -436,7 +561,7 @@ add_executable(port_practice_cpu_model_test tests/practice_cpu_model_test.cpp)
 target_compile_features(port_practice_cpu_model_test PRIVATE cxx_std_17)
 add_test(NAME port_practice_cpu_model COMMAND port_practice_cpu_model_test)
 add_executable(port_ghost_ai_test tests/ghost_ai_test.cpp)
-target_include_directories(port_ghost_ai_test PRIVATE runtime/host runtime/hle runtime/ppc)
+target_include_directories(port_ghost_ai_test PRIVATE runtime/host runtime/hle runtime/ppc third_party third_party/onnxruntime/include)
 target_compile_features(port_ghost_ai_test PRIVATE cxx_std_17)
 target_compile_options(port_ghost_ai_test PRIVATE /EHsc)
 target_compile_definitions(port_ghost_ai_test PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
@@ -550,6 +675,14 @@ add_executable(port_dxr_scene_test tests/dxr_scene_test.cpp runtime/gx/gx_dxr_sc
 target_include_directories(port_dxr_scene_test PRIVATE runtime/gx)
 target_compile_features(port_dxr_scene_test PRIVATE cxx_std_17)
 add_test(NAME port_dxr_scene COMMAND port_dxr_scene_test)
+add_executable(port_rtx_semantics_test tests/rtx_semantics_test.cpp runtime/gx/rtx_semantics.cpp)
+target_include_directories(port_rtx_semantics_test PRIVATE runtime/gx)
+target_compile_features(port_rtx_semantics_test PRIVATE cxx_std_17)
+add_test(NAME port_rtx_semantics COMMAND port_rtx_semantics_test)
+add_executable(port_rtx_lights_test tests/rtx_lights_test.cpp runtime/gx/rtx_lights.cpp)
+target_include_directories(port_rtx_lights_test PRIVATE runtime/gx)
+target_compile_features(port_rtx_lights_test PRIVATE cxx_std_17)
+add_test(NAME port_rtx_lights COMMAND port_rtx_lights_test)
 add_executable(port_ax_ucode_test tests/ax_ucode_test.cpp runtime/hle/ax_ucode.cpp)
 target_include_directories(port_ax_ucode_test PRIVATE runtime/hle)
 target_compile_features(port_ax_ucode_test PRIVATE cxx_std_17)
@@ -577,6 +710,10 @@ add_executable(port_vblank_model_test tests/vblank_model_test.cpp)
 target_include_directories(port_vblank_model_test PRIVATE runtime/gx)
 target_compile_features(port_vblank_model_test PRIVATE cxx_std_17)
 add_test(NAME port_vblank_model COMMAND port_vblank_model_test)
+add_executable(port_vulkan_recipes_test tests/vulkan_recipes_test.cpp)
+target_include_directories(port_vulkan_recipes_test PRIVATE runtime/gx)
+target_compile_features(port_vulkan_recipes_test PRIVATE cxx_std_17)
+add_test(NAME port_vulkan_recipes COMMAND port_vulkan_recipes_test)
 add_executable(port_box_melee_test tests/box_melee_test.cpp)
 target_include_directories(port_box_melee_test PRIVATE runtime/host runtime/ppc)
 target_compile_features(port_box_melee_test PRIVATE cxx_std_17)
@@ -739,6 +876,7 @@ endwhile()
 list(SUBLIST MELEE_VERSION_PARTS 0 4 MELEE_VERSION_PARTS)
 list(JOIN MELEE_VERSION_PARTS "," MELEE_VERSION_COMMAS)
 add_library(runtime STATIC ${RUNTIME_SOURCES} third_party/slippilib/SlippiGame.cpp)
+mu_squad_target(runtime)
 target_compile_definitions(runtime PRIVATE YOUGAME_COMPAT_TAG="${YOUGAME_COMPAT_TAG}" MELEE_PORT_VERSION="${MELEE_PORT_VERSION}")
 # ASIO output (audio mode 3): the Steinberg ASIO SDK host files only, under the SDK's GPL Version 3
 # option (asio.cpp, asiodrivers.cpp, asiolist.cpp; see third_party/asio/README.txt). Windows only. The
@@ -758,11 +896,14 @@ set(MELEE_PLAYBACK_GCT_SIZE "0" CACHE STRING "Size in bytes of that replay code 
 target_compile_definitions(runtime PRIVATE
   MELEE_PLAYBACK_GCT_BASE=${MELEE_PLAYBACK_GCT_BASE}u MELEE_PLAYBACK_GCT_SIZE=${MELEE_PLAYBACK_GCT_SIZE}u)
 target_include_directories(runtime PUBLIC runtime/ppc runtime/host runtime/hle runtime/gx "${PORT_GEN}" "${PROJECT_SOURCE_DIR}/native" third_party)
+# onnxruntime (MIT) C API for Phillip's policies (Fight a pro); the DLL is loaded at run time from beside the game.
+target_include_directories(runtime PRIVATE third_party/onnxruntime/include)
 target_compile_features(runtime PUBLIC cxx_std_17)
 target_compile_options(runtime PRIVATE /EHsc ${MELEE_ARCH_FLAG} /fp:precise /W3)
 target_compile_definitions(runtime PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING)
 include(runtime/ppc/ram_translator.cmake)
-target_link_libraries(runtime PUBLIC native_animation port_enet port_libusb bcrypt comdlg32 d3d12 d3d11 dxgi d3dcompiler xinput9_1_0 winmm user32 gdi32 setupapi winusb hid mfplat mfreadwrite mfuuid ole32 shell32)
+# advapi32 wintrust crypt32: the local channel's pipe, token and signer checks (runtime/hle/yougame_channel.cpp).
+target_link_libraries(runtime PUBLIC port_disc_rvz native_animation port_enet port_libusb bcrypt comdlg32 d3d12 d3d11 dxgi d3dcompiler xinput9_1_0 winmm user32 gdi32 setupapi winusb hid mfplat mfreadwrite mfuuid ole32 shell32 advapi32 wintrust crypt32)
 
 # mu_net: the project's own peer-to-peer session (no Slippi code). Keys, signatures and packet
 # sealing come from Monocypher, the transport is ENet. Built where its sources are present.
@@ -815,7 +956,7 @@ target_compile_definitions(melee_source PRIVATE MELEE_SOURCE_PORT NOMINMAX _CRT_
   MELEE_VERSION_COMMAS=${MELEE_VERSION_COMMAS})
 # Staging test builds only: read agent-test.json (runtime/hle/yougame_agent_test.h) in app-launched YouGame mode.
 # Off by default; never on for a build that goes to a production listing (tests/agent_test_hook_absent.sh checks it).
-option(YOUGAME_RANKED_BRANCH "Ranked: visible Ranked and local CPU practice" ON)   # ON in the main staging build (Friends + Ranked on the main build)
+option(YOUGAME_RANKED_BRANCH "Ranked: visible Ranked and local CPU practice" ON)   # ON in the main staging build (10-31: Friends + Ranked on the main build)
 if(YOUGAME_RANKED_BRANCH)
   target_compile_definitions(melee_source PRIVATE YOUGAME_RANKED_BRANCH=1)
   if(TARGET melee_port)
@@ -824,10 +965,12 @@ if(YOUGAME_RANKED_BRANCH)
   target_compile_definitions(runtime PRIVATE YOUGAME_RANKED_BRANCH=1)
 endif()
 option(YOUGAME_AGENT_TEST_HOOK "Staging test builds: read agent-test.json in app-launched YouGame mode" OFF)
-option(YOUGAME_FRIENDS_HANDOFF_DEFAULT "Experimental Friends live handoff agreement" OFF)
+option(YOUGAME_FRIENDS_HANDOFF_DEFAULT "Experimental Friends live handoff agreement" OFF)  # off again: the copy never starts the match (no start-at-N), so joins relaunch at once
 if(YOUGAME_FRIENDS_HANDOFF_DEFAULT)
   target_compile_definitions(melee_source PRIVATE YOUGAME_FRIENDS_HANDOFF_DEFAULT=1)
-  target_compile_definitions(melee_port PRIVATE YOUGAME_FRIENDS_HANDOFF_DEFAULT=1)
+  if(TARGET melee_port)   # the Windows source-only build has no melee_port
+    target_compile_definitions(melee_port PRIVATE YOUGAME_FRIENDS_HANDOFF_DEFAULT=1)
+  endif()
   target_compile_definitions(runtime PRIVATE YOUGAME_FRIENDS_HANDOFF_DEFAULT=1)
 endif()
 if(YOUGAME_AGENT_TEST_HOOK)
@@ -849,6 +992,12 @@ target_link_libraries(port_slippi_ticket_test PRIVATE runtime guest)
 target_compile_options(port_slippi_ticket_test PRIVATE /EHsc)
 target_compile_definitions(port_slippi_ticket_test PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
 add_test(NAME port_slippi_ticket COMMAND port_slippi_ticket_test)
+add_executable(port_slippi_netplay_rematch_test tests/slippi_netplay_rematch_test.cpp)
+target_link_libraries(port_slippi_netplay_rematch_test PRIVATE runtime guest)
+target_compile_options(port_slippi_netplay_rematch_test PRIVATE /EHsc)
+target_compile_definitions(port_slippi_netplay_rematch_test PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
+add_test(NAME port_slippi_netplay_rematch COMMAND port_slippi_netplay_rematch_test)
+set_tests_properties(port_slippi_netplay_rematch PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
 add_executable(port_slippi_login_test tests/slippi_login_test.cpp)
 target_link_libraries(port_slippi_login_test PRIVATE runtime guest)
 target_compile_options(port_slippi_login_test PRIVATE /EHsc)
@@ -907,12 +1056,47 @@ add_custom_command(TARGET melee_port POST_BUILD
   COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${MELEE_DXR_DXIL}"
           "$<TARGET_FILE_DIR:melee_port>/dxr_pathtrace.dxil"
   VERBATIM)
+# The path tracer's geometry pass (rtx_scene.cpp): compute, so Shader Model 6.0 is enough.
+set(MELEE_RTX_TRANSFORM_DXIL "${CMAKE_CURRENT_BINARY_DIR}/rtx_transform.dxil")
+add_custom_command(OUTPUT "${MELEE_RTX_TRANSFORM_DXIL}"
+  COMMAND "${MELEE_DXC_EXECUTABLE}" -T cs_6_0 -HV 2021 -O3
+          -Fo "${MELEE_RTX_TRANSFORM_DXIL}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gx/shaders/rtx_transform.hlsl"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gx/shaders/rtx_transform.hlsl"
+  VERBATIM)
+# The path tracer's ray-traced passes (rtx_tracer.cpp): DXR 1.1 for GeometryIndex().
+set(MELEE_RTX_TRACE_DXIL "${CMAKE_CURRENT_BINARY_DIR}/rtx_trace.dxil")
+add_custom_command(OUTPUT "${MELEE_RTX_TRACE_DXIL}"
+  COMMAND "${MELEE_DXC_EXECUTABLE}" -T lib_6_5 -HV 2021 -O3
+          -Fo "${MELEE_RTX_TRACE_DXIL}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gx/shaders/rtx_trace.hlsl"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gx/shaders/rtx_trace.hlsl"
+  VERBATIM)
+# The Melee integrator (rtx_melee_integrator.cpp): compute with inline ray queries, Shader Model 6.5.
+set(MELEE_RTX_DIRECT_DXIL "${CMAKE_CURRENT_BINARY_DIR}/rtx_direct.dxil")
+add_custom_command(OUTPUT "${MELEE_RTX_DIRECT_DXIL}"
+  COMMAND "${MELEE_DXC_EXECUTABLE}" -T cs_6_5 -HV 2021 -O3
+          -Fo "${MELEE_RTX_DIRECT_DXIL}" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gx/shaders/rtx_direct.hlsl"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/gx/shaders/rtx_direct.hlsl"
+  VERBATIM)
+add_custom_target(melee_rtx_shaders DEPENDS "${MELEE_RTX_TRANSFORM_DXIL}" "${MELEE_RTX_TRACE_DXIL}" "${MELEE_RTX_DIRECT_DXIL}")
+foreach(rtx_exe melee_port melee_source)
+  add_dependencies(${rtx_exe} melee_rtx_shaders melee_dxr_shader)
+  add_custom_command(TARGET ${rtx_exe} POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${MELEE_RTX_TRANSFORM_DXIL}"
+            "$<TARGET_FILE_DIR:${rtx_exe}>/rtx_transform.dxil"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${MELEE_RTX_TRACE_DXIL}"
+            "$<TARGET_FILE_DIR:${rtx_exe}>/rtx_trace.dxil"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${MELEE_RTX_DIRECT_DXIL}"
+            "$<TARGET_FILE_DIR:${rtx_exe}>/rtx_direct.dxil"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${MELEE_DXR_DXIL}"
+            "$<TARGET_FILE_DIR:${rtx_exe}>/dxr_pathtrace.dxil"
+    VERBATIM)
+endforeach()
 if(MELEE_CPU_BASELINE STREQUAL "AVX2")
   target_compile_definitions(melee_port PRIVATE MELEE_NEEDS_AVX2)
 endif()
 
 # Melee Unlocked client: Win32 launcher (Play page, Build tab, self-update). No runtime dependency.
-add_executable(melee_unlocked WIN32 app/launcher_mod_catalog.cpp runtime/host/mod_scan.cpp runtime/host/mod_profile.cpp app/launcher.cpp app/launcher_replay_data.cpp app/launcher_lobby.cpp app/launcher_lobby_p2p.cpp
+add_executable(melee_unlocked WIN32 app/launcher_mod_catalog.cpp runtime/host/mod_scan.cpp runtime/host/mod_profile.cpp app/launcher.cpp app/launcher_replay_data.cpp app/launcher_lobby.cpp app/launcher_lobby_p2p.cpp app/launcher_yougame.cpp
   third_party/dht/dht.c third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c
   runtime/host/updater.cpp runtime/host/net_trace_read.cpp app/launcher_trace_view.cpp app/launcher.rc)
 set_target_properties(melee_unlocked PROPERTIES OUTPUT_NAME MeleeUnlockedLauncher)
@@ -920,6 +1104,7 @@ add_executable(port_launcher_replay_data_test tests/launcher_replay_data_test.cp
 target_include_directories(port_launcher_replay_data_test PRIVATE app third_party)
 target_compile_features(port_launcher_replay_data_test PRIVATE cxx_std_17)
 target_compile_options(port_launcher_replay_data_test PRIVATE /EHsc)
+target_link_libraries(port_launcher_replay_data_test PRIVATE port_disc_rvz)   # .slpz
 add_test(NAME port_launcher_replay_data COMMAND port_launcher_replay_data_test)
 add_executable(port_launcher_trace_view_test tests/launcher_trace_view_test.cpp
   app/launcher_trace_view.cpp runtime/host/net_trace_read.cpp)
@@ -934,6 +1119,14 @@ target_compile_options(port_hps_bound_test PRIVATE /EHsc)
 target_compile_definitions(port_hps_bound_test PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(port_hps_bound_test PRIVATE mfplat mfreadwrite mfuuid ole32 shell32)
 add_test(NAME port_hps_bound COMMAND port_hps_bound_test)
+
+add_executable(port_audio_quality_test tests/audio_quality_test.cpp)
+target_include_directories(port_audio_quality_test PRIVATE runtime/hle runtime/host runtime/ppc)
+target_compile_features(port_audio_quality_test PRIVATE cxx_std_17)
+target_compile_options(port_audio_quality_test PRIVATE /EHsc)
+target_compile_definitions(port_audio_quality_test PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(port_audio_quality_test PRIVATE mfplat mfreadwrite mfuuid ole32 shell32)
+add_test(NAME port_audio_quality COMMAND port_audio_quality_test)
 add_executable(port_disc_fst_paths_test tests/disc_fst_paths_test.cpp runtime/host/disc_fst_paths.cpp)
 target_include_directories(port_disc_fst_paths_test PRIVATE runtime/host)
 target_compile_features(port_disc_fst_paths_test PRIVATE cxx_std_17)
@@ -963,7 +1156,10 @@ target_compile_features(melee_unlocked PRIVATE cxx_std_17)
 target_compile_options(melee_unlocked PRIVATE /EHsc)
 target_compile_definitions(melee_unlocked PRIVATE NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS MELEE_PORT_VERSION="${MELEE_PORT_VERSION}"
   MELEE_VERSION_COMMAS=${MELEE_VERSION_COMMAS})
-target_link_libraries(melee_unlocked PRIVATE comctl32 winhttp ws2_32 bcrypt user32 gdi32 shell32 comdlg32 msimg32 uxtheme winmm)
+target_link_libraries(melee_unlocked PRIVATE port_disc_rvz comctl32 winhttp ws2_32 bcrypt user32 gdi32 shell32 comdlg32 msimg32 uxtheme winmm)
+if(MELEE_YOUGAME_NO_UPSTREAM_UPDATES)
+  target_compile_definitions(melee_unlocked PRIVATE MELEE_YOUGAME_NO_UPSTREAM_UPDATES=1)
+endif()
 
 # Run via lobby/test_client.py, which owns a temporary HTTP/UDP service and database.
 add_executable(port_launcher_lobby_client_test tests/launcher_lobby_client_test.cpp app/launcher_lobby_p2p.cpp
@@ -1060,7 +1256,9 @@ if(EXISTS "${PROJECT_SOURCE_DIR}/melee/orig/GALE01/sys/main.dol")
     "${PROJECT_SOURCE_DIR}/melee/orig/GALE01/sys/main.dol")
 endif()
 
-add_executable(port_gpu_resource_test tests/gpu_resource_test.cpp runtime/gx/gx_d3d12.cpp runtime/gx/gx_shader.cpp runtime/gx/gx_texture.cpp runtime/gx/gx_streamline.cpp runtime/gx/gx_xess.cpp runtime/gx/flicker_scan.cpp runtime/gx/texture_pack.cpp runtime/gx/gx_dxr_scene.cpp runtime/gx/gx_dxr_gpu_scene.cpp runtime/gx/gx_dxr_path_tracer.cpp)
+add_executable(port_gpu_resource_test tests/gpu_resource_test.cpp runtime/gx/gx_d3d12.cpp runtime/gx/gx_shader.cpp runtime/gx/gx_texture.cpp runtime/gx/gx_streamline.cpp runtime/gx/gx_xess.cpp runtime/gx/gx_fsr.cpp runtime/gx/flicker_scan.cpp runtime/gx/texture_pack.cpp runtime/gx/gx_dxr_scene.cpp runtime/gx/gx_dxr_gpu_scene.cpp runtime/gx/gx_dxr_path_tracer.cpp
+  runtime/gx/rtx_semantics.cpp runtime/gx/rtx_lights.cpp runtime/gx/rtx_scene.cpp runtime/gx/rtx_tracer.cpp runtime/gx/rtx_melee_integrator.cpp runtime/gx/gx_fx_lights.cpp
+  runtime/gx/remix_bridge.cpp runtime/gx/rtx_plugin.cpp)
 target_include_directories(port_gpu_resource_test PRIVATE runtime/gx runtime/host runtime/ppc runtime/hle third_party)
 target_compile_features(port_gpu_resource_test PRIVATE cxx_std_17)
 target_compile_definitions(port_gpu_resource_test PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS GX_SRV_HEAP_SIZE=32 GX_SAMPLER_HEAP_SIZE=16 GX_CONSTANT_PAGE_SIZE=4096)
@@ -1068,7 +1266,8 @@ target_link_libraries(port_gpu_resource_test PRIVATE d3d12 dxgi d3dcompiler user
 add_test(NAME port_gpu_resources COMMAND port_gpu_resource_test)
 set_tests_properties(port_gpu_resources PROPERTIES TIMEOUT 60)
 
-add_executable(port_render_observer_test tests/render_observer_test.cpp runtime/gx/render_observer.cpp runtime/gx/gx_texture.cpp runtime/gx/authored_pose.cpp runtime/gx/subframe.cpp runtime/gx/gx_shader.cpp)
+add_executable(port_render_observer_test tests/render_observer_test.cpp runtime/gx/render_observer.cpp runtime/gx/gx_texture.cpp runtime/gx/authored_pose.cpp runtime/gx/subframe.cpp runtime/gx/gx_shader.cpp
+  runtime/gx/rtx_semantics.cpp)
 target_include_directories(port_render_observer_test PRIVATE runtime/ppc runtime/gx "${PROJECT_SOURCE_DIR}/native")
 target_compile_features(port_render_observer_test PRIVATE cxx_std_17)
 target_compile_definitions(port_render_observer_test PRIVATE NOMINMAX)
@@ -1101,6 +1300,10 @@ add_executable(port_native_pose_bridge_test tests/native_pose_bridge_test.cpp ru
 target_include_directories(port_native_pose_bridge_test PRIVATE runtime/gx runtime/abi "${PROJECT_SOURCE_DIR}/native")
 target_compile_features(port_native_pose_bridge_test PRIVATE cxx_std_17)
 add_test(NAME port_native_pose_bridge COMMAND port_native_pose_bridge_test)
+add_executable(port_native_pose_bridge_equiv_test tests/native_pose_bridge_equiv_test.cpp runtime/gx/native_pose_bridge.cpp)
+target_include_directories(port_native_pose_bridge_equiv_test PRIVATE runtime/gx runtime/abi "${PROJECT_SOURCE_DIR}/native")
+target_compile_features(port_native_pose_bridge_equiv_test PRIVATE cxx_std_17)
+add_test(NAME port_native_pose_bridge_equiv COMMAND port_native_pose_bridge_equiv_test)
 
 # Cache identity follows shader generation, constant layout and pipeline setup.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
@@ -1139,6 +1342,15 @@ target_compile_definitions(port_lab_view_test PRIVATE NOMINMAX _CRT_SECURE_NO_WA
 add_test(NAME port_lab_view COMMAND port_lab_view_test)
 set_tests_properties(port_lab_view PROPERTIES TIMEOUT 30)
 
+add_executable(port_coming_soon_overlay_test tests/coming_soon_overlay_test.cpp runtime/gx/coming_soon_overlay.cpp
+  third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
+  third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp)
+target_include_directories(port_coming_soon_overlay_test PRIVATE runtime/gx third_party/imgui)
+target_compile_features(port_coming_soon_overlay_test PRIVATE cxx_std_17)
+target_compile_definitions(port_coming_soon_overlay_test PRIVATE MELEE_COMING_SOON_TEST_CLOCK=1)
+add_test(NAME port_coming_soon_overlay COMMAND port_coming_soon_overlay_test)
+set_tests_properties(port_coming_soon_overlay PROPERTIES TIMEOUT 10)
+
 # NVIDIA Streamline (DLSS): optional, enabled only when the headers, import library, and core
 # redistributable DLLs are all present. A source archive may intentionally omit proprietary runtime
 # binaries; that must produce a normal non-Streamline build rather than a post-link copy failure.
@@ -1173,6 +1385,11 @@ if(EXISTS "${MELEE_STREAMLINE_ROOT}/include/sl.h" AND
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xess/bin/libxess.dll" "$<TARGET_FILE_DIR:melee_port>/libxess.dll")
   add_custom_command(TARGET melee_source POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/xess/bin/libxess.dll" "$<TARGET_FILE_DIR:melee_source>/libxess.dll")
+  # onnxruntime for Fight a pro (loaded at run time; missing file = no pro AIs). tools/fetch_onnxruntime.py
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime/bin/onnxruntime.dll")
+    add_custom_command(TARGET melee_source POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${CMAKE_CURRENT_SOURCE_DIR}/third_party/onnxruntime/bin/onnxruntime.dll" "$<TARGET_FILE_DIR:melee_source>/onnxruntime.dll")
+  endif()
   # librashader (player-chosen shader presets; loaded at run time; missing file = the setting is off)
   add_custom_command(TARGET melee_port POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/librashader/bin/librashader.dll" "$<TARGET_FILE_DIR:melee_port>/librashader.dll")
@@ -1229,3 +1446,6 @@ add_executable(port_phob_test tests/phob_test.cpp runtime/host/phob.cpp runtime/
 target_include_directories(port_phob_test PRIVATE runtime/host)
 target_compile_features(port_phob_test PRIVATE cxx_std_17)
 add_test(NAME port_phob COMMAND port_phob_test)
+
+# The local-only NVIDIA integrator (see melee_add_local_nvidia_integrator at the top).
+melee_add_local_nvidia_integrator(runtime melee_port melee_source)

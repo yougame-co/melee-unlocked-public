@@ -9,6 +9,11 @@
 #include <mutex>
 #include <thread>
 #include "gx_streamline.h"
+#include "gx_xess.h"
+#ifdef _WIN32
+#include "gx_fsr.h"
+#endif
+#include "phillip_ai.h"
 #ifdef GX_DLSS5
 #include "gx_dlss5.h"
 #endif
@@ -56,6 +61,7 @@ namespace gecko { int option_screen_shake_percent = 100; }
 #include "gecko_data.h"
 #include "yougame_link.h"
 #include "yougame_parity.h"
+#include "yougame_embed_fullscreen.h"
 #include "yougame_friends.h"
 #include "yougame_console_entry.h"
 #include <chrono>
@@ -85,6 +91,7 @@ static constexpr bool kShowFasterSoundEffects = true;
 #include "lab_view.h"
 #include "training_overlay.h"
 #include "net_overlay.h"
+#include "coming_soon_overlay.h"
 #include "replay_bar.h"
 #include "replay_control.h"
 #include "replay_coach.h"
@@ -130,6 +137,26 @@ constexpr bool kLabViewAvailable = false;
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 #endif
 namespace gx {
+
+// Video > Ray tracing presets: the look, brightness and strengths each sets (every effect on).
+static void apply_rtx_preset(RenderOptions& o) {
+  struct Preset { int look, brightness, reflection, floor, shadow, bounce; };
+  static const Preset presets[] = {
+    {0, 0, 0, 0, 0, 0},             // Custom: leaves everything as it is
+    {0, 100, 60, 0, 70, 50},        // Faithful
+    {60, 105, 80, 70, 90, 80},      // Balanced
+    {100, 115, 100, 100, 100, 100}, // Remastered
+    {100, 120, 200, 180, 140, 160}, // Showcase
+  };
+  if (o.rtx_preset <= 0 || o.rtx_preset > 4) return;
+  const Preset& p = presets[o.rtx_preset];
+  o.rtx_look = p.look; o.rtx_brightness = p.brightness; o.rtx_reflection_strength = p.reflection;
+  o.rtx_floor_strength = p.floor; o.rtx_shadow_strength = p.shadow; o.rtx_bounce_strength = p.bounce;
+  o.rtx_shadows = o.rtx_ao = o.rtx_fighter_shadows = o.rtx_bounce = o.rtx_reflections = true;
+  o.rtx_skin = o.rtx_stage_shade = true;
+  o.rtx_glossy_floors = p.floor > 0;
+  if (o.rtx_preset == 4) o.rtx_photo_mode = true;
+}
 namespace {
 std::atomic<uint32_t> g_guest_options_selection{0};
 std::atomic<bool> g_guest_options_open_request{false};
@@ -387,6 +414,56 @@ static void draw_combo_counter() {
   draw->PopClipRect();
 }
 
+// Community codes drawn over the match (HUD tab), from what the native game reports each drawn frame
+// (host API 24), in the game's font. Nana's percent: under each Ice Climbers player's damage, while
+// Nana is in play. Ally markers (online, as the code has them): YOU over your own fighter, a heart
+// over your teammate in a teams match.
+static void draw_community_code_overlays() {
+  const uint32_t codes = host::g_community_codes.load(std::memory_order_relaxed);
+  if (!g_hud_match || !(codes & (MU_DISPLAY_OPTION_NANA_PERCENT | MU_DISPLAY_OPTION_ALLY_INDICATORS))) return;
+  const OverlayBounds bounds = overlay_bounds();
+  const float width = bounds.right - bounds.left, height = bounds.bottom - bounds.top;
+  static constexpr ImU32 colors[4] = {
+    IM_COL32(255, 99, 107, 255), IM_COL32(83, 164, 255, 255),
+    IM_COL32(255, 211, 84, 255), IM_COL32(93, 220, 143, 255)};
+  ImDrawList* draw = ImGui::GetForegroundDrawList();
+  draw->PushClipRect(ImVec2(bounds.left, bounds.top), ImVec2(bounds.right, bounds.bottom), true);
+  const auto at_x = [&](float x640) {
+    const float x = true_widescreen_active() ? 320.0f + (x640 - 320.0f) * true_widescreen_factor() : x640;
+    return bounds.left + x / 640.0f * width;
+  };
+  if (codes & MU_DISPLAY_OPTION_NANA_PERCENT) {
+    const float px = std::clamp(height / 30.0f, 12.0f, 30.0f);
+    for (int slot = 0; slot < 4; ++slot) {
+      const HudPlayerSnapshot& p = g_hud_players[slot];
+      if (!p.present || p.nana_damage < 0) continue;
+      char label[24];
+      std::snprintf(label, sizeof label, "NANA %d%%", p.nana_damage);
+      const float w = practice_menu::text_width(px, label);
+      // Under the damage display (the game lays them out by port, as for the combo counter).
+      const float x = at_x(128.0f + 151.0f * slot) - w * 0.5f;
+      const float y = bounds.top + height * 0.955f - px;
+      practice_menu::text(draw, x, y, px, IM_COL32(255, 255, 255, 235), label, 0.0f, true);
+    }
+  }
+  const int me = slippi::online::is_online_match() ? slippi::online::local_player_index() : -1;
+  if ((codes & MU_DISPLAY_OPTION_ALLY_INDICATORS) && me >= 0 && me < 4) {
+    const float px = std::clamp(height / 26.0f, 14.0f, 34.0f);
+    for (int slot = 0; slot < 4; ++slot) {
+      const HudPlayerSnapshot& p = g_hud_players[slot];
+      const bool mine = slot == me, ally = !mine && p.team >= 0 && p.team == g_hud_players[me].team;
+      if (!p.present || (!mine && !ally)) continue;
+      if (!std::isfinite(p.tag_x) || !std::isfinite(p.tag_y) || p.tag_y <= 0.0f) continue;
+      const char* label = mine ? "YOU" : "\xE2\x99\xA5";
+      const float w = practice_menu::text_width(px, label);
+      const float x = at_x(p.tag_x) - w * 0.5f;
+      const float y = bounds.top + p.tag_y / 480.0f * height - px * 2.2f;
+      practice_menu::text(draw, x, y, px, mine ? colors[slot] : IM_COL32(255, 90, 140, 255), label, 0.0f, true);
+    }
+  }
+  draw->PopClipRect();
+}
+
 static void draw_player_nicknames() {
   if (!g_hud_match) return;
   const OverlayBounds bounds = overlay_bounds();
@@ -499,6 +576,13 @@ static bool load_family_option(const std::string& key, const std::string& value)
     if (key == "deadzone_" + k + "_c") { host::g_deadzones[f].c = std::clamp(std::atoi(value.c_str()), 0, 100); return true; }
     if (key == "radius_" + k + "_main") { host::g_deadzones[f].radius_main = std::clamp(std::atoi(value.c_str()), 50, 100); return true; }
     if (key == "radius_" + k + "_c") { host::g_deadzones[f].radius_c = std::clamp(std::atoi(value.c_str()), 50, 100); return true; }
+    // The 0.9.113 strength (1..10), then the size and window that replace it (written after it).
+    if (key == "snapback_" + k + "_x") { host::snapback_from_strength(std::atoi(value.c_str()), host::g_deadzones[f].snapback_x, host::g_deadzones[f].snapback_ms_x); return true; }
+    if (key == "snapback_" + k + "_y") { host::snapback_from_strength(std::atoi(value.c_str()), host::g_deadzones[f].snapback_y, host::g_deadzones[f].snapback_ms_y); return true; }
+    if (key == "snapback_size_" + k + "_x") { host::g_deadzones[f].snapback_x = std::clamp(std::atoi(value.c_str()), 0, host::kSnapbackEdge); return true; }
+    if (key == "snapback_size_" + k + "_y") { host::g_deadzones[f].snapback_y = std::clamp(std::atoi(value.c_str()), 0, host::kSnapbackEdge); return true; }
+    if (key == "snapback_ms_" + k + "_x") { host::g_deadzones[f].snapback_ms_x = std::clamp(std::atoi(value.c_str()), host::kSnapbackMinMs, host::kSnapbackMaxMs); return true; }
+    if (key == "snapback_ms_" + k + "_y") { host::g_deadzones[f].snapback_ms_y = std::clamp(std::atoi(value.c_str()), host::kSnapbackMinMs, host::kSnapbackMaxMs); return true; }
     if (key == "trigger_" + k + "_l") { host::g_deadzones[f].trig_l = std::clamp(std::atoi(value.c_str()), 0, 255); return true; }
     if (key == "trigger_" + k + "_r") { host::g_deadzones[f].trig_r = std::clamp(std::atoi(value.c_str()), 0, 255); return true; }
     if (key == "trigger_" + k + "_l_threshold" || key == "trigger_" + k + "_r_threshold") {
@@ -525,6 +609,15 @@ static std::string family_options_text() {
     // written only when changed, so a file that never used them stays as it was
     if (host::g_deadzones[f].radius_main < 100) out += "\nradius_" + k + "_main " + std::to_string(host::g_deadzones[f].radius_main);
     if (host::g_deadzones[f].radius_c < 100) out += "\nradius_" + k + "_c " + std::to_string(host::g_deadzones[f].radius_c);
+    // The nearest 0.9.113 strength first (an older version reads that), then the exact size and window.
+    for (int axis = 0; axis < 2; ++axis) {
+      const int size = axis ? host::g_deadzones[f].snapback_y : host::g_deadzones[f].snapback_x;
+      const int ms = axis ? host::g_deadzones[f].snapback_ms_y : host::g_deadzones[f].snapback_ms_x;
+      if (!size) continue;
+      const std::string a = axis ? "_y " : "_x ";
+      out += "\nsnapback_" + k + a + std::to_string(std::clamp((size - 10 + 2) / 4, 1, 10));
+      out += "\nsnapback_size_" + k + a + std::to_string(size) + "\nsnapback_ms_" + k + a + std::to_string(ms);
+    }
     if (host::g_deadzones[f].trig_l < 255) out += "\ntrigger_" + k + "_l " + std::to_string(host::g_deadzones[f].trig_l);
     if (host::g_deadzones[f].trig_r < 255) out += "\ntrigger_" + k + "_r " + std::to_string(host::g_deadzones[f].trig_r);
     if (host::g_deadzones[f].click_l != host::kDefaultTriggerClick)
@@ -2078,6 +2171,9 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   options.cpu_20xx = false;   // a file without the key: off
   options.freeze_fd = false;
   options.hide_ko_explosions = false;
+  options.hide_hud_emblems = false;
+  options.community_codes = 0;
+  options.pro_ai_stronger = 0;   // a file without the key: ask
   options.unlock_all = true;   // a file without the key: on
   options.results_screen = true;
   options.offline_delay = false;
@@ -2089,7 +2185,6 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   // black and white on X and A. That old key is read as off.
   options.lossless_lag_test = false;
   options.early_inputs = true;   // a file without the key: on
-  options.online_frame_protection = true;   // a file without the key: on
 #ifndef MELEE_NO_SLIPPI   // the spectator server is part of the Slippi layer
   options.slippi_spectator = true;   // a file without the key: on, as in Slippi Dolphin
   options.slippi_spectator_port = 51441;
@@ -2111,13 +2206,54 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   bool vsync_seen = false, showfps_seen = false;
   bool lowspec_look = false;   // "lowspec_look 1": written by builds that migrate Low spec to the image only
   int dlss5_defaults_version = 0;   // 2 from 0.9.60: NVIDIA's own DLSS 5 defaults
+  bool saved_true_widescreen = false, truewsfit_seen = false;
+  int saved_truewsaspect = -1;
+  // Video > Ray tracing and HDR keys, apart from the main chain below (one else-if chain that long
+  // exceeds MSVC's nesting limit).
+  auto load_rtx_key = [&options](const std::string& key, const std::string& value) -> bool {
+    try {
+      if (key == "pathtracing")
+        options.path_tracing = RenderOptions::kPathTracingAvailable && value == "1";
+      else if (key == "rayreconstruction")
+        options.ray_reconstruction = RenderOptions::kPathTracingAvailable && value == "1";
+      else if (key == "rtxlook") { int n = std::stoi(value); if (n >= 0 && n <= 100) options.rtx_look = n; }
+      else if (key == "rtxshadows") options.rtx_shadows = value == "1";
+      else if (key == "rtxao") options.rtx_ao = value == "1";
+      else if (key == "rtxfightershadows") options.rtx_fighter_shadows = value == "1";
+      else if (key == "rtxbounce") options.rtx_bounce = value == "1";
+      else if (key == "rtxreflections") options.rtx_reflections = value == "1";
+      else if (key == "rtxskin") options.rtx_skin = value == "1";
+      else if (key == "rtxstageshade") options.rtx_stage_shade = value == "1";
+      else if (key == "rtxmoddedstages") options.rtx_modded_stages = value == "1";
+      else if (key == "rtxmodfloors") { int n = std::stoi(value); if (n >= 0 && n <= 2) options.rtx_mod_floors = n; }
+      else if (key == "rtxeffectlight") options.rtx_effect_light = value == "1";
+      else if (key == "rtxglowlight") options.rtx_glow_light = value == "1";
+      else if (key == "rtxglossyfloors") options.rtx_glossy_floors = value == "1";
+      else if (key == "rtxbrightness") { int n = std::stoi(value); if (n >= 50 && n <= 200) options.rtx_brightness = n; }
+      else if (key == "rtxphotomode") options.rtx_photo_mode = value == "1";
+      else if (key == "rtxpreset") { int n = std::stoi(value); if (n >= 0 && n <= 4) options.rtx_preset = n; }
+      else if (key == "rtxreflstrength") { int n = std::stoi(value); if (n >= 0 && n <= 200) options.rtx_reflection_strength = n; }
+      else if (key == "rtxfloorstrength") { int n = std::stoi(value); if (n >= 0 && n <= 200) options.rtx_floor_strength = n; }
+      else if (key == "rtxshadowstrength") { int n = std::stoi(value); if (n >= 0 && n <= 200) options.rtx_shadow_strength = n; }
+      else if (key == "rtxbouncestrength") { int n = std::stoi(value); if (n >= 0 && n <= 200) options.rtx_bounce_strength = n; }
+      else if (key == "rtxradiancecache") options.rtx_radiance_cache = value == "1";
+      else if (key == "hdroutput") options.hdr_output = value == "1";
+      else if (key == "hdrpaperwhite") { int n = std::stoi(value); if (n >= 80 && n <= 500) options.hdr_paper_white = n; }
+      else if (key == "hdrpeak") { int n = std::stoi(value); if (n >= 0 && n <= 10000) options.hdr_peak = n; }
+      else if (key == "rtxintegrator") { int n = std::stoi(value); if (n >= 0 && n <= 2) options.rtx_integrator = n; }
+      else return false;
+    } catch (...) {}
+    return true;
+  };
   while (file >> key) {
     std::getline(file, value);
     const size_t first = value.find_first_not_of(" \t");
     value = first == std::string::npos ? std::string() : value.substr(first);
     while (!value.empty() && (value.back() == '\r' || value.back() == ' ' || value.back() == '\t')) value.pop_back();
+    if (key == "truewsfit") { truewsfit_seen = true; continue; }
     if (value.empty()) continue;
     if (source_port::mods::parse_choice(key, value, &options.mod_choices)) continue;
+    if (load_rtx_key(key, value)) continue;
     try {
       bool matched = true;
       if (key == "fps") { double rate = std::stod(value); if (rate == -1 || rate == 0 || rate >= 30) options.fps_cap = std::min(rate, 2000.0); }
@@ -2129,8 +2265,8 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "widescreen") options.widescreen = value == "1";
       else if (key == "fodreflections") options.fod_reflections = value != "0";
       else if (key == "cssbackgroundfree") options.css_background_free = value == "1";
-      else if (key == "truewidescreen") options.true_widescreen = value == "1";
-      else if (key == "truewsaspect") { int n = std::stoi(value); if (n >= 0 && n <= 3) options.true_aspect = (TrueAspect)n; }
+      else if (key == "truewidescreen") options.true_widescreen = saved_true_widescreen = value == "1";
+      else if (key == "truewsaspect") { int n = std::stoi(value); if (n >= 0 && n <= 3) { options.true_aspect = (TrueAspect)n; saved_truewsaspect = n; } }
       else if (key == "truewscustomw") { int n = std::stoi(value); if (n >= 1 && n <= 100) options.true_custom_w = n; }
       else if (key == "truewscustomh") { int n = std::stoi(value); if (n >= 1 && n <= 100) options.true_custom_h = n; }
       else if (key == "customtextures") options.custom_textures = value == "1";
@@ -2167,7 +2303,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "ssaa") { int a = std::stoi(value); if (a >= 1 && a <= 4) options.ssaa = a; }
       else if (key == "msaa") { int a = std::stoi(value); if (a == 1 || a == 2 || a == 4 || a == 8) options.msaa = a; }
       else if (key == "subframe") options.subframe = value == "0" ? SubFrameMode::Off : value == "2" ? SubFrameMode::AuthoredInterpolate : SubFrameMode::Authored;
-      else if (key == "onlineframeprotection") options.online_frame_protection = value == "1";
+      else if (key == "onlineframeprotection") {}   // removed setting (online drop to 60): older files still carry it
       else if (key == "music") slippi::jukebox::set_user_volume(std::stoi(value));
       else if (key == "musicpacks") slippi::jukebox::set_music_packs_enabled(value == "1");
       else if (key == "audio_mode") options.audio_mode = std::clamp(std::stoi(value), 0, 3);
@@ -2299,6 +2435,9 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "cpu_20xx") options.cpu_20xx = value == "1";
       else if (key == "freeze_fd") options.freeze_fd = value == "1";
       else if (key == "hide_ko_explosions") options.hide_ko_explosions = value == "1";
+      else if (key == "hide_hud_emblems") options.hide_hud_emblems = value == "1";
+      else if (key == "proaistronger") options.pro_ai_stronger = std::clamp(std::atoi(value.c_str()), 0, 2);
+      else if (key == "community_codes") options.community_codes = (uint32_t)std::strtoul(value.c_str(), nullptr, 16) & (MU_DISPLAY_OPTION_CODES_ALL | MU_DISPLAY_OPTION_OFFLINE_CODES);
       else if (key == "unlock_all") options.unlock_all = value != "0";
       else if (key == "results_screen") options.results_screen = value != "0";
 #ifndef MELEE_NO_SLIPPI
@@ -2331,7 +2470,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (load_family_option(key, value)) {}
       else if (load_binding_level(key, value)) {}
       else if (key == "autoopenoverlay") options.settings_open = value == "1";
-      else if (key == "dlss") { int m = std::stoi(value); if (m >= 0 && m <= 10) options.dlss_mode = m; }
+      else if (key == "dlss") { int m = std::stoi(value); if (m >= 0 && m <= 15) options.dlss_mode = m; }
       // Pre-multiplier saves wrote 0 or 1; both still mean what they always meant (off / 2x).
       else if (key == "framegen") options.frame_generation_mode = std::clamp(std::stoi(value), 0, 6);
       else if (key == "fgmax") options.fg_cached_max = std::clamp(std::atoi(value.c_str()), 0, 5);
@@ -2341,10 +2480,6 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "reflexflash") options.reflex_flash = value == "1";
       else if (key == "latencytest") options.latency_test = value == "1";
       else if (key == "lagtestnext") options.lossless_lag_test = value == "1";
-      else if (key == "pathtracing")
-        options.path_tracing = RenderOptions::kPathTracingAvailable && value == "1";
-      else if (key == "rayreconstruction")
-        options.ray_reconstruction = RenderOptions::kPathTracingAvailable && value == "1";
 #ifdef GX_DLSS5
       else if (key == "dlss5") options.dlss5 = value == "1";
       else if (key == "dlss5intensity") dlss5_float(value, options.dlss5_tuning.intensity, 0.0f, 10.0f);
@@ -2365,13 +2500,13 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       // Low spec: the switch, then what the player had before it was turned on, so turning it off
       // after a restart still restores their own settings rather than the defaults.
       else if (key == "lowspec") options.low_spec = value == "1";
-      else if (key == "lowspec_prev_backend") options.low_spec_previous.api = value == "d3d11" ? RenderApi::D3D11 : RenderApi::D3D12;
+      else if (key == "lowspec_prev_backend") options.low_spec_previous.api = value == "d3d11" ? RenderApi::D3D11 : value == "vulkan" ? RenderApi::Vulkan : RenderApi::D3D12;
       else if (key == "lowspec_prev_fps") { double rate = std::stod(value); if (rate == -1 || rate == 0 || rate >= 30) options.low_spec_previous.fps_cap = std::min(rate, 2000.0); }
       else if (key == "lowspec_prev_scale") { int n = std::stoi(value); if (n >= 0 && n <= 8) options.low_spec_previous.efb_scale = n; }
       else if (key == "lowspec_prev_ssaa") { int n = std::stoi(value); if (n >= 1 && n <= 4) options.low_spec_previous.ssaa = n; }
       else if (key == "lowspec_prev_anisotropy") { int n = std::stoi(value); if (n == 1 || n == 2 || n == 4 || n == 8 || n == 16) options.low_spec_previous.anisotropy = n; }
       else if (key == "lowspec_prev_effects") { int n = std::stoi(value); if (n >= 0 && n <= 3) options.low_spec_previous.effects_level = n; }
-      else if (key == "lowspec_prev_dlss") { int n = std::stoi(value); if (n >= 0 && n <= 10) options.low_spec_previous.dlss_mode = n; }
+      else if (key == "lowspec_prev_dlss") { int n = std::stoi(value); if (n >= 0 && n <= 15) options.low_spec_previous.dlss_mode = n; }   // as "dlss" (FSR is 11 to 15)
       else if (key == "lowspec_prev_subframe") options.low_spec_previous.subframe = value == "0" ? SubFrameMode::Off : value == "2" ? SubFrameMode::AuthoredInterpolate : SubFrameMode::Authored;
       else if (key == "discord") options.discord_presence = value == "1";
       // A Discord application id is a snowflake; anything else would only be rejected by Discord.
@@ -2497,6 +2632,32 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   // the Slippi code over True 16:9 (gx_d3d12 / gx_d3d11 apply True 16:9 only without the code).
   if (options.exclusive_fullscreen) options.fullscreen = false;
   if (options.widescreen) options.true_widescreen = false;
+  // DLSS 5 controls saved before 0.9.60 keep their values: NVIDIA's defaults (Tuning) are only for
+  // a settings file without them. Measured on the same frame, NVIDIA's Preset B changes far fewer
+  // pixels than the old defaults, so moving players over would look like DLSS 5 stopped working.
+  (void)dlss5_defaults_version;
+  // Move the old True widescreen 16:9 default to the window's shape once. Every save writes
+  // truewsfit, so choosing 16:9 again after this preserves that explicit choice.
+  if (saved_true_widescreen && saved_truewsaspect == (int)TrueAspect::Wide16_9 && !truewsfit_seen)
+    options.true_aspect = TrueAspect::FitWindow;
+  // Widescreen is True widescreen only (0.9.63). The Slippi code was a choice beside it that players
+  // took for the widescreen they knew from Slippi Dolphin, and in fullscreen it left the picture
+  // boxed in on wide screens; a saved Slippi code choice now fills the screen. --widescreen still
+  // runs the code for test runs, after this.
+  if (options.widescreen) {
+    options.widescreen = false;
+    options.true_widescreen = true;
+    options.true_aspect = TrueAspect::FitWindow;
+  }
+  migrate_lightweight(options, lowspec_look);   // files from before the "Lightweight" ladder
+  set_lightweight_level(options.lightweight);
+#ifdef GX_DLSS5
+  dlss5::profile_set_folder(options.settings_path);
+#endif
+  std::sort(texture_packs_off.begin(), texture_packs_off.end());
+  texture_packs_off.erase(std::unique(texture_packs_off.begin(), texture_packs_off.end()), texture_packs_off.end());
+  texpack::set_disabled_packs(std::move(texture_packs_off));
+  if (options.prewarm_only) return;   // no gameplay files or services in a graphics-only run
   // The player's Gecko codes live beside the settings file.
   std::filesystem::path codes = std::filesystem::path(options.settings_path).parent_path() / "GeckoCodes.ini";
   user_gecko::set_code_patches_allowed(!options.native_source);   // the Static Recomp can run a patched function from RAM
@@ -2516,9 +2677,6 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   g_gecko_chosen = gecko_chosen;
   g_gecko_saved_on = gecko_on;
   source_port::mods::set_choices(options.mod_choices);
-  std::sort(texture_packs_off.begin(), texture_packs_off.end());
-  texture_packs_off.erase(std::unique(texture_packs_off.begin(), texture_packs_off.end()), texture_packs_off.end());
-  texpack::set_disabled_packs(std::move(texture_packs_off));
   // The Training Lab's bits (0x8000 and up) are no longer offered: Training Mode CE replaces it.
   options.te_options &= 0x00007FFFu;
   // 20XX TE's "L-cancel training wheels" is not offered: the port's own Auto L-cancel does that.
@@ -2527,26 +2685,15 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   // from when it was 20XX TE's word 2 bit 0x800000 turns the option on once; the bit itself is
   // cleared here and never saved again, so the migration happens one time.
   if (options.te_options2 & 0x800000u) { options.cpu_20xx = true; options.te_options2 &= ~0x800000u; }
-  // DLSS 5 controls saved before 0.9.60 keep their values: NVIDIA's defaults (Tuning) are only for
-  // a settings file without them. Measured on the same frame, NVIDIA's Preset B changes far fewer
-  // pixels than the old defaults, so moving players over would look like DLSS 5 stopped working.
-  (void)dlss5_defaults_version;
-  // Widescreen is True widescreen only (0.9.63). The Slippi code was a choice beside it that players
-  // took for the widescreen they knew from Slippi Dolphin, and in fullscreen it left the picture
-  // boxed in on wide screens; a saved Slippi code choice becomes True 16:9. --widescreen still runs
-  // the code for test runs, after this.
-  if (options.widescreen) {
-    options.widescreen = false;
-    options.true_widescreen = true;
-    options.true_aspect = TrueAspect::Wide16_9;
-  }
   RenderOptions::live_cpu_20xx() = options.cpu_20xx;
-  RenderOptions::live_online_frame_protection().store(options.online_frame_protection, std::memory_order_relaxed);
   RenderOptions::live_clean_replays().store(options.clean_replays, std::memory_order_relaxed);
   RenderOptions::live_stadium_frozen() = options.stadium_frozen;
   RenderOptions::live_freeze_fd() = options.freeze_fd;
   host::g_freeze_fd.store(options.freeze_fd, std::memory_order_relaxed);
   host::g_hide_ko_explosions.store(options.hide_ko_explosions, std::memory_order_relaxed);
+  host::g_hide_hud_emblems.store(options.hide_hud_emblems, std::memory_order_relaxed);
+  host::g_community_codes.store(options.community_codes, std::memory_order_relaxed);
+  phillip_ai::set_stronger_choice(options.pro_ai_stronger);
   RenderOptions::live_unlock_all() = options.unlock_all;
   RenderOptions::live_results_screen() = options.results_screen;
   RenderOptions::live_offline_delay() = options.offline_delay;
@@ -2576,11 +2723,6 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   RenderOptions::live_mods_in_direct() = options.mods_in_direct;
   RenderOptions::live_te_options2() = options.te_options2;
   RenderOptions::live_te_menu_music().store(options.te_menu_music);
-  migrate_lightweight(options, lowspec_look);   // files from before the "Lightweight" ladder
-  set_lightweight_level(options.lightweight);
-#ifdef GX_DLSS5
-  dlss5::profile_set_folder(options.settings_path);
-#endif
   host::phob_store_load(options.settings_path);
 }
 
@@ -3419,6 +3561,8 @@ void settings_context_destroy() {
   ImGui::DestroyContext();
 }
 
+// HDR10 paper white of the settings panel (0 on an SDR screen); set by the Direct3D 12 presenter.
+namespace { float g_settings_hdr_nits = 0.0f; }
 #ifdef _WIN32
 struct PcSettingsUI::Impl {
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
@@ -3430,7 +3574,14 @@ struct PcSettingsUI::Impl {
   SettingsState state;
 };
 
-PcSettingsUI::PcSettingsUI(void* window, ID3D12Device* device, ID3D12CommandQueue* queue, const RenderOptions& options)
+void PcSettingsUI::set_hdr_paper_white(float nits) { g_settings_hdr_nits = nits; }
+bool PcSettingsUI::overlay_visible() const {
+  const SettingsState& s = impl_->state;
+  return s.open || s.menu_open || s.practice_open || settings_fills_window();
+}
+
+PcSettingsUI::PcSettingsUI(void* window, ID3D12Device* device, ID3D12CommandQueue* queue, const RenderOptions& options,
+                           int rtv_format)
     : impl_(std::make_unique<Impl>()) {
   auto& state = *impl_;
   const bool open = options.settings_open || settings_fills_window();
@@ -3445,8 +3596,8 @@ PcSettingsUI::PcSettingsUI(void* window, ID3D12Device* device, ID3D12CommandQueu
   desc.NumDescriptors = (UINT)state.used.size(); desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   if (FAILED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&state.heap)))) host::die("PC settings descriptor heap creation failed");
   state.stride = device->GetDescriptorHandleIncrementSize(desc.Type);
-  ImGui_ImplDX12_InitInfo info{}; info.Device = device; info.CommandQueue = queue; info.NumFramesInFlight = 3;
-  info.RTVFormat = DXGI_FORMAT_R8G8B8A8_UNORM; info.DSVFormat = DXGI_FORMAT_UNKNOWN;
+  ImGui_ImplDX12_InitInfo info{}; info.Device = device; info.CommandQueue = queue; info.NumFramesInFlight = 6;   // FSR frame generation draws the overlay twice per frame (two presents)
+  info.RTVFormat = (DXGI_FORMAT)rtv_format; info.DSVFormat = DXGI_FORMAT_UNKNOWN;
   info.SrvDescriptorHeap = state.heap.Get(); info.UserData = &state;
   info.SrvDescriptorAllocFn = [](ImGui_ImplDX12_InitInfo* i, D3D12_CPU_DESCRIPTOR_HANDLE* cpu, D3D12_GPU_DESCRIPTOR_HANDLE* gpu) {
     auto& s = *(Impl*)i->UserData;
@@ -3604,6 +3755,18 @@ bool percent_row(const char* label, uint8_t* value, const char* tip) {
   return changed;
 }
 
+// One group in two arrays (version 3 adds options to version 1 groups): shares are of both together.
+bool odds_group2(const char* const* labels, uint8_t* a, int na, const char* const* labels2, uint8_t* b, int nb) {
+  int total = 0;
+  for (int i = 0; i < na; ++i) total += a[i];
+  for (int i = 0; i < nb; ++i) total += b[i];
+  bool changed = false;
+  for (int i = 0; i < na; ++i) changed |= odds_row(labels[i], &a[i], total);
+  for (int i = 0; i < nb; ++i) changed |= odds_row(labels2[i], &b[i], total);
+  return changed;
+}
+static const char* const kSides[MU_PC_SIDE_COUNT] = {"Roll to the ledge", "Roll to the middle"};
+
 bool number_row(const char* label, uint8_t* value, int low, int high, const char* format, const char* tip) {
   ImGui::PushID(label);
   const float avail = ImGui::GetContentRegionAvail().x;
@@ -3699,10 +3862,21 @@ static bool draw_practice_cpu_tabs(RenderOptions& options, int tab) {
     bool freeze = c.freeze != 0;
     if (settings_toggle("Only react to hits", &freeze)) { c.freeze = freeze; changed = true; }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Stands still; only DI, techs, getups, ledge options and recovery stay on.");
+    bool moving_target = c.no_attacks != 0;
+    if (settings_toggle("Moving target (no attacks)", &moving_target)) { c.no_attacks = moving_target; changed = true; }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("It moves around, shields, dodges, DIs, techs and recovers, but never attacks or grabs:\n"
+                        "no attacks in range, out of shield, from the ledge, getting up or after a hit.");
     heading("Style");
     changed |= percent_row("Aggression", &c.aggression, "How often it attacks (rather than moves) when you are in range.");
     changed |= number_row("Attack range", &c.attack_range, 10, 80, "%d units", "How close you must be before it attacks.");
     changed |= number_row("Reaction time", &c.reaction_frames, 0, 40, "%d frames", "Frames before it answers an attack. People react in 15 to 25.");
+    changed |= number_row("CPU delay", &c.act_delay, 0, 30, "%d frames", "Frames it waits before it acts out of shield, getting up and leaving hitstun.");
+    {
+      static const char* const respawn[MU_PC_RESPAWN_COUNT] = {"Wait", "Get off at once", "Mix"};
+      int r = c.respawn < MU_PC_RESPAWN_COUNT ? c.respawn : 0;
+      if (settings_combo("Respawn platform", &r, respawn, MU_PC_RESPAWN_COUNT)) { c.respawn = (uint8_t)r; changed = true; }
+    }
     heading("Movement", "What it does between attacks. Weights within the group.");
     {
       // The two movement groups are picked from as one.
@@ -3724,10 +3898,12 @@ static bool draw_practice_cpu_tabs(RenderOptions& options, int tab) {
           std::snprintf(special[k], sizeof special[k], "%s: %s", prefix[k], name);
           labels[MU_PC_ATK_NEUTRAL_B + k] = special[k];
         }
-      changed |= odds_group(labels, c.attack_odds, MU_PC_ATK_COUNT);
+      static const char* const run_shine[1] = {"Run shine (dash in, then down special)"};
+      changed |= odds_group2(labels, c.attack_odds, MU_PC_ATK_COUNT, run_shine, &c.run_shine, 1);
     }
     heading("Throws", "Once it grabs you.");
     changed |= odds_group(kThrows, c.throw_odds, MU_PC_THROW_COUNT);
+    changed |= number_row("Throw wait", &c.throw_wait, 0, 60, "%d frames", "Frames it holds you before it throws. 0: 4 to 12.");
     heading("Jumps and aerials");
     {
       int d = c.jump_drift < MU_PC_DRIFT_COUNT ? c.jump_drift : 0;
@@ -3746,7 +3922,7 @@ static bool draw_practice_cpu_tabs(RenderOptions& options, int tab) {
   case 2:
     ImGui::BeginDisabled(!c.enabled || c.freeze);
     heading("When you attack near it", "Answered once per attack, after its reaction time.");
-    changed |= odds_group(kDefend, c.defend_odds, MU_PC_DEF_COUNT);
+    changed |= odds_group2(kDefend, c.defend_odds, MU_PC_DEF_COUNT, kSides, c.def2_odds, MU_PC_SIDE_COUNT);
     heading("Out of shield", "Once shieldstun ends.");
     changed |= odds_group(kOos, c.oos_odds, MU_PC_OOS_COUNT);
     ImGui::EndDisabled();
@@ -3760,9 +3936,9 @@ static bool draw_practice_cpu_tabs(RenderOptions& options, int tab) {
     if (settings_combo("Smash DI", &s, sdi, 4)) { c.sdi_amount = (uint8_t)s; changed = true; }
     changed |= percent_row("Floorhug", &c.floorhug, "Chance it holds down when hit on the ground (ASDI down), so weak hits leave it standing.");
     heading("Tech", "When it lands in tumble.");
-    changed |= odds_group(kTech, c.tech_odds, MU_PC_TECH_COUNT);
+    changed |= odds_group2(kTech, c.tech_odds, MU_PC_TECH_COUNT, kSides, c.tech2_odds, MU_PC_SIDE_COUNT);
     heading("After a missed tech");
-    changed |= odds_group(kGetup, c.getup_odds, MU_PC_GETUP_COUNT);
+    changed |= odds_group2(kGetup, c.getup_odds, MU_PC_GETUP_COUNT, kSides, c.getup2_odds, MU_PC_SIDE_COUNT);
     heading("As hitstun ends in the air");
     changed |= odds_group(kAfter, c.after_odds, MU_PC_AFTER_COUNT);
     ImGui::EndDisabled();
@@ -3987,6 +4163,7 @@ static void draw_native_practice(SettingsState& state, RenderOptions& options,
     f.time = ImGui::GetTime();
     const practice_menu::Result r = practice_menu::frame(look, f);
     if (r.changed) { state.dirty = true; apply_practice_tools(options); }
+    if (r.stronger_changed) { options.pro_ai_stronger = phillip_ai::stronger_choice(); state.dirty = true; }
     const auto close_menu = [&state]() { state.practice_open = false; state.practice_release_capture = true; };
     if (r.start_unranked && practice.can_start) { slippi::native_practice::submit_start_unranked(); close_menu(); }
     if (r.start_direct || r.start_teams) {
@@ -4233,7 +4410,7 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
            : g_display_keys.saved_vsync_yougame >= 0 ? "\nvsync_yougame " + std::to_string(g_display_keys.saved_vsync_yougame) : std::string())
        << "\nwidescreen " << options.widescreen
        << "\nfodreflections " << options.fod_reflections << "\ncssbackgroundfree " << options.css_background_free
-       << "\ntruewidescreen " << options.true_widescreen << "\ntruewsaspect " << (int)options.true_aspect
+       << "\ntruewidescreen " << options.true_widescreen << "\ntruewsaspect " << (int)options.true_aspect << "\ntruewsfit 1"
        << "\ntruewscustomw " << options.true_custom_w << "\ntruewscustomh " << options.true_custom_h << "\naspect " << (int)options.aspect
        << "\nwindow " << (options.window_pinned ? std::to_string(options.window_w) + "x" + std::to_string(options.window_h) : std::string("follow"))
        << "\nvolume " << g_volume << "\nperformance " << options.performance_overlay
@@ -4253,6 +4430,19 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\nlagtestnext " << (options.lossless_lag_test ? 1 : 0)
        << "\npathtracing " << (options.path_tracing ? 1 : 0)
        << "\nrayreconstruction " << (options.ray_reconstruction ? 1 : 0)
+       << "\nrtxlook " << options.rtx_look << "\nrtxshadows " << (options.rtx_shadows ? 1 : 0)
+       << "\nrtxao " << (options.rtx_ao ? 1 : 0) << "\nrtxfightershadows " << (options.rtx_fighter_shadows ? 1 : 0)
+       << "\nrtxintegrator " << options.rtx_integrator
+       << "\nrtxbounce " << (options.rtx_bounce ? 1 : 0) << "\nrtxreflections " << (options.rtx_reflections ? 1 : 0)
+       << "\nrtxskin " << (options.rtx_skin ? 1 : 0) << "\nrtxstageshade " << (options.rtx_stage_shade ? 1 : 0) << "\nrtxmoddedstages " << (options.rtx_modded_stages ? 1 : 0) << "\nrtxmodfloors " << options.rtx_mod_floors << "\nrtxeffectlight " << (options.rtx_effect_light ? 1 : 0) << "\nrtxglowlight " << (options.rtx_glow_light ? 1 : 0)
+       << "\nrtxglossyfloors " << (options.rtx_glossy_floors ? 1 : 0) << "\nrtxbrightness " << options.rtx_brightness
+       << "\nrtxphotomode " << (options.rtx_photo_mode ? 1 : 0)
+       << "\nrtxpreset " << options.rtx_preset << "\nrtxreflstrength " << options.rtx_reflection_strength
+       << "\nrtxfloorstrength " << options.rtx_floor_strength << "\nrtxshadowstrength " << options.rtx_shadow_strength
+       << "\nrtxbouncestrength " << options.rtx_bounce_strength
+       << "\nrtxradiancecache " << (options.rtx_radiance_cache ? 1 : 0)
+       << "\nhdroutput " << (options.hdr_output ? 1 : 0) << "\nhdrpaperwhite " << options.hdr_paper_white
+       << "\nhdrpeak " << options.hdr_peak
 #ifdef GX_DLSS5
        << "\ndlss5 " << (options.dlss5 ? 1 : 0) << "\ndlss5intensity " << options.dlss5_tuning.intensity
        << "\ndlss5detail " << options.dlss5_tuning.detail << "\ndlss5tone " << options.dlss5_tuning.tone
@@ -4269,7 +4459,6 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\ncontrast " << options.contrast << "\nvibrance " << options.vibrance
        << "\nanisotropy " << options.anisotropy << "\nssaa " << options.ssaa << "\nmsaa " << options.msaa
        << "\nsubframe " << (options.subframe == SubFrameMode::Off ? 0 : options.subframe == SubFrameMode::AuthoredInterpolate ? 2 : 1) << "\nmusic " << slippi::jukebox::user_volume()
-       << "\nonlineframeprotection " << (options.online_frame_protection ? 1 : 0)
        << "\nmusicpacks " << (slippi::jukebox::music_packs_enabled() ? 1 : 0)
        << "\nonlinedelay " << slippi::online::config().delay
        << "\nonlinedelayauto " << (slippi::online::config().auto_delay ? 1 : 0)
@@ -4344,7 +4533,7 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\narcade_grid_rgb " << std::hex << options.arcade_grid_rgb << std::dec
        // Low spec: the switch, and the settings it is holding for the player while it is on.
        << "\nlowspec " << (options.low_spec ? 1 : 0)
-       << "\nlowspec_prev_backend " << (options.low_spec_previous.api == RenderApi::D3D11 ? "d3d11" : "d3d12")
+       << "\nlowspec_prev_backend " << (options.low_spec_previous.api == RenderApi::D3D11 ? "d3d11" : options.low_spec_previous.api == RenderApi::Vulkan ? "vulkan" : "d3d12")
        << "\nlowspec_prev_fps " << options.low_spec_previous.fps_cap
        << "\nlowspec_prev_scale " << options.low_spec_previous.efb_scale
        << "\nlowspec_prev_ssaa " << options.low_spec_previous.ssaa
@@ -4367,6 +4556,9 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\ncpu_20xx " << (options.cpu_20xx ? 1 : 0)
        << "\nfreeze_fd " << (options.freeze_fd ? 1 : 0)
        << "\nhide_ko_explosions " << (options.hide_ko_explosions ? 1 : 0)
+       << "\nhide_hud_emblems " << (options.hide_hud_emblems ? 1 : 0)
+       << "\ncommunity_codes " << std::hex << options.community_codes << std::dec
+       << "\nproaistronger " << options.pro_ai_stronger
        << "\nunlock_all " << (options.unlock_all ? 1 : 0)
        << "\nresults_screen " << (options.results_screen ? 1 : 0)
 #ifndef MELEE_NO_SLIPPI
@@ -4774,9 +4966,33 @@ static void game_mods_panel(const RenderOptions& options) {
 }
 
 bool settings_frame(SettingsState& state, RenderOptions& options) {
+  const auto fullscreen_clock = [] {
+    return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+  };
+  const auto fullscreen_emit = [](int request) {
+    if (request < 0) return;
+    yougame::parity::signals.emit(request ? "yg {\"fullscreen\":1}" : "yg {\"fullscreen\":0}");
+    host::log("yougame: fullscreen request %d", request);
+  };
+  // Runs with the overlay closed too, on every renderer and both engines.
+  fullscreen_emit(yougame::embed_fullscreen::state.flush(yougame::embedded(), fullscreen_clock()));
   state.page_navigation.active = false;
   settings_page::observer = nullptr;
 #ifdef YOUGAME_AGENT_TEST_HOOK
+  bool agent_open_video = false;
+  static int agent_settings_frame = 0;
+  static int agent_click_diag_until = 0;
+  static settings_input::Click agent_click;
+  yougame::parity::Signals::Clock::time_point first_present;
+  if (!state.fill_window && yougame::parity::signals.first_present(first_present))
+    ++agent_settings_frame;
+  if (!state.fill_window && yougame::parity::signals.first_present(first_present) &&
+      yougame::agent_test::open_settings_video.exchange(false)) {
+    state.open = true;
+    agent_open_video = true;
+    host::log("agent-test: openSettings video");
+  }
   ImGuiID agent_menu_focus = 0;
   const char* agent_menu_label = "none";
   const auto agent_menu_state = [&state] {
@@ -4826,6 +5042,20 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     io.DisplayFramebufferScale = ImVec2(ui_scale, ui_scale);
     g_frame_ui_scale.store(ui_scale, std::memory_order_relaxed);
   }
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  if (const int frame = yougame::agent_test::ui_click_frame.load(std::memory_order_acquire);
+      frame > 0 && frame == agent_settings_frame) {
+    yougame::agent_test::ui_click_frame.store(0);
+    const int x = yougame::agent_test::ui_click_x.load(), y = yougame::agent_test::ui_click_y.load();
+    agent_click = settings_input::click(ImGui::GetIO(), x, y,
+        g_frame_ui_scale.load(std::memory_order_relaxed));
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    host::log("agent-test: uiClick frame %d at %d,%d (ui %.0f,%.0f) ms %lld",
+              frame, x, y, agent_click.pos.x, agent_click.pos.y, (long long)ms);
+    agent_click_diag_until = agent_settings_frame + 5;
+  }
+#endif
   // UI navigation is armed only after the selected pad has returned to neutral. A held A that
   // opened no UI cannot click Start, Cancel, or acknowledge a later disconnect.
   host::PadState pads[4]{};
@@ -4853,11 +5083,15 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   const int shortcut_port = host::window_take_settings_controller_port();
   if (shortcut_port >= 0 && shortcut_port < 4) state.settings_controller_port = shortcut_port;
   const bool nav_active = state.open || state.menu_open || practice_nav || state.fill_window;
-  // The panel follows the pad that was last picked up, not the first one that reads as active.
+  // The Practice menu starts on the trainee's controller; then it, like the panel, follows the pad
+  // that was last picked up, not the first one that reads as active. It used to read the trainee's
+  // port only, so a second pad in someone's hands could not move it (0.9.97 report).
+  if (practice_nav && !state.practice_nav_was) state.settings_controller_port = std::clamp(practice.controller_port, 0, 3);
+  state.practice_nav_was = practice_nav;
   const int followed = host::settings_nav::follow(nav_pads, state.settings_pad_was_at_rest.data(),
-                                                  state.settings_controller_port, nav_active && !practice_nav);
-  if (!practice_nav) state.settings_controller_port = followed;
-  int nav_port = practice_nav ? std::clamp(practice.controller_port, 0, 3) : followed;
+                                                  state.settings_controller_port, nav_active);
+  state.settings_controller_port = followed;
+  int nav_port = followed;
   if (pads[nav_port].err != 0)
     for (int i = 0; i < 4; ++i) if (pads[i].err == 0) { nav_port = i; break; }
   const host::PadState& pad = pads[nav_port];
@@ -4874,7 +5108,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   state.practice_generation = practice.generation;
   if (!nav_active) state.practice_pad_armed = false;
   else if (!state.practice_pad_armed && have_pad)
-    state.practice_pad_armed = pad.button == 0 && std::abs(pad.stick_x) < 30 && std::abs(pad.stick_y) < 30;
+    // Only what the menus read must be at rest (A, B, Start, the D-pad and the stick): a held X, Y,
+    // L, R or Z, or a pad that reports one, kept the menu from ever listening (0.9.97 report).
+    state.practice_pad_armed = (pad.button & 0x130F) == 0 && std::abs(pad.stick_x) < 30 && std::abs(pad.stick_y) < 30;
   if (g_ui_diag && nav_active) {
     static uint32_t last_sig = 0xFFFFFFFFu;
     const uint32_t sig = have_pad ? ((uint32_t)nav_port << 28) ^ pad.button ^
@@ -4913,6 +5149,28 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // Raw `pad` above still owns port following, neutral arming and release capture.
     settings_input::gamepad(io, navigation_pads[nav_port]);
   }
+  // Test runs (MELEE_TEST_PANEL_NAV, hidden only): a D-pad press per 8 frames from the string
+  // (U D L R, A for the A button, B for B), each logged with where the focus went.
+  static int test_nav_step = -1;
+  {
+    static const char* test_nav = host::test_env::getenv("MELEE_TEST_PANEL_NAV");
+    static int test_nav_frame = 0;
+    if (test_nav && state.open && test_nav_frame++ >= 120) {
+      const int step = (test_nav_frame - 120) / 8, phase = (test_nav_frame - 120) % 8;
+      auto& io = ImGui::GetIO();
+      io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+      io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+      const char c = step < (int)std::strlen(test_nav) ? test_nav[step] : 0;
+      const bool down = phase == 0;
+      io.AddKeyEvent(ImGuiKey_GamepadDpadUp, down && c == 'U');
+      io.AddKeyEvent(ImGuiKey_GamepadDpadDown, down && c == 'D');
+      io.AddKeyEvent(ImGuiKey_GamepadDpadLeft, down && c == 'L');
+      io.AddKeyEvent(ImGuiKey_GamepadDpadRight, down && c == 'R');
+      io.AddKeyEvent(ImGuiKey_GamepadFaceDown, down && c == 'A');
+      io.AddKeyEvent(ImGuiKey_GamepadFaceRight, down && c == 'B');
+      test_nav_step = c && phase == 6 ? step : -1;
+    }
+  }
   ImGui::NewFrame();
   if (yougame::active() || slippi::online::online_status_visible()) {
     const auto now = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -4923,9 +5181,10 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     const auto screen = ImGui::GetIO().DisplaySize;
     const auto passive_flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing;
-    float notice_bottom = 16.0f;
+    // A new notice also brings the corner hint back at the picture's top-right; start below it.
+    float notice_bottom = std::max(16.0f, screen_label::corner_hint_bottom() + 8.0f);
     if (!toast.empty()) {
-      ImGui::SetNextWindowPos(ImVec2(screen.x - 16, 16), ImGuiCond_Always, ImVec2(1, 0));
+      ImGui::SetNextWindowPos(ImVec2(screen.x - 16, notice_bottom), ImGuiCond_Always, ImVec2(1, 0));
       ImGui::SetNextWindowBgAlpha(0.85f);
       ImGui::Begin("##yougame_invite_notice", nullptr, passive_flags);
       ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + std::min(380.0f, screen.x - 64));
@@ -4944,17 +5203,49 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::PopTextWrapPos();
       ImGui::End();
     }
+#ifdef MELEE_DOUBLES
+    // The Doubles home's own box, larger than the pill and over the picture's middle: what is happening,
+    // then what each button does. While it shows, the home owns the pads, so it hides nothing playable.
+    if (const auto doubles_line = yougame::doubles::ui.shown(now, slippi::online::is_online_match());
+        !doubles_line.empty()) {
+      const float picture = std::min(screen.y, screen.x / std::max(0.1f, g_overlay_game_aspect));
+      const float font = std::max(12.0f, picture * 0.042f);
+      ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, screen.y * 0.5f + picture * 0.12f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+      ImGui::SetNextWindowBgAlpha(0.88f);
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(font * 0.9f, font * 0.6f));
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, font * 0.4f);
+      ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * font / ImGui::GetFontSize());
+      ImGui::Begin("##yougame_doubles_home", nullptr, passive_flags);
+      ImGui::TextUnformatted(doubles_line.c_str());
+      ImGui::End();
+      ImGui::PopFont();
+      ImGui::PopStyleVar(2);
+    }
+#endif
     // Online menu/CSS visibility alone must not create an empty or version-only pill.
     const bool show_status = !console_status.empty() || status == yougame::update::kMessage ||
         status == yougame::friends::kWaiting || status == yougame::friends::kJoined ||
         status == yougame::friends::kFailed || status == yougame::friends::kVersion ||
         status == yougame::blend::kSearchBoth || status == yougame::blend::kSearchYouGameOnly;
     if (!slippi::online::is_online_match() && show_status) {
-      ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, screen.y - 60), ImGuiCond_Always, ImVec2(0.5f, 1));
+      // One row on the picture's bottom edge, sized to the picture: 60 px up it sat on the retail menus'
+      // description box (VS. Mode, Name Entry) and on the CSS name cards.
+      const float picture = std::min(screen.y, screen.x / std::max(0.1f, g_overlay_game_aspect));
+      const float font = std::min(ImGui::GetFontSize(), std::max(8.0f, picture * 0.026f));
+      ImGui::SetNextWindowPos(ImVec2(screen.x * 0.5f, (screen.y + picture) * 0.5f - std::max(2.0f, picture * 0.006f)),
+                              ImGuiCond_Always, ImVec2(0.5f, 1));
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(font * 0.6f, font * 0.3f));
+      ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * font / ImGui::GetFontSize());
       ImGui::Begin("##yougame_friend_waiting", nullptr, passive_flags);
+      screen_label::reserve_bottom(ImGui::GetWindowPos().y);
       ImGui::TextUnformatted(yougame::slippi_link_status(status).c_str());
-      if (status == yougame::friends::kWaiting || !console_status.empty()) ImGui::TextDisabled("Z: cancel");
+      if (status == yougame::friends::kWaiting || !console_status.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("Z: cancel");
+      }
       ImGui::End();
+      ImGui::PopFont();
+      ImGui::PopStyleVar();
     }
   }
   ImGuiStyle launcher_saved_style;
@@ -5207,6 +5498,14 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                              !state.fill_window,
                          ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y);
   if (!clean_replay) net_overlay::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y);
+  {   // YouGame's Coming soon stickers over the online menu (drawn only while its first page shows)
+    const ImVec2 screen = ImGui::GetIO().DisplaySize;
+    const float aspect = presented_aspect(options, (int)screen.x, (int)screen.y, true);
+    float gw = screen.x, gh = gw / std::max(aspect, 0.1f);
+    if (gh > screen.y) { gh = screen.y; gw = gh * aspect; }
+    const float gx0 = (screen.x - gw) * 0.5f, gy0 = (screen.y - gh) * 0.5f;
+    coming_soon_overlay::draw(gx0, gy0, gx0 + gw, gy0 + gh);
+  }
   replay_bar::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y, state.open || state.menu_open || state.practice_open || state.fill_window);
   if (!clean_replay) screen_label::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y, g_overlay_game_aspect);
   // Start on the controller closes the panel from any page (the open chord is Start + Down + Z,
@@ -5390,9 +5689,16 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                    (scene_chrome ? ImGuiWindowFlags_NoBackground : 0));
     }
     static bool screenshot_tab_set = false;
-    if (!screenshot_tab_set) {
+    if (!screenshot_tab_set
+#ifdef YOUGAME_AGENT_TEST_HOOK
+        || agent_open_video
+#endif
+        ) {
       screenshot_tab_set = true;
       const char* requested = std::getenv("MELEE_SETTINGS_TAB");
+#ifdef YOUGAME_AGENT_TEST_HOOK
+      if (agent_open_video) requested = "Video";
+#endif
       static constexpr const char* tabs[] = {
           "Video", "Audio", "Game", "Controls", "Overlays", "Customize", "Gecko Codes", "Mods"};
       if (requested) for (int i = 0; i < 8; ++i)
@@ -5925,39 +6231,58 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       host::log("present: vsync %s (settings)", options.vsync ? "on" : "off");
 #endif
     if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Prevents horizontal screen tearing; may add display latency.\n"
-                        "With VSync off, tearing is possible when automatic variable-refresh detection is unavailable.");
+      ImGui::SetTooltip("On prevents tearing but can add display latency. Off favors lower latency.\n"
+                        "G-Sync/FreeSync must be enabled in your monitor and driver; the game keeps\n"
+                        "the frame rate below refresh when it detects VRR. Fixed-refresh displays\n"
+                        "can tear with Off. Driver VSync settings may override this switch.");
     // Display: one choice. Borderless and exclusive fullscreen were two switches that turned each
     // other off; the same two settings are written, so the renderers see no difference.
     {
       const char* displays[] = {"Window", "Borderless fullscreen", "Exclusive fullscreen (experimental)"};
-      int display = options.exclusive_fullscreen ? 2 : options.fullscreen ? 1 : 0;
+      const int app_display = yougame::embed_fullscreen::state.shown(yougame::embedded(), fullscreen_clock());
+      int display = app_display >= 0 ? app_display : options.exclusive_fullscreen ? 2 : options.fullscreen ? 1 : 0;
       if (settings_combo("Display", &display, displays, 3)) {
-        options.fullscreen = display == 1;
-        options.exclusive_fullscreen = display == 2;
-        changed = true;
+        if (app_display >= 0) {
+          fullscreen_emit(yougame::embed_fullscreen::state.request(yougame::embedded(), display != 0, fullscreen_clock()));
+        } else {
+          options.fullscreen = display == 1;
+          options.exclusive_fullscreen = display == 2;
+          changed = true;
+        }
       }
-      if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Borderless fullscreen: the game's window covers the whole screen.\n"
-                          "Exclusive fullscreen: the game takes the display over, or falls back to\n"
-                          "borderless when Windows does not allow it.\n%s", kExperimentalNote);
+      if (ImGui::IsItemHovered()) {
+        if (app_display >= 0) ImGui::SetTooltip("Full screen is the YouGame app's window. Shift+Esc leaves.");
+        else ImGui::SetTooltip("Borderless fullscreen: the game's window covers the whole screen.\n"
+                               "Exclusive fullscreen: the game takes the display over, or falls back to\n"
+                               "borderless when Windows does not allow it.\n%s", kExperimentalNote);
+      }
     }
     // Widescreen: True widescreen only. The Slippi code was offered here too until 0.9.63 (a saved
-    // choice of it loads as True 16:9, load_pc_settings); --widescreen still runs it for test runs.
-    // True 16:9 widens the frustum here in the renderer instead of running the Gecko code. The one
-    // thing the game does differently is draw a fighter who is in the added sides (the Source Port
+    // choice of it fills the screen, load_pc_settings); --widescreen still runs it for test runs.
+    // True widescreen widens the frustum here in the renderer instead of running the Gecko code.
+    // The one thing the game does differently is draw a fighter who is in the added sides (the Source Port
     // puts the fighter's state back afterwards, the Static Recomp uses the Slippi code's own
     // one-instruction change). Experimental because the game still lays out and culls scenery for
     // 73:60: geometry can be missing or pop in at the new edges.
     {
-      const char* widescreen_modes[] = {"Off", "16:9 (experimental)", "16:10 (experimental)",
-                                        "Custom (experimental)", "Fit my screen (experimental)"};
-      // Modes 1..4 are True widescreen at 16:9, 16:10, the player's W:H and the window's shape.
-      int widescreen_mode = options.true_widescreen ? 1 + std::clamp((int)options.true_aspect, 0, 3) : 0;
+      const char* widescreen_modes[] = {"Off", "Fill my screen (experimental)", "16:9 (experimental)",
+                                        "16:10 (experimental)", "Custom (experimental)"};
+      // UI order is independent of the saved TrueAspect enum values.
+      constexpr TrueAspect true_aspects[] = {TrueAspect::FitWindow, TrueAspect::Wide16_9,
+                                            TrueAspect::Wide16_10, TrueAspect::Custom};
+      int widescreen_mode = 0;
+      if (options.true_widescreen) {
+        switch (options.true_aspect) {
+          case TrueAspect::FitWindow: widescreen_mode = 1; break;
+          case TrueAspect::Wide16_9: widescreen_mode = 2; break;
+          case TrueAspect::Wide16_10: widescreen_mode = 3; break;
+          case TrueAspect::Custom: widescreen_mode = 4; break;
+        }
+      }
       if (settings_combo("Widescreen", &widescreen_mode, widescreen_modes, 5)) {
         options.widescreen = false;
         options.true_widescreen = widescreen_mode >= 1;
-        if (widescreen_mode >= 1) options.true_aspect = (TrueAspect)(widescreen_mode - 1);
+        if (widescreen_mode >= 1) options.true_aspect = true_aspects[widescreen_mode - 1];
         changed = true;
       }
       if (options.true_widescreen && !options.widescreen && options.true_aspect == TrueAspect::Custom) {
@@ -5975,7 +6300,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           settings_hint("Narrower than 4:3: it is drawn at 4:3.");
       }
       if (options.true_widescreen && !options.widescreen && options.true_aspect == TrueAspect::FitWindow)
-        settings_hint("Widens to the window's shape; a window wider than True widescreen draws gets side bars.");
+        settings_hint("Widens to the window's shape; a screen wider than 64:27 still gets side bars.");
       if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Widens the camera in the renderer and fills a wide screen. Online safe: it changes only\n"
                           "what you see, and applies at once. Fighters in the added sides are drawn.\n"
@@ -6058,7 +6383,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // DLSS chooses its own render size, so the internal resolution and supersampling settings do
     // nothing while it is on and are shown greyed out. DLAA renders at the internal resolution the
     // player picked and only anti-aliases it, so it leaves both of them working.
-    const bool dlss_picks_resolution = options.dlss_mode >= 2 && options.dlss_mode != 6;   // not DLAA / XeSS AA
+    const bool dlss_picks_resolution = options.dlss_mode >= 2 && options.dlss_mode != 6 && options.dlss_mode != 11;   // not DLAA / XeSS AA / FSR Native AA
     if (dlss_picks_resolution) ImGui::BeginDisabled();
     changed |= settings_combo("Internal resolution", &options.efb_scale, scales, 9);
     // DLSS (DLAA included) does its own anti-aliasing, so supersampling on top would render larger
@@ -6128,7 +6453,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // One click each: the authors' own download, checked against its published file and built from the
     // player's own disc (host::cosmetics::install_official_look). Open until all three are installed; once
     // an Animelee is built the Mods folder is scanned again and it is switched on.
-    {
+    // Not in the YouGame app: nothing is downloaded or run beside a verified build there (the
+    // Mediafire files and the patch tool), and its Mods folder panel is hidden as well.
+    if (!yougame::active()) {
       namespace mods = source_port::mods;
       const std::string mods_dir = mods::mods_folder().u8string();
       {
@@ -6546,34 +6873,98 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       const char* linux_backends[] = {"OpenGL (default)", "Vulkan (experimental)"};
       int linux_index = options.api == RenderApi::Vulkan ? 1 : 0;
       if (vulkan_available()) {
-        if (settings_combo("Graphics backend", &linux_index, linux_backends, 2)) { options.api = linux_index ? RenderApi::Vulkan : RenderApi::D3D12; changed = true; }
+        if (settings_combo("Graphics backend", &linux_index, linux_backends, 2)) {
+          options.api = linux_index ? RenderApi::Vulkan : RenderApi::D3D12; changed = true;
+          if (linux_index) vulkan_forget_failed_starts();
+        }
         settings_hint("Takes effect at the next launch: save settings, then restart.");
       } else ImGui::TextUnformatted("Graphics backend: OpenGL");
     }
     const bool d3d11 = true;   // the upscaler row below stays disabled
+    const bool vk_fsr = false;   // AMD FSR's Vulkan build is Windows only
     if (false)
 #endif
     {
-    // Vulkan is offered only where a Vulkan 1.3 GPU is present; it draws without DLSS, XeSS and the CRT model.
+    // Vulkan is offered only where a Vulkan 1.3 GPU is present; it draws without DLSS and XeSS (FSR upscaling runs on it).
     const char* backends[] = {"Direct3D 12 (default)", "Direct3D 11 (older GPUs and drivers)", "Vulkan (experimental)"};
     int api_index = options.api == RenderApi::D3D11 ? 1 : options.api == RenderApi::Vulkan ? 2 : 0;
     if (settings_combo("Graphics backend", &api_index, backends, vulkan_available() ? 3 : 2)) {
       options.api = api_index == 1 ? RenderApi::D3D11 : api_index == 2 ? RenderApi::Vulkan : RenderApi::D3D12; changed = true;
+      if (api_index == 2) vulkan_forget_failed_starts();
     }
     settings_hint("Takes effect at the next launch: save settings, then restart.");
     }
 #ifdef _WIN32
-    const bool d3d11 = options.api == RenderApi::D3D11 || options.api == RenderApi::Vulkan;   // no upscalers on either
+    const bool d3d11 = options.api == RenderApi::D3D11 || options.api == RenderApi::Vulkan;   // no DLSS or XeSS on either
+    const bool vk_fsr = options.api == RenderApi::Vulkan;   // but FSR runs on Vulkan
 #endif
     const char* upscalers[] = {"Native", "DLAA", "DLSS Quality", "DLSS Balanced", "DLSS Performance", "DLSS Ultra Performance",
-                               "XeSS AA", "XeSS Ultra Quality", "XeSS Quality", "XeSS Balanced", "XeSS Performance"};
-    if (d3d11) ImGui::BeginDisabled();
-    if (settings_combo("Upscaling (DLSS / XeSS)", &options.dlss_mode, upscalers, 11)) changed = true;
+                               "XeSS AA", "XeSS Ultra Quality", "XeSS Quality", "XeSS Balanced", "XeSS Performance",
+                               "FSR Native AA", "FSR Quality", "FSR Balanced", "FSR Performance", "FSR Ultra Performance"};
+    if (d3d11 && !vk_fsr) ImGui::BeginDisabled();
+    if (settings_combo("Upscaling (DLSS / XeSS / FSR)", &options.dlss_mode, upscalers, 16)) changed = true;
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip("DLSS: NVIDIA RTX cards. XeSS: Intel's upscaler, works on Intel, NVIDIA and AMD cards.\n"
+                        "FSR: AMD's upscaler, works on AMD, NVIDIA and Intel cards (FSR 4 on Radeon RX 6000 and newer).\n"
                         "AA modes (DLAA, XeSS AA) keep the full resolution and only smooth edges.\n"
                         "DLSS Ultra Performance would render below the GameCube's own resolution on\n"
                         "anything short of an 8K display, so there it switches to Performance.");
+    if (options.api == RenderApi::Vulkan)
+      settings_hint(vk_fsr ? "On Vulkan the FSR modes run; DLSS and XeSS need Direct3D 12 (they draw at native resolution here)."
+                           : "On Vulkan the game draws at the Internal resolution above: DLSS and XeSS need Direct3D 12.");
+#ifdef _WIN32
+    // Intel XeSS is its own download since 0.9.98 (libxess.dll, 78 MB unpacked): the XeSS modes need it
+    // beside the game, where updates leave it alone (host/updater.cpp xess_download).
+    {
+      std::string game_dir;
+      {
+        wchar_t module[MAX_PATH]{};
+        const DWORD length = GetModuleFileNameW(nullptr, module, MAX_PATH);
+        if (length > 0 && length < MAX_PATH) game_dir = std::filesystem::path(module).parent_path().u8string();
+      }
+      using host::updater::ModelState;
+      const ModelState xs = game_dir.empty() ? ModelState::Present : host::updater::xess_state(game_dir);
+      if (xs == ModelState::Downloading) {
+        settings_hint("%s", host::updater::xess_message().c_str());
+      } else if (xs == ModelState::Present && !xess::available() && !host::updater::xess_message().empty()) {
+        settings_hint("Intel XeSS is installed. Restart the game to use it.");
+        restart_now_button("xess");
+      } else if (xs != ModelState::Present && yougame::active()) {
+        // Not in the YouGame app: its builds carry libxess.dll in the verified build folder, and nothing
+        // is downloaded beside the game there.
+        settings_hint("Intel XeSS isn't available in this build.");
+      } else if (xs != ModelState::Present) {
+        char label[64];
+        std::snprintf(label, sizeof label, "Download Intel XeSS (%s)", host::updater::kXessSize);
+        if (ImGui::Button(label, ImVec2(0, 32))) host::updater::xess_download(game_dir);
+        if (xs == ModelState::Failed) settings_hint("%s", host::updater::xess_message().c_str());
+        else settings_hint("%s", xess::is_xess_mode(options.dlss_mode)
+                                     ? "XeSS is a separate download: until it is installed, the game draws at native resolution."
+                                     : "Intel's XeSS upscaler is a separate download. It goes beside the game and stays there through updates.");
+      }
+      // AMD FSR the same way: AMD's own signed files, fetched and checked one by one (host/updater.cpp).
+      const ModelState fs = game_dir.empty() ? ModelState::Present : host::updater::fsr_state(game_dir);
+      if (fs == ModelState::Downloading) {
+        settings_hint("%s", host::updater::fsr_message().c_str());
+      } else if (fs == ModelState::Present && !fsr::available() && !host::updater::fsr_message().empty()) {
+        settings_hint("AMD FSR is installed. Restart the game to use it.");
+        restart_now_button("fsr");
+      } else if (fs != ModelState::Present && yougame::active()) {
+        // Not in the YouGame app, as with XeSS above: nothing is downloaded beside a verified build there.
+        settings_hint("AMD FSR isn't available in this build.");
+      } else if (fs != ModelState::Present) {
+        char fsr_label[64];
+        std::snprintf(fsr_label, sizeof fsr_label, "Download AMD FSR (%s)", host::updater::kFsrSize);
+        if (ImGui::Button(fsr_label, ImVec2(0, 32))) host::updater::fsr_download(game_dir);
+        if (fs == ModelState::Failed) settings_hint("%s", host::updater::fsr_message().c_str());
+        else settings_hint("%s", fsr::is_fsr_mode(options.dlss_mode)
+                                     ? "FSR is a separate download: until it is installed, the game draws at native resolution."
+                                     : "AMD's FSR upscaler is a separate download, AMD's own signed files. It goes beside the game and stays there through updates.");
+      } else if (fsr::available() && fsr::is_fsr_mode(options.dlss_mode) && !fsr::provider().empty()) {
+        settings_hint("AMD's library runs %s on this graphics card.", fsr::provider().c_str());
+      }
+    }
+#endif
     // What each of these is actually costing, right where the settings that cost it are, instead of
     // only in the separate performance graph. Render latency is Reflex's measured total (works at
     // Native too, see gx_streamline.h); the two "adds" numbers are GPU-timestamp measured costs of
@@ -6601,6 +6992,43 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                           "two, not instant. \"Native (estimated)\" is the total with the two measured\n"
                           "GPU costs subtracted out -- an estimate, not a separate measurement.");
     }
+    bool vk_rows_disabled = false;   // Vulkan: DLSS frame generation and Reflex stay Direct3D 12 features
+#ifdef _WIN32
+    // With an FSR mode, frame generation is AMD's (the FSR download): 2x, on any graphics card,
+    // Direct3D 12 or Vulkan. It reuses FSR's depth and motion vectors as DLSS's reuses DLSS's.
+    if (fsr::is_fsr_mode(options.dlss_mode) && (!d3d11 || vk_fsr)) {
+      const bool fsr_loaded = vk_fsr ? fsr::vk_available() : fsr::available();
+      const bool fg_ok = vk_fsr ? fsr::vk_fg_available() : fsr::fg_available();
+      const std::string fg_name = vk_fsr ? fsr::vk_fg_provider() : fsr::fg_provider();
+      const char* fsr_fg_modes[] = {"Off", "2x (AMD FSR)"};
+      int fsr_fg = options.frame_generation_mode > 0 ? 1 : 0;
+      // Installed is enough to choose it (the launcher's settings window never loads AMD's library);
+      // only a game that loaded it and found frame generation unsupported keeps the row closed.
+      bool fsr_installed = fsr_loaded;
+      if (!fsr_installed) {
+        wchar_t module[MAX_PATH]{};
+        const DWORD length = GetModuleFileNameW(nullptr, module, MAX_PATH);
+        if (length > 0 && length < MAX_PATH) fsr_installed = host::updater::fsr_present(std::filesystem::path(module).parent_path().u8string());
+      }
+      const bool fg_unsupported = fsr_loaded && !fg_ok;
+      ImGui::BeginDisabled(!fsr_installed || fg_unsupported);
+      ImGui::SetNextItemWidth(160.0f);
+      if (settings_combo("Frame generation", &fsr_fg, fsr_fg_modes, 2)) { options.frame_generation_mode = fsr_fg; changed = true; }
+      ImGui::EndDisabled();
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("AMD FSR Frame Generation: a generated frame between each pair of rendered frames,\n"
+                          "in matches. It adds input delay, so use it for solo play rather than competitive\n"
+                          "online matches. Needs an FSR upscaling mode; menus are shown as rendered.");
+      if (!fsr_installed) settings_hint("%s", yougame::active() ? "AMD FSR frame generation isn't available in this build."
+                                                         : "Frame generation with FSR needs the AMD FSR download above.");
+      else if (fg_unsupported) settings_hint("AMD's frame generation did not start on this graphics card.");
+      else if (!fsr_loaded && options.frame_generation_mode > 0) settings_hint("Frame generation starts with the game.");
+      else if (options.frame_generation_mode > 0 && !fg_name.empty())
+        settings_hint("AMD's library runs %s on this graphics card.", fg_name.c_str());
+    } else
+#endif
+    {
+    if (d3d11 && vk_fsr) { ImGui::BeginDisabled(); vk_rows_disabled = true; }
     // Frame generation reuses DLSS's depth and motion vectors, so it needs a DLSS mode. Build the
     // list from Streamline's present-thread capability query: RTX 40 usually reports 2x, while newer
     // RTX 50 drivers can expose fixed multipliers through 6x and Dynamic.
@@ -6660,7 +7088,10 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SetTooltip("NVIDIA DLSS Frame Generation (RTX 40 series and newer): generated frames between\n"
                         "rendered frames. RTX 50 Multi Frame Generation can offer up to 6x when the\n"
                         "driver reports support. It adds input delay, so use it for solo play rather\n"
-                        "than competitive online matches. Needs DLSS upscaling; Reflex turns on with it.");
+                        "than competitive online matches. Needs DLSS upscaling; Reflex turns on with it.\n"
+                        "With an FSR mode, AMD's frame generation is offered here instead (any card).");
+    }
+    if (d3d11 && vk_fsr && !vk_rows_disabled) { ImGui::BeginDisabled(); vk_rows_disabled = true; }
     // NVIDIA Reflex, laid out the way games offer it.
     {
       const char* modes[] = {"Off", "On", "On + Boost"};
@@ -6673,14 +7104,237 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       // The flash indicator for latency analyzers is under Advanced, at the bottom of this tab.
     }
     if (d3d11) { ImGui::EndDisabled(); settings_hint("DLSS needs Direct3D 12 and an NVIDIA GPU."); }
-    // DXR path tracing: its switches are under Advanced. What cannot apply is cleared here, whether
-    // or not that group is open, so what the panel shows and what the renderer does agree.
-    const bool path_available = RenderOptions::kPathTracingAvailable && !d3d11 && options.dlss_mode < 6 &&
-                                dxr_path_tracing_available();
+    // Ray tracing. What cannot apply is cleared here, so what the panel shows and what the renderer
+    // does agree. The path tracer's G-buffer rides on DLSS's motion vectors: DLSS or DLAA must be on.
+    // The launcher's settings window has no path tracer to ask (rtx_path_tracing_known() false): there the
+    // GPU is taken as able and nothing the player chose is switched off; the game decides when it starts.
+    const bool rtx_known = rtx_path_tracing_known();
+    const bool rtx_ready = !rtx_known || rtx_path_tracing_ready();
+    const bool path_available = RenderOptions::kPathTracingAvailable && !d3d11 && options.dlss_mode >= 1 &&
+                                options.dlss_mode <= 5 && rtx_ready;
     if (!path_available && options.path_tracing) { options.path_tracing = false; changed = true; }
-    const bool rr_available = path_available && options.path_tracing && options.dlss_mode > 0 &&
-                              streamline::ray_reconstruction_available();
-    if (!rr_available && options.ray_reconstruction) { options.ray_reconstruction = false; changed = true; }
+    const bool rr_available = path_available && options.path_tracing &&
+                              (!rtx_known || streamline::ray_reconstruction_available());
+    if (!rr_available && options.ray_reconstruction && !rtx_remix_running()) { options.ray_reconstruction = false; changed = true; }
+    {
+      // Screenshot tooling (MELEE_SETTINGS_SCROLL_TO=raytracing): bring HDR and Ray tracing into view once.
+      static int scroll_frames = 0;
+      if (scroll_frames < 30) {
+        const char* target = std::getenv("MELEE_SETTINGS_SCROLL_TO");
+        if (target && std::strcmp(target, "raytracing") == 0) ImGui::SetScrollHereY(0.0f);
+        ++scroll_frames;
+      }
+    }
+    ImGui::SeparatorText("HDR");
+    ImGui::BeginDisabled(d3d11 || !hdr_display_available());
+    if (settings_toggle("HDR output", &options.hdr_output)) changed = true;
+    ImGui::EndDisabled();
+    if (d3d11) settings_hint("Needs Direct3D 12.");
+    else if (!hdr_display_available()) settings_hint("Turn on HDR in Windows display settings for this screen.");
+    if (options.hdr_output && hdr_display_available()) {
+      if (settings_slider("Paper white", &options.hdr_paper_white, 80, 500, "%d nits")) changed = true;
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("How bright the game's white (and the menus) is in HDR.");
+      if (settings_slider("Peak brightness", &options.hdr_peak, 0, 4000, options.hdr_peak ? "%d nits" : "From Windows")) changed = true;
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("The brightest highlights (path tracing). From Windows uses the display's own value.");
+    }
+    ImGui::SeparatorText("Ray tracing");
+    ImGui::BeginDisabled(!path_available);
+    if (settings_toggle("Path tracing", &options.path_tracing)) changed = true;
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      ImGui::SetTooltip("Lights matches with ray tracing from the game's own lights: soft shadows, ambient\n"
+                        "occlusion, highlights. Menus stay as drawn. Display only: replays and online are untouched.");
+    if (!path_available)
+      settings_hint(d3d11 ? "Needs Direct3D 12 and an RTX GPU." :
+                    !rtx_ready ? "Needs an RTX (ray-tracing) GPU and the Source Port." :
+                    "Turn on DLSS or DLAA above: path tracing uses its motion vectors.");
+    if (options.path_tracing) {
+      // Lighting: which renderer path traces the match. Always all three names, with one line under it
+      // that says what is drawing; then only the settings the chosen one reads.
+      const bool nvidia_ok = rtx_nvidia_integrator_available(), remix_ok = rtx_remix_available();
+      const int lighting = options.rtx_integrator >= 0 && options.rtx_integrator <= 2 ? options.rtx_integrator : 0;
+      {
+        const char* names[3] = {"Melee Unlocked", "NVIDIA RTX", "RTX Remix"};
+        int pick = lighting;
+        if (settings_combo("Lighting", &pick, names, 3)) { options.rtx_integrator = pick; changed = true; }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Melee Unlocked: the game's own path tracer, always here.\n"
+                            "NVIDIA RTX: NVIDIA's RTXDI direct light, ReSTIR GI and SHaRC on the same scene (RTX Pack).\n"
+                            "RTX Remix: NVIDIA's own path tracer draws the match; the game's HUD and effects go on top\n"
+                            "(RTX Pack). The RTX Pack is a separate download: NVIDIA's SDKs cannot be in the open-source game.");
+      }
+      bool pack_line = false;   // the pack's own line already says what is missing
+#ifdef _WIN32
+      {
+        std::string game_dir;
+        {
+          wchar_t module[MAX_PATH]{};
+          const DWORD length = GetModuleFileNameW(nullptr, module, MAX_PATH);
+          if (length > 0 && length < MAX_PATH) game_dir = std::filesystem::path(module).parent_path().u8string();
+        }
+        using host::updater::ModelState;
+        if (!game_dir.empty() && host::updater::rtx_pack_offered(game_dir)) {
+          // Installed during this run: the renderers load at the next start.
+          static const bool present_at_start = host::updater::rtx_pack_present(game_dir);
+          const ModelState ps = host::updater::rtx_pack_state(game_dir);
+          if (ps == ModelState::Downloading) {
+            settings_hint("%s", host::updater::rtx_pack_message().c_str());
+            pack_line = true;
+          } else if (ps == ModelState::Present && !present_at_start) {
+            settings_hint("The RTX Pack is installed. Restart the game to use NVIDIA RTX and RTX Remix.");
+            restart_now_button("rtxpack");
+            pack_line = true;
+          } else if (ps != ModelState::Present) {
+            const bool loaded = nvidia_ok || rtx_remix_running();
+            char label[80];
+            std::snprintf(label, sizeof label, "Download the RTX Pack (%s)", host::updater::kRtxPackSize);
+            ImGui::BeginDisabled(loaded);
+            if (ImGui::Button(label, ImVec2(0, 32))) host::updater::rtx_pack_download(game_dir);
+            ImGui::EndDisabled();
+            if (loaded) settings_hint("Set Lighting to Melee Unlocked and restart the game first: the old pack is in use.");
+            else if (ps == ModelState::Failed) settings_hint("%s", host::updater::rtx_pack_message().c_str());
+            else if (lighting != 0) settings_hint("NVIDIA RTX and RTX Remix come in the RTX Pack. Until it is installed, Melee Unlocked is drawing.");
+            else settings_hint("NVIDIA RTX and RTX Remix come in the RTX Pack, a separate download.");
+            pack_line = true;
+          }
+        }
+      }
+#endif
+      // What is drawing, when it is not what Lighting says.
+      if (!pack_line) {
+        const std::string why = rtx_renderer_status(lighting);
+        if (lighting == 2 && rtx_path_tracing_known() && !rtx_remix_running() && remix_ok && why.empty())
+          settings_hint("RTX Remix starts at the next start. DLSS, Frame generation and Reflex are off while it draws.");
+        else if (lighting != 2 && rtx_remix_running())
+          settings_hint("RTX Remix draws until the next start; then %s and DLSS return.", lighting == 1 ? "NVIDIA RTX" : "Melee Unlocked");
+        else if (!why.empty()) settings_hint("%s", why.c_str());
+        else if (lighting == 1 && rtx_path_tracing_known() && !nvidia_ok) settings_hint("NVIDIA RTX is not here. Melee Unlocked is drawing.");
+        else if (lighting == 2 && !remix_ok) settings_hint("RTX Remix is not here. Melee Unlocked is drawing.");
+      }
+      if (lighting == 2) {
+        settings_hint("RTX Remix uses its own lighting: the settings below are for Melee Unlocked and NVIDIA RTX.\n"
+                      "Exclusive fullscreen runs as borderless with it. Game capture and the Steam overlay show the\n"
+                      "plain picture.");
+      }
+      if (lighting != 2) {
+        // Presets set the look, brightness and every strength at once; moving one of them makes it Custom.
+        {
+          const char* presets[] = {"Custom", "Faithful", "Balanced", "Remastered", "Showcase"};
+          if (settings_combo("Preset", &options.rtx_preset, presets, 5)) {
+            apply_rtx_preset(options);
+            changed = true;
+          }
+          if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Faithful: the game's own lighting with ray-traced shadows.\n"
+                              "Balanced: a little shine and bounce light.\n"
+                              "Remastered: physically based light, reflections and glossy floors.\n"
+                              "Showcase: everything pushed: mirror floors, strong reflections, deep shadows.");
+        }
+        if (settings_slider("Look", &options.rtx_look, 0, 100, options.rtx_look >= 100 ? "Remastered" :
+                            options.rtx_look <= 0 ? "Faithful" : "%d%% remastered")) { changed = true; options.rtx_preset = 0; }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Faithful: the game's own lighting, with ray-traced shadows on top.\n"
+                            "Remastered: physically based light (deeper shade, real highlights).");
+        // Its own ID: the picture's Brightness slider further down this page has the same label, and two rows
+        // with one ID made controller navigation loop between them (Up never got past this group).
+        ImGui::PushID("rtx");
+        const bool rtx_bright = settings_slider("Brightness", &options.rtx_brightness, 50, 200, "%d%%");
+        ImGui::PopID();
+        if (rtx_bright) { changed = true; options.rtx_preset = 0; }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("How bright the path-traced picture is. Changes show at once behind this panel.");
+        if (lighting != 2) {   // both path tracers read the strengths
+          if (settings_slider("Reflection strength", &options.rtx_reflection_strength, 0, 200, "%d%%")) { changed = true; options.rtx_preset = 0; }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("How strongly shiny materials reflect the real scene.");
+          if (settings_slider("Floor reflection strength", &options.rtx_floor_strength, 0, 200, "%d%%")) { changed = true; options.rtx_preset = 0; }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("How mirror-like polished stage floors are (Glossy stage floors).");
+          if (settings_slider("Shadow strength", &options.rtx_shadow_strength, 0, 200, "%d%%")) { changed = true; options.rtx_preset = 0; }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("How dark ray-traced shadows and contact shade are.");
+          if (settings_slider("Bounce light strength", &options.rtx_bounce_strength, 0, 200, "%d%%")) { changed = true; options.rtx_preset = 0; }
+          if (ImGui::IsItemHovered()) ImGui::SetTooltip("How much colour light picks up bouncing off the stage onto everything.");
+        }
+        if (settings_toggle("Ray-traced shadows", &options.rtx_shadows)) { changed = true; options.rtx_preset = 0; }
+        if (settings_toggle("Ambient occlusion", &options.rtx_ao)) { changed = true; options.rtx_preset = 0; }
+        if (settings_toggle("Bounce light", &options.rtx_bounce)) { changed = true; options.rtx_preset = 0; }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Light reflected off the stage onto the fighters and lit surfaces: colour from the\n"
+                            "ground and walls, shade that is not flat.");
+        if (settings_toggle("Reflections", &options.rtx_reflections)) { changed = true; options.rtx_preset = 0; }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Glossy and mirror-like surfaces reflect the real scene (fighters, stage, effects).");
+        ImGui::BeginDisabled(!options.rtx_reflections);
+        if (settings_toggle("Glossy stage floors", &options.rtx_glossy_floors)) { changed = true; options.rtx_preset = 0; }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+          ImGui::SetTooltip("The stage's floors reflect the fighters, effects and the stage's own lights,\n"
+                            "more at a glancing view, as polished floors do.");
+        if (settings_toggle("Soft skin", &options.rtx_skin)) { changed = true; options.rtx_preset = 0; }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Light scatters under the fighters' matte surfaces: softer shading and a warm\n"
+                            "edge where light turns to shadow (Kirby, Jigglypuff, Yoshi, faces).");
+        {
+          // Screenshot tooling (MELEE_SETTINGS_SCROLL_TO=rtxlighting): bring the lower rows into view once.
+          static int scroll_frames = 0;
+          if (scroll_frames < 30) {
+            const char* target = std::getenv("MELEE_SETTINGS_SCROLL_TO");
+            if (target && std::strcmp(target, "rtxlighting") == 0) ImGui::SetScrollHereY(0.0f);
+            ++scroll_frames;
+          }
+        }
+        if (lighting == 0) {
+          if (settings_toggle("Photo mode", &options.rtx_photo_mode)) changed = true;
+          if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Pause the match and the picture keeps refining for a few seconds, to a clean\n"
+                              "image with every ray averaged in. Moving again resets it at once.");
+        }
+        ImGui::BeginDisabled(!options.rtx_shadows);
+        if (settings_toggle("Fighter shadows on the stage", &options.rtx_fighter_shadows)) { changed = true; options.rtx_preset = 0; }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+          ImGui::SetTooltip("Most stages have their light painted in. This casts the fighters' real shadows\n"
+                            "onto them from the stage's sun.");
+        ImGui::BeginDisabled(!options.rtx_shadows);
+        if (settings_toggle("Stage shadows and contact shade", &options.rtx_stage_shade)) { changed = true; options.rtx_preset = 0; }
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+          ImGui::SetTooltip("On stages whose light is painted in: the stage's own platforms, buildings and\n"
+                            "trees cast the sun's shadows, and corners and contacts get soft shade.");
+        if (settings_toggle("Path tracing on stage mods", &options.rtx_modded_stages)) changed = true;
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("On a stage whose files come from a mod: path traced like the game's own stages, or\n"
+                            "off to show the mod exactly as its maker drew it.");
+        {   // both path tracers read the stage-mod floor rule
+          const char* mod_floors[] = {"Off", "Sheen", "Mirror"};
+          if (settings_combo("Shiny floors on stage mods", &options.rtx_mod_floors, mod_floors, 3)) changed = true;
+          if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Floors of a modded stage: as the mod made them (Off), a soft polished sheen with real\n"
+                              "reflections (Sheen), or a full mirror (Mirror, the look before 0.9.106).");
+        }
+        if (settings_toggle("Effects light the stage", &options.rtx_effect_light)) changed = true;
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Fire, sparks, shines and flashes cast their own light on the stage and the fighters\n"
+                            "near them, in their own colour.");
+        if (settings_toggle("Glowing stage art lights the fighters", &options.rtx_glow_light)) changed = true;
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("The stage's own glowing lines and lamps (Battlefield's neon edges) light the\n"
+                            "fighters near them: a rim of their colour.");
+      }
+
+      if (lighting == 1) {
+        ImGui::BeginDisabled(!options.rtx_bounce);
+        if (settings_toggle("Radiance cache (SHaRC)", &options.rtx_radiance_cache)) changed = true;
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+          ImGui::SetTooltip("NVIDIA's world-space radiance cache: bounce light carries every further bounce.");
+      }
+      if (lighting != 2) {
+        ImGui::BeginDisabled(!rr_available);
+        if (settings_toggle("NVIDIA Ray Reconstruction", &options.ray_reconstruction)) changed = true;
+        ImGui::EndDisabled();
+        if (!rr_available)
+          settings_hint("Needs the DLSS Ray Reconstruction runtime (sl.dlss_d.dll and nvngx_dlssd.dll).");
+      }
+    }
 #ifdef GX_DLSS5
     {
       // EXPERIMENTAL: DLSS 5 rides on the DLSS/DLAA pass (it needs its depth and motion vectors).
@@ -6857,8 +7511,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       }
       if (nr_blocked) ImGui::EndDisabled();
       // NVIDIA's model is a separate download: one button fetches it from the release, checks it and
-      // puts it beside the game (host/updater.cpp), where updates leave it alone.
-      if (!dlss5::model_found()) {
+      // puts it beside the game (host/updater.cpp), where updates leave it alone. Not in the YouGame app:
+      // there every file beside the game comes from the verified build, and the model is not part of it.
+      if (!dlss5::model_found() && yougame::active()) {
+        settings_hint("The DLSS 5 model isn't offered in the YouGame app yet.");
+      } else if (!dlss5::model_found()) {
         std::string game_dir;
         {
           wchar_t module[MAX_PATH]{};
@@ -6890,11 +7547,12 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       }
     }
 #endif
-    if (options.dlss_mode == 1 || options.dlss_mode == 6) {
+    if (options.dlss_mode == 1 || options.dlss_mode == 6 || options.dlss_mode == 11) {
       ImGui::TextWrapped("DLAA anti-aliases the game at the Internal resolution above without changing it, then the picture is fitted to the window as usual. Internal resolution and Anti-aliasing keep working, so DLAA stacks with 4x SSAA if you want both.");
     } else if (dlss_picks_resolution) {
       static const char* ratios[] = {"", "", "67% (Quality)", "58% (Balanced)", "50% (Performance)", "33% (Ultra Performance)",
-                                     "", "77% (Ultra Quality)", "67% (Quality)", "59% (Balanced)", "50% (Performance)"};
+                                     "", "77% (Ultra Quality)", "67% (Quality)", "59% (Balanced)", "50% (Performance)",
+                                     "", "67% (Quality)", "59% (Balanced)", "50% (Performance)", "33% (Ultra Performance)"};
       ImGui::TextWrapped("DLSS renders the game at %s of the window size (at 1080p about 1280x960) and upscales it. That is what DLSS is for in heavy games; Melee is cheap to render, so here it is a downgrade in sharpness, and Internal resolution and Anti-aliasing above are ignored while it is on. For the sharpest image choose Native, set Internal resolution to 3x or higher and Anti-aliasing to 4x SSAA (the Dolphin look), or choose DLAA (full resolution, DLSS used only as anti-aliasing).", ratios[options.dlss_mode]);
     }
     // Border art: the files in the Borders folder, read when the list is opened or the page appears.
@@ -7110,15 +7768,6 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     const char* subframe_modes[] = {"Off (60 Hz poses only)", "Predict ahead (no delay, can overshoot on speed changes)", "Interpolate (exact, one frame of delay)"};
     int sf = options.subframe == SubFrameMode::Off ? 0 : options.subframe == SubFrameMode::AuthoredInterpolate ? 2 : 1;
     if (settings_combo("Sub-frame animation", &sf, subframe_modes, 3)) { options.subframe = sf == 0 ? SubFrameMode::Off : sf == 2 ? SubFrameMode::AuthoredInterpolate : SubFrameMode::Authored; changed = true; }
-    if (settings_toggle("Online: protect match speed", &options.online_frame_protection)) {
-      RenderOptions::live_online_frame_protection().store(options.online_frame_protection, std::memory_order_relaxed);
-      changed = true;
-    }
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("If your PC can't keep up with an online match at your frame rate, the game turns off\n"
-                        "in-between frames for that match, so the match runs at full speed for you and your\n"
-                        "opponent. A PC that keeps up is never affected.\n"
-                        "Off keeps your frame rate even if the match slows down.");
     if (sf == 1) ImGui::TextWrapped("Samples supported animation beyond the latest pose. Sudden stops can require correction.");
     if (sf == 2) ImGui::TextWrapped("Samples between completed poses. This adds up to one simulation tick of visual delay; unsupported motion may hold.");
     // Say it rather than quietly ignoring the setting: a player who picked a mode and sees no
@@ -7303,21 +7952,6 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                           "filenames a replacement has to use. Only useful if you are making a pack.");
       ImGui::SameLine();
       if (settings_widgets::SmallButton("Open texture dump")) texpack::open_dump_folder();
-      if (RenderOptions::kPathTracingAvailable) {
-        ImGui::BeginDisabled(!path_available);
-        if (settings_toggle("DXR diffuse path tracing (experimental)", &options.path_tracing)) changed = true;
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", kExperimentalNote);
-        if (options.path_tracing)
-          settings_hint("Adds three low-sample diffuse bounces to the raster image. High GPU cost; match scenes only.");
-        if (!path_available)
-          settings_hint("DXR needs Direct3D 12, a ray-tracing capable GPU, and Native, DLAA, or DLSS selected.");
-        ImGui::BeginDisabled(!rr_available);
-        if (settings_toggle("NVIDIA Ray Reconstruction", &options.ray_reconstruction)) changed = true;
-        ImGui::EndDisabled();
-        if (!rr_available)
-          settings_hint("Needs DXR path tracing, an NVIDIA DLSS mode, and the signed DLSS Ray Reconstruction runtime.");
-      }
 #ifdef GX_DLSS5
       // The DLSS 5 internals, while DLSS 5 is on (it is switched off above whenever it cannot run).
       if (options.dlss5) {
@@ -7392,6 +8026,8 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Auto and Low latency share the Windows output with other apps.\nAuto adjusts buffering and remembers it per device; Low latency keeps your selected software buffer fixed.\nWASAPI exclusive takes over the Windows output while the game runs.\nASIO uses an installed interface driver and its outputs 1 and 2; if it cannot start, Auto is used.\nThe fastest stable choice depends on the device and driver.");
     if (options.audio_mode != mode_at_start) { ImGui::TextDisabled("Applies after restart."); restart_now_button("audio_mode"); }
+    if (options.audio_mode >= 2)
+      ImGui::TextWrapped("Exclusive and ASIO bypass the Windows app volume. Lower the game volume and your amp before switching.");
     // This dialog can enable the manually selected interface mode, so its official logo is
     // shown with the picker even before that mode is selected. Preserve the artwork's alpha
     // and aspect ratio; the same asset is packaged in ui_sources/vendor beside the game.
@@ -8210,8 +8846,10 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         }
         ImGui::TextWrapped("Imports use one shared native profile. Stage DATs that fail the exact-ISO "
                            "visual check use the clean disc resource online. Changes take effect after restart.");
-        ImGui::TextWrapped("On the character select screen, L and R step the highlighted costume through "
-                           "its installed skins, no restart needed.");
+        ImGui::TextWrapped(options.native_source ?
+            "Character select: place your token, then L/R cycles this fighter's colors and installed skins. "
+            "X/Y changes color. Online and Teams cycle skins within the selected color." :
+            "Character select: place your token, then L/R cycles skins for the selected color. X/Y changes color.");
         // Several files at once (batch import): each is imported as if picked alone, and the message
         // counts them and names the ones that did not go in.
         auto import_all = [](const std::vector<std::string>& files, auto&& one) {
@@ -8234,6 +8872,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         }
         if (ImGui::IsItemHovered())
           ImGui::SetTooltip("Import a Nucleus project ZIP, costume DAT/ZIP, or stage DAT/ZIP. Select several to import them all.\n"
+                            "Pause-screen ZIPs and GmPause.usd are supported too.\n"
                             "Stage DATs use only their matching disc file. Unsafe stage changes stay offline.\n"
                             "A portrait or stock icon PNG works too when its name says the costume\n"
                             "(\"Fox Green.png\", \"PlFxGr stock.png\"), alone or as a ZIP of pictures.");
@@ -8333,6 +8972,12 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           if (!skin_packs.empty()) {
             ImGui::Spacing();
             ImGui::TextUnformatted("Costume packs");
+            // Keep the complete pack controls in view for the isolated screenshot check.
+            static int pack_scroll_frames = 0;
+            const char* pack_scroll = std::getenv("MELEE_SETTINGS_SCROLL_TO");
+            if (pack_scroll && std::strcmp(pack_scroll, "packs") == 0 && pack_scroll_frames < 4) {
+              ImGui::SetScrollHereY(0.0f); ++pack_scroll_frames;
+            }
 #ifdef MELEE_NO_SLIPPI   // the same rule without the other build's mode names
             ImGui::TextWrapped("Each button sets every costume the pack has. Skins that stay on online keep working in "
                                "online matches; the rest show the standard costume there.");
@@ -8353,13 +8998,21 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                 pending_preview = host::cosmetics::apply_pack_set(pack.key, variant, true);
                 if (!pending_preview.ok) { mod_message = pending_preview.message; pending_pack.clear(); }
               };
-              const bool one_set = pack.variants.size() == 1;
-              for (const auto& variant : pack.variants) {
-                const std::string label = one_set ? "Use all" : variant.empty() ? "Use standard set" : "Use " + variant;
-                ask(label.c_str(), variant);
-                ImGui::SameLine();
-              }
-              ask("Use none", "none");
+              // Every set stays under its source pack. A long m-ex pack must not create a row of
+              // buttons extending beyond the window, hiding its remaining costumes and controls.
+              static std::map<std::string, int> pack_sets;
+              int& chosen = pack_sets[pack.key];
+              chosen = std::clamp(chosen, 0, (int)pack.variants.size() - 1);
+              std::vector<std::string> set_labels;
+              std::vector<const char*> set_names;
+              for (const auto& variant : pack.variants)
+                set_labels.push_back(variant.empty() ? "Original costumes" : variant);
+              for (const auto& label : set_labels) set_names.push_back(label.c_str());
+              ImGui::SetNextItemWidth(230.0f);
+              settings_combo("Costume set", &chosen, set_names.data(), (int)set_names.size());
+              ask("Apply set", pack.variants[(size_t)chosen]);
+              ImGui::SameLine();
+              ask("Clear pack selections", "none");
               if (pending_pack == pack.key) {
                 std::string ask_line = pending_variant == "none"
                     ? std::to_string(pending_preview.cleared) + " costumes go back to standard."
@@ -8392,6 +9045,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           using CosmeticAsset = host::cosmetics::AssetInfo;
           std::map<std::string, std::map<std::string, std::vector<const CosmeticAsset*>>> characters;
           std::map<std::string, std::vector<const CosmeticAsset*>> stages;
+          std::vector<const CosmeticAsset*> pause_screens;
           std::map<std::string, std::vector<const CosmeticAsset*>> pictures;   // a costume's own portrait and stock icon
           std::map<std::string, std::map<std::string, std::vector<const CosmeticAsset*>>> effects;
           std::map<std::string, std::vector<const CosmeticAsset*>> fighter_sounds;
@@ -8402,6 +9056,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             else if (asset.kind == "character_portrait") pictures[asset.character + ", " + asset.costume].push_back(&asset);
             else if (asset.kind == "effect_visual") effects[asset.character][asset.costume].push_back(&asset);
             else if (asset.kind == "fighter_sound") fighter_sounds[asset.character].push_back(&asset);
+            else if (asset.kind == "pause_screen") pause_screens.push_back(&asset);
           }
           static std::string rename_id;
           static std::array<char, 97> rename_text{};
@@ -8572,8 +9227,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                   }
                 }
                 if (variants.size() > 1)
-                  ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
-                                     "%zu variants; the saved selection wins.", variants.size());
+                  ImGui::TextDisabled("%zu skins for this color. You can also cycle them on character select.", variants.size());
                 // What online play does with the selected skin, said here instead of only in the log.
                 // The check runs when the game starts, so a skin picked just now has no verdict yet.
                 if (current != 0) {
@@ -8721,6 +9375,10 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
               ImGui::TextWrapped("%s", details->availability_message.c_str());
             ImGui::PopID();
           };
+          if (!pause_screens.empty()) {
+            draw_resource_slot("Pause screen", pause_screens);
+            settings_hint("Choose a pause-screen style or Vanilla. Restart to apply it.");
+          }
           if (!pictures.empty() && settings_widgets::CollapsingHeader("Portraits and stock icons", ImGuiTreeNodeFlags_DefaultOpen))
             for (const auto& slot : pictures) draw_resource_slot(slot.first, slot.second);
           if (!stages.empty() && settings_widgets::CollapsingHeader("Stages", ImGuiTreeNodeFlags_DefaultOpen))
@@ -8890,6 +9548,15 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("A CPU Captain Falcon never starts his rapid jab. Offline only.");
       cpu_changed |= settings_toggle("CPU Zelda and Sheik: no transform", &options.cpu_no_transform);
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("A CPU Zelda or Sheik never uses the down special. Offline only.");
+      if (options.cpu_training_word() != 0) {
+        ImGui::TextWrapped("CPU training overrides are on. They also affect Training CPUs set to Stand "
+                           "and stay on when mod packs are disabled.");
+        if (ImGui::Button("Reset CPU training options")) {
+          options.cpu_tech = options.cpu_getup = options.cpu_di = options.cpu_sdi = 0;
+          options.cpu_no_taunt = options.cpu_lcancel = options.cpu_no_rapid_jab = options.cpu_no_transform = false;
+          cpu_changed = true;
+        }
+      }
       if (cpu_changed) {
         RenderOptions::live_cpu_training() = options.cpu_training_word();
         changed = true;
@@ -9041,6 +9708,73 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SetTooltip("No burst of colour when a fighter is KO'd off the side, top or bottom.\n"
                         "The match is exactly the same, so it also works online and in replays.\n"
                         "Picture only, yours alone. Both engines. Takes effect from the next KO.");
+    if (settings_toggle("Hide emblems behind percents", &options.hide_hud_emblems)) {
+      host::g_hide_hud_emblems.store(options.hide_hud_emblems, std::memory_order_relaxed);
+      changed = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("No character emblem behind each player's damage percent.\n"
+                        "Picture only, yours alone: the match is the same, online and in replays too. Both engines.");
+
+    // Community codes: players' favourite Gecko codes, built in (shim/mu_code_features.c). Picture and
+    // sound only, so each is yours alone, online and in replays too.
+    ImGui::TextUnformatted("Community codes");
+    {
+      struct Code { uint32_t bit; const char* name; const char* tip; };
+      static const Code kCodes[] = {
+        {MU_DISPLAY_OPTION_HUD_FADE, "HUD transparency",
+         "A player's damage and stock icons turn see-through while a fighter is behind them."},
+        {MU_DISPLAY_OPTION_NANA_PERCENT, "Show Nana's percent",
+         "Nana's damage under each Ice Climbers player's percent."},
+        {MU_DISPLAY_OPTION_ALLY_INDICATORS, "Ally indicators online",
+         "Online: YOU over your fighter, and a heart over your teammate in teams."},
+        {MU_DISPLAY_OPTION_ANGEL_STOCK_COLORS, "Respawn platform by stocks",
+         "The respawn platform turns green with three stocks left, orange with two, red with one."},
+        {MU_DISPLAY_OPTION_NO_GO_TEXT, "Hide GO! at match start",
+         "No GO! graphic when a match starts. Its sound and timing are unchanged."},
+        {MU_DISPLAY_OPTION_VCANCEL_SOUND, "V-cancel sound",
+         "The menu's confirm sound plays on a successful V-cancel."},
+        {MU_DISPLAY_OPTION_HITBOX_ID_COLORS, "Hitbox colours by ID",
+         "Shown hitboxes: ID 0 red, 1 green, 2 cyan, 3 purple."},
+        {MU_DISPLAY_OPTION_HITBOX_ID_ORDER, "Highest-priority hitbox on top",
+         "Shown hitboxes are drawn 3 to 0, so ID 0 is in front."},
+        {MU_DISPLAY_OPTION_HITBOX_ANGLES, "Hitbox knockback angles",
+         "Shown hitboxes carry a line along their knockback angle."},
+        {MU_DISPLAY_OPTION_HQ_FOD_REFLECTIONS, "Full Fountain of Dreams reflections",
+         "With Fountain of Dreams reflections on: the reflection at full resolution with full\n"
+         "fighter models and live background scenery. Applies from the next match on the stage.\n"
+         "Stage skins with a different reflection layout keep their own background artwork."},
+      };
+      for (const Code& c : kCodes) {
+        bool on = (options.community_codes & c.bit) != 0;
+        if (settings_toggle(c.name, &on)) {
+          options.community_codes = on ? (options.community_codes | c.bit) : (options.community_codes & ~c.bit);
+          host::g_community_codes.store(options.community_codes, std::memory_order_relaxed);
+          changed = true;
+        }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("%s\nPicture or sound only, yours alone. Source Port.", c.tip);
+      }
+      // Offline only: these change menu timing and the pause, so online they stay off.
+      static const Code kOffline[] = {
+        {MU_DISPLAY_OPTION_INSTANT_MELEE, "Instant Melee",
+         "Faster stage, stage select and character select loads, and pausing during the\n"
+         "match countdown."},
+        {MU_DISPLAY_OPTION_FREE_PAUSE_CAMERA, "Unrestricted pause camera",
+         "The pause camera turns all the way down, left and right and zooms much further."},
+      };
+      for (const Code& c : kOffline) {
+        bool on = (options.community_codes & c.bit) != 0;
+        if (settings_toggle(c.name, &on)) {
+          options.community_codes = on ? (options.community_codes | c.bit) : (options.community_codes & ~c.bit);
+          host::g_community_codes.store(options.community_codes, std::memory_order_relaxed);
+          changed = true;
+        }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("%s\nOffline only: off in online matches. Source Port (on the Static Recomp, add the\n"
+                            "Gecko code itself).", c.tip);
+      }
+    }
 
 
     ImGui::TextUnformatted("Input delay");
@@ -9678,6 +10412,29 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           ImGui::SetNextItemWidth(200.0f);
           changed |= settings_slider("C-stick radius", &dz.radius_c, 50, 100, dz.radius_c >= 100 ? "Full" : "%d%%");
           if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kRadiusTip);
+          if (cur_family.fam != (int)host::PadFamily::GameCube && cur_family.fam != (int)host::PadFamily::Box) {
+            // The snapback filter for these sticks (a GameCube controller has PhobGCC's in the Phob section).
+            static const char* kSnapTip =
+                "Stops the stick reading on the other side for a frame or two after you let go of it\n"
+                "(snapback). Right after a hard release, a reading on the other side up to this size\n"
+                "reads as centre, for this long; a full reversal (dash dance) passes at once.\n"
+                "Size is out of the stick's 127 (60 is the edge); 0 is off. Try 40 and 20 ms.";
+            for (int axis = 0; axis < 2; ++axis) {
+              int& size = axis ? dz.snapback_y : dz.snapback_x;
+              int& ms = axis ? dz.snapback_ms_y : dz.snapback_ms_x;
+              ImGui::PushID(axis);
+              ImGui::SetNextItemWidth(200.0f);
+              changed |= settings_slider(axis ? "Snapback filter Y" : "Snapback filter X", &size, 0, host::kSnapbackEdge, size ? "%d" : "Off");
+              if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kSnapTip);
+              ImGui::SameLine();
+              ImGui::BeginDisabled(size == 0);
+              ImGui::SetNextItemWidth(160.0f);
+              changed |= settings_slider(axis ? "for##y" : "for##x", &ms, host::kSnapbackMinMs, host::kSnapbackMaxMs, "%d ms");
+              ImGui::EndDisabled();
+              if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", kSnapTip);
+              ImGui::PopID();
+            }
+          }
           ImGui::SeparatorText("Triggers");
           static const char* kTrigTip =
               "Full: the trigger works as on a GameCube controller (a full press clicks and gives\n"
@@ -10375,8 +11132,28 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     if ((options.show_fps || ping_line || latency_line || vram_line) && !clean_replay) {
       char lines[4][40];
       int n = 0;
-      if (options.show_fps) std::snprintf(lines[n++], sizeof lines[0], "FPS: %.0f", ImGui::GetIO().Framerate);
-      if (ping_line) std::snprintf(lines[n++], sizeof lines[0], "Ping: %d ms", slippi::online::ping_ms());
+      if (options.show_fps) {
+        // Frames shown, and the game's own rate when it falls short of 60 (the frames shown can be many
+        // more than the game steps: a high count over a slow game looked fine while it played badly).
+        const double game_hz = host::game_rate();
+        if (game_hz > 20.0 && game_hz < 57.0)
+          std::snprintf(lines[n++], sizeof lines[0], "FPS: %.0f (game %.0f Hz)", ImGui::GetIO().Framerate, game_hz);
+        else
+          std::snprintf(lines[n++], sizeof lines[0], "FPS: %.0f", ImGui::GetIO().Framerate);
+      }
+      if (ping_line) {
+        // Teams: each other player's ping, in port order, as Slippi shows them.
+        const std::vector<int> pings = slippi::online::remote_pings_ms();
+        if (pings.size() > 1) {
+          int used = std::snprintf(lines[n], sizeof lines[0], "Ping:");
+          for (size_t i = 0; i < pings.size() && used > 0 && used < (int)sizeof lines[0]; ++i)
+            used += std::snprintf(lines[n] + used, sizeof lines[0] - used, i ? " | %d" : " %d", pings[i]);
+          if (used > 0 && used < (int)sizeof lines[0]) std::snprintf(lines[n] + used, sizeof lines[0] - used, " ms");
+          ++n;
+        } else {
+          std::snprintf(lines[n++], sizeof lines[0], "Ping: %d ms", slippi::online::ping_ms());
+        }
+      }
       if (options.reflex_stats && streamline::reflex_latency_ms() > 0.0f && n < 3)
         std::snprintf(lines[n++], sizeof lines[0], "Render latency: %.1f ms", streamline::reflex_latency_ms());
       if (vram_line) std::snprintf(lines[n++], sizeof lines[0], "VRAM: %.1f / %.1f GB", vram_used, vram_total);
@@ -10446,6 +11223,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   if (!state.fill_window && !state.open && !state.menu_open && !g_hud_match && yougame::stdio_bridge())
     draw_back_to_yougame_hint();
   if (!state.fill_window && !state.open && !state.menu_open) draw_combo_counter();
+  if (!state.fill_window && !state.open && !state.menu_open) draw_community_code_overlays();
   {
     // Menu sounds: a tick when the highlighted category or control changes, a brighter one when
     // a page opens or the panel opens, a lower one when a page or the panel closes.
@@ -10503,15 +11281,33 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       last_open = state.open; last_tab = state.active_tab; last_detail = detail;
       last_style = options.overlay_style; last_legacy = state.legacy_presentation;
     }
-    const ImGuiIO& diag_io = ImGui::GetIO();
-    if (diag_io.MouseClicked[0] || diag_io.MouseReleased[0])
+  }
+  const ImGuiIO& diag_io = ImGui::GetIO();
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  const bool agent_click_diag = agent_click_diag_until && agent_settings_frame <= agent_click_diag_until;
+  const bool agent_click_down_seen = agent_click_diag && settings_input::click_event_seen(agent_click.down);
+  const bool agent_click_up_seen = agent_click_diag && settings_input::click_event_seen(agent_click.up);
+  if (agent_click_down_seen || agent_click_up_seen) {
+    host::log("ui diag: mouse %s at %.0f,%.0f hovered id %08X active id %08X nav id %08X frame %d",
+              agent_click_down_seen ? "down" : "up", diag_io.MousePos.x, diag_io.MousePos.y,
+              ImGui::GetHoveredID(), ImGui::GetActiveID(), ImGui::GetFocusID(), agent_settings_frame);
+    if (agent_click_up_seen) agent_click_diag_until = 0;
+  } else
+#endif
+  if (g_ui_diag && (diag_io.MouseClicked[0] || diag_io.MouseReleased[0]))
       host::log("ui diag: mouse %s at %.0f,%.0f hovered id %08X active id %08X nav id %08X",
                 diag_io.MouseClicked[0] ? "down" : "up", diag_io.MousePos.x, diag_io.MousePos.y,
                 ImGui::GetHoveredID(), ImGui::GetActiveID(), ImGui::GetFocusID());
-  }
   if (launcher_old_look) {
     if (g_settings_old_font) ImGui::PopFont();
     ImGui::GetStyle() = launcher_saved_style;
+  }
+  if (test_nav_step >= 0) {
+    const ImGuiContext& g = *ImGui::GetCurrentContext();
+    const ImGuiWindow* w = g.NavWindow;
+    host::log("panel nav: step %d nav id %08X active %08X window %s rect y %.0f..%.0f scroll %.0f/%.0f", test_nav_step,
+              g.NavId, g.ActiveId, w ? w->Name : "-", w ? w->NavRectRel[0].Min.y : 0.f, w ? w->NavRectRel[0].Max.y : 0.f,
+              w ? w->Scroll.y : 0.f, w ? w->ScrollMax.y : 0.f);
   }
   draw_update_handoff_notice();
   ImGui::Render();
@@ -10526,6 +11322,30 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         const uint32_t alpha = (vertex.col >> IM_COL32_A_SHIFT) & 0xff;
         const uint32_t scaled = (uint32_t)std::lround(alpha * alpha_scale);
         vertex.col = (vertex.col & ~IM_COL32_A_MASK) | (scaled << IM_COL32_A_SHIFT);
+      }
+    }
+  }
+  // HDR10 output: the panel's sRGB colours as PQ at paper white (BT.2020), so it reads the same
+  // as on an SDR screen.
+  if (g_settings_hdr_nits > 0.0f) {
+    auto pq = [](float nits) {
+      const float y = std::pow(std::clamp(nits / 10000.0f, 0.0f, 1.0f), 0.1593017578125f);
+      return std::pow((0.8359375f + 18.8515625f * y) / (1.0f + 18.6875f * y), 78.84375f);
+    };
+    auto decode = [](uint32_t v) {
+      const float c = v / 255.0f;
+      return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+    };
+    ImDrawData* data = ImGui::GetDrawData();
+    for (int list_index = 0; data && list_index < data->CmdListsCount; ++list_index) {
+      for (ImDrawVert& vertex : data->CmdLists[list_index]->VtxBuffer) {
+        const float r = decode((vertex.col >> IM_COL32_R_SHIFT) & 0xff), g = decode((vertex.col >> IM_COL32_G_SHIFT) & 0xff),
+                    b = decode((vertex.col >> IM_COL32_B_SHIFT) & 0xff);
+        const float r2 = 0.6274f * r + 0.3293f * g + 0.0433f * b, g2 = 0.0691f * r + 0.9195f * g + 0.0114f * b,
+                    b2 = 0.0164f * r + 0.0880f * g + 0.8956f * b;
+        auto q = [&](float lin) { return (uint32_t)std::lround(pq(lin * g_settings_hdr_nits) * 255.0f); };
+        vertex.col = (vertex.col & IM_COL32_A_MASK) | (q(r2) << IM_COL32_R_SHIFT) | (q(g2) << IM_COL32_G_SHIFT) |
+                     (q(b2) << IM_COL32_B_SHIFT);
       }
     }
   }
@@ -10546,8 +11366,21 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
 
 #ifdef _WIN32
 void PcSettingsUI::draw(ID3D12GraphicsCommandList* list) {
+  // A panel rebuilt this frame (HDR switched on or off) has not run a frame yet: nothing to draw.
+  ImDrawData* data = ImGui::GetCurrentContext() ? ImGui::GetDrawData() : nullptr;
+  if (!data) return;
   ID3D12DescriptorHeap* heap = impl_->heap.Get(); list->SetDescriptorHeaps(1, &heap);
-  ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), list);
+  ImGui_ImplDX12_RenderDrawData(data, list);
 }
+#endif
+#ifndef _WIN32
+// No Direct3D 12 here: no path tracing, no HDR swap chain, no local NVIDIA module.
+bool rtx_path_tracing_ready() { return false; }
+bool rtx_path_tracing_known() { return true; }
+bool rtx_nvidia_integrator_available() { return false; }
+bool rtx_remix_available() { return false; }
+bool rtx_remix_running() { return false; }
+std::string rtx_renderer_status(int) { return {}; }
+bool hdr_display_available() { return false; }
 #endif
 }

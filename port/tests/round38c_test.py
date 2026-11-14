@@ -13,7 +13,8 @@ def read(path):
 
 class Round38cTest(unittest.TestCase):
     def compile(self, name, text, *defines):
-        menu.OnlineMenuTest().compile_fixture(name, text, *defines)
+        prefix = '#include "slippi_agent_lock.h"\nnamespace agent_lock = slippi::agent_lock;\n'
+        menu.OnlineMenuTest().compile_fixture(name, prefix + text, *defines)
 
     def test_version_failure_steps_and_no_sensitive_diagnostics(self):
         net = read('port/runtime/hle/slippi_net.cpp')
@@ -30,6 +31,10 @@ class Round38cTest(unittest.TestCase):
 #include <thread>
 #include <vector>
 #include <algorithm>
+#include <atomic>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 using json = nlohmann::json;
 std::vector<std::string> logged;
 namespace host { void log(const char* f,...) { char b[256]; va_list a;va_start(a,f);vsnprintf(b,sizeof b,f,a);va_end(a);logged.push_back(b); } }
@@ -44,14 +49,17 @@ std::string str_or(const json& j,const char* k,const char* fallback) {
 }
 bool release_version_valid(const std::string& s){return s=="3.6.4" || s=="3.6.5";}
 bool version_newer(const std::string& s,const char*){return s=="3.6.5";}
+bool version_newer(const std::string& a,const std::string& b){return a=="3.6.5" && b!="3.6.5";}
+const json* json_member(const json& j,const char* k){if(!j.is_object())return nullptr;auto it=j.find(k);return it==j.end()?nullptr:&*it;}
 struct UserInfo {std::string uid="synthetic-user",latest_version;};
 using VersionFetch=std::function<bool(const std::string&,std::string*,int*)>;
-struct User { UserInfo info_;std::mutex mutex_;UserInfo GetUserInfo(){return info_;}
+struct User { UserInfo info_;std::mutex mutex_;std::string dir_;UserInfo GetUserInfo(){return info_;}
 bool check(std::string* error,VersionFetch fetch={}) {
 ''' + check + r'''
 } };
 int main(){
  User u;std::string error;int checks=0;
+ u.dir_=(std::filesystem::temp_directory_path()/("38c-version-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()))).u8string();
  // Every failed try logs its step; three tries, then no known version blocks with one more line.
  auto expect=[&](const char* step,int tries=3){
   const std::string line=std::string("slippi: version check failed: ")+step;
@@ -59,7 +67,6 @@ int main(){
   for(const auto& l:logged) if(l.find("sensitive")!=std::string::npos)std::abort();
   logged.clear();++checks;};
  auto unknown=[&]{if(logged.empty() || logged.back().find("no known version")==std::string::npos)std::abort();logged.pop_back();};
- if(u.check(&error))std::abort();unknown();expect("send-request 12029");
  auto fetch=[&](bool ok,int status,std::string text){return [=](const std::string&,std::string* out,int* code){*out=text;*code=status;return ok;};};
  if(u.check(&error,fetch(false,0,"sensitive-response")))std::abort();unknown();expect("http-get 0");
  if(u.check(&error,fetch(true,503,"sensitive-response")))std::abort();unknown();expect("http-status 503");
@@ -81,6 +88,12 @@ int main(){
  if(error!="Slippi 3.6.5 is out. Update Melee Unlocked")std::abort();++checks;
  if(!u.check(&error,fetch(true,200,R"({"latestVersion":"3.6.4"})")) || !error.empty())std::abort();++checks;
  if(!logged.empty())std::abort();
+ // The default transport: three failed tries, then one try for the rest of the session (v0.9.93).
+ // Without the account's version or the kept answer (version-check.json) nothing is known.
+ u.info_.latest_version.clear();std::filesystem::remove(std::filesystem::u8path(u.dir_)/"version-check.json");
+ if(u.check(&error))std::abort();unknown();expect("send-request 12029");
+ if(u.check(&error))std::abort();unknown();expect("send-request 12029",1);
+ std::filesystem::remove_all(std::filesystem::u8path(u.dir_));
  u.info_.uid.clear();if(u.check(&error))std::abort();expect("signed-out 0",1);
  printf("version diagnostics: %d checks passed\n",checks);
 }

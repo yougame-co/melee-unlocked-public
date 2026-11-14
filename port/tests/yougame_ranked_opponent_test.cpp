@@ -11,6 +11,7 @@ static bool enabled = true, visible = true;
 static int local_seat;
 static ranked::json participants;
 bool active() { return enabled; }
+bool session() { return enabled; }   // the app session or a launcher one (yougame_link.cpp)
 uint8_t rank_visibility() { return visible; }
 uint8_t local_rank() { return ranked::roster_rank_byte(participants, local_seat); }
 uint8_t opponent_rank() { return ranked::roster_rank_byte(participants, 1-local_seat); }

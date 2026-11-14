@@ -177,6 +177,24 @@ int mu_ko_explosions_hidden(void)
 }
 _Static_assert(MU_DISPLAY_NO_KO_EXPLOSIONS == MU_DISPLAY_OPTION_NO_KO_EXPLOSIONS, "display option bits");
 
+int mu_hud_emblems_hidden(void)
+{
+    return (mu_display_options() & MU_DISPLAY_NO_HUD_EMBLEMS) != 0;
+}
+_Static_assert(MU_DISPLAY_NO_HUD_EMBLEMS == MU_DISPLAY_OPTION_NO_HUD_EMBLEMS, "display option bits");
+/* The community codes (shim/mu_code_features.c). */
+_Static_assert(MU_DISPLAY_HUD_FADE == MU_DISPLAY_OPTION_HUD_FADE, "display option bits");
+_Static_assert(MU_DISPLAY_ANGEL_STOCK_COLORS == MU_DISPLAY_OPTION_ANGEL_STOCK_COLORS, "display option bits");
+_Static_assert(MU_DISPLAY_NANA_PERCENT == MU_DISPLAY_OPTION_NANA_PERCENT, "display option bits");
+_Static_assert(MU_DISPLAY_ALLY_INDICATORS == MU_DISPLAY_OPTION_ALLY_INDICATORS, "display option bits");
+_Static_assert(MU_DISPLAY_NO_GO_TEXT == MU_DISPLAY_OPTION_NO_GO_TEXT, "display option bits");
+_Static_assert(MU_DISPLAY_HITBOX_ID_COLORS == MU_DISPLAY_OPTION_HITBOX_ID_COLORS, "display option bits");
+_Static_assert(MU_DISPLAY_HITBOX_ID_ORDER == MU_DISPLAY_OPTION_HITBOX_ID_ORDER, "display option bits");
+_Static_assert(MU_DISPLAY_HITBOX_ANGLES == MU_DISPLAY_OPTION_HITBOX_ANGLES, "display option bits");
+_Static_assert(MU_DISPLAY_HQ_FOD_REFLECTIONS == MU_DISPLAY_OPTION_HQ_FOD_REFLECTIONS, "display option bits");
+_Static_assert(MU_DISPLAY_VCANCEL_SOUND == MU_DISPLAY_OPTION_VCANCEL_SOUND, "display option bits");
+_Static_assert(MU_DISPLAY_CODES_ALL == MU_DISPLAY_OPTION_CODES_ALL, "display option bits");
+
 int mu_console_active(void);
 
 /* Camera state participates in rollback snapshots: local strength must not change it online. */
@@ -230,6 +248,15 @@ int mu_native_owner_tracking(void)
     return mu_host && mu_host->native_owner_tracking ? mu_host->native_owner_tracking() != 0 : 0;
 }
 
+/* Render semantics for the host's ray-traced renderer (tokens 0xF3-0xF6, mu_rtx_tokens.h): the HSD
+ * hooks in tobj.c, dobj.c, lobj.c, cobj.c and eflib.c write them only while this is nonzero. */
+int mu_native_rtx_semantics(void)
+{
+    return mu_host && mu_host->version >= 32 && mu_host->native_rtx_semantics
+               ? mu_host->native_rtx_semantics() != 0
+               : 0;
+}
+
 const MuHostApi* mu_host;
 
 static int32_t mu_run(void);
@@ -263,7 +290,8 @@ uint32_t mu_snapshot_ranges(MuStateRegion* out, uint32_t capacity);
 int mu_practice_bridge(int op, int* args, int count);
 _Static_assert(MU_PRACTICE_DIRECT_FIRST_MATCH == 9 && MU_PRACTICE_REQUEST_MAJOR == 6 && MU_PRACTICE_FRAME_PAUSE == 10 &&
                MU_PRACTICE_CPU_MOVE == 11 && MU_PRACTICE_TRAINING_PICK == 12 &&
-               MU_PRACTICE_TRAINING_STAGE == 13 && MU_PRACTICE_UNLOCKED == 14,
+               MU_PRACTICE_TRAINING_STAGE == 13 && MU_PRACTICE_UNLOCKED == 14 && MU_PRACTICE_PAGE_PAUSE == 15 &&
+               MU_PRACTICE_BOOT_MATCH == 35,
                "practice op numbering (mu_practice.c)");
 
 /* Native game-side Slippi hooks use this instead of the console's EXI memory-mapped device. */
@@ -306,6 +334,8 @@ MU_EXPORT int32_t mu_game_entry(const MuHostApi* host, MuGameApi* game)
     game->state_regions = mu_state_regions;
     game->state_exclusions = mu_snapshot_exclusions;
     game->snapshot_ranges = mu_snapshot_ranges;
+    extern int mu_css_transfer(int, void*, unsigned);
+    game->css_state = mu_css_transfer;
     game->practice = (int32_t (*)(int32_t, int32_t*, int32_t)) mu_practice_bridge;
     return 0;
 }
@@ -428,8 +458,12 @@ int mu_native_pose_capture_enabled(void)
            mu_host->native_pose_capture_enabled();
 }
 
+void mu_native_pose_step_view(MuNativePoseSnapshot* snapshot);
 void mu_native_pose_snapshot(const MuNativePoseSnapshot* snapshot)
 {
-    if (mu_host != NULL && mu_host->native_pose_snapshot != NULL)
-        mu_host->native_pose_snapshot(snapshot);
+    if (mu_host != NULL && mu_host->native_pose_snapshot != NULL) {
+        MuNativePoseSnapshot stepped = *snapshot;
+        mu_native_pose_step_view(&stepped);
+        mu_host->native_pose_snapshot(&stepped);
+    }
 }

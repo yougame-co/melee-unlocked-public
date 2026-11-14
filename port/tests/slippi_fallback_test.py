@@ -61,6 +61,7 @@ int enet_host_service(ENetHost*,ENetEvent* e,int ms) {
 namespace host { void log(const char*,...) {} }
 namespace slippi {
 uint64_t time_ms() {return clock_ms;}
+constexpr uint64_t kConnectTimeoutMs=8000;   // slippi_net.h
 constexpr int intercept_callback=1;
 struct Packet {Packet(unsigned char*,size_t) {}};
 struct ActiveConnectionInfo {int player_idx=0;};

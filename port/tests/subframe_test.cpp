@@ -80,7 +80,7 @@ int main() {
   gx::SubFrameSolver::fractional(prev, scaled, 0.5, true, 40, 3.0f, out, nullptr, nullptr, nullptr, &st);
   check(st.cuts == 1 && near(out[0], 3.0f), "non-rigid delta retains current pose");
   // Draw pairing by identity through the solver.
-  gx::Frame a, b; a.sequence = 1; b.sequence = 2; a.vertices.resize(3); b.vertices.resize(3);
+  gx::Frame a, b; a.sequence = 1; b.sequence = 2; a.vertices.resize(3, gx::Vertex{}); b.vertices.resize(3, gx::Vertex{});
   gx::DrawCall d{}; d.identity = 7; d.object_generation = 1; d.vertex_count = 3; d.primitive = 0x90; d.components = 0; d.matrix_index_a = 0;
   d.xf_regs[0x3F] = 0;
   rot_z(0, 0, d.posMatrices); std::memcpy(d.normalMatrices, ident_n, sizeof ident_n);
@@ -165,7 +165,7 @@ int main() {
   // Matrix selectors are discrete even when the vertex stream is unchanged.
   gx::Frame texture_previous, texture_current;
   texture_previous.sequence = 1; texture_current.sequence = 2;
-  texture_previous.vertices.resize(3); texture_current.vertices.resize(3);
+  texture_previous.vertices.resize(3, gx::Vertex{}); texture_current.vertices.resize(3, gx::Vertex{});
   gx::DrawCall texture_draw{}; texture_draw.identity = 15; texture_draw.vertex_count = 3;
   texture_draw.primitive = 0x90; texture_draw.xf_regs[0x3F] = 1;
   texture_draw.matrix_index_a = 6u << 6;
@@ -326,5 +326,66 @@ int main() {
           "a paired draw holding the previous frame is carried off that view");
     gx::set_authored_interpolate(false);
   }
-  std::puts("sub-frame rigid fractions, cuts, blends and pairing passed");
+  // Menus interpolate, so every menu draw is shown between the previous frame and this one. A
+  // draw whose vertex stream cannot be blended (here a leftover texture-matrix selector differs, as
+  // on most menu ticks) must still advance its matrices with the rest: holding it at the current
+  // frame drew those pieces of a sliding menu row a tick ahead of the pieces that blended, which
+  // is the doubled Online menu rows at 180 Hz. A draw whose matrix binding really changed holds.
+  {
+    gx::Frame ma, mb; ma.sequence = 10; mb.sequence = 11; ma.vertices.resize(6); mb.vertices.resize(6);
+    gx::DrawCall row{}; row.identity = 21; row.object_generation = 3; row.vertex_count = 3; row.primitive = 0x90;
+    row.components = 0; row.matrix_index_a = 0; row.xf_regs[0x3F] = 0;
+    std::memcpy(row.normalMatrices, ident_n, sizeof ident_n);
+    rot_z(0, 0, row.posMatrices); ma.draws.push_back(row);
+    gx::DrawCall cap = row; cap.identity = 22; cap.first_vertex = 3; cap.components = gx::VB_HAS_POSMTXIDX;
+    ma.draws.push_back(cap);
+    rot_z(0, 6, row.posMatrices); mb.draws.push_back(row);   // the row slides 6 units this tick
+    rot_z(0, 6, cap.posMatrices); mb.draws.push_back(cap);
+    mb.vertices[0].pos[0] = 0.5f;          // rewritten text: the stream changed
+    mb.vertices[1].texmtx[3] = 5;          // leftover selector: the stream cannot blend
+    mb.vertices[3].pos[0] = 0.5f;          // the end cap is rewritten too, and its binding moved
+    mb.vertices[3].posmtx = 3;
+    gx::SubFrameSolver menu; menu.max_rotation = 3.0f; menu.set_menu_mode(true);
+    menu.set_frames(&ma, &mb);
+    check(menu.stats().paired == 2, "menu row and end cap pair");
+    std::vector<gx::DrawMatrices> mm;
+    menu.build(0.5, true, mm, true);
+    check(mm.size() == 2 && !mm[0].vertices && near(mm[0].pos[3], 3.0f),
+          "a menu draw that cannot blend its stream still advances with the rest of the menu");
+    check(near(mm[1].pos[3], 6.0f), "a menu draw whose matrix binding changed holds its current frame");
+    check(menu.stats().menu_advanced == 1, "unchanged menu route-6 bindings count as advanced");
+    check(menu.stats().menu_held == 1, "changed menu route-6 posmtx counts as held");
+    menu.build(0.75, true, mm, true);
+    check(menu.stats().menu_advanced == 1 && menu.stats().menu_held == 1,
+          "menu route-6 counters reset on each build");
+  }
+  // Three shaken fighter draws must not outvote the stage's actual camera.
+  // An unpaired piece of stage art should follow the camera pan alone.
+  {
+    gx::Frame before, after; before.sequence = 1; after.sequence = 2;
+    before.vertices.resize(3, gx::Vertex{}); after.vertices.resize(3, gx::Vertex{});
+    auto old_view = std::make_shared<gx::AuthoredPose>(), new_view = std::make_shared<gx::AuthoredPose>();
+    old_view->has_view = new_view->has_view = true;
+    old_view->view = new_view->view = NativeMelee::Identity(); new_view->view[3] = 2;
+    gx::AuthoredJoint root; root.generation = 1; root.scale = {1,1,1}; root.world = NativeMelee::Identity();
+    old_view->joints.push_back(root); new_view->joints.push_back(root);
+    auto old_model = std::make_shared<gx::AuthoredPose>(*old_view), new_model = std::make_shared<gx::AuthoredPose>(*new_view);
+    old_model->model_shift = new_model->model_shift = old_model->quake = new_model->quake = true;
+    old_model->view[3] += 2; old_model->quake_shift = {-2,0};
+    new_model->view[3] -= 2; new_model->quake_shift = {2,0};
+    for (int i = 0; i < 4; ++i) {
+      gx::DrawCall draw{}; draw.identity = i + 100; draw.object_generation = 1;
+      draw.vertex_count = 3; draw.primitive = 0x90;
+      draw.authored_pose = i ? old_model : old_view;
+      rot_z(0, draw.authored_pose->view[3], draw.posMatrices);
+      std::memcpy(draw.normalMatrices, ident_n, sizeof ident_n); before.draws.push_back(draw);
+      draw.authored_pose = i ? new_model : new_view;
+      rot_z(0, draw.authored_pose->view[3], draw.posMatrices); after.draws.push_back(draw);
+    }
+    auto scenery = after.draws[0]; scenery.identity = 999; after.draws.push_back(scenery);
+    solver.set_frames(&before, &after); solver.build(.5, false, mats, true);
+    std::printf("model-shake stage carry: %g (paired=%u carried=%u)\n", mats.back().pos[3], solver.stats().paired, solver.stats().carried);
+    check(near(mats.back().pos[3], 3), "fighter hit shake cannot become the stage camera");
+  }
+  std::puts("sub-frame rigid fractions, cuts, blends, pairing and model-shake isolation passed");
 }

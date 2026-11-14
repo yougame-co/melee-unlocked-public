@@ -1,3 +1,8 @@
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+#include "mu_squad.h"
+#include <melee/gm/gm_1A3F.h>
+#endif
 /* Native Slippi online play.
  *
  * The console game gets online play from Slippi's patches: it exchanges pads with the host's Slippi
@@ -163,6 +168,7 @@ typedef struct MuOnlineState {
     u8 delay;
     int frame;                /* next online pad frame to fetch */
     unsigned int rng_offset;
+    u8 last_partner[PAD_SIZE];
     u8 last_local[PAD_SIZE];
     u8 delay_index;
     u8 delay_buffer[MAX_DELAY][PAD_SIZE];
@@ -406,6 +412,10 @@ static u32 compute_checksum(void)
                 continue;
             }
             fp = gobj->user_data;
+#if MU_SQUAD
+            /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+            if (gmSquad_Live()) acc ^= (u32) fp->kind;
+#endif
             acc ^= (u32) fp->motion_id;
             acc ^= float_bits(fp->cur_pos.x);
             acc ^= float_bits(fp->cur_pos.y);
@@ -654,6 +664,23 @@ static int trace_pads(void)
     return on;
 }
 
+/* Tests only (MELEE_ONLINE_EARLY_CHECKSUMS=1, and only in a harness match, mu_online.test): compare
+ * the opponent's checksums from frame 1 instead of from the first frame after the freeze, so a pair
+ * run shows the two games agree through the entry animation too. Players never get this: a match
+ * from the menus has mu_online.test 0 and keeps Slippi's rule. Frame 0 is never compared: the first
+ * pads carry finalized frame 0 with checksum 0 (nothing is finalized yet) and the ring starts zeroed,
+ * so a frame-0 entry is the "nothing yet" value, not a state. */
+static int early_checksums(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        char* getenv(const char* name);
+        const char* v = getenv("MELEE_ONLINE_EARLY_CHECKSUMS");
+        on = v != NULL && v[0] == '1';
+    }
+    return on && mu_online.test;
+}
+
 static void trace_pads_line(const PADStatus* stat, int frame, const char* kind, int confirmed)
 {
     char line[200];
@@ -822,7 +849,7 @@ static void clamp_stick_at_rest(PADStatus* pad)
 int mu_online_pad_renew(PADStatus* stat)
 {
     int frame, i;
-    u8 tx[25];
+    u8 tx[33];
     u8 local[PAD_SIZE];
     unsigned int got = 0;
     PADStatus* source;
@@ -938,6 +965,20 @@ int mu_online_pad_renew(PADStatus* stat)
     put32(tx + 8, mu_online.tx_checksum);
     tx[12] = mu_online.delay;
     memcpy(tx + 13, mu_online.last_local, PAD_SIZE);
+    memset(tx + 25, 0, 8);
+    {
+        const int partner_source = mu_lobby_partner_source();
+        if (partner_source >= 0 && partner_source < 4) {
+            PADStatus* second = &stat[partner_source];
+            clamp_stick_at_rest(second);
+            if (second->err == -3) wire_to_pad(second, mu_online.last_partner);
+            pad_to_wire(mu_online.last_partner, second);
+            memcpy(tx + 25, mu_online.last_partner, 8);
+        }
+    }
+    /* The second pad is sampled only on a new frame. Its delayed confirmed queue comes back as
+     * a virtual remote port: the existing remote_inputs history saves and replays it on rollback.
+     * Early input/ring samples remain main-port only; this pad never needs an early prediction. */
     /* The host asks for its full reply capacity; the answer lands in the command buffer and the
      * part this code reads (Slippi's reply and the early inputs after it) is copied out. */
     mu_online.rxb_size = 0;
@@ -1310,11 +1351,16 @@ rollback_inputs_done:
     confirmed = frame == 0 ? written : NULL;
     if (frame != 0 && !mu_online.desync_displayed) {
         int remote_count = rxb[RXB_OPNT_COUNT];
+        /* The first frame compared: after the freeze (Slippi's rule), or frame 1 in a test. */
+        const int first_compared = early_checksums() ? 1 : UNFREEZE_FRAME + 1;
+        if (frame == 1 && first_compared == 1) {
+            logf_("online: checksums compared from frame 1 (MELEE_ONLINE_EARLY_CHECKSUMS)");
+        }
         for (i = 0; i < remote_count && i < REMOTES; i++) {
             int cf = (int) be32(rxb + RXB_OPNT_DESYNC + 8 * i);
             u32 remote = be32(rxb + RXB_OPNT_DESYNC + 8 * i + 4);
             int k;
-            if (cf > mu_online.stable_finalized || cf <= UNFREEZE_FRAME) {
+            if (cf > mu_online.stable_finalized || cf < first_compared) {
                 continue;
             }
             for (k = 0; k < DESYNC_ENTRIES; k++) {
@@ -1399,6 +1445,24 @@ static void camera_tasks(void)
 
 #include "mu_console_rollback.inc"
 
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+ * Read-only observation AFTER a body, including every resimulation. The reply's
+ * minimum remote latest input is the same frontier check_predictions uses.
+ * Do not use command(): its shared response buffer is synchronized game memory. */
+static void squad_digest_observe(int ending)
+{
+    u8 payload[9];
+    if (!mu_online.test || !gmSquad_OnlineChosen() || !mu_online.active) return;
+    payload[0] = ending ? MU_SQUAD_OP_DIGEST_END : MU_SQUAD_OP_DIGEST_FRAME;
+    put32(payload + 1, (u32) (global_frame() - 1));
+    put32(payload + 5, mu_online.disconnected ? (u32) -1 : be32(mu_online.rxb + RXB_SMALLEST_LATEST));
+    mu_online_abi_command(MU_SQUAD_COMMAND, payload, sizeof payload, NULL, 0, NULL);
+}
+#else
+#line 1409 /* Preserve ee1088f OFF debug declaration locations. */
+#endif
+
 int mu_online_frame_end(void)
 {
     int current;
@@ -1407,6 +1471,12 @@ int mu_online_frame_end(void)
         return ENGINE_CONTINUE;
     }
     mu_online_audio_frame_end();
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+    squad_digest_observe(0);
+#else
+#line 1418 /* Preserve ee1088f OFF debug declaration locations. */
+#endif
     current = global_frame() - 1;
     if (current > mu_online.latest_frame) {
         mu_online.latest_frame = current;
@@ -1471,9 +1541,28 @@ static int fetch_match_state(unsigned int* size)
 static int p2p_menus = -1;   /* -1 not asked yet, else whether the kind is 3 */
 static u8 p2p_port;          /* the pad port the host named for the local player */
 
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+ * Nonzero only while the host answers the launch question. Its diagnostic harness prepares the
+ * squad lineup from inside that answer (h_online_test_match), and nothing else may. */
+static int launch_query;
+int mu_online_launch_query(void)
+{
+    return launch_query;
+}
+#endif
+
 static int launch_kind(int* mode, int* input_port)
 {
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+    int kind;
+    launch_query = 1;
+    kind = mu_online_abi_test_match(mode, input_port);
+    launch_query = 0;
+#else
     int kind = mu_online_abi_test_match(mode, input_port);
+#endif
     if (p2p_menus < 0) {
         p2p_menus = kind == 3;
         p2p_port = kind == 3 ? (u8) (*input_port & 3) : 0;
@@ -1590,6 +1679,15 @@ int mu_online_pending(void)
     return mu_online.pending;
 }
 
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+ * The menu-free diagnostic harness (launch kind 1), never a user-approved lobby match. */
+int mu_online_harness(void)
+{
+    return mu_online.test;
+}
+#endif
+
 void mu_online_start_melee(StartMeleeData* data)
 {
     unsigned int size = 0;
@@ -1631,6 +1729,14 @@ void mu_online_start_melee(StartMeleeData* data)
     }
 #endif
     mu_replay_apply_game_info(data, mu_online.match_state + MSRB_GAME_INFO_BLOCK);
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+    /* The harness skips gmVsMelee_EnterVs in debug VS. Run its production squad entry
+     * after importing match info and before fighters or Game Start are created. */
+    if (mu_online.test && gm_GetCurrentGameMode() == GM_DEBUG_VS && gmSquad_OnlineChosen())
+        gmSquad_OnEnterVs(data);
+    if (gmSquad_OnlineReady()) gmSquad_ApplyLiveStart(data);
+#endif
     /* Teams: the costume follows the team. The match state carries the colour each player picked,
      * and when all four picked the same team the host deals the teams out itself, so the picked
      * colour is the wrong team's for two of them (all four played in red). The console's online code
@@ -1698,6 +1804,12 @@ void mu_online_match_exit(void)
     if (!mu_online.active) {
         return;
     }
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+    squad_digest_observe(1);
+#else
+#line 1745 /* Preserve ee1088f OFF debug declaration locations. */
+#endif
     mu_online_audio_match_exit();
     mu_online_rules_clear();
     logf_("online: match exit: %d rollbacks (deepest %d frames), %d re-simulated frames",
@@ -1737,6 +1849,13 @@ void mu_online_scene_loop_exit(void)
         console_match_exit();
         return;
     }
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+     * The terminal body bypasses frame_end; record it before scene teardown. */
+    squad_digest_observe(0);
+#else
+#line 1784 /* Preserve ee1088f OFF debug declaration locations. */
+#endif
     if (!mu_online.resim) {
         return;
     }

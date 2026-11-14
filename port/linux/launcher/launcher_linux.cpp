@@ -14,6 +14,10 @@
 #include "launcher_lobby_p2p.h"
 #include "slippi_account.h"
 #include "updater.h"
+#include "launcher_yougame.h"
+#include "disc_rvz.h"
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -58,6 +62,7 @@ namespace {
 std::string g_dir;                 // the folder the launcher and the game are in
 std::string g_iso;
 bool g_save_replays = true;
+bool g_compress_replays = false;  // launcher.ini compressreplays=1: the game keeps earlier replays as .slpz
 std::string g_replay_folder;      // launcher.ini replaydir=: where replays are saved; empty = <g_dir>/Replays
 bool g_replay_as_played = false;
 int g_replay_sort = 0;
@@ -86,8 +91,10 @@ void load_ini() {
   std::ifstream f(ini_path());
   for (std::string line; std::getline(f, line);) {
     if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (launcher::yougame::load_line(line)) continue;
     if (line.rfind("iso=", 0) == 0) g_iso = line.substr(4);
     else if (line == "savereplays=0") g_save_replays = false;
+    else if (line == "compressreplays=1") g_compress_replays = true;
     else if (line.rfind("replaydir=", 0) == 0) g_replay_folder = line.substr(10);
     else if (line == "replayasplayed=1") g_replay_as_played = true;
     else if (line == "replayhideshort=1") g_replay_hide_short = true;
@@ -100,10 +107,14 @@ void save_ini() {
   std::ofstream f(ini_path(), std::ios::trunc);
   f << "iso=" << g_iso << "\n";
   if (!g_save_replays) f << "savereplays=0\n";
+  if (g_compress_replays) f << "compressreplays=1\n";
   if (!g_replay_folder.empty()) f << "replaydir=" << g_replay_folder << "\n";
   if (g_replay_as_played) f << "replayasplayed=1\n";
   if (g_replay_hide_short) f << "replayhideshort=1\n";
   if (g_replay_sort) f << "replaysort=" << g_replay_sort << "\n";
+  f << launcher::yougame::ini_lines();   // YouGame: the environment and the saved session
+  f.close();
+  chmod(ini_path().c_str(), 0600);       // the session is in it: readable by this user only
 }
 
 // The same check as the Windows launcher's: Melee NTSC 1.02 and a full image (not an NKit one).
@@ -189,6 +200,7 @@ void open_path(const std::string& path) {
 
 // ---------------------------------------------------------------------------- the game process
 std::atomic<pid_t> g_game_pid{0};
+std::string g_yg_start_version;   // set only while starting the release YouGame is on (Versions/<v>-legacy)
 std::atomic<bool> g_game_done{false};
 std::atomic<int> g_game_code{0};
 std::chrono::system_clock::time_point g_launch_time;
@@ -203,8 +215,28 @@ bool start_process(const std::vector<std::string>& argv) {
   posix_spawn_file_actions_t actions;
   posix_spawn_file_actions_init(&actions);
   posix_spawn_file_actions_addchdir_np(&actions, g_dir.c_str());
+  // The game's error output goes to melee_port.stderr.log beside it (sent with a crash report): the C
+  // library and the graphics driver say there why they stopped the game, and the game's log cannot.
+  const std::string stderr_log = g_dir + "/melee_port.stderr.log";
+  posix_spawn_file_actions_addopen(&actions, 2, stderr_log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   pid_t pid = 0;
-  const int rc = posix_spawn(&pid, args[0], &actions, nullptr, args.data(), environ);
+  // The game's YouGame rows ask this launcher (launcher_yougame.h): its address and a launch token.
+  std::vector<std::string> env_store;
+  for (char** e = environ; *e; ++e)
+    if (std::strncmp(*e, "YOUGAME_", 8) != 0 && std::strncmp(*e, "MELEE_YOUGAME_", 14) != 0) env_store.push_back(*e);
+  if (const std::string bridge = launcher::yougame::bridge_url(); !bridge.empty()) {
+    const std::string game_dir = argv[0].substr(0, argv[0].find_last_of('/'));
+    launcher::yougame::set_build(g_yg_start_version.empty() ? std::string(MELEE_PORT_VERSION) : g_yg_start_version,
+                                 std::wstring(argv[0].begin(), argv[0].end()),
+                                 std::wstring(game_dir.begin(), game_dir.end()) + L"/melee_game.so");
+    env_store.push_back("YOUGAME_BRIDGE=" + bridge);
+    env_store.push_back("YOUGAME_TOKEN=" + launcher::yougame::new_launch_token());
+    env_store.push_back("MELEE_YOUGAME_LAUNCHER=1");
+  }
+  std::vector<char*> env;
+  for (auto& s : env_store) env.push_back(s.data());
+  env.push_back(nullptr);
+  const int rc = posix_spawn(&pid, args[0], &actions, nullptr, args.data(), env.data());
   posix_spawn_file_actions_destroy(&actions);
   if (rc != 0) { status(std::string("The game could not be started: ") + std::strerror(rc)); return false; }
   g_launch_time = std::chrono::system_clock::now();
@@ -253,6 +285,51 @@ void play(const std::vector<std::string>& extra = {}) {
   g_replay_active = false;
   if (start_process(a)) status("Melee Unlocked is running.");
 }
+// YouGame on an older release: the game asked to restart in it (bridge thread); the main loop starts
+// it once the game has closed. One start only: the next Play is this version again.
+std::mutex g_yg_restart_mutex;
+std::string g_yg_restart_version, g_yg_restart_mode;
+std::string yougame_older_dir(const std::string& version) { return g_dir + "/Versions/" + version + "-legacy"; }
+std::string yougame_restart_older(const launcher::yougame::Allowed& older, const std::string& mode) {
+  const std::string folder = yougame_older_dir(older.version);
+  const std::string exe = folder + "/melee_source", lib = folder + "/melee_game.so";
+  if (!file_exists(exe) || !file_exists(lib)) {
+    if (host::updater::rollback_state() != host::updater::RollbackState::Downloading)
+      host::updater::install_release(older.version, false, g_dir);
+    return "Getting Melee Unlocked " + older.version + " for YouGame. Try again in a minute.";
+  }
+  // YouGame's own hashes, when it lists them, must be what was installed.
+  if ((!older.exe_sha256.empty() && launcher::yougame::file_sha256(std::wstring(exe.begin(), exe.end())) != older.exe_sha256) ||
+      (!older.game_sha256.empty() && launcher::yougame::file_sha256(std::wstring(lib.begin(), lib.end())) != older.game_sha256))
+    return "Melee Unlocked " + older.version + " in the Versions folder is not the build YouGame uses.";
+  std::lock_guard<std::mutex> lock(g_yg_restart_mutex);
+  g_yg_restart_version = older.version;
+  g_yg_restart_mode = mode;
+  return std::string();
+}
+bool start_yougame_older() {
+  std::string version, mode;
+  {
+    std::lock_guard<std::mutex> lock(g_yg_restart_mutex);
+    if (g_yg_restart_version.empty()) return false;
+    version.swap(g_yg_restart_version); mode.swap(g_yg_restart_mode);
+    g_yg_restart_version.clear(); g_yg_restart_mode.clear();
+  }
+  const std::string folder = yougame_older_dir(version);
+  // That release's own game and Sys; this install's settings, saves, card and replays.
+  std::vector<std::string> a = base_args();
+  a[0] = folder + "/melee_source";
+  for (size_t i = 0; i + 1 < a.size(); ++i)
+    if (a[i] == "--sys-dir") a[i + 1] = folder + "/Sys";
+  a.insert(a.end(), {"--online-mode", mode});
+  g_replay_active = false;
+  g_yg_start_version = version;
+  const bool ok = start_process(a);
+  g_yg_start_version.clear();
+  status(ok ? "Melee Unlocked " + version + " is running for YouGame." : "Melee Unlocked " + version + " could not be started.");
+  return ok;
+}
+
 void open_settings(const std::string& tab = std::string()) {
   if (!file_exists(game_exe())) { status("The game is missing from this folder."); return; }
   std::vector<std::string> a{game_exe(), "--settings-window", "--settings-path", g_dir + "/port-settings.ini"};
@@ -302,7 +379,7 @@ void refresh_replays() {
       if (!fs::is_directory(root, ec)) continue;
       for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end; !ec && it != end; it.increment(ec)) {
         if (it.depth() > 3) { it.disable_recursion_pending(); continue; }
-        if (!it->is_regular_file(ec) || it->path().extension() != ".slp") continue;
+        if (!it->is_regular_file(ec) || (it->path().extension() != ".slp" && it->path().extension() != ".slpz")) continue;
         const auto canon = fs::weakly_canonical(it->path(), ec).string();
         if (seen.insert(canon).second) files.push_back(it->path());
       }
@@ -346,7 +423,7 @@ ReplayStart replay_start(const fs::path& file) {
   std::string sys = g_dir + "/SysPlayback";
   if (!file_exists(sys + "/codehandler.bin")) sys = g_dir + "/Sys";
   a.insert(a.end(), {"--sys-dir", sys, "--replay", file.string()});
-  if (g_replay_as_played && file_exists(file.string() + ".trace")) a.push_back("--as-experienced");
+  if (g_replay_as_played && file_exists(fs::path(file).replace_extension(".trace").string())) a.push_back("--as-experienced");   // Game_X.trace, as the game writes it
   if (!start_process(a)) return ReplayStart::Failed;
   g_replay_active = true;
   status("Watching " + file.filename().string());
@@ -446,6 +523,39 @@ void refresh_mods() {
     }
   }
 }
+// Dolphin's RVZ/WIA images: unpacked once, on a thread, to the full ISO they were made from.
+struct Unpack {
+  std::thread worker;
+  std::atomic<int> percent{0};
+  std::atomic<bool> done{false};
+  bool ok = false, game = false;
+  std::string error;
+  fs::path out;
+};
+std::unique_ptr<Unpack> g_unpack;
+bool g_iso_changed = false;   // the Play page copies g_iso into its text box again
+bool compressed_disc(const std::string& path) { return disc_rvz::detect(fs::path(path)) != disc_rvz::Format::NotCompressed; }
+void start_unpack(const fs::path& src, const fs::path& out, bool game) {
+  if (g_unpack) { status("Already unpacking a disc image."); return; }
+  g_unpack = std::make_unique<Unpack>();
+  g_unpack->out = out; g_unpack->game = game;
+  status("Unpacking " + src.filename().string() + " to a full ISO...");
+  Unpack* u = g_unpack.get();
+  u->worker = std::thread([u, src] {
+    u->ok = disc_rvz::convert(src, u->out, [u](uint64_t done, uint64_t total) {
+      u->percent = total ? (int)(done * 100 / total) : 0; return true; }, &u->error);
+    u->done = true;
+  });
+}
+void refresh_mods();
+void poll_unpack() {
+  if (!g_unpack || !g_unpack->done) return;
+  g_unpack->worker.join();
+  if (!g_unpack->ok) status(g_unpack->error);
+  else if (g_unpack->game) { g_iso = g_unpack->out.string(); g_iso_changed = true; save_ini(); status("Unpacked to " + g_iso); }
+  else { refresh_mods(); status("Unpacked and added " + g_unpack->out.filename().string()); }
+  g_unpack.reset();
+}
 void play_mod(const ModDisc& mod) {
   play({mod.kind == "te" ? "--mod-gci" : "--mod-iso", mod.path.string(), "--card-dir", g_dir + "/User/GC/Mods/" + mod.path.stem().string()});
 }
@@ -468,19 +578,76 @@ void style() {
   c[ImGuiCol_CheckMark] = ImVec4(0.85f, 0.57f, 0.98f, 1);
 }
 
+// YouGame: the account line, Connect (email sign-in, sent only to YouGame) or Disconnect, and Open
+// YouGame (the Melee Unlocked page on the YouGame site, in the browser).
+std::atomic<bool> g_yg_save{false};
+std::atomic<bool> g_yg_busy{false};
+std::mutex g_yg_mutex;
+std::string g_yg_status;
+void yougame_line() {
+#ifdef MELEE_YOUGAME_COMING_SOON
+  ImGui::TextDisabled("YouGame online: coming soon");   // not open yet: nothing to connect
+  return;
+#endif
+  const launcher::yougame::Account a = launcher::yougame::account();
+  const std::string text = a.signed_in ? "YouGame: " + a.name + (a.code.empty() ? "" : " (" + a.code + ")") : "YouGame: not connected";
+  ImGui::TextColored(a.signed_in ? ImVec4(0.75f, 0.8f, 1, 1) : ImVec4(0.6f, 0.62f, 0.7f, 1), "%s", text.c_str());
+  ImGui::SameLine();
+  if (a.signed_in) {
+    if (ImGui::SmallButton("Disconnect##yg")) launcher::yougame::sign_out();
+  } else if (ImGui::SmallButton("Connect##yg")) {
+    ImGui::OpenPopup("Connect YouGame");
+  }
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Open YouGame")) open_path(launcher::yougame::game_page());
+  if (ImGui::BeginPopupModal("Connect YouGame", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    static char email[256], pass[256];
+    ImGui::TextUnformatted("Sign in with your YouGame account. Your password goes only to YouGame.");
+    ImGui::InputText("Email", email, sizeof email);
+    ImGui::InputText("Password", pass, sizeof pass, ImGuiInputTextFlags_Password);
+    { std::lock_guard<std::mutex> lock(g_yg_mutex); if (!g_yg_status.empty()) ImGui::TextWrapped("%s", g_yg_status.c_str()); }
+    ImGui::BeginDisabled(g_yg_busy.load());
+    if (ImGui::Button("Sign in") && email[0] && pass[0]) {
+      g_yg_busy = true;
+      { std::lock_guard<std::mutex> lock(g_yg_mutex); g_yg_status = "Signing in..."; }
+      std::thread([e = std::string(email), p = std::string(pass)] {
+        std::string why;
+        const bool ok = launcher::yougame::sign_in(e, p, &why);
+        std::lock_guard<std::mutex> lock(g_yg_mutex);
+        g_yg_status = ok ? "" : why;
+        g_yg_busy = false;
+      }).detach();
+      std::memset(pass, 0, sizeof pass);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Close") || launcher::yougame::account().signed_in) { std::memset(pass, 0, sizeof pass); ImGui::CloseCurrentPopup(); }
+    // yougame.co in the browser, never the app
+    if (ImGui::SmallButton("Create an account")) open_path(launcher::yougame::signup_page());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Forgot password")) open_path(launcher::yougame::reset_page());
+    ImGui::EndPopup();
+  }
+  if (g_yg_save.exchange(false)) save_ini();
+}
+
 void page_play() {
   ImGui::TextColored(ImVec4(0.85f, 0.7f, 1, 1), "MELEE UNLOCKED %s", MELEE_PORT_VERSION);
   ImGui::Separator();
   ImGui::Text("Melee NTSC 1.02 disc image");
   static char iso[1024] = "";
   static bool init = false;
-  if (!init) { std::snprintf(iso, sizeof iso, "%s", g_iso.c_str()); init = true; }
+  if (!init || g_iso_changed) { std::snprintf(iso, sizeof iso, "%s", g_iso.c_str()); init = true; g_iso_changed = false; }
+  poll_unpack();
+  if (g_unpack) ImGui::Text("Unpacking the disc image: %d%%", g_unpack->percent.load());
   ImGui::SetNextItemWidth(-130);
   if (ImGui::InputText("##iso", iso, sizeof iso)) { g_iso = iso; save_ini(); }
   ImGui::SameLine();
   if (ImGui::Button("Browse...", ImVec2(-1, 0))) {
-    const auto picked = choose_file("Choose your Melee NTSC 1.02 disc image", "Disc images", "*.iso *.gcm *.ISO *.GCM");
-    if (!picked.empty()) { g_iso = picked; std::snprintf(iso, sizeof iso, "%s", g_iso.c_str()); save_ini(); }
+    const auto picked = choose_file("Choose your Melee NTSC 1.02 disc image", "Disc images", "*.iso *.gcm *.rvz *.wia *.ISO *.GCM *.RVZ *.WIA");
+    if (!picked.empty() && compressed_disc(picked))
+      start_unpack(picked, fs::path(g_dir) / "Disc" / fs::path(picked).stem().concat(".iso"), true);
+    else if (!picked.empty()) { g_iso = picked; std::snprintf(iso, sizeof iso, "%s", g_iso.c_str()); save_ini(); }
   }
   std::string why;
   if (!g_iso.empty()) {
@@ -490,6 +657,7 @@ void page_play() {
   bool account = false;
   const auto line = account_line(&account);
   ImGui::TextColored(account ? ImVec4(0.75f, 0.8f, 1, 1) : ImVec4(1, 0.8f, 0.5f, 1), "%s", line.c_str());
+  yougame_line();
   ImGui::Spacing();
   ImGui::BeginDisabled(playing());
   if (ImGui::Button(playing() ? "RUNNING" : "PLAY", ImVec2(260, 64))) play();
@@ -501,6 +669,9 @@ void page_play() {
   ImGui::EndGroup();
   ImGui::Spacing();
   if (ImGui::Checkbox("Save my replays", &g_save_replays)) save_ini();
+  ImGui::SameLine();
+  // .slpz: the same replay 8 to 12 times smaller; the game compresses earlier sessions' replays as it starts.
+  if (ImGui::Checkbox("Keep replays compressed (.slpz)", &g_compress_replays)) save_ini();
   {
     static char folder[1024] = "";
     static bool filled = false;
@@ -563,7 +734,7 @@ void page_replays() {
   if (ImGui::Button("Refresh")) refresh_replays();
   ImGui::SameLine();
   if (ImGui::Button("Open replay...")) {
-    const auto picked = choose_file("Open a replay", "Slippi replays", "*.slp");
+    const auto picked = choose_file("Open a replay", "Slippi replays", "*.slp *.slpz");
     if (!picked.empty()) replay_start(picked);
   }
   ImGui::SameLine();
@@ -634,12 +805,16 @@ void page_replays() {
 }
 
 void page_mods() {
+  poll_unpack();
+  if (g_unpack) ImGui::Text("Unpacking the disc image: %d%%", g_unpack->percent.load());
   ImGui::TextWrapped("Mod discs (.iso) go in Mods/Discs and training mode saves (.gci) in Mods/Saves. Skins, stages and music are chosen in Settings.");
   if (ImGui::Button("Open the Mods folder")) open_path(g_dir + "/Mods");
   ImGui::SameLine();
   if (ImGui::Button("Add a mod...")) {
-    const auto picked = choose_file("Add a mod disc or save", "Mods", "*.iso *.gcm *.gci *.ISO *.GCI");
-    if (!picked.empty()) {
+    const auto picked = choose_file("Add a mod disc or save", "Mods", "*.iso *.gcm *.rvz *.wia *.gci *.ISO *.GCI *.RVZ *.WIA");
+    if (!picked.empty() && compressed_disc(picked)) {
+      start_unpack(picked, fs::path(g_dir) / "Mods" / "Discs" / fs::path(picked).stem().concat(".iso"), false);
+    } else if (!picked.empty()) {
       const fs::path src(picked);
       std::string ext = src.extension().string();
       for (char& c : ext) c = (char)std::tolower((unsigned char)c);
@@ -701,10 +876,48 @@ namespace { void page_online() { page_online_impl(); } }
 #include "launcher_linux_lobby.inl"
 
 int main(int argc, char** argv) {
-  (void)argc; (void)argv;
   g_dir = exe_dir();
   host::g_log = std::fopen((g_dir + "/launcher.log").c_str(), "w");
   load_ini();
+  // Steam Game Mode: open the game directly with the saved ISO, CPU compatibility choice,
+  // controller/card paths and replay preference, without creating a launcher window.
+  if (argc > 1 && std::strcmp(argv[1], "--play") == 0) {
+    std::vector<std::string> extra;
+    for (int i = 2; i < argc; ++i) {
+      if (std::strcmp(argv[i], "--iso") == 0) {
+        if (++i == argc) { std::fprintf(stderr, "--iso requires a disc path\n"); return 2; }
+        g_iso = fs::absolute(fs::u8path(argv[i])).string();
+      } else extra.push_back(argv[i]);
+    }
+    if (!check_ready()) { std::fprintf(stderr, "%s\n", status_text().c_str()); return 2; }
+    auto args = base_args();
+    args.insert(args.end(), extra.begin(), extra.end());
+    std::vector<char*> command;
+    for (auto& arg : args) command.push_back(arg.data());
+    command.push_back(nullptr);
+    if (chdir(g_dir.c_str()) != 0) { std::perror("game folder"); return 1; }
+    // Replacing this process lets Steam track the game and receive its real exit status.
+    execv(command[0], command.data());
+    std::perror("Melee Unlocked could not start");
+    return 1;
+  }
+  // YouGame: the bridge for the game's YouGame rows, up for the whole run. On Linux the release YouGame
+  // is on cannot be fetched beside this one yet: the game says where to get it instead.
+  launcher::yougame::set_on_session_change([] { g_yg_save = true; });
+#ifndef MELEE_YOUGAME_COMING_SOON
+  if (std::string why; !launcher::yougame::start_bridge(&why)) std::fprintf(stderr, "yougame: bridge did not start (%s)\n", why.c_str());
+  launcher::yougame::set_restart_older(yougame_restart_older);
+  // Which builds YouGame allows: when it is on an older release, get that one beside this version
+  // now, so the game's offer to restart in it is ready when a player takes it.
+  std::thread([exe = game_exe(), lib = g_dir + "/melee_game.so"] {
+    launcher::yougame::refresh_allowed(MELEE_PORT_VERSION, std::wstring(exe.begin(), exe.end()), std::wstring(lib.begin(), lib.end()));
+    const launcher::yougame::Allowed older = launcher::yougame::behind();
+    if (older.version.empty()) return;
+    for (int i = 0; i < 60 && host::updater::releases().empty(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    if (!file_exists(yougame_older_dir(older.version) + "/melee_source"))
+      host::updater::install_release(older.version, false, g_dir);
+  }).detach();
+#endif   // MELEE_YOUGAME_COMING_SOON: none of YouGame starts until it opens
   refresh_replays();
   refresh_mods();
   host::updater::check(MELEE_PORT_VERSION);
@@ -774,7 +987,7 @@ int main(int argc, char** argv) {
       } while (SDL_PollEvent(&e));
     }
     // The game has ended: a queue's next replay, a crash report offer.
-    if (g_game_done.exchange(false)) {
+    if (g_game_done.exchange(false) && !start_yougame_older()) {
       const int code = g_game_code.load();
       if (crash_newer_than_launch()) g_crash_offer = "Melee Unlocked stopped with an error. Send the crash report to the developer?";
       if (g_replay_active) {

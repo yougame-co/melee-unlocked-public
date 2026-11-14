@@ -15,6 +15,7 @@ static std::string read(const fs::path& path) {
   return {std::istreambuf_iterator<char>(in), {}};
 }
 int main(int argc, char** argv) {
+  setenv("YOUGAME_AGENT_COPY", "1", 1);  // the AGENT TEST app's flag: agent_test::load ignores the file without it
   CHECK(argc == 2);
   const auto root = fs::u8path(argv[1]);
   fs::remove_all(root);

@@ -104,7 +104,13 @@ static void path_tests(const fs::path& root) {
 #endif
   CHECK(resolve_ancestors(data / "into-build/new/file", ec) == physical / "build/sub/new/file" && !ec);
   CHECK(!outside_build(build, data / "into-build/new/file", ec) && !ec);
+#ifdef _WIN32
+  // Windows collapses ".." by the path text before a link is followed (GetFullPathNameW, and
+  // CreateFileW does the same), so a write to into-build/../file really lands in data/file.
+  CHECK(resolve_ancestors(data / "into-build/../file", ec) == physical / "data/file" && !ec);
+#else
   CHECK(resolve_ancestors(data / "into-build/../file", ec) == physical / "build/file" && !ec);
+#endif
   fs::create_directory_symlink(data, build / "out", ec); CHECK(!ec);
   CHECK(outside_build(build, build / "out/new/file", ec) && !ec);
   fs::create_directory_symlink(build, root / "build-alias", ec); CHECK(!ec);

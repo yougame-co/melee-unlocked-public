@@ -6,6 +6,7 @@
 #include "yougame_console.h"
 #include "yougame_console_card.h"
 #include "yougame_console_io.h"
+#include "yougame_doubles.h"
 #include "yougame_console_notice.h"
 #include <atomic>
 #include <functional>
@@ -246,7 +247,11 @@ class Entry {
   uint16_t lobby_buttons_[4]{};
 };
 inline Entry entry;
+// The Doubles home draws its own box (pc_settings.cpp); this is the Friends pill only.
 inline std::string waiting_status() {
+#ifdef MELEE_DOUBLES
+  if (!doubles::ui.status().empty()) return {};
+#endif
   if (friends::lobby.host()) return {}; // corner line over CSS, never a waiting panel
   const auto status = entry.status();
   // Show the accepted invite immediately, including the safe-scene settling gap.

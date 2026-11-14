@@ -14,7 +14,7 @@ struct Attachment {
 
 // Keep the wire object's location here so the app handoff can change independently.
 template<class Json> bool attachment(const Json& push, Attachment& out) {
-  const auto mirror = push.find("posix");   // {type:"pads", posix:{version:1, fd:N, size:S}} (controller-lead, linux-lead 10-25)
+  const auto mirror = push.find("posix");   // {type:"pads", posix:{version:1, fd:N, size:S}} (10-25)
   if (mirror == push.end() || !mirror->is_object()) return false;
   const auto number = [&](const char* key, uint64_t max, uint64_t& value) {
     const auto n = mirror->find(key);

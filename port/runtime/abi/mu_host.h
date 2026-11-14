@@ -19,8 +19,8 @@
 extern "C" {
 #endif
 
-#define MU_HOST_API_VERSION 28
-#define MU_GAME_API_VERSION 9
+#define MU_HOST_API_VERSION 32
+#define MU_GAME_API_VERSION 10
 #define MU_SLIPPI_RESPONSE_CAPACITY 4096u
 
 /* Values are raw IEEE-754 bits so the two builds can be compared exactly. */
@@ -418,6 +418,20 @@ typedef struct MuHostApi {
     /* Version 28. Frozen console boot choice: nonzero only when the agreed session
      * card contains the host's save. Empty-digest sessions keep fresh-card boot. */
     int32_t (*console_has_save)(void);
+    /* Version 29. Same-process origin continuation/query. No network or native memory transfer.
+     * 0 query canonical boot, 1/2/4 consume mode/scene/body resume flags, 8 skip drawing.
+     * Version 30: 16 queries the Friends CSS lock (never active inside a fight),
+     * 32 admits the canonical Friends boot save loader. */
+    int32_t (*console_origin)(int32_t operation);
+    /* Version 31 (upstream's version 24). Each drawn frame, per player slot 0..3, for the community
+     * codes' overlays: Nana's damage (-1 when the player has no Nana in play) and the player's team
+     * in a teams match (-1 otherwise). Display only. */
+    void (*hud_extras)(int32_t slot, int32_t nana_damage, int32_t team);
+    /* Version 32 (upstream's version 25). Nonzero while the host's ray-traced renderer wants render
+     * semantics: the game then writes the private FIFO tokens 0xF3-0xF6 (mu_rtx_tokens.h) describing
+     * its materials, textures, lights, cameras and particle passes. Display only; zero means not one
+     * byte is written. */
+    int32_t (*native_rtx_semantics)(void);
 } MuHostApi;
 
 /* Start each new sound in the sound frame being mixed now instead of the next one (5 ms sooner):
@@ -454,6 +468,26 @@ typedef struct MuHostApi {
  * it still runs in full (its particles draw random numbers, some only as its model is drawn) and
  * the match is the same; it is only out of sight. Online and in replays too. */
 #define MU_DISPLAY_OPTION_NO_KO_EXPLOSIONS 0x400u
+/* "Hide emblems behind percents": the character emblem behind each damage percent is not drawn. */
+#define MU_DISPLAY_OPTION_NO_HUD_EMBLEMS 0x800u
+/* Community codes (HUD tab), the native versions of the players' favourite Gecko codes. All are
+ * picture or sound only: never in a replay, never sent to an opponent. */
+#define MU_DISPLAY_OPTION_HUD_FADE           0x00001000u   /* HUD Transparency: a player's HUD fades while a fighter is behind it */
+#define MU_DISPLAY_OPTION_ANGEL_STOCK_COLORS 0x00002000u   /* the respawn platform's colour by the stocks left */
+#define MU_DISPLAY_OPTION_NANA_PERCENT       0x00004000u   /* Nana's damage shown under Popo's */
+#define MU_DISPLAY_OPTION_ALLY_INDICATORS    0x00008000u   /* online: YOU over your fighter; teams: a heart over your teammate */
+#define MU_DISPLAY_OPTION_NO_GO_TEXT         0x00010000u   /* no GO! graphic at the start of a match (its sound stays) */
+#define MU_DISPLAY_OPTION_HITBOX_ID_COLORS   0x00020000u   /* shown hitboxes coloured by id: 0 red, 1 green, 2 cyan, 3 purple */
+#define MU_DISPLAY_OPTION_HITBOX_ID_ORDER    0x00040000u   /* shown hitboxes drawn 3 to 0, so id 0 (the highest priority) is on top */
+#define MU_DISPLAY_OPTION_HITBOX_ANGLES      0x00080000u   /* shown hitboxes carry a line along their knockback angle */
+#define MU_DISPLAY_OPTION_HQ_FOD_REFLECTIONS 0x00100000u   /* Fountain of Dreams reflections at full resolution with full models */
+#define MU_DISPLAY_OPTION_VCANCEL_SOUND      0x00200000u   /* the menu's confirm sound on a successful V-cancel */
+#define MU_DISPLAY_OPTION_CODES_ALL 0x003FF000u
+/* Offline community codes: they change menu timing and the pause, so the host sends them only
+ * outside network play (source_host.cpp h_display_options). Saved with the codes above. */
+#define MU_DISPLAY_OPTION_INSTANT_MELEE      0x00400000u   /* Instant Melee: faster stage, stage select and character select loads; pause during the countdown */
+#define MU_DISPLAY_OPTION_FREE_PAUSE_CAMERA  0x00800000u   /* Unrestricted pause camera */
+#define MU_DISPLAY_OPTION_OFFLINE_CODES 0x00C00000u
 
 #define MU_MOD_ASSETS_PRESENT 0x1u
 /* The 20XX Hack Pack's disc files are among the overlays (StageSwapTable.bin, numbered music,
@@ -670,6 +704,8 @@ typedef struct MuGameApi {
      * and changes the few pieces of scene state it needs through these operations (MU_PRACTICE_*).
      * `args` carries inputs and receives outputs; returns 0 on success, -1 for an unknown op. */
     int32_t (*practice)(int32_t op, int32_t* args, int32_t count);
+    /* Version 10: exact MU_CSS_SIZE bytes; returns zero on success, before any body input. */
+    int32_t (*css_state)(int32_t operation, void* bytes, uint32_t size);
 } MuGameApi;
 
 enum {
@@ -693,6 +729,9 @@ enum {
     MU_PRACTICE_FRIENDS_RETURN = 17, /* leave to Online, Friends row highlighted */
     MU_PRACTICE_PAGE_PAUSE = 15,    /* in [0] -1 query, 0 resume, 1 pause; out [0] flag,
                                       [1] live match, [2] scene frame counter */
+    MU_PRACTICE_BOOT_MATCH = 35,    /* agent test: the --match VS game from the main menu, no
+                                      character or stage screens; returns its stage, -1 refused
+                                      (shim/mu_boot_match.c). 32-34 are the CPU bracket's ops. */
 };
 
 /* The library's one export. The host fills `host`, the game fills `game`. */

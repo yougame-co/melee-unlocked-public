@@ -24,6 +24,9 @@ inline const Ghost kGhosts[] = {
 
 // Keep saved indices stable. No habit data or specialist is released.
 inline constexpr bool kReleased[] = {false, false, false, false, false};
+// Costume each entry plays in (0.9.98 practice_menu.cpp): the default for every slot, no player data.
+inline constexpr uint8_t kPreferredCostume[] = {0, 0, 0, 0, 0};
 static_assert(sizeof kReleased / sizeof kReleased[0] == sizeof kGhosts / sizeof kGhosts[0], "one flag per ghost");
+static_assert(sizeof kPreferredCostume / sizeof kPreferredCostume[0] == sizeof kGhosts / sizeof kGhosts[0], "one costume per ghost");
 
 }  // namespace practice_ghosts

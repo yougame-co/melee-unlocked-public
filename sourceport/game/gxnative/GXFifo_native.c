@@ -11,6 +11,10 @@
 #include "gx/__gx.h"
 #include "mu_gxpipe.h"
 
+/* Native builds compile this file instead of GXFifo.c, so its storage check lives here: the game
+ * allocates GXFifoObj and every function below casts it to the private layout. */
+_Static_assert(sizeof(struct __GXFifoObj) <= sizeof(GXFifoObj), "GXFifoObj storage");
+
 static struct __GXFifoObj* CPUFifo;
 static struct __GXFifoObj* GPFifo;
 static OSThread* __GXCurrentThread;

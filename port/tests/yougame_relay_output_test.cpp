@@ -27,10 +27,10 @@ void timing() {
   t.arrival(106, true, 105, true); t.poll(109);
   CHECK(!t.report(30099, line, sizeof line));
   CHECK(t.report(30100, line, sizeof line));
-  CHECK(std::string(line) == "[relay-pads] 30 s: lines=6 hs=5 arrival-hs p50=1.000 p95=2.000 max=2.000 poll-arrival p50=0.500 p95=3.000 max=3.000 neg=1 overwritten=2");
+  CHECK(std::string(line) == "[relay-pads] 30 s: lines=6 hs=5 arrival-hs p50=1.000 p95=2.000 max=2.000 poll-arrival p50=0.500 p95=3.000 max=3.000 neg=1 overwritten=2 initial-age=0.875");
   CHECK(!t.report(30101, line, sizeof line));
   CHECK(t.report(60100, line, sizeof line));
-  CHECK(std::string(line) == "[relay-pads] 30 s: lines=0 hs=0 arrival-hs p50=0.000 p95=0.000 max=0.000 poll-arrival p50=0.000 p95=0.000 max=0.000 neg=0 overwritten=0");
+  CHECK(std::string(line) == "[relay-pads] 30 s: lines=0 hs=0 arrival-hs p50=0.000 p95=0.000 max=0.000 poll-arrival p50=0.000 p95=0.000 max=0.000 neg=0 overwritten=0 initial-age=-1.000");
   t.arrival(60101, false, 0, false);
   CHECK(!t.report(100000, line, sizeof line));
   t.arrival(100001, false, 0, true); t.arrival(100002, false, 0, true); t.poll(100003);
@@ -39,6 +39,7 @@ void timing() {
   CHECK(std::string(line).find("overwritten=1") != std::string::npos);
   // Detaching a full window preserves its output and the live pending arrival.
   Timing live, completed;
+  // The run's first line is the app's replay of the current state: initial-age only.
   live.arrival(100, true, 99, true); live.poll(102);
   live.arrival(110, true, 107, true);
   CHECK(!live.take_report(30099, completed));
@@ -47,18 +48,25 @@ void timing() {
   live.poll(115);  // belongs to the next window even though arrival preceded the swap
   live.arrival(30110, true, 30106, true); live.poll(30111);
   completed.format(line, sizeof line);
-  CHECK(std::string(line) == "[relay-pads] 30 s: lines=2 hs=2 arrival-hs p50=1.000 p95=3.000 max=3.000 poll-arrival p50=2.000 p95=2.000 max=2.000 neg=0 overwritten=0");
+  CHECK(std::string(line) == "[relay-pads] 30 s: lines=2 hs=2 arrival-hs p50=3.000 p95=3.000 max=3.000 poll-arrival p50=0.000 p95=0.000 max=0.000 neg=0 overwritten=0 initial-age=1.000");
   CHECK(live.take_report(60100, completed));  // reuse the previous destination buffers
   completed.format(line, sizeof line);
-  CHECK(std::string(line) == "[relay-pads] 30 s: lines=1 hs=1 arrival-hs p50=4.000 p95=4.000 max=4.000 poll-arrival p50=1.000 p95=5.000 max=5.000 neg=0 overwritten=0");
-  // Exercise the bounded ring at and beyond capacity before swapping and sorting.
+  CHECK(std::string(line) == "[relay-pads] 30 s: lines=1 hs=1 arrival-hs p50=4.000 p95=4.000 max=4.000 poll-arrival p50=1.000 p95=5.000 max=5.000 neg=0 overwritten=0 initial-age=-1.000");
+  // A run whose replay has no pad: the pad connected later is a fresh sample, not the replay.
+  Timing padless;
+  padless.arrival(10, true, 1, false);
+  padless.arrival(20, true, 19, true); padless.poll(21);
+  CHECK(padless.report(30020, line, sizeof line));
+  CHECK(std::string(line) == "[relay-pads] 30 s: lines=1 hs=1 arrival-hs p50=1.000 p95=1.000 max=1.000 poll-arrival p50=1.000 p95=1.000 max=1.000 neg=0 overwritten=0 initial-age=-1.000");
+  // Exercise the bounded ring at and beyond capacity before swapping and sorting. After a detach
+  // the first line with a pad is a fresh sample (the replay is once per run), so every line counts.
   live.reset();
   for (size_t i = 0; i < Timing::capacity + 10; ++i) {
     live.arrival(70000, true, 69998, true); live.poll(70001);
   }
   CHECK(live.take_report(100000, completed));
   completed.format(line, sizeof line);
-  CHECK(std::string(line) == "[relay-pads] 30 s: lines=262154 hs=262154 arrival-hs p50=2.000 p95=2.000 max=2.000 poll-arrival p50=1.000 p95=1.000 max=1.000 neg=0 overwritten=0");
+  CHECK(std::string(line) == "[relay-pads] 30 s: lines=262154 hs=262154 arrival-hs p50=2.000 p95=2.000 max=2.000 poll-arrival p50=1.000 p95=1.000 max=1.000 neg=0 overwritten=0 initial-age=-1.000");
   Frame frame; std::string reason;
   CHECK(parse("yg-pads {\"seq\":0,\"t\":0,\"hs\":123.125,\"pads\":[]}", frame, reason));
   CHECK(frame.has_hs && frame.hs == 123.125);

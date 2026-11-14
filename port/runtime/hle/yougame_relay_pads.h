@@ -80,7 +80,7 @@ inline bool parse(const std::string& line, Frame& out, std::string& reason) {
     if (pad.present) return fail("duplicate slot");
     auto string = [&](const char* key) { const auto i = p.find(key); return i != p.end() && i->is_string(); };
     // The id is the app's opaque per-run handle ("p1", "virtual") and the only pad identity the log shows, so it
-    // stays short and plain; the pad's name never reaches the log (pack-platform).
+    // stays short and plain; the pad's name never reaches the log.
     if (!string("id")) return fail("id must be 1..32 of A-Z a-z 0-9 _ -");
     const auto& id = p["id"].get_ref<const std::string&>();
     if (id.empty() || id.size() > 32 || !std::all_of(id.begin(), id.end(), [](unsigned char c) {
@@ -150,7 +150,7 @@ class State {
       active_ = true; first_local_ = received_ms; first_app_ = next.t;
       emit_locked("pads: relay mode (app): non-adapter pads come from the YouGame app");
     }
-    // Connects and disconnects by the app's opaque id and kind only, never the pad's name (pack-platform).
+    // Connects and disconnects by the app's opaque id and kind only, never the pad's name.
     for (unsigned slot = 0; slot < next.pads.size(); ++slot) {
       const auto& before = latest_.pads[slot];
       const auto& now = next.pads[slot];

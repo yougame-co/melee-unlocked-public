@@ -7,6 +7,7 @@
 #include "yougame_console_notice.h"
 #include "friends_handoff_join.h"
 #include "friends_handoff_transfer.h"
+#include "yougame_css_join.h"
 
 namespace yougame::console {
 using Bytes = std::vector<uint8_t>;
@@ -46,6 +47,7 @@ struct SessionIO {
   std::function<void(const std::string&,const std::string&)> rebound; // validated held-seat identity replacement
   std::function<int()> connection;
   std::function<bool(int)> attach;
+  std::function<bool()> helper_missing = [] { return false; }; // the last attach was refused no_direct
   std::function<int(unsigned)> state;
   std::function<std::string(unsigned)> route;
   std::function<std::vector<uint64_t>(unsigned)> rtt; // consume app path RTT samples
@@ -53,6 +55,16 @@ struct SessionIO {
   std::function<bool()> confirm_start = [] { return true; };
   bool held_reenter = false;
   std::function<bool()> previous_session_active = [] { return false; };
+  std::function<int()> css_scene = [] { return 1; };
+  std::function<void(bool)> css_lock;
+  std::function<void(const std::string&)> css_hold;
+  css_join::Begin css_begin;
+  std::function<void()> css_relaunch;
+  std::function<void()> css_adopted;
+#ifdef MELEE_DOUBLES
+  bool doubles = false;
+  std::function<void(const std::string&)> doubles_home; // authoritative invite profile, before ordinary Friends setup
+#endif
   bool friends_lobby = false; // Human Friends waits in local CSS without a seat deadline/START gate.
   bool handoff_join = false; // Only Friends entry opts in; defaults preserve all other callers.
   handoff_join::Info handoff_info;
@@ -63,6 +75,7 @@ struct SessionIO {
   std::function<bool()> css_ready = [] { return true; };
   std::function<std::string(const std::string&)> freeze_pick;
   std::function<void(const std::string&,bool)> waiting;
+  std::function<void(int)> progress; // percent of the host's state received (Friends handoff guest)
   // Human entry freezes Rooms config, then relaunches; it never boots this running engine.
   std::function<void(const SessionConfig&)> prepared;
   std::function<void(const SessionConfig&)> committed;

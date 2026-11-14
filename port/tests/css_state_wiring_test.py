@@ -1,6 +1,9 @@
 """Pin the CSS diagnostic to the stored decomp patch and the native change-only logger."""
 from pathlib import Path
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -47,6 +50,23 @@ class CssStateWiringTest(unittest.TestCase):
         self.assertLess(emit, save)
         self.assertIn("previous_valid = 0;", self.shim)
         self.assertIn("previous_valid = 1;", self.shim[save:])
+
+    def test_squad_count_field_only_on_the_squad_css(self):
+        self.assertIn('",\\"squad\\":{\\"count\\":%d}", squad', self.shim)
+        self.assertIn("if (squad != previous_squad) previous_valid = 0;", self.shim)
+        cc = shutil.which("cc")
+        if not cc:
+            self.skipTest("needs a C compiler")
+        with tempfile.TemporaryDirectory(prefix="css-state-") as directory:
+            for squad in ([], ["-DMU_SQUAD=1"]):
+                exe = Path(directory) / ("squad" if squad else "plain")
+                subprocess.run([cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-DMU_NATIVE", *squad,
+                                "-I", str(ROOT / "sourceport/game/include"), "-I", str(ROOT / "port/runtime/abi"),
+                                str(ROOT / "port/tests/css_state_test.c"),
+                                str(ROOT / "sourceport/game/shim/mu_css_state.c"), "-o", str(exe)],
+                               check=True, capture_output=True, text=True)
+                out = subprocess.run([str(exe)], check=True, capture_output=True, text=True).stdout
+                self.assertRegex(out, r"css_state: \d+ checks passed")
 
 
 if __name__ == "__main__":

@@ -56,13 +56,13 @@ int main() {
   CHECK(events.toast(101) == "Signing in to YouGame...");
   CHECK(events.toast(6100).empty());
   CHECK(events.push({{"type", "notice"}, {"reason", "version"}}, 10));
-  CHECK(events.toast(11) == kVersion);
+  CHECK(events.toast(11) == kVersionDetail);
   // A chat message is display only: its own line, never an invite, never a join.
   const json message = {{"slug", "melee-unlocked"}, {"type", "notice"}, {"kind", "message"}, {"id", "m1"},
                         {"from", "Ada"}, {"text", std::string(140, 'x')}};
   CHECK(events.push(message, 20));
   CHECK(events.message(21) == "Ada: " + std::string(140, 'x'));
-  CHECK(events.toast(21) == kVersion);  // the version toast stays
+  CHECK(events.toast(21) == kVersionDetail);  // the version toast stays
   CHECK(!events.push(message, 30));     // same id and line: dropped
   CHECK(events.push({{"type", "notice"}, {"kind", "message"}, {"id", "m1"}, {"from", "Ada"}, {"text", "again"}}, 30));
   CHECK(events.message(31) == "Ada: again");  // the page restarted its counter

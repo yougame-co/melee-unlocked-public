@@ -194,7 +194,7 @@ int mu_ranked_setup_finish_game(int connected, MuYgU16 stage)
     /* Slippi scores a conclusive game and ends the set only on its disconnect winner (-3, shown
      * during the game; asm main.asm:617-741). The setup scene checks the link on every frame and
      * ends the set there if it is really gone. 11-01: a post-game read that said "not connected"
-     * abandoned the set after a conclusive game 1, so that read no longer decides; it is logged. */
+     * abandoned a reported set after a conclusive game 1, so that read no longer decides; it is logged. */
     int result = mu_ranked_setup_record_game(set, result_winner, result_end, stage, result_disconnect);
     if (result == MU_SETUP_SET_OVER || result == MU_SETUP_SET_ABORTED) update_result_pending = 1;
     if (result == MU_SETUP_NEXT_GAME || result == MU_SETUP_TIEBREAK || result == MU_SETUP_SET_OVER ||
@@ -218,7 +218,7 @@ int mu_ranked_setup_finish_game(int connected, MuYgU16 stage)
             mu_online_abi_log(line);
         }
         if (result == MU_SETUP_SET_ABORTED) {
-            /* Which of record_game's conditions ended it (11-01: the set died after a conclusive
+            /* Which of record_game's conditions ended it (11-01: a reported set died after a conclusive
              * game 1; only the post-game link read can have said "disconnected"). */
             const MuMatchState* ms = mu_slippi_match_state();
             snprintf(line, sizeof line, "ranked set: abandoned after game %u: disconnect shown %d, "

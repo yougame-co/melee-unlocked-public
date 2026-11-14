@@ -271,6 +271,7 @@ static void source_match_key(const std::filesystem::path& dir) {
 }
 
 int main(int argc, char** argv) {
+  setenv("YOUGAME_AGENT_COPY", "1", 1);  // the AGENT TEST app's flag: agent_test::load ignores the file without it
   CHECK(argc == 2);
   const auto directory = std::filesystem::u8path(argv[1]);
   std::filesystem::create_directories(directory);
@@ -278,6 +279,29 @@ int main(int argc, char** argv) {
     { std::ofstream file(directory / "agent-test.json"); file << object.dump(); CHECK(file.good()); }
     return load(true, directory.u8string().c_str(), engine);
   };
+  for (const auto engine : {Engine::Source, Engine::Static}) {
+    const auto video = parse({{"openSettings", "video"}}, engine);
+    CHECK(video.open_settings_video);
+    CHECK(video.arguments.empty() && video.environment.empty());
+    CHECK(video.log == "agent-test.json applied default keys: openSettings");
+    CHECK(!yougame::agent_paths::session.path.empty());
+    CHECK(open_settings_video.exchange(false));
+    CHECK(!open_settings_video.exchange(false));
+    for (const auto& invalid : {nlohmann::json("Video"), nlohmann::json("audio"), nlohmann::json(""),
+         nlohmann::json(0), nlohmann::json(true), nlohmann::json(nullptr), nlohmann::json::array(), nlohmann::json::object()}) {
+      const auto bad = parse({{"openSettings", invalid}}, engine);
+      CHECK(!bad.open_settings_video && !open_settings_video.load());
+      CHECK(bad.log == "agent-test: openSettings invalid value; ignored");
+    }
+    parse({{"openSettings", "video"}}, engine);
+    CHECK(!load(false, directory.u8string().c_str(), engine).open_settings_video);
+    CHECK(!open_settings_video.load());
+    parse({{"openSettings", "video"}}, engine);
+    CHECK(!parse(nlohmann::json::object(), engine).open_settings_video);
+    CHECK(!open_settings_video.load());
+    CHECK(parse({{"mute", true}, {"openSettings", "video"}}, engine).log ==
+          "agent-test.json applied default keys: mute, openSettings");
+  }
   for (const std::string name : {std::string("ace-0.9_Online.txt"), std::string("a"), std::string(64, 'a'), std::string(".menu")}) {
     { std::ofstream file(directory / name); file << "0 0 0\n"; }
     const auto s = parse({{"script", name}});
@@ -331,9 +355,16 @@ int main(int argc, char** argv) {
     }
   }
   const auto source = parse({{"script", "a"}, {"captureEvery", 30}, {"frames", 600}}, Engine::Source);
+#ifdef __APPLE__
+  // The Mac Source Port captures through its GL renderer.
+  CHECK(source.arguments == (std::vector<std::string>{"--capture", (directory / "agent-captures" / "cap.ppm").u8string(),
+                                                       "--capture-every", "30", "--frames", "600", "--script", (directory / "a").u8string()}));
+  CHECK(source.log.find("not supported") == std::string::npos);
+#else
   CHECK(source.arguments == (std::vector<std::string>{"--frames", "600", "--script", (directory / "a").u8string()}));
-  CHECK(source.agent_script);
   CHECK(source.log.find("agent test: captureEvery not supported on the Source Port; ignored") != std::string::npos);
+#endif
+  CHECK(source.agent_script);
   std::filesystem::create_directories(directory / "fixtures");
   { std::ofstream file(directory / "fixtures" / "ab_vs_source.txt"); file << "0 START\n"; }
   for (const char* name : {"a", "fixtures/ab_vs_source.txt", "fixtures\\ab_vs_source.txt"}) {

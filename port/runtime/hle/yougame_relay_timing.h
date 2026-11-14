@@ -33,7 +33,13 @@ class Timing {
     }
     void clear() { count = 0; maximum = 0; }
   };
+  // The run's first line is the app replaying the pads' current state as the game starts: its hs
+  // is when the helper last sampled a change, often tens of seconds earlier, so its age goes to
+  // initial-age (-1 in a window without one) instead of the latency percentiles. Once per run, with
+  // or without a pad in it: a pad connected later is a fresh sample.
   void arrival(double now, bool has_hs, double hs, bool attached) {
+    const bool replay = !replayed_;
+    replayed_ = true;
     if (!attached) { reset(); return; }
     if (!active_) { active_ = true; start_ = now; }
     if (pending_) ++overwritten_;
@@ -41,9 +47,10 @@ class Timing {
     if (has_hs) {
       ++hs_;
       if (now < hs) ++negative_;
+      else if (replay) initial_age_ = now - hs;
       else arrival_.add(now - hs);
     }
-    pending_ = true; pending_stats_ = has_hs && now >= hs; arrived_ = now;
+    pending_ = true; pending_stats_ = !replay && has_hs && now >= hs; arrived_ = now;
   }
   void poll(double now) {
     if (!pending_) return;
@@ -58,33 +65,34 @@ class Timing {
     std::swap(arrival_, completed.arrival_); std::swap(poll_, completed.poll_);
     completed.lines_ = lines_; completed.hs_ = hs_;
     completed.negative_ = negative_; completed.overwritten_ = overwritten_;
-    start_ = now; lines_ = hs_ = negative_ = overwritten_ = 0;
+    completed.initial_age_ = initial_age_;
+    start_ = now; lines_ = hs_ = negative_ = overwritten_ = 0; initial_age_ = -1;
     arrival_.clear(); poll_.clear();
     return true;
   }
   void format(char* out, size_t size) {
     const double a50 = arrival_.percentile(.50), a95 = arrival_.percentile(.95);
     const double p50 = poll_.percentile(.50), p95 = poll_.percentile(.95);
-    std::snprintf(out, size, "[relay-pads] 30 s: lines=%llu hs=%llu arrival-hs p50=%.3f p95=%.3f max=%.3f poll-arrival p50=%.3f p95=%.3f max=%.3f neg=%llu overwritten=%llu",
+    std::snprintf(out, size, "[relay-pads] 30 s: lines=%llu hs=%llu arrival-hs p50=%.3f p95=%.3f max=%.3f poll-arrival p50=%.3f p95=%.3f max=%.3f neg=%llu overwritten=%llu initial-age=%.3f",
         (unsigned long long)lines_, (unsigned long long)hs_, a50, a95, arrival_.maximum,
-        p50, p95, poll_.maximum, (unsigned long long)negative_, (unsigned long long)overwritten_);
+        p50, p95, poll_.maximum, (unsigned long long)negative_, (unsigned long long)overwritten_, initial_age_);
   }
   bool report(double now, char* out, size_t size) {
     if (!due(now)) return false;
     format(out, size);
-    start_ = now; lines_ = hs_ = negative_ = overwritten_ = 0;
+    start_ = now; lines_ = hs_ = negative_ = overwritten_ = 0; initial_age_ = -1;
     arrival_.clear(); poll_.clear();
     return true;
   }
   void reset() {
     active_ = pending_ = pending_stats_ = false;
-    lines_ = hs_ = negative_ = overwritten_ = 0;
+    lines_ = hs_ = negative_ = overwritten_ = 0; initial_age_ = -1;
     arrival_.clear(); poll_.clear();
   }
  private:
   Samples arrival_, poll_;
-  bool active_ = false, pending_ = false, pending_stats_ = false;
-  double start_ = 0, arrived_ = 0;
+  bool active_ = false, pending_ = false, pending_stats_ = false, replayed_ = false;
+  double start_ = 0, arrived_ = 0, initial_age_ = -1;
   uint64_t lines_ = 0, hs_ = 0, negative_ = 0, overwritten_ = 0;
 };
 } // namespace yougame::relay_pads

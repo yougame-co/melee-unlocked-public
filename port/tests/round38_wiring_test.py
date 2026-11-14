@@ -116,45 +116,51 @@ int main() {
         self.assertIn('i.room_mismatch && i.room_mismatch() ? kMixedBuilds', console)
         self.assertIn('session_notice(error) ? session_notice(error)', body(link, 'friends_entry'))
         self.assertIn('console: room open refused (close %d, %s)', link)
-        self.assertIn('room->lobby_mismatch() ? "lobby_mismatch" : "unclassified"', link)
+        self.assertIn('room->lobby_mismatch() ? "lobby_mismatch" : room->busy() ? "busy" : room->room_full() ? "room_full" : "unclassified"', link)
         self.assertIn('return fail(kMixedBuilds)', console)
         self.assertNotIn('MELEE_SOURCE_PORT', body(link, 'console_io'))
 
     def test_production_room_refusal_log_executes(self):
         link = read('port/runtime/hle/yougame_link.cpp')
-        start = link.index('    if (!room->open_session("",ticket,code,&error,ms,session))')
+        start = link.index('    bool opened = room->open_session("",ticket,code,&error,ms,session);')
         refusal = link[start:link.index('    conn = room->connection();', start)]
         menu.OnlineMenuTest().compile_fixture('round38-room-log', r'''
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>
+#include <chrono>
 #include <string>
+#include <thread>
 static std::string logged;
 namespace host { void log(const char* fmt,...) { char b[200]; va_list a; va_start(a,fmt);
   vsnprintf(b,sizeof b,fmt,a); va_end(a); logged=b; } }
-struct Socket { bool mismatch=false;
-  bool open_session(const char*,const std::string&,const std::string&,std::string*,int,const std::string&) { return false; }
+struct Socket { bool mismatch=false, refused_busy=false, full=false; int opens=0;
+  bool open_session(const char*,const std::string&,const std::string&,std::string*,int,const std::string&) { ++opens; return false; }
   int close_code() const { return 1006; } bool lobby_mismatch() const { return mismatch; }
+  bool busy() const { return refused_busy; } bool room_full() const { return full; }
 } socket;
 bool attempt() { auto* room=&socket; std::string ticket,code,error,session; int ms=100;
 ''' + refusal + r'''
   return true;
 }
 int main() {
-  for (bool mismatch : {false,true}) {
-    socket.mismatch=mismatch; if (attempt()) std::abort();
+  for (bool full : {false,true}) for (bool busy : {false,true}) for (bool mismatch : {false,true}) {
+    socket.mismatch=mismatch; socket.refused_busy=busy; socket.full=full; socket.opens=0; if (attempt()) std::abort();
     const std::string want=std::string("console: room open refused (close 1006, ")+
-        (mismatch?"lobby_mismatch":"unclassified")+")";
+        (mismatch?"lobby_mismatch":busy?"busy":full?"room_full":"unclassified")+")";
     if (logged!=want) std::abort();
+    if (socket.opens!=(busy?2:1)) std::abort(); // a busy refusal is retried exactly once
   }
-  puts("room refusal log: 4 checks passed");
+  puts("room refusal log: 24 checks passed");
 }
 ''')
 
     def test_protocol_key_both_branches_and_comment(self):
         io = body(read('port/runtime/hle/yougame_link.cpp'), 'console_io')
-        self.assertEqual(io.count('+ "-console4";'), 2)
+        self.assertEqual(io.count('+ "-console5";'), 2)
         self.assertIn('console4 adds game-local save choices and rejoin agreement', io)
+        self.assertIn('console5 unlocks every fighter and stage', io)
+        self.assertNotIn('-console4";', io)  # 62 seats must not share a session with these
 
 
 if __name__ == '__main__':

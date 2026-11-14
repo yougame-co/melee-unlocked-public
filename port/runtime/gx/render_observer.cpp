@@ -1,10 +1,12 @@
 // Guest execution remains authoritative. These hooks own host metadata only.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "render_observer.h"
+#include "rtx_semantics.h"
 #include "ppc.h"
 #include "gx_texture.h"
 #include "gx_retro.h"
 #include "authored_pose.h"
+#include "../abi/mu_pose_view.h"
 #include "gx_core.h"   // authored_capture_wanted
 #include <algorithm>
 #include <cmath>
@@ -51,7 +53,8 @@ uint8_t* guest_memory = nullptr;   // the last memory a joint was displayed from
 // Without that, flat colours alone treated a held item as stage art: Peach's turnip drew black.
 bool owners_wanted() {
   const LookLive& l = look_live();
-  return owner_tracking.load(std::memory_order_relaxed) || l.colours.load(std::memory_order_relaxed) != 0 ||
+  // The path tracer tells fighters from the stage by these too (rtx_semantics.h).
+  return owner_tracking.load(std::memory_order_relaxed) || rtx_semantics_enabled() || l.colours.load(std::memory_order_relaxed) != 0 ||
          l.effect_owners.load(std::memory_order_relaxed) || l.fighter.load(std::memory_order_relaxed) != 0 ||
          l.stage.load(std::memory_order_relaxed) != 0 || l.retro.load(std::memory_order_relaxed) ||
          // The Arcade look's 2D camera and background find the fighters by their skinned draws.
@@ -90,9 +93,21 @@ bool camera_quaking(Reader& r) {
 // Camera_8002AF68 adds to the eye and its target. Read only while a quake runs.
 void capture_quake(Reader& r, AuthoredPose& pose) {
   pose.quake = camera_quaking(r);
-  if (!pose.quake) return;
-  const float x = r.real(0x80452C68 + 0x84), y = r.real(0x80452C68 + 0x88);
-  if (std::isfinite(x) && std::isfinite(y)) pose.quake_shift = {x, y};
+  if (pose.quake) {
+    const float x = r.real(0x80452C68 + 0x84), y = r.real(0x80452C68 + 0x88);
+    if (std::isfinite(x) && std::isfinite(y)) pose.quake_shift = {x, y};
+  }
+  // The active CObj retains the camera-only view when ftDrawCommon adds a
+  // fighter's hit/grab shake. A missing camera must not invalidate the pose.
+  Reader camera_reader{current_memory};
+  const uint32_t camera = camera_reader.word(0x804D765C);
+  std::array<float,12> view;
+  float shift[2];
+  if (camera && camera_reader.matrix(camera + 0x54, view) &&
+      mu_pose_view_model_shift(pose.view.data(), view.data(), shift)) {
+    pose.model_shift = pose.quake = true;
+    pose.quake_shift[0] -= shift[0]; pose.quake_shift[1] -= shift[1];
+  }
 }
 
 // HSD_RObj (robj.h): next +0x00, flags +0x04, union u +0x08 (jobj / limit f32 / ik_hint

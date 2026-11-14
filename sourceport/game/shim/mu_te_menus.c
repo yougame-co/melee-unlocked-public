@@ -70,6 +70,13 @@ int mu_te_shield_cycle(int port, int dir)
     return index;
 }
 
+int mu_te_shield_restore(int port, int choice)
+{
+    if (port < 0 || port >= 4 || choice < -1 || choice >= SHIELD_COUNT) return -1;
+    shield_choice[port] = (signed char) choice;
+    return 0;
+}
+
 int mu_te_shield_choice(int port)
 {
     return port >= 0 && port < 4 ? shield_choice[port] : -1;

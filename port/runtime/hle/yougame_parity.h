@@ -1,9 +1,11 @@
 // Host-only YouGame presentation and overlay protocol; no platform or game state.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <cstdint>
+#include <string>
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include <chrono>
 #include <limits>
@@ -12,14 +14,32 @@
 namespace yougame::parity {
 inline constexpr const char* kSettingsHint = "F1: game settings";
 inline constexpr const char* kMenuHint = "Shift+Tab / YouGame menu (D-pad + Start)";
+// 11-01: YouGame hints over the game fade out within 5 s of the game starting, and a friend's
+// new message or invite brings them back for another 5 s. `notice` is the toast text on screen now
+// (empty when none); a different non-empty text is a new notice. UI thread only.
+class CornerHintFade {
+ public:
+  static constexpr double kShown = 4.5, kFade = 0.5;
+  float alpha(const std::string& notice, double now) {
+    if (start_ < 0 || (!notice.empty() && notice != notice_)) start_ = now;
+    notice_ = notice;
+    const double t = now - start_;
+    return t < kShown ? 1.0f : float(std::clamp((kShown + kFade - t) / kFade, 0.0, 1.0));
+  }
+ private:
+  double start_ = -1;
+  std::string notice_;
+};
 #if defined(_WIN32) || defined(__linux__)
-inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\"]}";
+inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\",\"match\",\"fullscreen\"]}";
 #else
-inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\"]}";
+inline constexpr const char* kCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"match\",\"fullscreen\"]}";
 #endif
-inline constexpr const char* kToplevelCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\",\"toplevel\"]}";
+inline constexpr const char* kToplevelCaps = "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\",\"toplevel\",\"match\",\"fullscreen\"]}";
 inline constexpr const char* caps(bool toplevel) { return toplevel ? kToplevelCaps : kCaps; }
 inline constexpr const char* kReady = "yg {\"ready\":true}";
+inline constexpr const char* kMatchOn = "yg {\"match\":1}";
+inline constexpr const char* kMatchOff = "yg {\"match\":0}";
 inline constexpr const char* kDown = "yg {\"overlay\":\"down\"}";
 inline constexpr const char* kUp = "yg {\"overlay\":\"up\"}";
 inline constexpr const char* kCancel = "yg {\"overlay\":\"cancel\"}";
@@ -43,6 +63,18 @@ class Signals {
   void start(bool stdio, Writer writer, bool toplevel = false) {
     if (!stdio || !writer) return;
     std::call_once(caps_, [&] { writer(caps(toplevel)); writer_.store(writer); });
+  }
+  // The match state (cap "match"): sent once right after caps, even when 0, then on every change.
+  // `in` is 1 or 0 from the scene, -1 to resend nothing new. Returns the state written, or -1 when
+  // nothing was (no app, or the app already has it); the caller logs it.
+  int sync_match(int in) {
+    std::lock_guard<std::mutex> lock(match_mutex_);
+    if (in >= 0) match_ = in != 0;
+    auto writer = writer_.load();
+    if (!writer || match_sent_ == int(match_)) return -1;
+    writer(match_ ? kMatchOn : kMatchOff);
+    match_sent_ = match_;
+    return match_sent_;
   }
   void emit(const char* line) const {
     if (line) if (auto writer = writer_.load()) writer(line);
@@ -81,6 +113,9 @@ class Signals {
   std::atomic<Clock::duration::rep> first_present_{kNotPresented};
 #endif
   std::once_flag caps_;
+  std::mutex match_mutex_;
+  bool match_ = false;
+  int match_sent_ = -1;
   std::atomic<Writer> writer_{nullptr};
   std::atomic<bool> ready_{false};
 };

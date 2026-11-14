@@ -95,7 +95,10 @@ class ConsoleWiring(unittest.TestCase):
         self.assertIn('io.background_service = true;', production)
         self.assertIn('link->service(); return link;', link)
         service = body(link, 'service')
-        self.assertIn('pump(0)', service)
+        self.assertIn('prepare_service()', service)
+        self.assertIn('activate_service()', service)
+        self.assertIn('service_enabled_.store(true', body(link.replace('() noexcept', '()'), 'activate_service'))
+        self.assertIn('pump(0)', body(read('port/runtime/hle/yougame_console_link.cpp'), 'prepare_service'))
         for forbidden in ('retrace(', 'advance(', 'poll('):
             self.assertNotIn(forbidden, service)
         engine = read('port/runtime/hle/yougame_console_engine.cpp')
@@ -124,7 +127,7 @@ class ConsoleWiring(unittest.TestCase):
         self.assertIn('open_session("",ticket,code,&error,ms,session)', backend)
 
     def test_handoff_leaves_savestate_exclusions_and_pad_padding_to_each_process(self):
-        # Gate 1 (, 11-02): the only bytes that differed after an equal-frame load were host
+        # Gate 1 (Linux test PC, 11-02): the only bytes that differed after an equal-frame load were host
         # state (sound synth, command queues) and PADStatus padding copied into gmMain_8046B108.
         host = read('port/app/source_host.cpp')
         start = body(host, 'handoff_start')
@@ -135,10 +138,15 @@ class ConsoleWiring(unittest.TestCase):
         self.assertIn('append_sound_driver_exclusions(exclusions);', body(host, 'begin_native_savestates'))
         self.assertIn('memset(&status[i], 0, sizeof status[i]);', body(read('sourceport/game/shim/mu_pad.c'), 'PADRead'))
 
-    def test_main_build_friends_default_keeps_console_handoff(self):
-        self.assertIn('#define YOUGAME_FRIENDS_ROW 1', read('port/runtime/hle/yougame_mode_policy.h'))
+    def test_main_build_friends_default_uses_local_menus(self):
+        policy = read('port/runtime/hle/' + 'yougame_mode_policy.h')
+        self.assertIn('#define YOUGAME_FRIENDS_ROW 1', policy)
+        self.assertIn('constexpr bool friends_shared_menus = false;', policy)
         practice = body(read('port/runtime/hle/native_practice.cpp'), 'tick')
-        self.assertIn('yougame::console::friends_entry(room);', practice)
+        # The console handoff stays compiled behind the policy; Friends joins as known peers.
+        handoff = practice.index('yougame::console::friends_entry(room);')
+        self.assertIn('if (yougame::mode_policy::friends_shared_menus && g_bridge) {', practice[handoff - 120:handoff])
+        self.assertIn('slippi::online::native_start_match(2, {}, 0, 0, &error, room);', practice[handoff:])
         self.assertIn('yougame::friends::events.take_host()', practice)
         events = read('port/runtime/hle/yougame_friends.h')
         self.assertIn('friend_entry_ = visible && selected;', events)
@@ -150,7 +158,7 @@ class ConsoleWiring(unittest.TestCase):
         game = read('sourceport/game/shim/mu_console_pad.c')
         self.assertNotIn('#include "mu_shim.h"', game)
         self.assertNotIn('controller.h', pad)
-        self.assertIn('return mu_host->console_frame_begin && mu_host->console_frame_begin();',
+        self.assertIn('return mu_host->console_frame_begin ? mu_host->console_frame_begin() : 0;',
                       body(pad, 'mu_console_host_frame_begin'))
         hook = body(game, 'mu_console_frame_begin')
         self.assertLess(hook.index('mu_console_host_frame_begin()'), hook.index('mu_console_replace_raw()'))
@@ -240,7 +248,7 @@ class ConsoleWiring(unittest.TestCase):
         self.assertNotIn('MELEE_SOURCE_PORT', body(link, 'console_io'))
         self.assertIn('host_save_reader.store(&source_port::console_host_save', self.host)
         # 30.x seats (console1: no shared save, intro boot) must never share a session with these.
-        self.assertEqual(body(link, 'console_io').count('+ "-console4";'), 2)
+        self.assertEqual(body(link, 'console_io').count('+ "-console5";'), 2)
         self.assertNotIn('-console1"', link)
         self.assertIn('atomic_load(&g_console_host_snapshot)', body(self.host, 'console_host_save'))
         self.assertIn('card_find("SuperSmashBros0110290334")', body(self.host, 'card_refresh_snapshot'))
@@ -261,7 +269,7 @@ class ConsoleWiring(unittest.TestCase):
         self.assertIn('console: menu stalls ', advance)
         draw = body(read('port/runtime/gx/replay_bar.cpp').split('namespace screen_label {')[1], 'draw')
         self.assertIn('console_menu_visible()', draw)
-        self.assertIn('picture_height*0.027f', draw)
+        self.assertIn('menu_notice(width,height,game_aspect,size)', draw)
         self.assertIn('g_overlay_game_aspect);', read('port/runtime/gx/pc_settings.cpp'))
         self.assertIn('IM_COL32(255,239,170', draw)
 
@@ -270,6 +278,8 @@ class ConsoleWiring(unittest.TestCase):
                      'h_audio_options', 'h_display_options', 'h_mod_flags', 'h_match_override',
                      'h_rng_seed_override', 'h_online_test_match'):
             self.assertIn('if (yougame::console::console_active())', body(self.host, name))
+        self.assertIn('if (yougame::console::console_active()) return 0;',
+                      body(self.host, 'h_game_options3'))  # full roster, never the card's
         self.assertIn('if (yougame::console::console_active()) return;',
                       body(read('port/runtime/hle/native_practice.cpp'), 'tick'))
         bridge = body(self.host, 'console_practice_bridge')
@@ -503,10 +513,62 @@ float mu_screen_shake_scale(void)
 _Static_assert(MU_DISPLAY_NO_KO_EXPLOSIONS == MU_DISPLAY_OPTION_NO_KO_EXPLOSIONS, "display option bits");
 
 """
+        # v0.9.96 adds the hide-emblems-behind-percents reader the same way.
+        emblems = """int mu_hud_emblems_hidden(void)
+{
+    return (mu_display_options() & MU_DISPLAY_NO_HUD_EMBLEMS) != 0;
+}
+_Static_assert(MU_DISPLAY_NO_HUD_EMBLEMS == MU_DISPLAY_OPTION_NO_HUD_EMBLEMS, "display option bits");
+
+"""
+        # v0.9.97 adds the community codes' bit checks after it and numbers the page-pause op; reverse both.
+        codes = """/* The community codes (shim/mu_code_features.c). */
+_Static_assert(MU_DISPLAY_HUD_FADE == MU_DISPLAY_OPTION_HUD_FADE, "display option bits");
+_Static_assert(MU_DISPLAY_ANGEL_STOCK_COLORS == MU_DISPLAY_OPTION_ANGEL_STOCK_COLORS, "display option bits");
+_Static_assert(MU_DISPLAY_NANA_PERCENT == MU_DISPLAY_OPTION_NANA_PERCENT, "display option bits");
+_Static_assert(MU_DISPLAY_ALLY_INDICATORS == MU_DISPLAY_OPTION_ALLY_INDICATORS, "display option bits");
+_Static_assert(MU_DISPLAY_NO_GO_TEXT == MU_DISPLAY_OPTION_NO_GO_TEXT, "display option bits");
+_Static_assert(MU_DISPLAY_HITBOX_ID_COLORS == MU_DISPLAY_OPTION_HITBOX_ID_COLORS, "display option bits");
+_Static_assert(MU_DISPLAY_HITBOX_ID_ORDER == MU_DISPLAY_OPTION_HITBOX_ID_ORDER, "display option bits");
+_Static_assert(MU_DISPLAY_HITBOX_ANGLES == MU_DISPLAY_OPTION_HITBOX_ANGLES, "display option bits");
+_Static_assert(MU_DISPLAY_HQ_FOD_REFLECTIONS == MU_DISPLAY_OPTION_HQ_FOD_REFLECTIONS, "display option bits");
+_Static_assert(MU_DISPLAY_VCANCEL_SOUND == MU_DISPLAY_OPTION_VCANCEL_SOUND, "display option bits");
+_Static_assert(MU_DISPLAY_CODES_ALL == MU_DISPLAY_OPTION_CODES_ALL, "display option bits");
+"""
+        page_pause = ' && MU_PRACTICE_PAGE_PAUSE == 15'
         entry = read(path)
+        self.assertEqual(entry.count(codes), 1)
+        self.assertEqual(entry.count(page_pause), 1)
+        entry = entry.replace(codes, '').replace(page_pause, '')
         self.assertEqual(entry.count(shake), 1)
         self.assertEqual(entry.count(ko), 1)
-        self.assertEqual(entry.replace(shake, '').replace(ko, '').replace('103 * sizeof(uint32_t)',
+        self.assertEqual(entry.count(emblems), 1)
+        self.assertEqual(entry.count('MU_PRACTICE_BOOT_MATCH == 35,'), 1)   # build 51 bootMatch op
+        # Upstream 0.9.98: the pose copy sent to the host is stepped for the view (render only).
+        pose_step = ('void mu_native_pose_step_view(MuNativePoseSnapshot* snapshot);\n', '')
+        pose_send = ('    if (mu_host != NULL && mu_host->native_pose_snapshot != NULL) {\n'
+                     '        MuNativePoseSnapshot stepped = *snapshot;\n'
+                     '        mu_native_pose_step_view(&stepped);\n'
+                     '        mu_host->native_pose_snapshot(&stepped);\n'
+                     '    }\n',
+                     '    if (mu_host != NULL && mu_host->native_pose_snapshot != NULL)\n'
+                     '        mu_host->native_pose_snapshot(snapshot);\n')
+        # Upstream 0.9.104: the ray-traced renderer's render-semantics query (host API 32 here, its 25).
+        rtx = ('''/* Render semantics for the host's ray-traced renderer (tokens 0xF3-0xF6, mu_rtx_tokens.h): the HSD
+ * hooks in tobj.c, dobj.c, lobj.c, cobj.c and eflib.c write them only while this is nonzero. */
+int mu_native_rtx_semantics(void)
+{
+    return mu_host && mu_host->version >= 32 && mu_host->native_rtx_semantics
+               ? mu_host->native_rtx_semantics() != 0
+               : 0;
+}
+
+''', '')
+        for old, new in (pose_step, pose_send, rtx):
+            self.assertEqual(entry.count(old), 1)
+            entry = entry.replace(old, new)
+        self.assertEqual(entry.replace('    extern int mu_css_transfer(int, void*, unsigned);\n    game->css_state = mu_css_transfer;\n', '').replace(shake, '').replace(ko, '').replace(emblems, '').replace(
+                         ' &&\n               MU_PRACTICE_BOOT_MATCH == 35,', ',').replace('103 * sizeof(uint32_t)',
                          '80 * sizeof(uint32_t)'), baseline(path))
         path = 'port/runtime/abi/mu_host.h'
         old = re.search(r'typedef struct MuStatePod \{(.*?)\} MuStatePod;', baseline(path), re.S)[1]
@@ -526,6 +588,16 @@ _Static_assert(MU_DISPLAY_NO_KO_EXPLOSIONS == MU_DISPLAY_OPTION_NO_KO_EXPLOSIONS
         tourney = "\n#ifndef MU_NO_SLIPPI\n        && !mu_tourney_playing()\n#endif\n    "
         self.assertEqual(new.count(tourney), 1)
         new = new.replace(tourney, "")
+        # Optional Squad Strike hashes fighter kind only while a squad match is live; with
+        # MELEE_SQUAD_STRIKE off the guarded line is compiled out and the checksum is unchanged.
+        squad = ("#if MU_SQUAD\n            /* Based on Squad Strike by Chris (x9x9x9x9x9), "
+                 "https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's "
+                 "permission (11-03-2026) */\n            if (gmSquad_Live()) acc ^= (u32) fp->kind;\n"
+                 "#endif\n")
+        self.assertEqual(new.count(squad), 1)
+        new = new.replace(squad, "")
+        from squad_wiring_test import without_squad
+        new = without_squad(new)  # online setup restoration is also optional
         # Round A's explicit console branches are already independently pinned above; these
         # pin the untouched Slippi routines, including extracted predictor helpers.
         names = (
@@ -575,7 +647,9 @@ _Static_assert(MU_DISPLAY_NO_KO_EXPLOSIONS == MU_DISPLAY_OPTION_NO_KO_EXPLOSIONS
         def controller(text):
             start = text.index('diff --git a/src/sysdolphin/baselib/controller.c ')
             end = text.index('\ndiff --git ', start + 1)
-            return re.sub(r'^@@[^\n]*\n', '', text[start:end], flags=re.M)
+            # Hunk headers and the index line are presentation: build 56's regenerated patch names the
+            # true post-image blob where 55's still carried upstream's.
+            return re.sub(r'^(?:@@|index )[^\n]*\n', '', text[start:end], flags=re.M)
         now = controller(read(path))
         added = ('+#ifdef MU_NATIVE\n'
                  '+    /* Console rollback steps scripts once per body, after its checkpoint, never on alarms. */\n'
@@ -586,8 +660,15 @@ _Static_assert(MU_DISPLAY_NO_KO_EXPLOSIONS == MU_DISPLAY_OPTION_NO_KO_EXPLOSIONS
     def test_patch_hunk_counts(self):
         patch = read('sourceport/patches/melee-native.patch')
         hunks = list(re.finditer(r'^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[^\n]*\n', patch, re.M))
-        # Build 28 plus upstream v0.9.87 has 10067 hunks.
-        self.assertEqual(len(hunks), 10067)
+        # Build 28 + v0.9.87: 10067; Phase B adds 6; Build 49.1 GX layouts add 2.
+        # Optional Squad Strike adds 11 guarded hook hunks.
+        # Build 53: upstream v0.9.97's community codes add 4 (V-cancel sound 1, full FoD reflections 3).
+        # Build 56: upstream v0.9.99 adds 6 (stage skins in mnstagesw 4, Training fixes in gmtrainingmode 2).
+        # Build 57: upstream v0.9.101 adds 3 net (lbcollision +3, itfreeze +1, hsd_3A76 -1).
+        # Build 58: upstream v0.9.102 adds 1 (grizumi, the live Fountain of Dreams scenery).
+        # Build 65: upstream v0.9.104 adds 9 (render semantics in cobj/dobj/lobj/tobj 6, Kirby hats in ftparts 2, gm_1601 1).
+        # The 4-player Friends select adds 2 (the host-only Rules and Teams guards in mncharsel).
+        self.assertEqual(len(hunks), 10113)  # build 97: v0.9.117's itzako hunk (95: gricemt)
         for i, h in enumerate(hunks):
             after = patch[h.end():hunks[i + 1].start() if i + 1 < len(hunks) else len(patch)]
             after = after.split('diff --git ')[0]

@@ -5,6 +5,12 @@
 #include <cstring>
 #include <vector>
 #include "../abi/mu_ranked_wire.h"
+#include "../abi/mu_pick_preview.h"
+#include "../abi/mu_lobby_wire.h"
+#if MU_SQUAD
+// Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+#include "../abi/mu_squad_wire.h"
+#endif
 
 namespace slippi::online {
 
@@ -23,6 +29,9 @@ enum Cmd : uint8_t {
   CMD_YOUGAME_DATA = MU_YG_COMMAND,
   CMD_YOUGAME_FRIENDS_MENU = 0xE6,
   CMD_YOUGAME_SLIPPI_LINK = 0xE7, // 0 CSS query, 1 Y; 2 menu refusal query, 3 Y; 4 leave
+  // Upstream's online-menu query (Melee Unlocked 1.0 numbers it 0xE7, taken above by the Slippi
+  // link): the launcher's split rows and Coming soon (slippi_online.cpp, shim/mu_slippi_menu.c).
+  CMD_YOUGAME_MENU = 0xEF,
 };
 
 // Results of a native command call, mirrored by the host ABI comment in mu_host.h.
@@ -39,11 +48,39 @@ inline uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint3
 
 // Fixed EXI payload sizes. Unknown commands pass here; the dispatcher reports them itself.
 inline bool command_payload_valid(uint8_t cmd, const uint8_t* payload, uint32_t payload_len) {
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  if (cmd == MU_SQUAD_COMMAND) {
+    if (!payload || !payload_len) return false;
+    switch (payload[0]) {
+      case 0: return payload_len == 2 && payload[1] <= 1; // chosen row
+      // Count zero is a bounded invalidation transaction: the handler clears the
+      // previous lineup and rejects lock-in. Do not filter it out before dispatch.
+      case 1: return payload_len >= 2 && payload[1] <= MU_SQUAD_LINEUP &&
+                     payload_len == 2u + 2u * payload[1]; // own lineup / clear
+      case 2: return payload_len == 9; // begin budget digest, two u32 BE budgets
+      case 3: return payload_len >= 10 && payload_len <= 137; // file fact
+      case MU_SQUAD_OP_LOBBY_MODE: case 4: case 5: return payload_len == 1; // finish digest / read setup
+      case MU_SQUAD_OP_FRIEND: return payload_len == 2 && payload[1] <= MU_SQUAD_FRIEND_INTENT;
+      case MU_SQUAD_OP_CONSOLE: // off / arm, or a costume fact laid out as op 3's
+        return (payload_len == 2 && payload[1] <= MU_SQUAD_CONSOLE_ARM) ||
+               (payload_len >= 11 && payload_len <= 138 && payload[1] == MU_SQUAD_CONSOLE_FACT);
+      default: return false;
+    }
+  }
+#endif
+  // Live pick previews: {send, wire} every character-screen frame, or {read}.
+  if (cmd == MU_PICK_PREVIEW_COMMAND)
+    return payload && ((payload_len == 1u + MU_PICK_PREVIEW_WIRE && payload[0] == MU_PICK_PREVIEW_OP_SEND) ||
+                       (payload_len == 1 && payload[0] == MU_PICK_PREVIEW_OP_READ));
+  // The 4-door Friends lobby select (mu_lobby_wire.h): exact sizes, every field in range.
+  if (cmd == MU_LOBBY_COMMAND) return mu_lobby_request_ok(payload, payload_len) != 0;
+  // Reason byte: 1 the CSS's hold-Z, 2 the Friends lobby's match is over and its select is back (the room stays).
   if (cmd == CMD_CLEANUP_CONNECTION)
-    return payload_len == 0 || (payload_len == 1 && payload && payload[0] == 1);
+    return payload_len == 0 || (payload_len == 1 && payload && (payload[0] == 1 || payload[0] == 2));
   uint32_t expected = 0;
   switch (cmd) {
-    case CMD_ONLINE_INPUTS: expected = 25; break;
+    case CMD_ONLINE_INPUTS: return payload && (payload_len == 25 || payload_len == 33); // native local partner appends eight pad bytes
     case CMD_CAPTURE_SAVESTATE: case CMD_LOAD_SAVESTATE: expected = 32; break;
     case CMD_FIND_OPPONENT: expected = 19; break;
     case CMD_SET_MATCH_SELECTIONS: expected = 9; break;
@@ -66,6 +103,8 @@ inline bool command_payload_valid(uint8_t cmd, const uint8_t* payload, uint32_t 
     case CMD_GET_PLAYER_SETTINGS: case CMD_GET_DELAY: case CMD_GET_RANK:
     case CMD_FETCH_RANK: case CMD_GET_RANK_VISIBILITY: case CMD_YOUGAME_RANKED:
     expected = 0; break;
+    // The online menu's upstream query; one byte when the menu reports its pick (slippi_online.cpp).
+    case CMD_YOUGAME_MENU: return payload_len == 0 || (payload_len == 1 && payload);
     default: return true;
   }
   if (payload_len != expected || (expected && !payload)) return false;
@@ -93,7 +132,19 @@ int32_t native_command(uint8_t command, const uint8_t* payload, uint32_t payload
     return NATIVE_COMMAND_NEEDS_NATIVE_ROLLBACK;
   if (!response || response_capacity < minimum_capacity || (payload_size && !payload))
     return NATIVE_COMMAND_BOUNDS;
-  if (!command_payload_valid(command, payload, payload_size)) return NATIVE_COMMAND_BOUNDS;
+  if (!command_payload_valid(command, payload, payload_size)) {
+#if MU_SQUAD
+    // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+    // A malformed selection must invalidate match 1 too. Dispatch only the
+    // canonical bounded clear, never the rejected bytes, then retain the error.
+    if (command == MU_SQUAD_COMMAND && payload_size && payload[0] == 1) {
+      const uint8_t clear[] = {1, 0};
+      std::vector<uint8_t> ignored;
+      handle(command, clear, sizeof clear, ignored);
+    }
+#endif
+    return NATIVE_COMMAND_BOUNDS;
+  }
   std::vector<uint8_t> reply;
   if (!handle(command, payload, payload_size, reply)) return NATIVE_COMMAND_UNKNOWN;
   if (reply.size() > response_capacity) return NATIVE_COMMAND_BOUNDS;

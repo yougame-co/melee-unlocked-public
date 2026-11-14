@@ -12,6 +12,7 @@ the user supplies their own Melee NTSC 1.02 ISO. Usage:
 """
 import argparse
 import hashlib
+import json
 import re
 import shutil
 import struct
@@ -67,14 +68,19 @@ Game Builds
 -----------
 The launcher's Build tab picks the Game Build: the Source Port (the game built from source) or the
 Static Recomp (the original game code translated ahead of time; mod discs such as Akaneia run on
-it). A compatibility build for older processors is included. Optional experimental DLSS 5 uses
+it). The launcher downloads the matching compatibility build for older processors when needed.
+For manual installs, extract MeleeUnlocked-{version}-compat-win64.zip into this folder.
+Intel XeSS and AMD FSR are optional downloads from Settings > Video. Optional experimental DLSS 5 uses
 NVIDIA's separate model, which is not included in this archive.
 
-Pro ghosts (Source Port)
+Fight a pro (Source Port)
 ------------------------
-In Training, open the Practice menu (Start + D-pad Up + Z) and choose Fight a pro: Mang0, Zain,
-Cody Schwab or aMSa. The CPU becomes that player's character and plays the way that player does,
-learned from their own games. It runs on your PC, works offline and is never used online.
+In Training, open the Practice menu (Start + D-pad Up + Z) and choose Zain, Cody Schwab or aMSa.
+The CPU becomes their Marth, Fox or Yoshi, played by Phillip's AI from players' games and self-play.
+The three included policies work immediately. Lighter matchup policies download automatically.
+Stronger Pro AI (Requires additional download) asks before downloading the larger policies;
+Fight a pro lets you change Ask, Always or Never and download them later. They play on PCs that
+pass the speed check. Pro AI runs locally and is never used online.
 
 Controllers: a GameCube adapter (WUP-028, official or Mayflash in Wii U mode) is used
 automatically if it has the WinUSB driver that Slippi installs. Close Slippi Dolphin first.
@@ -135,7 +141,7 @@ License and source code
 Melee Unlocked is free software under the GNU General Public License, version 3 or (at your
 option) any later version: licenses\\COPYING.txt, with the notices in licenses\\NOTICE.txt.
 Source code for this version: https://github.com/hero88go/melee-unlocked/tree/v{version}
-The NVIDIA (DLSS, Streamline, Reflex) and Intel (XeSS) runtime files and the Microsoft Visual C++
+The NVIDIA (DLSS, Streamline, Reflex), Intel (XeSS) and AMD (FSR) runtime files and the Microsoft Visual C++
 runtime files in this folder are not covered by the GPL; their own terms are in licenses\\.
 ASIO is a registered trademark of Steinberg Media Technologies GmbH. The SDK and host-helper
 license texts are licenses\\steinberg-asio-sdk.txt and licenses\\steinberg-asio-bsd.txt.
@@ -223,6 +229,21 @@ def imgui_font_notice():
     return "\n".join(lines) + "\n" + mit[grant.start():]
 
 
+def ship_vulkan_cache(source, target):
+    recipes = source / "vk_recipes.bin"
+    if not recipes.is_file():
+        print(f"vulkan cache: none at {source} (first Vulkan sessions compile their shaders)")
+        return 0
+    target.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for spv in sorted(source.glob("*.spv")):
+        shutil.copy2(spv, target / spv.name)
+        count += 1
+    shutil.copy2(recipes, target / "vk_recipes.shipped.bin")
+    print(f"vulkan cache: {count} SPIR-V files and {recipes.stat().st_size} bytes of recipes from {source}")
+    return count
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--version", default=(ROOT / "VERSION").read_text().strip())
@@ -258,9 +279,16 @@ def main():
                     help="the pro AI network (ghost_ai.bin); default: beside --source-exe")
     ap.add_argument("--ghost-ai-dir", type=Path, default=None,
                     help="directory containing the released player-specific models ghost_ai_{mang0,zain,cody,amsa}.bin")
+    ap.add_argument("--pro-ai-dir", type=Path,
+                    default=None,   # opt-in: third-party models and onnxruntime ship only when asked for
+                    help="Fight a pro: a ProAI folder from tools/ghost_ai/phillip_catalog.py (catalog.json + "
+                         "Phillip's .onnx policies); onnxruntime.dll comes from beside --source-exe")
     ap.add_argument("--no-ghost-ai", action="store_true",
                     help="ship no pro AI files (Fight a pro not in this release)")
     ap.add_argument("--out", type=Path, default=ROOT / "release")
+    ap.add_argument("--rtx-pack", type=Path, default=None,
+                    help="MeleeUnlocked-<version>-RTX-Pack.zip, built outside this repository: its SHA-256 goes in "
+                         "rtxpack.sha256 so PC settings offers it (host/updater.cpp rtx_pack_download)")
     args = ap.parse_args()
     if not args.compat_exe and not args.skip_compat_exe:
         raise SystemExit("missing --compat-exe (the SSE2 build for pre-Haswell/pre-Ryzen CPUs). "
@@ -348,8 +376,34 @@ def main():
             if compat_dbg.is_file():
                 shutil.copy2(compat_dbg, folder / "melee_game_compat.dbg")
             print(f"Source Port compatibility build: {args.source_compat_exe}")
-        # Fight a pro: the network the practice CPU plays with (port/runtime/hle/ghost_ai.cpp).
-        if args.ghost_ai_dir:
+        # Fight a pro: Phillip's published policies (port/runtime/hle/phillip_ai.cpp) or, before 1.0,
+        # the networks trained here (port/runtime/hle/ghost_ai.cpp).
+        if args.pro_ai_dir:
+            catalog_path = args.pro_ai_dir / "catalog.json"
+            if not catalog_path.is_file():
+                raise SystemExit(f"missing Fight a pro catalog: {catalog_path}")
+            catalog = json.loads(catalog_path.read_text())
+            if catalog.get("version") != 1 or not catalog.get("models"):
+                raise SystemExit(f"{catalog_path}: no policies")
+            out_dir = folder / "ProAI"
+            out_dir.mkdir()
+            # Each pro's imitation policy ships; matchup policies download in game on first use.
+            for model in catalog["models"]:
+                source = args.pro_ai_dir / model["file"]
+                if not source.is_file():
+                    if model["kind"] == "imitation" or not model.get("source"):   # ours have nowhere to download from
+                        raise SystemExit(f"missing Fight a pro policy: {source}")
+                    continue
+                if hashlib.sha256(source.read_bytes()).hexdigest() != model["sha256"]:
+                    raise SystemExit(f"Fight a pro policy changed: {source}")
+                shutil.copy2(source, out_dir / source.name)
+            shutil.copy2(catalog_path, out_dir / "catalog.json")
+            ort = args.source_exe.parent / "onnxruntime.dll"
+            if not ort.is_file():
+                raise SystemExit(f"missing {ort} (tools/fetch_onnxruntime.py, then rebuild melee_source)")
+            shutil.copy2(ort, folder / "onnxruntime.dll")
+            print(f"source port pro AI: {len(catalog['models'])} Phillip policies")
+        elif args.ghost_ai_dir:
             specialists = ("mang0", "zain", "cody", "amsa")
             for pro in specialists:
                 source = args.ghost_ai_dir / f"ghost_ai_{pro}.bin"
@@ -393,8 +447,22 @@ def main():
     if missing_dlls:
         raise SystemExit(f"missing runtime DLLs: {', '.join(missing_dlls)}")
     for dll in runtime_dlls:
+        if dll == "libxess.dll":
+            continue   # its own download (below)
         src = args.exe.parent / dll
         shutil.copy2(src, folder / dll)
+    # Intel XeSS is its own download since 0.9.98 (78 MB unpacked, for the players who pick it):
+    # MeleeUnlocked-XeSS.zip, fetched from PC settings > Video (host/updater.cpp xess_download, which
+    # checks the file against this exact build).
+    xess = args.exe.parent / "libxess.dll"
+    if hashlib.sha256(xess.read_bytes()).hexdigest() != "251659dd84a3e84de67c886a4186e01f3eca49b00641906fe38bb6b807e5d5b7":
+        raise SystemExit(f"{xess} is not the XeSS build the game checks for (host/updater.cpp kXessSha256)")
+    args.out.mkdir(parents=True, exist_ok=True)
+    xess_zip = args.out / "MeleeUnlocked-XeSS.zip"
+    with zipfile.ZipFile(xess_zip, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(xess, "libxess.dll")
+        z.write(ROOT / "port/third_party/xess/LICENSE.txt", "intel-xess.txt")
+    print(f"{xess_zip} ({xess_zip.stat().st_size / 1e6:.1f} MB)")
     # NVIDIA's signed DLSS 5 model (RTX Remix 1.6 SDK, NVIDIA RTX SDKs license, redistributable
     # inside an application). Beside the exe is where NVIDIA's runtime loads it from. The DLSS5
     # folder is for a player's own build for other cards; an update ships only its readme.
@@ -452,6 +520,11 @@ def main():
         (folder / "shadercache").mkdir()
         shutil.copy2(recipes, folder / "shadercache/recipes.bin")
         print(f"pipeline recipes: {recipes} ({recipes.stat().st_size} bytes)")
+    # Vulkan: the warmed SPIR-V and its pipeline recipes, from a run on Vulkan with this build
+    # (gx_vulkan.cpp prewarm_pipelines). SPIR-V is the same on every GPU and driver; pipelines.bin is
+    # the driver's own and stays out. The recipes ship as vk_recipes.shipped.bin so extracting an
+    # update never overwrites the player's own vk_recipes.bin.
+    ship_vulkan_cache(ROOT / "shadercache/vulkan-v1", folder / "shadercache/vulkan-v1")
     # The CRT shader presets, so the shader option has something to pick without a second download.
     shaders = ROOT / "port/third_party/slang-shaders"
     if not (shaders / "crt").is_dir():
@@ -496,6 +569,7 @@ def main():
                      (ROOT / "port/third_party/ngx/LICENSE.txt", "nvidia-rtx-sdks.txt"),
                      (ROOT / "docs/licenses/nvidia-dlss-third-party.txt", "nvidia-dlss-third-party.txt"),
                      (ROOT / "port/third_party/xess/LICENSE.txt", "intel-xess.txt"),
+                     (ROOT / "port/third_party/fsr/LICENSE.md", "amd-fsr.md"),
                      (ROOT / "port/third_party/librashader/LICENSE.md", "librashader-MPL-2.0.md"),
                      (ROOT / "port/third_party/dxc/LICENSE-LLVM.txt", "directx-shader-compiler-LLVM.txt"),
                      (ROOT / "port/third_party/dxc/LICENSE-MS.txt", "directx-shader-compiler-dxil-Microsoft.txt"),
@@ -505,6 +579,9 @@ def main():
                      (ROOT / "port/third_party/imgui/LICENSE.txt", "imgui.txt"),
                      (ROOT / "port/third_party/libusb/COPYING", "libusb-LGPL-2.1.txt"),
                      (ROOT / "port/third_party/stb/LICENSE", "stb.txt"),
+                     (ROOT / "port/third_party/zstd/LICENSE", "zstd.txt"),
+                     (ROOT / "port/third_party/bzip2/LICENSE", "bzip2.txt"),
+                     (ROOT / "port/third_party/lzma/lzma-sdk.txt", "lzma-sdk.txt"),
                      (ROOT / "port/third_party/earcut/LICENSE", "earcut.txt"),
                      (ROOT / "port/third_party/asio/LICENSE.txt", "steinberg-asio-sdk.txt"),
                      (ROOT / "port/third_party/asio/NOTICE-BSD.txt", "steinberg-asio-bsd.txt"),
@@ -513,6 +590,9 @@ def main():
                      (ROOT / "docs/licenses/dsp-coefficients.txt", "dsp-coefficients.txt"),
                      (ROOT / "docs/licenses/hps_decode-MIT.txt", "hps_decode.txt"),
                      (ROOT / "docs/licenses/slippilab-MIT.txt", "slippilab.txt"),
+                     (ROOT / "docs/licenses/slippi-ai-MIT.txt", "phillip-slippi-ai-MIT.txt"),
+                     (ROOT / "port/third_party/onnxruntime/LICENSE", "onnxruntime.txt"),
+                     (ROOT / "port/third_party/onnxruntime/ThirdPartyNotices.txt", "onnxruntime-third-party.txt"),
                      (ROOT / "port/runtime/gx/ui_sources/gd_melee/assets/kit/SourceSans3-OFL.md",
                       "source-sans-3-OFL.md")):
         if not src.is_file():
@@ -543,6 +623,32 @@ def main():
     shutil.copy2(ROOT / "docs/third-party-training-mode-ce.txt", licenses / "training-mode-ce.txt")
     shutil.copy2(ROOT / "docs/training-mods.md", folder / "TrainingMods.md")
     shutil.copy2(ui_src / "gd_melee/ORIGIN.md", licenses / "gd-melee-origin.md")
+    # The builds for processors without AVX2 are their own download since 0.9.98, so nobody else
+    # downloads them: MeleeUnlocked-<version>-compat-win64.zip, named with its SHA-256 in compat.sha256,
+    # which the launcher fetches on a PC that needs it (host/updater.cpp compat_build_download).
+    compat_files = [folder / n for n in ("melee_port_compat.exe", "melee_source_compat.exe", "melee_game_compat.dll",
+                                         "melee_game_compat.snapexcl", "melee_game_compat.dbg") if (folder / n).is_file()]
+    if compat_files:
+        compat_zip = args.out / f"{name}-compat-win64.zip"
+        with zipfile.ZipFile(compat_zip, "w", zipfile.ZIP_DEFLATED) as z:
+            for p in compat_files:
+                z.write(p, p.name)
+        for p in compat_files:
+            p.unlink()
+        compat_sha = hashlib.sha256(compat_zip.read_bytes()).hexdigest()
+        (folder / "compat.sha256").write_text(f"{compat_sha} {compat_zip.name}\n", encoding="ascii")
+        print(f"{compat_zip} ({compat_zip.stat().st_size / 1e6:.1f} MB, {len(compat_files)} files)")
+
+    # The RTX Pack (NVIDIA RTX and RTX Remix) is its own download, built outside this repository from
+    # NVIDIA's SDKs: only its name and SHA-256 ship here (rtxpack.sha256), and only for this version.
+    if args.rtx_pack:
+        expected = f"{name}-RTX-Pack.zip"
+        if args.rtx_pack.name != expected or not args.rtx_pack.is_file():
+            raise SystemExit(f"--rtx-pack must be {expected} (got {args.rtx_pack})")
+        pack_sha = hashlib.sha256(args.rtx_pack.read_bytes()).hexdigest()
+        (folder / "rtxpack.sha256").write_text(f"{pack_sha} {args.rtx_pack.name}\n", encoding="ascii")
+        print(f"rtx pack: {args.rtx_pack.name} ({args.rtx_pack.stat().st_size / 1e6:.1f} MB) offered")
+
     def zip_folder(zip_path):
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
             for path in folder.rglob("*"):
@@ -550,14 +656,20 @@ def main():
         total = sum(p.stat().st_size for p in folder.rglob("*") if p.is_file())
         print(f"{zip_path} ({zip_path.stat().st_size / 1e6:.1f} MB zipped, {total / 1e6:.1f} MB unpacked)")
 
-    path_shader = args.exe.parent / "dxr_pathtrace.dxil"
-    if not path_shader.is_file():
-        raise SystemExit(f"missing DXR shader: {path_shader}")
-    shutil.copy2(path_shader, folder / path_shader.name)
+    # The path tracer's shaders. A build made with the local NVIDIA SDK module (its RTXDI and SHaRC
+    # shaders sit beside the exe) is never packaged: that code may not be distributed.
+    for private in ("rtxdi_melee.dxil", "sharc_update.dxil", "sharc_resolve.dxil"):
+        if (args.exe.parent / private).exists():
+            raise SystemExit(f"{private} beside the exe: this build has the local NVIDIA module; package a release build")
+    for shader in ("dxr_pathtrace.dxil", "rtx_transform.dxil", "rtx_trace.dxil", "rtx_direct.dxil"):
+        path_shader = args.exe.parent / shader
+        if not path_shader.is_file():
+            raise SystemExit(f"missing path tracing shader: {path_shader}")
+        shutil.copy2(path_shader, folder / path_shader.name)
     (folder / "README.txt").write_text(readme_text(args.version, args.playback_exe, args.local_candidate) +
         "\nThis experimental Mod Update includes Source Port and Static Recomp game builds.\n"
         "DLSS 5 requires NVIDIA's separate model (nvngx_dlssnr.dll), which is not included.\n"
-        "Experimental DXR path tracing and Ray Reconstruction are off by default.\n",
+        "Path tracing (Settings, Video, Ray tracing) is off by default; it needs an RTX GPU and Direct3D 12.\n",
         encoding="utf-8")
     zip_folder(args.out / f"{name}-win64.zip")
 

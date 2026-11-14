@@ -302,7 +302,7 @@ static void result_logging() {
       game, why+ok+" (connected)"+w,
       game, why+err+" (not connected)"+w,
       "ranked set: link error: Lost connection to the mm server\n"}));
-    // 11-01, a set: a conclusive game counts even when the read after it says "not connected"
+    // 11-01, a reported set: a conclusive game counts even when the read after it says "not connected"
     // (Slippi ends a set only on the disconnect shown in game); the setup screen checks the link.
     reset(seat,1,practice);set_lines.clear();match.connection_state=MU_SLP_MM_IDLE;
     mu_ranked_setup_game_result(seat,2,0);CHECK(mu_ranked_setup_finish_game(0,31)==MU_SETUP_NEXT_GAME);

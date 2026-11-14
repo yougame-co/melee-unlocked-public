@@ -96,6 +96,45 @@ uint64_t hash_spans(const std::vector<Span>& spans) {
   return h;
 }
 
+void Snapshot::capture(std::vector<Span> spans) {
+  const auto began = std::chrono::steady_clock::now();
+  size_t size = 0;
+  for (const auto& span : spans) size += span.size;
+  std::vector<uint8_t> bytes(size);
+  size_t at = 0;
+  for (const auto& span : spans) {
+    std::memcpy(bytes.data() + at, span.address, span.size);
+    at += span.size;
+  }
+  spans_ = std::move(spans);
+  bytes_ = std::move(bytes);
+  capture_ms_ = elapsed_ms(began);
+}
+
+void Snapshot::restore() const {
+  size_t at = 0;
+  for (const auto& span : spans_) {
+    std::memcpy(span.address, bytes_.data() + at, span.size);
+    at += span.size;
+  }
+}
+
+std::vector<Snapshot::Difference> Snapshot::differences(size_t limit) const {
+  std::vector<Difference> out;
+  size_t at = 0;
+  for (size_t n = 0; n < spans_.size() && out.size() < limit; ++n) {
+    const auto& span = spans_[n];
+    for (uint32_t i = 0; i < span.size && out.size() < limit;) {
+      if (span.address[i] == bytes_[at+i]) { ++i; continue; }
+      const uint32_t first = i++;
+      while (i < span.size && span.address[i] != bytes_[at+i]) ++i;
+      out.push_back({n, first, i-first, bytes_[at+first], span.address[first]});
+    }
+    at += span.size;
+  }
+  return out;
+}
+
 void Engine::start_workers() {
   const unsigned hw = std::thread::hardware_concurrency();
   const int count = hw >= 8 ? 3 : hw >= 4 ? 1 : 0;

@@ -5,6 +5,9 @@
 #pragma once
 #include "../abi/mu_host.h"
 #include <cstdint>
+#ifdef MELEE_DOUBLES
+#include <array>
+#endif
 #include <memory>
 #include <optional>
 #include <string>
@@ -27,6 +30,12 @@ struct SessionConfig {
   bool default_card = false;   // Agreed fresh save; survives relaunch against a frozen host digest.
   std::string card_digest;      // Frozen SHA-256 of the host Melee GCI, unless default was agreed.
   std::vector<uint8_t> card_bytes; // Verified host copy, carried only inside this process.
+#ifdef MELEE_DOUBLES
+  bool doubles = false;
+  std::array<int,4> doubles_teams{{-1,-1,-1,-1}};
+  std::array<std::string,4> doubles_seats;
+  int doubles_stage = 31;
+#endif
   std::string settings_digest;  // Frozen settings key; friends1 carries the host CSS fighter/costume/pad.
 };
 
@@ -46,6 +55,9 @@ public:
   virtual void pump(int wait_ms) = 0;
   // Set once a peer has left or timed out: a short reason for the log and the notice.
   virtual std::optional<std::string> lost() const = 0;
+  // CSS preparation controls are delivered only by main, before live room service starts.
+  virtual void css_join_message(const nlohmann::json&) {}
+  virtual void css_join_release() {}
   // Transport recovery pauses only wall-clock liveness deadlines, never frame/input rules.
   virtual bool reconnecting() const { return false; }
   virtual uint64_t liveness_clock(uint64_t ordinary) const { return ordinary; }

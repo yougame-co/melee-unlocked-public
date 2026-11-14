@@ -8,6 +8,7 @@
 #ifndef __APPLE__
 #include <ucontext.h>
 #endif
+#include <fcntl.h>
 #include <unistd.h>
 #ifdef __APPLE__
 #include "../../mac/context_registers.h"
@@ -60,8 +61,47 @@ static void linux_crash_dialog(const char* head, bool stopped) {
   MessageBoxA(nullptr, text.c_str(), "Melee Unlocked", MB_ICONERROR | MB_OK);
 }
 
+// An abort the C library raises itself (memory found damaged: "malloc(): corrupted top size") can
+// come while it holds its memory lock. The report below needs memory (fopen, the dialog) and waited
+// forever there: the game stayed frozen on screen until the player closed it, and the report had no
+// stack (a 0.9.107 Linux report, 11-09). So the crash file is written first here with system calls
+// only, and the process ends within 10 s whatever the rest does. The C library's own reason is in
+// melee_port.stderr.log (the launcher sends the game's error output there).
+static volatile sig_atomic_t g_abort_note_written = 0;
+static void abort_put(int fd, const char* s) { if (write(fd, s, std::strlen(s)) < 0) {} }
+static void abort_put_number(int fd, unsigned long long v, int base, int width) {
+  char b[32]; int n = 0;
+  do { b[n++] = "0123456789ABCDEF"[v % (unsigned)base]; v /= (unsigned)base; } while (v && n < 31);
+  while (n < width && n < 31) b[n++] = ' ';
+  char out[32]; for (int i = 0; i < n; ++i) out[i] = b[n - 1 - i]; out[n] = 0;
+  abort_put(fd, out);
+}
+static void linux_abort_note() {
+  alarm(10);   // a report that waits on the C library's memory lock ends here (SIGALRM ends the process)
+  const int fd = open("melee_port_crash.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) return;
+  abort_put(fd, "FATAL: the game stopped itself (abort), version " MELEE_PORT_VERSION "\n");
+  void* frames[48];
+  const int count = backtrace(frames, 48);   // loaded at start (linux_install_crash_handlers): no memory needed now
+  for (int i = 1; i < count; ++i) {
+    Dl_info info{};
+    const char* leaf = "?";
+    uintptr_t offset = (uintptr_t)frames[i];
+    if (dladdr(frames[i], &info) && info.dli_fname) {
+      leaf = std::strrchr(info.dli_fname, '/') ? std::strrchr(info.dli_fname, '/') + 1 : info.dli_fname;
+      offset = (uintptr_t)frames[i] - (uintptr_t)info.dli_fbase;
+    }
+    abort_put(fd, "stack "); abort_put_number(fd, (unsigned long long)(i - 1), 10, 2); abort_put(fd, ": ");
+    abort_put(fd, leaf); abort_put(fd, "+0x"); abort_put_number(fd, offset, 16, 0); abort_put(fd, "\n");
+  }
+  abort_put(fd, "the C library's reason, if it gave one, is in melee_port.stderr.log\n");
+  close(fd);
+  g_abort_note_written = 1;
+}
+
 static volatile sig_atomic_t g_linux_crash_entered = 0;
 static void linux_crash_signal(int sig, siginfo_t* si, void* uc_void) {
+  ::gx::cache_store::freeze();   // first (async-signal-safe): no cache save starts or lands from here on
   if (g_linux_crash_entered) { signal(sig, SIG_DFL); raise(sig); return; }
   g_linux_crash_entered = 1;
   const ucontext_t* uc = static_cast<const ucontext_t*>(uc_void);
@@ -80,16 +120,41 @@ static void linux_crash_signal(int sig, siginfo_t* si, void* uc_void) {
   char head[512];
   std::snprintf(head, sizeof head, "CRASH: signal %d (%s) at %p (%s+0x%llX), address %p, version %s", sig, strsignal(sig),
                 (void*)rip, module, (unsigned long long)offset, si ? si->si_addr : nullptr, MELEE_PORT_VERSION);
-  host::log("%s", head);
-  if (FILE* f = std::fopen("melee_port_crash.txt", "w")) {
-    std::fprintf(f, "%s\n", head);
-    void* frames[48];
-    const int count = backtrace(frames, 48);
-    linux_stack_lines(frames, count, f, 0);
-    host::log_flush();
-    linux_guest_trace(f);
-    std::fclose(f);
+  // A fault inside the C library's memory code (a 0.9.110 report: libc.so.6, mid start) leaves its memory
+  // lock held or its lists damaged, and fopen needs both: the handler died there and the report came with
+  // no crash file and no stack. So the file is written with system calls first, as linux_abort_note does,
+  // and the process ends within 10 s whatever the rest does.
+  alarm(10);
+  {
+    const int fd = open("melee_port_crash.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+      abort_put(fd, head); abort_put(fd, "\n");
+      void* frames[48];
+      const int count = backtrace(frames, 48);   // loaded at start (linux_install_crash_handlers)
+      for (int i = 0; i < count; ++i) {
+        Dl_info fi{};
+        const char* leaf = "?";
+        uintptr_t at = (uintptr_t)frames[i];
+        if (dladdr(frames[i], &fi) && fi.dli_fname) {
+          leaf = std::strrchr(fi.dli_fname, '/') ? std::strrchr(fi.dli_fname, '/') + 1 : fi.dli_fname;
+          at = (uintptr_t)frames[i] - (uintptr_t)fi.dli_fbase;
+        }
+        abort_put(fd, "stack "); abort_put_number(fd, (unsigned long long)i, 10, 2); abort_put(fd, ": ");
+        abort_put(fd, leaf); abort_put(fd, "+0x"); abort_put_number(fd, at, 16, 0); abort_put(fd, "\n");
+      }
+      if (host::cpu) {
+        abort_put(fd, "last guest function "); abort_put_number(fd, host::cpu->last_pc, 16, 0);
+        abort_put(fd, ", lr "); abort_put_number(fd, host::cpu->lr, 16, 0);
+        abort_put(fd, "\nrecent guest functions (oldest first):\n");
+        for (uint32_t i = 0; i < 64; ++i) {
+          const uint32_t pc = host::cpu->trace[(host::cpu->trace_pos + i) & 63];
+          if (pc) { abort_put(fd, "  "); abort_put_number(fd, pc, 16, 0); abort_put(fd, "\n"); }
+        }
+      }
+      close(fd);
+    }
   }
+  host::log("%s", head);
   host::log_flush();
   linux_crash_dialog(head, false);
   if (yougame::active()) {   // the app's "stopped" notice reads this line (yougame_mode_policy.h crash_line)
@@ -113,6 +178,8 @@ static void linux_install_crash_handlers() {
   sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
   sigemptyset(&sa.sa_mask);
   for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE}) sigaction(sig, &sa, nullptr);
+  void* warm[4];
+  backtrace(warm, 4);   // its first call loads libgcc_s, which needs memory: done now, not in a crash
 }
 
 static void throw_stack_lines(FILE*) {}
@@ -120,6 +187,7 @@ static volatile LONG g_throw_frozen = 0;
 
 // host::die: the same report without a signal.
 static void die_report(const char* message) {
+  if (g_abort_note_written) return;   // an abort: its file is written (linux_abort_note); nothing here may need memory
   char head[640];
   std::snprintf(head, sizeof head, "FATAL: %s, version %s", message, MELEE_PORT_VERSION);
   if (FILE* f = std::fopen("melee_port_crash.txt", "w")) {

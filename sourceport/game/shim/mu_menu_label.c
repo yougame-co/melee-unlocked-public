@@ -18,11 +18,27 @@
 #include <sysdolphin/baselib/pobj.h>
 #include <sysdolphin/baselib/tobj.h>
 #include "mu_menu_label.h"
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+#include "mu_squad_label_art.h"
+#else
+#line 21 /* OFF diagnostics retain the original DISC_SET line numbers. */
+#endif
 
 void mu_slippi_friends_label(HSD_JObj* label, int menu_kind, int selection, int capture)
 {
     static HSD_ImageDesc* native[8];
+#ifdef MELEE_DOUBLES
+    static HSD_ImageDesc image[4];
+#else
     static HSD_ImageDesc image[3];
+#endif
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+    static HSD_ImageDesc squad_image;
+#else
+#line 30
+#endif
     int kind = mu_slippi_menu_label_kind(selection), slot;
     HSD_DObj* dobj;
     if (!mu_slippi_menus_enabled() || !mu_slippi_yougame_menu() ||
@@ -49,10 +65,25 @@ void mu_slippi_friends_label(HSD_JObj* label, int menu_kind, int selection, int 
                     DISC_SET(image[kind - 1].image_ptr,
                              kind == 1 ? mu_baked_friends : mu_baked_slippi);
                     replacement = &image[kind - 1];
+#ifdef MELEE_DOUBLES
+                } else if (kind == 9) {
+                    image[3] = *original;
+                    DISC_SET(image[3].image_ptr, mu_baked_doubles);
+                    replacement = &image[3];
+#endif
                 } else if (kind == 8) {
                     image[2] = *original;
                     DISC_SET(image[2].image_ptr, mu_baked_tournament);
                     replacement = &image[2];
+#if MU_SQUAD
+                /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+                } else if (kind == 10) {
+                    squad_image = *original;
+                    DISC_SET(squad_image.image_ptr, mu_baked_squad);
+                    replacement = &squad_image;
+#else
+#line 66
+#endif
                 } else if (kind >= 3 && kind <= 5) {
                     replacement = native[2 + selection];
                 } else if ((kind == 6 || kind == 7) &&
@@ -408,3 +439,31 @@ void mu_slippi_title_panel_update(HSD_GObj* panel, int canvas)
     /* The panel animation may reselect its native image every tick. */
     state->title_texture->imagedesc = &state->image;
 }
+
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+/* Reuse the Online row's baked label inside the Friends mode toggle. SIS owns the camera. */
+void mu_squad_lobby_label_draw(void* object)
+{
+    GXTexObj tex;
+    GXColor white = { 255, 255, 255, 255 };
+    extern bool gmSquad_LobbyChosen(void);
+    (void) object;
+    if (!mu_lobby_css() || !gmSquad_LobbyChosen() || mu_lobby_curtain()) return;
+    GXSetTevColor(GX_TEVREG0, white);
+    GXInitTexObj(&tex, (void*) mu_baked_squad, MU_LABEL_W, MU_LABEL_H,
+                 GX_TF_IA4, GX_CLAMP, GX_CLAMP, GX_FALSE);
+    GXInitTexObjLOD(&tex, GX_LINEAR, GX_LINEAR, 0, 0, 0, GX_FALSE, GX_FALSE, GX_ANISO_1);
+    GXLoadTexObj(&tex, GX_TEXMAP0);
+    GXSetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_TEXC, GX_CC_C0, GX_CC_ZERO);
+    GXSetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_TEXA, GX_CA_A0, GX_CA_ZERO);
+    GXSetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_FALSE, GX_TEVPREV);
+    GXSetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_FALSE, GX_TEVPREV);
+    GXBegin(GX_QUADS, GX_VTXFMT0, 4);
+    GXPosition3f32(-42.5f, 26.5f, 0); GXTexCoord2f32(0, 0);
+    GXPosition3f32(-26.0f, 26.5f, 0); GXTexCoord2f32(1, 0);
+    GXPosition3f32(-26.0f, 23.6875f, 0); GXTexCoord2f32(1, 1);
+    GXPosition3f32(-42.5f, 23.6875f, 0); GXTexCoord2f32(0, 1);
+    GXEnd();
+}
+#endif

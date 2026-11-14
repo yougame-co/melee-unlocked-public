@@ -19,6 +19,7 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <sddl.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <intrin.h>
@@ -50,10 +51,13 @@
 #include "launcher_engine.h"
 #include "launcher_lobby.h"
 #include "launcher_lobby_p2p.h"
+#include "launcher_yougame.h"
 #include "launcher_theme.h"
 #include "launcher_replay_data.h"
 #include "launcher_trace_view.h"
 #include "launcher_lang.h"
+#include "disc_rvz.h"
+#include "replay_slpz.h"
 #include "launcher_crash_text.h"   // with launcher_crash_zip.h; launcher_crash.inl sits inside the namespace below
 #ifndef MELEE_NO_SLIPPI
 #include "slippi_account.h"
@@ -89,6 +93,8 @@ const UINT WM_APP_LOG = WM_APP + 1;      // lParam: heap std::string* to append 
 const UINT WM_APP_BUILD_DONE = WM_APP + 2;
 const UINT WM_APP_GAME_DONE = WM_APP + 3;
 const UINT WM_APP_CACHE_WARM_DONE = WM_APP + 4;
+const UINT WM_APP_YOUGAME = WM_APP + 52;
+const UINT WM_APP_GAME_DISC = WM_APP + 61;   // lParam: heap std::string*, the 1.02 disc unpacked from an RVZ/WIA   // the YouGame session changed: save launcher.ini, repaint
 
 // Client area in layout units; S() turns these into pixels for the current DPI.
 const int WIN_W = 720, WIN_H = 480;
@@ -168,10 +174,14 @@ launcher::VanillaChoice g_vanilla;
 bool g_install_requested = false;
 bool g_warm_cache_on_play = false;
 bool g_dlss5_asked = false;   // launcher.ini dlss5asked=1: the DLSS 5 download was offered once already
+bool g_launch_after_compat = false;   // a start waits for the build for this processor (compat_build_download)
+std::filesystem::path g_replay_after_compat;
+int g_replay_after_compat_place = 0, g_replay_after_compat_count = 0;
 // Replay Viewer: "Show it as it was played" (launcher.ini replayasplayed=1). It applies to a replay
 // that has a session trace file beside it; see launcher_replays.inl.
 bool g_replay_as_played = false;
 bool g_save_replays = true;   // launcher.ini savereplays=0 turns it off
+bool g_compress_replays = false;   // launcher.ini compressreplays=1: the game keeps earlier replays as .slpz
 std::string g_replay_folder;  // launcher.ini replaydir=: where replays are saved; empty = <g_dir>\Replays
 // Replay Viewer list: the sort order (launcher.ini replaysort=1..3; none or 0 is most recent first,
 // an index into kReplaySorts) and "Hide short games" (replayhideshort=1).
@@ -245,12 +255,19 @@ void load_language() {
   if (code.empty()) code = launcher::lang::system_default();
   launcher::lang::set_language(code, {widen(g_dir + "\\lang")});
 }
+bool source_available();   // below: the Source Port is installed beside the launcher
+
 void load_ini() {
   {
     std::ifstream f(ini_path());
+    // A fresh install (no launcher.ini yet) starts on the Source Port when it is installed. An older
+    // file without an engine line is a player who stayed on the Static Recomp, then the only
+    // default, so it keeps that; the choice is saved either way from now on.
+    if (!f && source_available()) g_engine = ENGINE_SOURCE;
     std::string line;
     while (std::getline(f, line)) {
       if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (launcher::yougame::load_line(line)) continue;
       if (line.rfind("engine=", 0) == 0) { g_engine = launcher::parse_engine_line(line, g_engine); continue; }
       if (launcher::parse_vanilla_line(line, g_vanilla)) continue;
       if (line.rfind("cpubuild=", 0) == 0) {
@@ -262,6 +279,7 @@ void load_ini() {
       else if (line == "dlss5asked=1") g_dlss5_asked = true;
       else if (line == "replayasplayed=1") g_replay_as_played = true;
       else if (line == "savereplays=0") g_save_replays = false;
+      else if (line == "compressreplays=1") g_compress_replays = true;
       else if (line.rfind("replaydir=", 0) == 0) g_replay_folder = line.substr(10);
       else if (line == "replayhideshort=1") g_replay_hide_short = true;
       else if (line.rfind("replaysort=", 0) == 0) g_replay_sort = std::clamp(std::atoi(line.c_str() + 11), 0, 3);
@@ -298,18 +316,20 @@ void save_ini() {
     if (g_dlss5_asked) f << "dlss5asked=1\n";
     if (g_replay_as_played) f << "replayasplayed=1\n";
     if (!g_save_replays) f << "savereplays=0\n";
+    if (g_compress_replays) f << "compressreplays=1\n";
     if (!g_replay_folder.empty()) f << "replaydir=" << g_replay_folder << "\n";
     if (g_replay_sort != 0) f << "replaysort=" << g_replay_sort << "\n";
     if (g_replay_hide_short) f << "replayhideshort=1\n";
     // Kept so that browsing for a disc does not silently undo a hand-set override.
     if (g_cpu_build != CPU_AUTO) f << "cpubuild=" << g_cpu_build << "\n";
-    if (g_engine != ENGINE_LEGACY) f << "engine=" << g_engine << "\n";
+    f << "engine=" << g_engine << "\n";   // always: no line means a player from before the Source Port default
     if (g_vanilla.vanilla) f << "vanilla=1\n";
     if (g_vanilla.own_code) f << "vanillaowncode=1\n";   // kept while Vanilla is off, like the mod choices
     if (!g_language.empty()) f << "language=" << g_language << "\n";
     // The lobby: which versions this player takes match requests for, and their custom ISO.
     if (!g_lobby_prefs.open_to.empty() && g_lobby_prefs.open_to != "vanilla") f << "lobbyopen=" << g_lobby_prefs.open_to << "\n";
     if (!g_lobby_prefs.custom_iso.empty()) f << "lobbyiso=" << g_lobby_prefs.custom_iso << "\nlobbyisoname=" << g_lobby_prefs.custom_name << "\n";
+    f << launcher::yougame::ini_lines();   // YouGame: the environment and the protected session
     char color[16]; std::snprintf(color,sizeof color,"accent=#%02X%02X%02X",GetRValue(launcher::theme::accent),GetGValue(launcher::theme::accent),GetBValue(launcher::theme::accent));
     f << color << "\n";
   }
@@ -426,10 +446,20 @@ std::string source_exe_dir() {
 }
 bool source_available() { return !source_exe_dir().empty(); }
 
+// A processor without AVX2 (or the compatibility build picked by hand) gets the _compat programs.
+bool wants_compat_build() { return g_cpu_build == CPU_COMPAT || (g_cpu_build == CPU_AUTO && !cpu_has_avx2()); }
+// The Source Port program in `dir` for this processor: every start (Play, replays, mods) goes
+// through here. Replays started melee_source.exe on any processor, so a player without AVX2 still
+// got the AVX2 message there after Play was fixed (0.9.96 report).
+std::string source_exe_in(const std::string& dir) {
+  if (wants_compat_build() && file_exists(dir + "\\melee_source_compat.exe")) return dir + "\\melee_source_compat.exe";
+  return dir + "\\melee_source.exe";
+}
+
 std::string game_exe() {
   // The Source Port when it is picked and installed. Picked but gone since (an update that dropped
   // it, or an older version without it) falls back to Static Recomp rather than failing to start.
-  const bool old_cpu = g_cpu_build == CPU_COMPAT || (g_cpu_build == CPU_AUTO && !cpu_has_avx2());
+  const bool old_cpu = wants_compat_build();
   if (g_engine == ENGINE_SOURCE) {
     const std::string d = source_exe_dir();
     // The Windows Source Port is AVX2 only: on an older processor it refuses to start with an
@@ -487,6 +517,25 @@ std::string replay_dir_for_game() {
   return unsaved_replay_dir();
 }
 
+// The game builds two Sys files from the player's disc on its first start and never writes them
+// inside its own folder (sysgen.cpp: "generated data must be outside the build directory"). With
+// only --user-dir it would put them under this folder's User, so the current version gets a data
+// folder of its own in %LOCALAPPDATA%, the same one MeleeUnlocked.bat uses. An older version from
+// Versions keeps its own arguments.
+std::string sysgen_data_arg(const std::string& exe) {
+#ifdef MELEE_NO_SLIPPI
+  (void)exe;
+  return "";
+#else
+  const std::string name = exe.substr(exe.find_last_of("\\/") + 1);
+  if (!g_active_version.empty() || name.rfind("melee_source", 0) != 0) return "";
+  wchar_t local[MAX_PATH]{};
+  const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return "";
+  return " --sysgen-data-dir \"" + narrow(local) + "\\MeleeUnlocked-YouGame\"";
+#endif
+}
+
 std::string game_args() {
   std::string base = active_dir();
   std::string a = " --iso \"" + g_iso + "\" --threaded-renderer --settings-path \"" + settings_ini_path() + "\"";
@@ -496,9 +545,38 @@ std::string game_args() {
     a += " --sys-dir \"" + base + "\\Sys\" --replay-dir \"" + replay_dir_for_game() + "\" --card-dir \"" + g_dir + "\\User\\GC\\CardA\"";
 #else
   if (file_exists(base + "\\Sys\\codehandler.bin"))
-    a += " --sys-dir \"" + base + "\\Sys\" --user-dir \"" + g_dir + "\\User\\Slippi\" --replay-dir \"" + replay_dir_for_game() + "\" --card-dir \"" + g_dir + "\\User\\GC\\CardA\"";
+    a += " --sys-dir \"" + base + "\\Sys\" --user-dir \"" + g_dir + "\\User\\Slippi\" --replay-dir \"" + replay_dir_for_game() + "\" --card-dir \"" + g_dir + "\\User\\GC\\CardA\"" + sysgen_data_arg(g_game_exe);
 #endif
   return a;
+}
+
+// The YouGame app's plugin channel for this Windows user: the named pipes the game itself looks for
+// (yougame_channel.cpp, pipe_name: \\.\pipe\yougame-[staging-]sdk-v1-<user SID>). Only whether one
+// exists: WaitNamedPipe with a 1 ms wait never connects, so the app sees nothing and the game still
+// runs every check of its own when it connects. Returns which app answers ("YouGame" or "YouGame
+// staging"), or "" when neither does. The pipe name holds the user's SID, so it is not logged.
+std::string yougame_app_channel() {
+  HANDLE token = nullptr;
+  if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return "";
+  DWORD size = 0;
+  GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+  std::vector<BYTE> user(size);
+  const bool ok = size && GetTokenInformation(token, TokenUser, user.data(), size, &size);
+  CloseHandle(token);
+  if (!ok) return "";
+  LPWSTR sid = nullptr;
+  if (!ConvertSidToStringSidW(reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid, &sid)) return "";
+  const std::wstring sid_text = sid;
+  LocalFree(sid);
+  for (const bool staging : {false, true}) {
+    const std::wstring name = std::wstring(L"\\\\.\\pipe\\yougame-") + (staging ? L"staging-" : L"") + L"sdk-v1-" + sid_text;
+    const BOOL free_instance = WaitNamedPipeW(name.c_str(), 1);
+    const DWORD error = GetLastError();
+    // ERROR_SEM_TIMEOUT: the pipe exists and every instance is busy with another game.
+    if (free_instance || error == ERROR_SEM_TIMEOUT || error == ERROR_PIPE_BUSY)
+      return staging ? "YouGame staging" : "YouGame";
+  }
+  return "";
 }
 
 // ---------------------------------------------------------------------------- painting helpers
@@ -798,6 +876,42 @@ void paint_rail(HDC dc) {
   }
 }
 
+// The YouGame line on the Play page: the account, then Connect or Disconnect, then Open YouGame (the
+// Melee Unlocked page on the YouGame site, in the browser). The two links' rectangles are kept for clicks.
+RECT g_yg_link[2] = {};
+bool g_yg_hot = false;
+void paint_yougame_line(HDC dc) {
+#ifdef MELEE_YOUGAME_COMING_SOON
+  // YouGame is not open yet: one line saying so, nothing to click.
+  dot(dc, CX, 287, C_FAINT);
+  draw_text(dc, launcher::lang::txw(L"YouGame online: coming soon"), LR(CX + 15, 284, CW - 15, 17), g_font, C_DIM,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+  g_yg_link[0] = g_yg_link[1] = RECT{};
+  return;
+#endif
+  const launcher::yougame::Account a = launcher::yougame::account();
+  std::wstring base = a.signed_in ? L"YouGame: " + widen(a.name) + (a.code.empty() ? L"" : L" (" + widen(a.code) + L")")
+                                  : launcher::lang::txw(L"YouGame: not connected");
+  dot(dc, CX, 287, a.signed_in ? C_OK : C_FAINT);
+  const RECT line = LR(CX + 15, 284, CW - 15, 17);
+  HGDIOBJ old = SelectObject(dc, g_font);
+  int x = line.left;
+  auto put = [&](const std::wstring& s, COLORREF c) {
+    SIZE z{};
+    GetTextExtentPoint32W(dc, s.c_str(), (int)s.size(), &z);
+    RECT r{x, line.top, std::min<LONG>(x + z.cx, line.right), line.bottom};
+    draw_text(dc, s, r, g_font, c, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    x = r.right;
+    return r;
+  };
+  put(base, C_DIM);
+  put(L"  |  ", C_FAINT);
+  g_yg_link[0] = put(launcher::lang::txw(a.signed_in ? L"Disconnect" : L"Connect"), C_TEXT);
+  put(L"  |  ", C_FAINT);
+  g_yg_link[1] = put(launcher::lang::txw(L"Open YouGame"), C_TEXT);
+  SelectObject(dc, old);
+}
+
 void paint_play(HDC dc) {
   draw_text(dc, L"MELEE NTSC 1.02 DISC IMAGE", LR(CX, 32, CW, 18), g_font_label, C_FAINT,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER, S(1));
@@ -857,9 +971,16 @@ void paint_play(HDC dc) {
   const std::string mods_line = mod_manager::summary();
   dot(dc, CX, 263, mods_line == launcher::lang::tx("Mods: none active") ? C_FAINT : C_OK);
   draw_text(dc, widen(mods_line + " | " + launcher::lang::tx("Open Mods folder")), LR(CX + 15, 260, CW - 15, 17), g_font, C_DIM, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-  RECT sep = LR(CX, 282, CW, 1);
+  if (!vanilla_active()) paint_yougame_line(dc);
+  RECT sep = LR(CX, 306, CW, 1);
   fill(dc, sep, C_SEP);
-  draw_text(dc, HINT_TEXT, LR(CX, 294, CW, 44), g_font_small, C_FAINT, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
+  // No game disc yet: Play stays grey, and a Melee ISO put in the Mods folder reads as an active mod
+  // (a report, 11-11: the player had only done that). Say what is missing where the hint goes.
+  if (g_iso.empty())
+    draw_text(dc, launcher::lang::txw(L"No Melee disc chosen yet: press Browse and pick your Melee NTSC 1.02 ISO. A disc in the Mods folder only loads as a mod."),
+              LR(CX, 314, CW, 32), g_font_small, C_WARN, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
+  else
+    draw_text(dc, HINT_TEXT, LR(CX, 314, CW, 32), g_font_small, C_FAINT, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL);
   std::string version_status = g_active_version.empty() ? "" : launcher::lang::fill(launcher::lang::tx("Playing {version}"), launcher::lang::Args{{"version", g_active_version}});
   if (!version_status.empty() && !vanilla_supported()) version_status += ". " + launcher::lang::tx("Vanilla needs 0.9.17 or newer");
   bool status_bad = host::updater::rollback_state() == host::updater::RollbackState::Failed;
@@ -867,6 +988,11 @@ void paint_play(HDC dc) {
     version_status = host::updater::rollback_message();
   else if (host::updater::rollback_state() == host::updater::RollbackState::Failed)
     version_status = host::updater::rollback_message();
+  else if (wants_compat_build() && !host::updater::compat_build_message().empty()) {
+    // The build for this processor: its progress, then its result.
+    version_status = host::updater::compat_build_message();
+    status_bad = host::updater::compat_build_state(active_dir()) == host::updater::ModelState::Failed;
+  }
   else if (!host::updater::dlss5_model_message().empty()) {
     // The DLSS 5 download: its progress, then its result.
     version_status = host::updater::dlss5_model_message();
@@ -893,6 +1019,7 @@ void paint_build(HDC dc) {
 }
 
 namespace crash_report { void note_launch(); }   // launcher_crash.inl, below: the replay viewer counts as a launch too
+void settings_standby_stop();
 #include "launcher_replays.inl"
 #include "launcher_match_character.inl"
 #include "launcher_theme_picker.inl"
@@ -938,6 +1065,127 @@ void capture_test_client(HWND window, const char* name) {
   if (bitmap) DeleteObject(bitmap); DeleteDC(dc); ReleaseDC(nullptr, screen);
 }
 void open_settings(const std::string& tab);   // below; the Mods page's "Choose skins" opens the Mods tab
+
+// ---- YouGame sign-in: email and password, sent only to YouGame's sign-in service ----
+// YouGame on an older release: the game asked to restart in it (bridge thread), and the window
+// thread starts it once the game has closed (WM_APP_GAME_DONE). One start only: the next Play is
+// this version again.
+std::mutex g_yg_restart_mutex;
+std::string g_yg_restart_folder, g_yg_restart_mode;
+std::string g_yougame_launch_args;   // added to the next game start's command line, then cleared
+bool take_yougame_restart(std::string& folder, std::string& mode) {
+  std::lock_guard<std::mutex> lock(g_yg_restart_mutex);
+  if (g_yg_restart_folder.empty()) return false;
+  folder.swap(g_yg_restart_folder); mode.swap(g_yg_restart_mode);
+  g_yg_restart_folder.clear(); g_yg_restart_mode.clear();
+  return true;
+}
+std::string yougame_restart_older(const launcher::yougame::Allowed& older, const std::string& mode) {
+  const std::string folder_name = older.version + "-legacy";   // host::updater::install_release's folder
+  const std::string folder = g_dir + "\\Versions\\" + folder_name;
+  const std::string exe = folder + "\\melee_source.exe", dll = folder + "\\melee_game.dll";
+  if (!file_exists(exe) || !file_exists(dll)) {
+    if (host::updater::rollback_state() != host::updater::RollbackState::Downloading)
+      host::updater::install_release(older.version, false, g_dir);
+    return "Getting Melee Unlocked " + older.version + " for YouGame. Try again in a minute.";
+  }
+  // YouGame's own hashes, when it lists them, must be what was installed.
+  if ((!older.exe_sha256.empty() && launcher::yougame::file_sha256(widen(exe)) != older.exe_sha256) ||
+      (!older.game_sha256.empty() && launcher::yougame::file_sha256(widen(dll)) != older.game_sha256))
+    return "Melee Unlocked " + older.version + " in the Versions folder is not the build YouGame uses.";
+  std::lock_guard<std::mutex> lock(g_yg_restart_mutex);
+  g_yg_restart_folder = folder_name;
+  g_yg_restart_mode = mode;
+  return std::string();
+}
+HWND g_yg_signin = nullptr, g_yg_email = nullptr, g_yg_pass = nullptr, g_yg_status = nullptr, g_yg_ok = nullptr;
+bool g_yg_busy = false;
+LRESULT CALLBACK yougame_signin_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+  switch (m) {
+    case WM_COMMAND:
+      if (LOWORD(w) == IDOK && !g_yg_busy) {
+        wchar_t email[256]{}, pass[256]{};
+        GetWindowTextW(g_yg_email, email, 255);
+        GetWindowTextW(g_yg_pass, pass, 255);
+        if (!email[0] || !pass[0]) { SetWindowTextW(g_yg_status, launcher::lang::txw(L"Enter your YouGame email and password.").c_str()); return 0; }
+        g_yg_busy = true;
+        EnableWindow(g_yg_ok, FALSE);
+        SetWindowTextW(g_yg_status, launcher::lang::txw(L"Signing in...").c_str());
+        std::thread([h, e = narrow(email), p = narrow(pass)] {
+          std::string why;
+          const bool ok = launcher::yougame::sign_in(e, p, &why);
+          PostMessageW(h, WM_APP + 1, ok, (LPARAM)new std::string(why));
+        }).detach();
+        SecureZeroMemory(pass, sizeof pass);
+      } else if (LOWORD(w) == IDCANCEL) {
+        DestroyWindow(h);
+      } else if (LOWORD(w) == 102 || LOWORD(w) == 103) {   // yougame.co in the browser, never the app
+        const std::string url = LOWORD(w) == 102 ? launcher::yougame::signup_page() : launcher::yougame::reset_page();
+        ShellExecuteW(nullptr, L"open", widen(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+      }
+      return 0;
+    case WM_APP + 1: {
+      std::unique_ptr<std::string> why((std::string*)l);
+      g_yg_busy = false;
+      if (w) { DestroyWindow(h); return 0; }
+      SetWindowTextW(g_yg_status, widen(*why).c_str());
+      SetWindowTextW(g_yg_pass, L"");
+      EnableWindow(g_yg_ok, TRUE);
+      return 0;
+    }
+    case WM_CTLCOLORSTATIC: SetBkMode((HDC)w, TRANSPARENT); return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    case WM_DESTROY:
+      EnableWindow(g_main, TRUE);
+      SetForegroundWindow(g_main);
+      g_yg_signin = nullptr;
+      return 0;
+  }
+  return DefWindowProcW(h, m, w, l);
+}
+void yougame_connect() {
+  if (launcher::yougame::account().signed_in) {
+    if (MessageBoxW(g_main, launcher::lang::txw(L"Disconnect your YouGame account from this launcher?").c_str(), L"YouGame",
+                    MB_YESNO | MB_ICONQUESTION) == IDYES)
+      launcher::yougame::sign_out();
+    return;
+  }
+  if (g_yg_signin) { SetForegroundWindow(g_yg_signin); return; }
+  static bool registered = false;
+  if (!registered) {
+    WNDCLASSW c{};
+    c.lpfnWndProc = yougame_signin_proc;
+    c.hInstance = GetModuleHandleW(nullptr);
+    c.lpszClassName = L"MeleeUnlockedYouGameSignIn";
+    c.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    c.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
+    RegisterClassW(&c);
+    registered = true;
+  }
+  RECT mr; GetWindowRect(g_main, &mr);
+  const int w = S(380), h = S(290);
+  g_yg_signin = CreateWindowExW(WS_EX_DLGMODALFRAME, L"MeleeUnlockedYouGameSignIn", L"Connect YouGame", WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                                (mr.left + mr.right - w) / 2, (mr.top + mr.bottom - h) / 2, w, h, g_main, nullptr, GetModuleHandleW(nullptr), nullptr);
+  auto child = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int cw, int ch, int id) {
+    HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, S(x), S(y), S(cw), S(ch), g_yg_signin,
+                             (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE);
+    return c;
+  };
+  child(L"STATIC", launcher::lang::txw(L"Sign in with your YouGame account. Your password goes only to YouGame.").c_str(), 0, 16, 12, 340, 34, 0);
+  child(L"STATIC", launcher::lang::txw(L"Email").c_str(), 0, 16, 52, 340, 18, 0);
+  g_yg_email = child(L"EDIT", L"", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 16, 72, 340, 24, 100);
+  child(L"STATIC", launcher::lang::txw(L"Password").c_str(), 0, 16, 104, 340, 18, 0);
+  g_yg_pass = child(L"EDIT", L"", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD, 16, 124, 340, 24, 101);
+  g_yg_status = child(L"STATIC", L"", 0, 16, 156, 340, 34, 0);
+  child(L"BUTTON", launcher::lang::txw(L"Create an account").c_str(), WS_TABSTOP, 16, 196, 166, 28, 102);
+  child(L"BUTTON", launcher::lang::txw(L"Forgot password").c_str(), WS_TABSTOP, 190, 196, 168, 28, 103);
+  g_yg_ok = child(L"BUTTON", launcher::lang::txw(L"Sign in").c_str(), WS_TABSTOP | BS_DEFPUSHBUTTON, 176, 236, 88, 28, IDOK);
+  child(L"BUTTON", launcher::lang::txw(L"Cancel").c_str(), WS_TABSTOP, 270, 236, 88, 28, IDCANCEL);
+  EnableWindow(g_main, FALSE);
+  ShowWindow(g_yg_signin, SW_SHOW);
+  SetFocus(g_yg_email);
+}
 #include "launcher_mods.inl"
 
 // The Language button: a menu of the languages, each named in itself. Picking one saves it and
@@ -1166,6 +1414,7 @@ void settings_standby_stop() {
   CloseHandle(g_settings_standby); g_settings_standby = nullptr;
 }
 void settings_standby_start() {
+  if (wants_compat_build() && host::updater::compat_build_needed(active_dir())) return;
   const std::string exe = game_exe();
   if (g_settings_standby && WaitForSingleObject(g_settings_standby, 0) == WAIT_TIMEOUT && g_settings_standby_exe == exe) return;
   settings_standby_stop();
@@ -1388,7 +1637,7 @@ void start_game() {
     MessageBoxW(g_main, problem.c_str(), L"Melee Unlocked Launcher", MB_OK | MB_ICONWARNING);
     return;
   }
-  g_game_exe = !g_mod_launch_iso.empty() ? (g_mod_launch_engine == "source" ? source_exe_dir() + "\\melee_source.exe" : static_recomp_exe()) : game_exe();
+  g_game_exe = !g_mod_launch_iso.empty() ? (g_mod_launch_engine == "source" ? source_exe_in(source_exe_dir()) : static_recomp_exe()) : game_exe();
   if (file_exists(g_game_exe) && game_exe_version_mismatch(g_game_exe)) {
     g_mod_launch_iso.clear(); g_mod_launch_engine.clear(); g_mod_launch_kind.clear(); return;
   }
@@ -1420,6 +1669,18 @@ std::string static_recomp_exe() {
   return dir + "\\melee_port.exe";
 }
 void launch_game_now() {
+  // A processor without AVX2 needs its own build, a separate download since 0.9.98: the start waits
+  // for it (the timer below starts the game when it is in place) instead of starting the AVX2 build,
+  // which cannot run there.
+  if (wants_compat_build() && host::updater::compat_build_needed(active_dir())) {
+    settings_standby_stop();
+    if (host::updater::compat_build_state(active_dir()) != host::updater::ModelState::Downloading)
+      host::updater::compat_build_download(active_dir());
+    g_launch_after_compat = true;
+    g_replay_after_compat.clear();
+    invalidate(LR(398, 348, 300, 32));
+    return;
+  }
   std::string cwd = work_dir();
   std::string exe = g_game_exe, args = game_args();
   // Vanilla, on a plain PLAY only: a lobby match is online and a mod launch is modded, so neither
@@ -1427,7 +1688,7 @@ void launch_game_now() {
   if (vanilla_active() && g_lobby_launch_args.empty() && g_mod_launch_iso.empty() && exe == game_exe())
     args += launcher::vanilla_launch_args(g_vanilla);
   if (!g_mod_launch_iso.empty()) {
-    exe = g_mod_launch_engine == "source" ? source_exe_dir() + "\\melee_source.exe" : static_recomp_exe();
+    exe = g_mod_launch_engine == "source" ? source_exe_in(source_exe_dir()) : static_recomp_exe();
     const std::string base = active_dir();
     args = g_mod_launch_engine == "source"
         ? " --iso \"" + g_iso + "\" " + (g_mod_launch_kind == "te" ? "--mod-gci" : "--mod-iso") + " \"" + g_mod_launch_iso + "\""
@@ -1447,23 +1708,59 @@ void launch_game_now() {
 #else
     if (file_exists(base + "\\Sys\\codehandler.bin"))
       args += " --sys-dir \"" + base + "\\Sys\" --user-dir \"" + g_dir + "\\User\\Slippi\" --replay-dir \"" + replay_dir_for_game() +
-              "\" --card-dir \"" + g_dir + "\\User\\GC\\Mods\\" + g_mod_launch_key + "\"";
+              "\" --card-dir \"" + g_dir + "\\User\\GC\\Mods\\" + g_mod_launch_key + "\"" + sysgen_data_arg(exe);
 #endif
     g_mod_launch_iso.clear(); g_mod_launch_engine.clear(); g_mod_launch_kind.clear();
   }
-  std::string cmd = "\"" + exe + "\"" + args + g_lobby_launch_args +
+  std::string cmd = "\"" + exe + "\"" + args + g_lobby_launch_args + g_yougame_launch_args +
       " --lobby-status-file \"" + g_dir + "\\lobby-game-status.json\"";
   g_lobby_game_active = !g_lobby_launch_args.empty();
   g_lobby_launch_args.clear();
+  // The game's YouGame rows ask this launcher (launcher_yougame.h): its address, a token for this
+  // launch, and the build's hashes for the ticket's build check. Set only for this one start.
+  // When the YouGame app is running for this Windows user, the game talks to the app over its plugin
+  // channel instead, the same way as when it is started on its own: these variables would turn that
+  // channel off in the game (yougame_link.cpp), so the launcher leaves them out.
+  const std::string app_channel = vanilla_active() ? std::string() : yougame_app_channel();
+#ifdef MELEE_YOUGAME_COMING_SOON
+  const std::string yougame_bridge;   // YouGame is not open yet: the game gets no bridge
+  const std::string yougame_decision = vanilla_active() ? std::string()
+      : "YouGame: this launcher has no bridge in this build; the game looks for the YouGame app itself (" +
+        (app_channel.empty() ? std::string("no app channel for this user now") : "the " + app_channel + " app is running") + ").";
+#else
+  const std::string yougame_bridge = vanilla_active() || !app_channel.empty() ? std::string() : launcher::yougame::bridge_url();
+  const std::string yougame_decision = vanilla_active() ? std::string()
+      : !app_channel.empty() ? "YouGame: the " + app_channel + " app is running; the game uses its plugin channel, not the launcher's bridge."
+      : "YouGame: no YouGame app channel for this user; the game uses the launcher's bridge.";
+#endif
+  if (!yougame_decision.empty()) log_line("%s", yougame_decision.c_str());
   // Test runs only (MELEE_LAUNCHER_TEST): extra game arguments (hidden, local peering instead of
-  // Slippi's servers) and the exact command line written to a file for the lobby gate to check.
+  // Slippi's servers) and the exact command line written to a file for the lobby gate to check,
+  // with the YouGame line above under it.
   if (g_launcher_test) {
     if (const char* extra = std::getenv("MELEE_LAUNCHER_TEST_GAME_ARGS")) cmd += std::string(" ") + extra;
     if (const char* log_path = std::getenv("MELEE_LAUNCHER_TEST_LAUNCH_LOG"))
-      if (FILE* f = std::fopen(log_path, "ab")) { std::fprintf(f, "%s\n", cmd.c_str()); std::fclose(f); }
+      if (FILE* f = std::fopen(log_path, "ab")) {
+        std::fprintf(f, "%s\n", cmd.c_str());
+        if (!yougame_decision.empty()) std::fprintf(f, "%s\n", yougame_decision.c_str());
+        std::fclose(f);
+      }
+  }
+  if (!yougame_bridge.empty()) {
+    const std::string game_dir = exe.substr(0, exe.find_last_of("\\/"));
+    launcher::yougame::set_build(g_active_version.empty() ? std::string(MELEE_PORT_VERSION) : g_active_version.substr(0, g_active_version.find('-')),
+                                 widen(exe), widen(game_dir + "\\melee_game.dll"));
+    SetEnvironmentVariableW(L"YOUGAME_BRIDGE", widen(yougame_bridge).c_str());
+    SetEnvironmentVariableW(L"YOUGAME_TOKEN", widen(launcher::yougame::new_launch_token()).c_str());
+    SetEnvironmentVariableW(L"MELEE_YOUGAME_LAUNCHER", L"1");
   }
   PROCESS_INFORMATION pi{};
   const DWORD error = launcher::start_process(widen(exe), widen(cmd), widen(cwd), 0, pi);
+  if (!yougame_bridge.empty()) {
+    SetEnvironmentVariableW(L"YOUGAME_BRIDGE", nullptr);
+    SetEnvironmentVariableW(L"YOUGAME_TOKEN", nullptr);
+    SetEnvironmentVariableW(L"MELEE_YOUGAME_LAUNCHER", nullptr);
+  }
   if (error != ERROR_SUCCESS) {
     launcher::lobby::game_running(false);
 #ifdef MELEE_NO_SLIPPI
@@ -1504,9 +1801,14 @@ void explain_nkit() {
 
 void browse() {
   wchar_t file[MAX_PATH]{};
-  OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof ofn; ofn.hwndOwner = g_main; ofn.lpstrFilter = L"GameCube disc image (*.iso;*.gcm)\0*.iso;*.gcm\0All files\0*.*\0"; ofn.lpstrFile = file; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST;
+  OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof ofn; ofn.hwndOwner = g_main; ofn.lpstrFilter = L"GameCube disc image (*.iso;*.gcm;*.rvz;*.wia)\0*.iso;*.gcm;*.rvz;*.wia\0All files\0*.*\0"; ofn.lpstrFile = file; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST;
   if (GetOpenFileNameW(&ofn)) {
     if (nkit_image(file)) { explain_nkit(); return; }
+    // Dolphin's compressed images are unpacked to a full ISO first (the Mods page shows progress);
+    // the 1.02 disc then becomes the game disc and a modded one goes into Mods.
+    if (disc_rvz::detect(std::filesystem::path(file)) != disc_rvz::Format::NotCompressed) {
+      mod_manager::open(); std::thread(mod_manager::install_file, std::wstring(file), std::string(), g_iso).detach(); return;
+    }
     if (mod_manager::hash_file(file, BCRYPT_MD5_ALGORITHM) != mod_manager::kVanillaMd5) {
       mod_manager::open(); std::thread(mod_manager::install_file, std::wstring(file), std::string(), g_iso).detach();
     } else { set_iso(narrow(file)); save_ini(); }
@@ -1796,8 +2098,37 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 #endif
       refresh_account_line();
       ShowWindow(g_slippi_btn, g_slippi_missing && !vanilla_active() ? SW_SHOW : SW_HIDE);
+      // YouGame: the bridge the game's YouGame rows ask (launcher_yougame.h), up for the whole run.
+      launcher::yougame::set_on_session_change([] { PostMessageW(g_main, WM_APP_YOUGAME, 0, 0); });
+#ifndef MELEE_YOUGAME_COMING_SOON
+      if (std::string why; !launcher::yougame::start_bridge(&why)) log_line("yougame: the launcher's bridge did not start (%s)", why.c_str());
+      // Which builds YouGame allows: when it is on an older release, get that one beside this
+      // version now, so the game's offer to restart in it is ready when a player takes it.
+      launcher::yougame::set_restart_older(yougame_restart_older);
+      if (!vanilla_active())
+        std::thread([exe = source_exe_dir() + "\\melee_source.exe", dll = source_exe_dir() + "\\melee_game.dll",
+                     version = g_active_version.empty() ? std::string(MELEE_PORT_VERSION) : g_active_version.substr(0, g_active_version.find('-'))] {
+          launcher::yougame::refresh_allowed(version, widen(exe), widen(dll));
+          const launcher::yougame::Allowed older = launcher::yougame::behind();
+          if (older.version.empty()) return;
+          for (int i = 0; i < 60 && host::updater::releases().empty(); ++i) Sleep(500);   // the release list
+          if (!file_exists(g_dir + "\\Versions\\" + older.version + "-legacy\\melee_source.exe"))
+            host::updater::install_release(older.version, false, g_dir);
+        }).detach();
+      // Test runs only: sign in to the stand-in site (MELEE_YOUGAME_SITE / _AUTH) as "email:password".
+      if (const char* who = g_launcher_test ? std::getenv("MELEE_LAUNCHER_TEST_YOUGAME") : nullptr)
+        if (const char* colon = std::strchr(who, ':'))
+          std::thread([email = std::string(who, colon), pass = std::string(colon + 1)] {
+            std::string why;
+            if (!launcher::yougame::sign_in(email, pass, &why)) log_line("yougame: test sign-in failed (%s)", why.c_str());
+          }).detach();
+#endif   // MELEE_YOUGAME_COMING_SOON: none of YouGame starts until it opens
+      if (const char* ms = g_launcher_test ? std::getenv("MELEE_LAUNCHER_TEST_CAPTURE_MS") : nullptr)
+        std::thread([ms = std::atoi(ms)] { Sleep(ms); PostMessageW(g_main, WM_APP + 41, 0, 0); }).detach();
 #ifndef MELEE_NO_SLIPPI   // the public releases are the other build: this one must never install them over itself
+#ifndef MELEE_YOUGAME_NO_UPSTREAM_UPDATES   // upstream's releases have no YouGame plugin: never offer them over this build
       if (!g_launcher_test) { host::updater::check(MELEE_PORT_VERSION); refresh_updater(); }
+#endif
       if (!g_launcher_test) PostMessageW(hwnd, WM_APP + 77, 0, 0);   // offer DLSS 5 once the window is up
 #endif
       SetTimer(hwnd, ID_TIMER, 500, nullptr);
@@ -1832,6 +2163,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DRAWITEM: if(((DRAWITEMSTRUCT*)lp)->CtlID==ID_REPLAY_LIST) draw_replay((DRAWITEMSTRUCT*)lp); else draw_buffered((DRAWITEMSTRUCT*)lp, draw_button); return TRUE;
     case WM_MEASUREITEM: if(((MEASUREITEMSTRUCT*)lp)->CtlID==ID_REPLAY_LIST) { ((MEASUREITEMSTRUCT*)lp)->itemHeight=S(84); return TRUE; } break;
+    case WM_CONTEXTMENU: if((HWND)wp==g_replays[0]&&g_replays[0]) { replay_context_menu(GET_X_LPARAM(lp),GET_Y_LPARAM(lp)); return 0; } break;
     case WM_MOUSEMOVE: {
       POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
       int hot = -1;
@@ -1843,6 +2175,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       }
       g_seg_hot = build_seg_at(p);   // only the cursor changes over a segment, so nothing to repaint
       g_dog_hot = PtInRect(&g_dog_rect, p) != 0;
+      g_yg_hot = g_tab == 0 && !vanilla_active() && (PtInRect(&g_yg_link[0], p) || PtInRect(&g_yg_link[1], p));
       if (!g_tracking) { TRACKMOUSEEVENT t{sizeof t, TME_LEAVE, hwnd, 0}; TrackMouseEvent(&t); g_tracking = true; }
       return 0;
     }
@@ -1852,13 +2185,18 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (g_nav_hot >= 0) { int was = g_nav_hot; g_nav_hot = -1; invalidate(nav_rect(was)); }
       return 0;
     case WM_SETCURSOR:
-      if (LOWORD(lp) == HTCLIENT && (g_nav_hot >= 0 || g_seg_hot >= 0 || g_dog_hot)) { SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE; }
+      if (LOWORD(lp) == HTCLIENT && (g_nav_hot >= 0 || g_seg_hot >= 0 || g_dog_hot || g_yg_hot)) { SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE; }
       break;
     case WM_LBUTTONDOWN: {
       POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
       RECT mods_line = LR(CX, 260, CW, 17);
       RECT version_line = version_text_rect();
       if (g_tab == 0 && PtInRect(&version_line, p)) { show_changelog(); return 0; }
+      if (g_tab == 0 && !vanilla_active() && PtInRect(&g_yg_link[0], p)) { yougame_connect(); return 0; }
+      if (g_tab == 0 && !vanilla_active() && PtInRect(&g_yg_link[1], p)) {
+        ShellExecuteW(nullptr, L"open", widen(launcher::yougame::game_page()).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return 0;
+      }
       if (g_tab == 0 && PtInRect(&mods_line, p)) {
         std::error_code ec; std::filesystem::create_directories(widen(mod_manager::mods_dir()), ec);
         ShellExecuteW(nullptr, L"open", widen(mod_manager::mods_dir()).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -1974,7 +2312,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           SetCursor(old);
         }
         if (nkit_image(file)) { explain_nkit(); continue; }
-        if (mod_manager::is_mod_file(file) || (disc && !vanilla)) {
+        const bool compressed_disc = disc_rvz::detect(std::filesystem::path(file)) != disc_rvz::Format::NotCompressed;
+        if (compressed_disc || mod_manager::is_mod_file(file) || (disc && !vanilla)) {
           mod_manager::open();
           std::thread(mod_manager::install_file, file, std::string(), base_iso).detach();
         } else if (game_disc.empty()) game_disc = file;
@@ -2000,8 +2339,29 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       set_iso(g_iso);
       if (wp == 0) { select_tab(0); refresh_updater(); } else InvalidateRect(hwnd, nullptr, FALSE);
       return 0;
+    case WM_APP_GAME_DISC: {   // an RVZ/WIA image held the 1.02 disc; it is unpacked beside the game
+      std::unique_ptr<std::string> path((std::string*)lp);
+      set_iso(*path); save_ini(); select_tab(1); refresh_updater(); start_build();
+      return 0;
+    }
+    case WM_APP_YOUGAME:
+      save_ini();
+      if (g_tab == 0) InvalidateRect(hwnd, nullptr, FALSE);
+      return 0;
     case WM_APP_GAME_DONE:
       g_playing = false;
+      // The game closed to restart in the release YouGame is on: start it now, straight into the
+      // YouGame mode the player picked. Only this start; the active version stays as it was.
+      if (std::string folder, mode; take_yougame_restart(folder, mode)) {
+        launcher::lobby::game_running(false);
+        const std::string saved = g_active_version;
+        g_active_version = folder;
+        g_yougame_launch_args = " --online-mode " + mode;
+        start_game();
+        g_yougame_launch_args.clear();
+        g_active_version = saved;
+        return 0;
+      }
       // A replay queue that went on to its next replay: that game is running now, so nothing below
       // applies yet and the launcher stays minimized.
       if(replay_game_done((DWORD)wp)) return 0;
@@ -2173,6 +2533,31 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       refresh_updater();
       if (g_tab == 0 && host::updater::rollback_state() == host::updater::RollbackState::Downloading) invalidate(LR(398, 348, 300, 32));
       {
+        // The build for this processor: repainted while it downloads, and a start that waited for it
+        // goes ahead once it is in place (or gives up and shows why).
+        static host::updater::ModelState last = host::updater::ModelState::Present;
+        const host::updater::ModelState now = host::updater::compat_build_state(active_dir());
+        if (g_tab == 0 && (now == host::updater::ModelState::Downloading || now != last)) invalidate(LR(398, 348, 300, 32));
+        last = now;
+        if (!g_replay_after_compat.empty() && now == host::updater::ModelState::Present) {
+          const auto file = g_replay_after_compat;
+          g_replay_after_compat.clear();
+          if (replay_start(file, g_replay_after_compat_place, g_replay_after_compat_count) == ReplayStart::Failed)
+            g_replay_playing.clear();
+        } else if (!g_replay_after_compat.empty() && now == host::updater::ModelState::Failed) {
+          g_replay_after_compat.clear();
+          g_replay_playing.clear();
+          replay_status(host::updater::compat_build_message());
+        }
+        if (g_launch_after_compat && now == host::updater::ModelState::Present) {
+          g_launch_after_compat = false;
+          g_game_exe = !g_mod_launch_iso.empty() ? (g_mod_launch_engine == "source" ? source_exe_in(source_exe_dir()) : static_recomp_exe()) : game_exe();
+          launch_game_now();
+        } else if (g_launch_after_compat && now == host::updater::ModelState::Failed) {
+          g_launch_after_compat = false;
+        }
+      }
+      {
         // The DLSS 5 download's line: repainted while it runs and once when it ends.
         static host::updater::ModelState last = host::updater::ModelState::Missing;
         const host::updater::ModelState now = host::updater::dlss5_model_state(g_dir);
@@ -2181,7 +2566,13 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       }
       return 0;
     }
-    case WM_APP + 77: offer_dlss5(); return 0;
+    case WM_APP + 77:
+      if (wants_compat_build() && host::updater::compat_build_needed(active_dir())) {
+        settings_standby_stop();
+        host::updater::compat_build_download(active_dir());
+      }
+      offer_dlss5();
+      return 0;
     case WM_CTLCOLORLISTBOX: SetTextColor((HDC)wp,C_TEXT); SetBkColor((HDC)wp,C_FIELD); return (LRESULT)g_br_field;
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT: {
@@ -2269,6 +2660,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   ShowWindow(hwnd, g_launcher_test ? SW_SHOWNOACTIVATE : show);
   std::thread(mod_manager::rescan).detach();
   MSG m;
-  while (GetMessageW(&m, nullptr, 0, 0)) { if (!IsDialogMessageW(hwnd, &m)) { TranslateMessage(&m); DispatchMessageW(&m); } }
+  while (GetMessageW(&m, nullptr, 0, 0)) {
+    if (g_yg_signin && IsDialogMessageW(g_yg_signin, &m)) continue;   // Tab and Enter in YouGame's sign-in
+    if (!IsDialogMessageW(hwnd, &m)) { TranslateMessage(&m); DispatchMessageW(&m); }
+  }
   return 0;
 }

@@ -16,12 +16,15 @@
 #endif
 #include "gx_shader.h"
 #include "gx_texture.h"
+#include "pipeline_cache_store.h"
+#include "progress_frame.h"
+#include <limits>
 #ifdef GX_PC_SETTINGS   // the full game (port/linux/full): texture packs and F2 captures
 #include "texture_pack.h"
 #include "video_background.h"
-#include "video_background_learning.h"
 #include "user_shader.h"
 #endif
+#include "video_background_learning.h"   // scene_slot: which scene is the character select (every build)
 #include "crt_shader.h"
 #include "gx_retro.h"
 #ifdef __APPLE__
@@ -63,9 +66,7 @@
 #include <unistd.h>
 
 extern char** environ;
-#ifdef __APPLE__
 namespace host { void log(const char* fmt, ...); }   // melee.log (--log-file)
-#endif
 namespace linux_renderer {
 namespace {
 // Keep shader progress visible both in standalone stderr and the app's melee.log.
@@ -246,7 +247,7 @@ struct ProgramAttributes {
 };
 class Renderer final : public gx::Backend {
  public:
-  Renderer(SDL_Window* window, const std::filesystem::path& cache, int scale, bool vsync)
+  Renderer(SDL_Window* window, const std::filesystem::path& cache, int scale, bool vsync, bool prewarm_only)
 #ifdef __APPLE__
       : window_(window), cache_(cache / (
         "gx-gl410-v2-s"
@@ -312,12 +313,28 @@ void main() {
     seed_cache();
     boot_prewarm_ = true;
 #endif
-    prewarm();
+    start_cache_saver();
+#ifdef __APPLE__
+    const bool saved_sync = sync_shaders_;
+    if (prewarm_only) sync_shaders_ = true;   // finish translations now; this run has no later frames
+#endif
+    prewarm(prewarm_only);
+#ifdef __APPLE__
+    sync_shaders_ = saved_sync;
+#endif
+    if (prewarm_only) recipes_written_ = false;
+    // The recipe list is whole from here (it matches the file just read): a new program saves it again.
+    { std::lock_guard<std::mutex> lock(recipes_mutex_); saved_recipes_ = recipes_.size(); }
+    recipes_ready_ = true;
+    log_pipeline_stats("startup", cache_saver_.saved_bytes());
 #ifdef __APPLE__
     boot_prewarm_ = false;
     std::fprintf(stderr, "opengl: shader translation %s; frame compile budget %.1f ms\n",
                  sync_shaders_ ? "synchronous (diagnostic)" : "asynchronous (one worker)", compile_budget_ms_);
 #endif
+  }
+  gx::PrewarmStats prewarm_stats() const override {
+    return {"opengl", recipes_.size(), programs_loaded_.load(), programs_linked_.load()};
   }
   ~Renderer() override {
 #ifdef YOUGAME_AGENT_TEST_HOOK
@@ -334,8 +351,9 @@ void main() {
 #ifndef __APPLE__
     stop_translators();
 #endif
+    cache_saver_.stop();   // the last save (recipes and queued program binaries), on the saver thread
+    log_pipeline_stats("session", cache_saver_.saved_bytes());
     if (!context_) return;
-    save_recipes();
     for (auto& p : attribute_locations_) glDeleteVertexArrays(1, &p.second.vao);
     for (auto& p : programs_) glDeleteProgram(p.second);
     for (auto& p : shaders_) glDeleteShader(p.second);
@@ -346,6 +364,23 @@ void main() {
     glDeleteTextures(1, &last_color_); glDeleteFramebuffers(1, &last_frame_);
     glDeleteFramebuffers(1, &efb_); glDeleteBuffers(1, &vertices_); glDeleteBuffers(1, &indices_);
     glDeleteBuffers(2, uniform_); glDeleteVertexArrays(1, &vao_); SDL_GL_DeleteContext(context_);
+  }
+  bool supports_game_reset() const override { return true; }
+  void reset_game_state() override {
+    glFinish();
+    for (auto& t : textures_) destroy(t.second);
+    for (auto& c : copies_) destroy(c.second);
+    textures_.clear(); copies_.clear(); have_last_ = false;
+#ifdef GX_PC_SETTINGS
+    for (auto& v : video_) { if (v.id) glDeleteTextures(1, &v.id); v = {}; }
+#endif
+    replacement_bytes_ = 0;
+    glBindFramebuffer(GL_FRAMEBUFFER, msaa_fbo_ ? msaa_fbo_ : efb_);
+    glDisable(GL_SCISSOR_TEST); glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE); glDepthMask(GL_TRUE);
+    glClearColor(0,0,0,0); glClearDepth(1); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glBindFramebuffer(GL_FRAMEBUFFER, efb_);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    invalidate_state();
   }
   void presentation_stats(uint32_t* frames, uint32_t* pipes, uint32_t* textures) const override {
     if (frames) *frames = presented_;
@@ -415,7 +450,7 @@ void main() {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indices_);
     glBindBufferBase(GL_UNIFORM_BUFFER, 0, uniform_[0]); glBindBufferBase(GL_UNIFORM_BUFFER, 1, uniform_[1]);
     gx::set_main_projection(gx::frame_scene_draw(frame));
-    gx::set_css_scene(frame.scene_major == 1 && frame.scene_minor == 0);
+    gx::set_css_scene(gx::video_bg::learning::scene_slot(frame.scene_major, frame.scene_minor) == 0);   // the character select, as Direct3D decides it
 #ifdef GX_PC_SETTINGS
     // Menu video backgrounds: the character select's video goes in after Melee's untextured
     // animated backdrop, the stage select's right after the learned backdrop draw (as on Windows).
@@ -575,7 +610,8 @@ void main() {
     GLenum format = 0;
     glGetProgramBinary(p, length, nullptr, &format, data.data() + sizeof format);
     std::memcpy(data.data(), &format, sizeof format);
-    write_cache(path, data);
+    // Written by the saver thread: the frame that linked the program does not wait for the disk.
+    cache_saver_.enqueue(path.string(), std::vector<uint8_t>(data.begin(), data.end()));
   }
   // Cache writes never stop the game: a full disk or read-only folder only loses the speedup.
   void write_cache(const std::filesystem::path& path, const std::string& data) {
@@ -668,14 +704,17 @@ void main() {
   // seed) would hold the first frame for seconds: there the start builds what fits in MELEE_PREWARM_BOOT_MS (500),
   // the player's own programs first, and the rest are built between frames, MELEE_PREWARM_FRAME_MS (4) per frame.
   // Missing translations are queued; ready GLSL shares the per-frame compile budget. Elsewhere all recipes are visited at start.
-  void prewarm() {
+  void prewarm(bool prewarm_only) {
     std::vector<ProgramRecipe> list;
     if (!parse_recipes(read_text(cache_ / "recipes.bin"), list)) return;
-    for (const auto& r : list)
-      if (recipe_hashes_.insert(gx::hash_bytes(&r, sizeof r)).second) recipes_.push_back(r);
-    saved_recipes_ = recipes_.size();
+    {
+      std::lock_guard<std::mutex> lock(recipes_mutex_);
+      for (const auto& r : list)
+        if (recipe_hashes_.insert(gx::hash_bytes(&r, sizeof r)).second) recipes_.push_back(r);
+      saved_recipes_ = recipes_.size();
+    }
     pending_ = recipes_; pending_next_ = 0;
-    const double boot_ms = env_ms("MELEE_PREWARM_BOOT_MS", 500);
+    const double boot_ms = prewarm_only ? std::numeric_limits<double>::max() : env_ms("MELEE_PREWARM_BOOT_MS", 500);
     const size_t count = pending_.size();
     const double ms = prewarm_some(boot_ms);
     shader_log("opengl: prewarmed %zu programs from %zu recipes before guest startup in %.1f ms%s%s",
@@ -710,7 +749,7 @@ void main() {
     return spent();
   }
 #else
-  void prewarm() {
+  void prewarm(bool) {
     const std::string data = read_text(cache_ / "recipes.bin");
     uint64_t header[3]{};
     if (data.size() < sizeof header) return;
@@ -720,28 +759,86 @@ void main() {
         gx::hash_bytes(data.data() + sizeof header, count * sizeof(ProgramRecipe)) != header[2]) return;
     const auto start = std::chrono::steady_clock::now();
     prewarming_ = true;
+    progress_pacer_ = gx::progress_frame::Pacer();
     for (size_t i = 0; i < count; ++i) {
+      show_progress(i, count);
       ProgramRecipe r; std::memcpy(&r, data.data() + sizeof header + i * sizeof r, sizeof r);
       gx::DrawCall dc{}; dc.components = r.components; dc.bp = r.bp;
       std::memcpy(dc.xf_regs, r.xf, sizeof r.xf);
       try { program(dc); } catch (const std::exception&) {}   // a bad recipe only loses its prewarm
     }
     prewarming_ = false;
-    saved_recipes_ = recipes_.size();
+    { std::lock_guard<std::mutex> lock(recipes_mutex_); saved_recipes_ = recipes_.size(); }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     shader_log("opengl: prewarmed %zu programs from %zu recipes before guest startup in %.1f ms%s",
                  programs_.size(), count, ms, binaries_ ? "" : " (driver keeps no program binaries)");
   }
 #endif
-  void save_recipes() {
-    if (recipes_.size() == saved_recipes_) return;
+  // ---- Saving the caches while the game runs (pipeline_cache_store.h) ----
+  // Program binaries are queued as they link (save_binary); the recipe list is written by the saver
+  // thread a moment after new programs arrive, on an exit or relaunch (flush_all), and from the
+  // destructor. Only the render thread appends to recipes_; the saver copies it under the lock.
+  void start_cache_saver() {
+    // A failed write is forgotten as saved, so the next round writes it again (pipeline_cache_store.h).
+    cache_saver_.add((cache_ / "recipes.bin").string(), [this](gx::cache_store::Buffer& out) { return produce_recipes(out); },
+                     [this] { std::lock_guard<std::mutex> lock(recipes_mutex_); saved_recipes_ = 0; recipes_written_ = false; });
+    cache_saver_.add_folder(cache_.string());   // program binaries: a killed game's temporaries go too
+    cache_saver_.on_saved([this](uint64_t bytes, const char* why) { log_pipeline_stats(why, bytes); });
+    cache_saver_.start();
+  }
+  gx::cache_store::Produce produce_recipes(gx::cache_store::Buffer& out) {
+    if (!recipes_ready_) return gx::cache_store::Produce::Nothing;
+    std::lock_guard<std::mutex> lock(recipes_mutex_);
+    if (recipes_written_ && recipes_.size() == saved_recipes_) return gx::cache_store::Produce::Nothing;
+    recipes_written_ = true;
     saved_recipes_ = recipes_.size();
     const size_t bytes = recipes_.size() * sizeof(ProgramRecipe);
     const uint64_t header[3] = {RECIPE_MAGIC, recipes_.size(), gx::hash_bytes(recipes_.data(), bytes)};
-    std::string data(sizeof header + bytes, '\0');
-    std::memcpy(data.data(), header, sizeof header);
-    std::memcpy(data.data() + sizeof header, recipes_.data(), bytes);
-    write_cache(cache_ / "recipes.bin", data);
+    out.resize(sizeof header + bytes);
+    std::memcpy(out.data(), header, sizeof header);
+    std::memcpy(out.data() + sizeof header, recipes_.data(), bytes);
+    return gx::cache_store::Produce::Write;
+  }
+  void add_recipe(const ProgramRecipe& r) {   // render thread
+    { std::lock_guard<std::mutex> lock(recipes_mutex_); recipes_.push_back(r); }
+    if (!prewarming_) cache_saver_.mark_dirty();
+  }
+  // One line per save and per session in melee.log; the second launch should say compiled=0 where the
+  // driver keeps program binaries (macOS keeps none, so there every program is linked again).
+  void log_pipeline_stats(const char* why, uint64_t saved_bytes) {
+    host::log("opengl: pipelines cache_hits=%llu compiled=%llu saved_bytes=%llu (%s)%s", (unsigned long long)programs_loaded_.load(),
+              (unsigned long long)programs_linked_.load(), (unsigned long long)saved_bytes, why,
+              binaries_ ? "" : " (driver keeps no program binaries)");
+  }
+  // "Preparing graphics" between prewarmed programs (progress_frame.h): scissored clears of the
+  // window, then a swap. No shader is involved, so it works before any program exists.
+  gx::progress_frame::Pacer progress_pacer_;
+  void show_progress(size_t done, size_t total) {
+    if (!progress_pacer_.due()) return;
+    // A hidden or minimized window (the player box starts hidden) can block a swap until it is
+    // shown: the prewarm never waits for a frame nobody sees.
+    if (SDL_GetWindowFlags(window_) & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED)) return;
+    int w = 0, h = 0; SDL_GL_GetDrawableSize(window_, &w, &h);
+    if (w <= 0 || h <= 0) return;
+    invalidate_state();
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, w, h);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glEnable(GL_SCISSOR_TEST);
+    for (const auto& r : gx::progress_frame::layout(w, h, done, total)) {
+      glScissor(r.x, h - r.y - r.h, r.w, r.h);   // GL counts rows from the bottom
+      glClearColor(((r.rgba >> 24) & 255) / 255.0f, ((r.rgba >> 16) & 255) / 255.0f, ((r.rgba >> 8) & 255) / 255.0f, (r.rgba & 255) / 255.0f);
+      glClear(GL_COLOR_BUFFER_BIT);
+    }
+    glDisable(GL_SCISSOR_TEST);
+    glClearColor(0, 0, 0, 1);
+    // Without vsync for this swap: a progress frame must not wait for the display between programs.
+    const int interval = SDL_GL_GetSwapInterval();
+    if (interval != 0) SDL_GL_SetSwapInterval(0);
+    SDL_GL_SwapWindow(window_);
+    if (interval != 0) SDL_GL_SetSwapInterval(interval);
+    glBindFramebuffer(GL_FRAMEBUFFER, draw_fbo());
+    invalidate_state();
   }
   static void destroy(Texture& t) { if (t.id) glDeleteTextures(1, &t.id); if (t.fbo) glDeleteFramebuffers(1, &t.fbo); }
 #ifdef __APPLE__
@@ -793,10 +890,7 @@ void main() {
     double work_ms = 0; // active build attempts only; excludes time waiting in the queue
   };
   void remember_recipe(const ProgramRecipe& r) {
-    if (recipes_.size() < RECIPE_LIMIT && recipe_hashes_.insert(gx::hash_bytes(&r, sizeof r)).second) {
-      recipes_.push_back(r);
-      if (!prewarming_ && recipes_.size() >= saved_recipes_ + 32) save_recipes();
-    }
+    if (recipes_.size() < RECIPE_LIMIT && recipe_hashes_.insert(gx::hash_bytes(&r, sizeof r)).second) add_recipe(r);
   }
   GLuint program(const gx::DrawCall& dc) {
     const auto vs = gx::make_vs_uid(dc); const auto ps = gx::make_ps_uid(dc);
@@ -827,6 +921,7 @@ void main() {
       if (!compile_allowed()) return 0;
       const auto start = Clock::now();
       p = load_binary(binary); build.binary_tried = true;
+      if (p) ++programs_loaded_;
       compile_spent_ms_ += milliseconds(start);
     }
     if (!p) {
@@ -836,6 +931,7 @@ void main() {
       if (!vertex || !pixel || !compile_allowed()) return 0;
       const auto start = Clock::now();
       p = link_gl(vertex, pixel, binaries_);
+      ++programs_linked_;
       if (binaries_) save_binary(p, binary);
       compile_spent_ms_ += milliseconds(start);
     }
@@ -951,18 +1047,19 @@ void main() {
     std::ostringstream name; name << "prog-" << std::hex << key.vertex << "-" << key.pixel << ".bin";
     const auto binary = cache_ / name.str();
     GLuint p = binaries_ ? load_binary(binary) : 0;
+    if (p) ++programs_loaded_;
     if (!p) {
       const GLuint vsh = shader(GL_VERTEX_SHADER, gx::generate_vertex_shader(vs));
       const GLuint psh = shader(GL_FRAGMENT_SHADER, gx::generate_pixel_shader(ps));
       if (!vsh || !psh) return 0;   // still being translated in the background
       p = link_gl(vsh, psh, binaries_);
+      ++programs_linked_;
       if (binaries_) save_binary(p, binary);
     }
     if (recipes_.size() < RECIPE_LIMIT) {
       ProgramRecipe r; r.components = dc.components; r.bp = dc.bp;
       std::memcpy(r.xf, dc.xf_regs, sizeof r.xf);
-      recipes_.push_back(r);
-      if (!prewarming_ && recipes_.size() >= saved_recipes_ + 32) save_recipes();
+      add_recipe(r);
     }
     for (int i = 0; i < 2; ++i) {
       const GLuint block = glGetUniformBlockIndex(p, i ? "PSBlock" : "VSBlock");
@@ -1823,11 +1920,17 @@ void main() {
   std::unordered_map<uint64_t, Texture> textures_; std::unordered_map<uint32_t, Texture> copies_;
   std::vector<uint8_t> decoded_; std::vector<uint32_t> index_scratch_;
   std::vector<size_t> vertex_offsets_;
+  std::mutex recipes_mutex_;                 // recipes_ and saved_recipes_: render thread appends, saver copies
+  std::atomic<bool> recipes_ready_{false};   // after the prewarm: a list saved halfway would drop recipes
+  std::atomic<uint64_t> programs_loaded_{0}, programs_linked_{0};   // from program binaries / linked (the saver logs them)
+  bool recipes_written_ = true;   // saver thread; an empty first list still tests the cache write
+  // Last member, so it is destroyed first: its thread reads recipes_.
+  gx::cache_store::Saver cache_saver_;
 };
 } // namespace
 
-std::unique_ptr<gx::Backend> create(SDL_Window* window, const std::filesystem::path& cache, int scale, bool vsync) {
-  return std::make_unique<Renderer>(window, cache, scale, vsync);
+std::unique_ptr<gx::Backend> create(SDL_Window* window, const std::filesystem::path& cache, int scale, bool vsync, bool prewarm_only) {
+  return std::make_unique<Renderer>(window, cache, scale, vsync, prewarm_only);
 }
 void capture_efb(gx::Backend& backend, const std::filesystem::path& path) {
 #ifdef MELEE_LINUX_UNLOCKED

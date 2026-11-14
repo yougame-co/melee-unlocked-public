@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Build the native Linux ELF game and host from the same source tree."""
+# Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
 import argparse
 import os
 from pathlib import Path
@@ -8,6 +9,8 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+# Those targets are not registered by ctest in a Linux configuration.
+LINUX_TEST_EXCLUSION_REASON = "Tests declared after the root Linux return() are unavailable to the Linux build."
 
 
 def run(*arguments):
@@ -20,12 +23,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--jobs', type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument('--cpu', choices=('SSE2', 'AVX', 'AVX2'), default='AVX2')
+    parser.add_argument('--doubles', action='store_true', help='experimental console Doubles (default off)')
     parser.add_argument('--headless-build', action='store_true')
     parser.add_argument('--agent-test-hook', action='store_true',
                         help='staging only: enable agent-test.json in the full Source Port')
-    # ON like CMakeLists.txt: the main staging build carries Ranked (Friends + Ranked on the main build).
+    # ON like CMakeLists.txt: the main staging build carries Ranked (10-31: Friends + Ranked on the main build).
     parser.add_argument('--ranked-branch', action=argparse.BooleanOptionalAction, default=True,
                         help='visible Ranked and Practice vs CPU (default on; --no-ranked-branch turns it off)')
+    # Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+    parser.add_argument('--squad-strike', action=argparse.BooleanOptionalAction, default=False,
+                        help='build Squad Strike in both the game and full host; delayed squad_pair proof also needs --agent-test-hook (full host + --port-gen headers)')
+    parser.add_argument('--print-cmake', action='store_true', help='print configure commands without building (any platform)')
     parser.add_argument('--host-only', action='store_true', help='use the existing game build')
     parser.add_argument('--test', action='store_true')
     parser.add_argument('--build-dir', type=Path, default=ROOT / 'build-linux')
@@ -33,7 +41,7 @@ def main():
     parser.add_argument('--port-gen', type=Path, default=Path(os.environ.get('MELEE_PORT_GEN', ROOT.parent / 'mu-gen-090')),
                         help='generated hle_decls.h and guest_symbols.h, for the full Source Port')
     args = parser.parse_args()
-    if sys.platform != 'linux':
+    if sys.platform != 'linux' and not args.print_cmake:
         parser.error('run this script with Linux Python (including Ubuntu under WSL)')
     if args.jobs < 1:
         parser.error('--jobs must be positive')
@@ -41,8 +49,14 @@ def main():
     if args.agent_test_hook and (not full or not (args.port_gen / 'guest_symbols.h').exists()):
         parser.error('--agent-test-hook requires the full graphics host and --port-gen headers')
     for name in ('gcc-14', 'g++-14', 'cmake', 'ninja'):
-        if not shutil.which(name):
+        if not args.print_cmake and not shutil.which(name):
             parser.error('missing build tool: ' + name)
+    squad = ['-DMELEE_SQUAD_STRIKE=ON'] if args.squad_strike else []
+    def configure(*command):
+        if args.print_cmake:
+            print('+ ' + ' '.join(str(x) for x in command), flush=True)
+        else:
+            run(*command)
     game_build = args.game_build_dir.resolve()
     host_build = args.build_dir.resolve()
     if not args.host_only:
@@ -50,35 +64,47 @@ def main():
         # Windows game build uses; otherwise the submodule.
         decomp = ROOT / 'build-native/decomp'
         extra = ['-DMELEE_DECOMP_DIR=' + str(decomp)] if (decomp / 'src/melee').is_dir() else []
-        run('cmake', '-S', ROOT / 'sourceport/game', '-B', game_build, '-G', 'Ninja',
+        configure('cmake', '-S', ROOT / 'sourceport/game', '-B', game_build, '-G', 'Ninja',
             '-DCMAKE_C_COMPILER=gcc-14', '-DCMAKE_CXX_COMPILER=g++-14',
             '-DCMAKE_BUILD_TYPE=Release', '-DMELEE_CPU_BASELINE=' + args.cpu,
             '-DYOUGAME_AGENT_TEST_HOOK=' + ('ON' if args.agent_test_hook else 'OFF'),
-            '-DYOUGAME_RANKED_BRANCH=' + ('ON' if args.ranked_branch else 'OFF'), *extra)
-        run('cmake', '--build', game_build, '--target',
-            'mu_game_tests' if args.test else 'melee_game', '-j', args.jobs)
-        if args.test:
+            '-DYOUGAME_RANKED_BRANCH=' + ('ON' if args.ranked_branch else 'OFF'),
+            '-DMELEE_DOUBLES=' + ('ON' if args.doubles else 'OFF'), *squad, *extra)
+        if not args.print_cmake:
+            run('cmake', '--build', game_build, '--target',
+                'mu_game_tests' if args.test else 'melee_game', '-j', args.jobs)
+        if args.test and not args.print_cmake:
             run('ctest', '--test-dir', game_build, '--output-on-failure')
-    run('cmake', '-S', ROOT, '-B', host_build, '-G', 'Ninja',
+    configure('cmake', '-S', ROOT, '-B', host_build, '-G', 'Ninja',
         '-DCMAKE_CXX_COMPILER=g++-14', '-DCMAKE_BUILD_TYPE=Release',
         '-DMELEE_BUILD_NATIVE_LINUX=ON', '-DMELEE_CPU_BASELINE=' + args.cpu,
         '-DMELEE_LINUX_GAME_LIBRARY=' + str(game_build / 'melee_game.so'),
         '-DMELEE_LINUX_GRAPHICS=' + ('OFF' if args.headless_build else 'ON'),
         '-DYOUGAME_AGENT_TEST_HOOK=' + ('ON' if args.agent_test_hook else 'OFF'),
         '-DYOUGAME_RANKED_BRANCH=' + ('ON' if args.ranked_branch else 'OFF'),
-        '-DMELEE_PORT_GEN=' + (str(args.port_gen.resolve()) if (args.port_gen / 'hle_decls.h').exists() else ''))
+        '-DMELEE_DOUBLES=' + ('ON' if args.doubles else 'OFF'),
+        '-DMELEE_PORT_GEN=' + (str(args.port_gen.resolve()) if (args.port_gen / 'hle_decls.h').exists() else ''), *squad)
+    if args.print_cmake:
+        print('YOUGAME_RANKED_BRANCH=' + ('ON' if args.ranked_branch else 'OFF') +
+              ' MELEE_DOUBLES=' + ('ON' if args.doubles else 'OFF') +
+              ' MELEE_SQUAD_STRIKE=' + ('ON' if args.squad_strike else 'OFF'))
+        return
     targets = ['melee_linux'] + (['melee_' 'source', 'melee_launcher'] if full else [])
     if full and args.cpu != 'AVX2':
         targets = ['melee_' 'source']   # the compatibility build: only the game, under its own names
 
+    if args.test and args.doubles:
+        targets += ['port_yougame_doubles_test', 'port_yougame_doubles_runtime_test',
+                    'port_yougame_doubles_four_peer_test']
     if args.test:
         targets += ['linux_gc_adapter_test', 'linux_input_script_test', 'port_yougame_sysgen_test',
-                    'port_handoff_state_test', 'port_handoff_agent_hook_test', 'port_handoff_agent_off_test',
-                    'port_handoff_delta_test', 'port_friends_handoff_join_test',
+                    'port_gx_object_layout_test', 'port_css_join_test', 'port_css_origin_test', 'port_handoff_state_test', 'port_handoff_agent_hook_test', 'port_handoff_agent_off_test',
+                    'port_handoff_delta_test', 'port_friends_handoff_join_test', 'port_friends_timing_test', 'port_friends_link_evidence_test',
                     'port_sdl_video_thread_test',
                     'port_settings_mouse_test', 'port_keyboard_navigation_test', 'port_controller_profiles_test',
                     'port_settings_profile_bindings_test', 'port_dolphin_profile_test',
                     'port_yougame_embed_view_test', 'port_yougame_embed_volume_test',
+                    'port_yougame_embed_fullscreen_test',
                     'port_yougame_embed_toplevel_test',
                     'port_yougame_shortcuts_off_test', 'port_yougame_shortcuts_hook_test',
                     # Registered above the root CMakeLists' Linux return() (0b0028).
@@ -97,7 +123,7 @@ def main():
                     'port_ranked_setup_model_test', 'port_ranked_setup_widgets_test', 'port_ranked_setup_screen_test', 'port_ranked_setup_cpu_hook_test', 'port_ranked_setup_cpu_off_test',
                     'port_ranked_setup_online_hook_test', 'port_ranked_setup_online_off_test', 'port_yougame_ranked_r1_test', 'port_yougame_mode_policy_test', 'port_yougame_display_defaults_test', 'port_yougame_display_defaults_agent_test', 'port_settings_nav_test', 'port_friends_input_test', 'port_friends_label_test', 'port_session_logs_test',
                     'port_yougame_blend_test', 'port_yougame_release_default_test', 'port_yougame_release_mixed_test',
-                    'port_yougame_search_test', 'port_yougame_http_cancel_test',
+                    'port_yougame_search_test', 'port_yougame_http_cancel_test', 'port_yougame_channel_test',
                     'port_yougame_tourney_test',
                     'port_practice_ghost_placeholders_test', 'port_yougame_pad_trace_hook_test',
                     'port_yougame_pad_trace_off_test',
@@ -116,7 +142,8 @@ def main():
     if args.test:
         run('ctest', '--test-dir', host_build, '--output-on-failure')
     print('Native executable: ' + str(host_build / 'port/linux/melee_linux'))
-    print('YOUGAME_RANKED_BRANCH=' + ('ON' if args.ranked_branch else 'OFF'))
+    print('YOUGAME_RANKED_BRANCH=' + ('ON' if args.ranked_branch else 'OFF') +
+          ' MELEE_SQUAD_STRIKE=' + ('ON' if args.squad_strike else 'OFF'))
     print('YOUGAME_AGENT_TEST_HOOK=' + ('ON (STAGING ONLY)' if args.agent_test_hook else 'OFF'))
 
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #define NOMINMAX
 #include <windows.h>
+#include <atomic>
 #include "gx_d3d12.h"
 #include "gx_shader.h"
 #include "gx_texture.h"
@@ -29,6 +30,8 @@ void loading_show(const wchar_t*, size_t, size_t) {}
 double now_seconds() { return 0.0; }
 void loading_close() {}
 void log_memory() {}
+std::atomic<bool> g_stage_file_modded{false};
+std::atomic<bool> g_stage_water{false};
 }
 namespace slippi { void request_widescreen(bool) {} void request_fod_reflections(bool) {} }
 // These visual setting hooks are not exercised by the resource-pool test. Keep the production
@@ -62,6 +65,21 @@ static gx::TextureRef texture(uint32_t addr, uint8_t r, uint8_t b) {
   data->hash=gx::hash_bytes(data->image.data(),data->image.size()); t.data=data; return t;
 }
 int main(int argc, char** argv) {
+  if (argc == 3 && std::string(argv[1]) == "--pause-text") {
+    try {
+      const std::string name = "tex1_108x20_c68e0bb8472069de_14";
+      gx::texpack::set_cosmetic_companions({{"pause_text", "GmPause.usd", argv[2]}});
+      check(gx::texpack::has(name) && gx::texpack::has("tex1_108x20_m_c68e0bb8472069de_14"),
+            "selected pause text is found with general texture packs off");
+      check(!gx::texpack::has("tex1_108x20_c68e0bb8472069df_14"), "unrelated text is not replaced");
+      auto decoded = gx::texpack::load(name, ~0ull);
+      check(decoded && decoded->width && decoded->height, "pause text PNG decodes with the production loader");
+      gx::texpack::set_cosmetic_companions({});
+      check(!gx::texpack::has(name), "removing the pause style restores the standard text texture");
+      std::puts("pause text texture diagnostic passed");
+      return 0;
+    } catch (const std::exception& error) { std::fprintf(stderr, "%s\n", error.what()); return 1; }
+  }
   // Optional real-asset diagnostic: exercise the exact production PNG decoder and native
   // selector identity lookup without booting the game or touching the ISO/catalog.
   if (argc == 3) {
@@ -173,15 +191,15 @@ int main(int argc, char** argv) {
     check(warmed > 0, "recorded pipelines prewarm before the next draw");
     for (unsigned n=0; n<6; ++n) { frame.sequence=n+1; renderer->submit_frame(frame); }
     const uint64_t owner_b = frame.draws[0].cached_pipeline_owner;
-    // A draw's cached pipeline belongs to one backend AND one motion-vector (DLSS) variant: the
-    // variant changes shader generation and the render target count, so a pipeline built for the
-    // other one must never be handed back after DLSS is switched on or off. The owner is
-    // backend_id*4 + 2*variant + wire, so the plain variant is a multiple of four and two backends
-    // created in sequence step by four.
+    // A draw's cached pipeline belongs to one backend AND one variant (path-tracing G-buffer,
+    // motion vectors for DLSS, wireframe): each changes shader generation or the render target
+    // count, so a pipeline built for another one must never be handed back after a switch. The
+    // owner is backend_id*8 + 4*gbuffer + 2*motion vectors + wire, so the plain variant is a
+    // multiple of eight and two backends created in sequence step by eight.
     printf("pso cache owners: %llu then %llu\n",(unsigned long long)owner_a,(unsigned long long)owner_b);
     check(owner_a!=0&&owner_b!=0,"draws resolved a real pipeline");
-    check(owner_a%4==0&&owner_b%4==0,"pipelines without motion vectors or wireframe cache under the backend's first owner");
-    check(owner_b==owner_a+4,"each backend owns one cache identity per motion-vector and wireframe variant");
+    check(owner_a%8==0&&owner_b%8==0,"pipelines without a G-buffer, motion vectors or wireframe cache under the backend's first owner");
+    check(owner_b==owner_a+8,"each backend owns one cache identity per G-buffer, motion-vector and wireframe variant");
 
     // Texture generator 7 must read Vertex::texmtx[7] (offset 104), not generator 6's index.
     static_assert(offsetof(gx::Vertex,texmtx)+7==104,"texmtx[7] byte offset");

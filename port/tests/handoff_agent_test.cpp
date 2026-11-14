@@ -1,8 +1,14 @@
 // Source-only configuration, confined outputs, and inert non-hook builds.
 #include "yougame_agent_test.h"
 #include <cstdio>
+#if defined(YOUGAME_FRIENDS_HANDOFF_DEFAULT) && YOUGAME_FRIENDS_HANDOFF_DEFAULT
+constexpr bool kJoinDefault = true;   // compiled-in default (50j); agent-test.json cannot turn it off
+#else
+constexpr bool kJoinDefault = false;
+#endif
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 int main(int argc, char** argv) {
+  setenv("YOUGAME_AGENT_COPY", "1", 1);  // the AGENT TEST app's flag: agent_test::load ignores the file without it
   using namespace yougame::agent_test;
   using json = nlohmann::json;
   CHECK(argc == 2);
@@ -16,7 +22,7 @@ int main(int argc, char** argv) {
       {"handoffHashLog", "a.log"}, {"handoffKeep", json::array({json::array({"0x80000000", 8})})}};
   auto map = [&](const json& value, Engine engine = Engine::Source) { return map_keys(value, engine, root); };
 #ifdef YOUGAME_AGENT_TEST_HOOK
-  CHECK(!yougame::console::friends_handoff_join_enabled());
+  CHECK(yougame::console::friends_handoff_join_enabled() == kJoinDefault);
   CHECK(map({{"friendsHandoffJoin",true}}).friends_handoff_join);
   CHECK(!map({{"friendsHandoffJoin",true}}, Engine::Static).friends_handoff_join);
   for (const auto& bad : {json(1),json("true"),json(nullptr)})
@@ -25,7 +31,7 @@ int main(int argc, char** argv) {
   CHECK(load(true, root.string().c_str()).friends_handoff_join);
   CHECK(yougame::console::friends_handoff_join_enabled());
   load(false, root.string().c_str());
-  CHECK(!yougame::console::friends_handoff_join_enabled());
+  CHECK(yougame::console::friends_handoff_join_enabled() == kJoinDefault);
   auto settings = map(config);
   CHECK(settings.handoff.enabled() && settings.handoff.error.empty());
   CHECK(settings.handoff.at == 900 && settings.handoff.keep.size() == 1);
@@ -50,7 +56,7 @@ int main(int argc, char** argv) {
   CHECK(handoff.enabled()); // load publishes only an active, Source hook configuration
   CHECK(!load(false, root.string().c_str()).handoff.enabled() && !handoff.enabled());
 #else
-  CHECK(!yougame::console::friends_handoff_join_enabled());
+  CHECK(yougame::console::friends_handoff_join_enabled() == kJoinDefault);
   CHECK(map({{"friendsHandoffJoin",true}}).arguments.empty());
   CHECK(map(config).arguments.empty());
   CHECK(map(config).environment.empty());

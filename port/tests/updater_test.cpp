@@ -30,9 +30,40 @@ bool make_zip(const std::filesystem::path& folder, const std::filesystem::path& 
   CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
   return code == 0;
 }
+// --download <dlss5|xess|fsr|compat|rtxpack> <game folder>: the real download and install of one optional
+// part, as the game's buttons run it (network; not part of ctest). Prints the outcome and its message.
+int run_download(const std::string& part, const std::string& dir) {
+  using namespace host::updater;
+  struct Part { const char* name; void (*start)(const std::string&); ModelState (*state)(const std::string&); std::string (*message)(); };
+  const Part parts[] = {
+      {"dlss5", dlss5_model_download, dlss5_model_state, dlss5_model_message},
+      {"xess", xess_download, xess_state, xess_message},
+      {"fsr", fsr_download, fsr_state, fsr_message},
+      {"compat", compat_build_download, compat_build_state, compat_build_message},
+      {"rtxpack", rtx_pack_download, rtx_pack_state, rtx_pack_message}};
+  for (const Part& p : parts) {
+    if (part != p.name) continue;
+    p.start(dir);
+    Sleep(100);
+    std::string last;
+    while (p.state(dir) == ModelState::Downloading) {
+      const std::string m = p.message();
+      if (m != last) { std::printf("  %s\n", m.c_str()); last = m; }
+      Sleep(250);
+    }
+    const ModelState s = p.state(dir);
+    std::printf("%s: %s | %s\n", p.name, s == ModelState::Present ? "INSTALLED" : s == ModelState::Failed ? "FAILED" : "MISSING",
+                p.message().c_str());
+    shutdown();
+    return s == ModelState::Present ? 0 : 1;
+  }
+  std::printf("unknown part %s\n", part.c_str());
+  return 2;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 4 && std::string(argv[1]) == "--download") return run_download(argv[2], argv[3]);
   // port_updater_test <zip> <dest> <release folder>: check and unpack one real release zip.
   if (argc == 4 && std::string(argv[1]).rfind("--", 0) != 0) {   // not the --hold-updater-test fixture
     const bool inside = host::updater::archive_inside(argv[1], argv[3]);
@@ -40,14 +71,19 @@ int main(int argc, char** argv) {
     std::printf("inside %d unpacked %d\n", inside, unpacked);
     return inside && unpacked ? 0 : 1;
   }
-  if (argc == 4 && std::string(argv[1]) == "--hold-updater-test") {
+  if (argc == 5 && std::string(argv[1]) == "--hold-updater-test") {
     HANDLE ready = OpenEventA(EVENT_MODIFY_STATE, FALSE, argv[2]);
     HANDLE quit = OpenEventA(SYNCHRONIZE, FALSE, argv[3]);
-    if (!ready || !quit) return 2;
+    HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)std::stoul(argv[4]));
+    if (!ready || !quit || !parent) return 2;
     SetEvent(ready);
-    const DWORD result = WaitForSingleObject(quit, 30000);
-    CloseHandle(ready); CloseHandle(quit);
-    return result == WAIT_OBJECT_0 ? 0 : 3;
+    // Either sibling may take the parent's full 60 s startup allowance on a
+    // busy PC. Remain alive through enumeration, but leave at once if the
+    // parent test is killed instead of signalling quit.
+    HANDLE stop[] = {quit, parent};
+    const DWORD result = WaitForMultipleObjects(2, stop, FALSE, 180000);
+    CloseHandle(ready); CloseHandle(quit); CloseHandle(parent);
+    return result < WAIT_OBJECT_0 + 2 ? 0 : 3;
   }
   namespace fs = std::filesystem;
   using host::updater::archive_inside;
@@ -63,6 +99,24 @@ int main(int argc, char** argv) {
   fs::remove_all(root, ec);
   fs::create_directories(root / "MeleeUnlocked-9.9.9" / "Sys", ec);
   fs::create_directories(root / "Other", ec);
+  {
+    const auto dir = root / "optional";
+    using host::updater::compat_build_needed;
+    fs::create_directories(dir);
+    check(!compat_build_needed(dir.u8string()), "old packages do not require a separate compatibility download");
+    const std::string sha(64, 'a');
+    std::ofstream(dir / "compat.sha256") << sha << " MeleeUnlocked-9.9.9-compat-win64.zip\n";
+    check(compat_build_needed(dir.u8string()), "the matching compatibility build is required on a new package");
+    std::ofstream(dir / "compat.installed") << sha << "\n";
+    check(compat_build_needed(dir.u8string()), "a marker alone cannot claim a missing build is installed");
+    for (const char* name : {"melee_port_compat.exe", "melee_source_compat.exe", "melee_game_compat.dll", "melee_game_compat.snapexcl"})
+      std::ofstream(dir / name).put('x');
+    check(!compat_build_needed(dir.u8string()), "the complete matching compatibility build is reused");
+    std::ofstream(dir / "compat.sha256") << std::string(64, 'b') << " MeleeUnlocked-9.9.10-compat-win64.zip\n";
+    check(compat_build_needed(dir.u8string()), "an update requires its matching compatibility build");
+    std::ofstream(dir / "compat.sha256") << sha << " MeleeUnlocked-../../other.zip\n";
+    check(!compat_build_needed(dir.u8string()), "malformed compatibility metadata is ignored");
+  }
   { std::ofstream(root / "MeleeUnlocked-9.9.9" / "melee_port.exe") << "x"; }
   { std::ofstream(root / "MeleeUnlocked-9.9.9" / "Sys" / "codehandler.bin") << "x"; }
   { std::ofstream(root / "Other" / "stray.txt") << "x"; }
@@ -128,7 +182,8 @@ int main(int argc, char** argv) {
     ready[i] = CreateEventA(nullptr, TRUE, FALSE, ready_name.c_str());
     quit[i] = CreateEventA(nullptr, TRUE, FALSE, quit_name.c_str());
     std::wstring command = L"\"" + exe.wstring() + L"\" --hold-updater-test " +
-      std::wstring(ready_name.begin(), ready_name.end()) + L" " + std::wstring(quit_name.begin(), quit_name.end());
+      std::wstring(ready_name.begin(), ready_name.end()) + L" " + std::wstring(quit_name.begin(), quit_name.end()) +
+      L" " + std::to_wstring(GetCurrentProcessId());
     STARTUPINFOW si{}; si.cb = sizeof si;
     const bool started = !ec && CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
       CREATE_NO_WINDOW | IDLE_PRIORITY_CLASS, nullptr, nullptr, &si, &children[i]);

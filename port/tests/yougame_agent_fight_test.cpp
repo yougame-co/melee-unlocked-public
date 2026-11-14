@@ -171,7 +171,8 @@ static void injection() {
 }
 
 static void parsing(const char* scratch) {
-  const auto directory = std::filesystem::u8path(scratch) / "fight-profile";
+  // The agent root accepts only a plain drive path in Windows form (C:\...); CMake passes "/".
+  const auto directory = (std::filesystem::u8path(scratch) / "fight-profile").make_preferred();
   std::filesystem::create_directory(directory);
   const auto path = directory / "agent-test.json";
   auto load = [&](const nlohmann::json& object, bool active = true) {
@@ -201,6 +202,7 @@ static void parsing(const char* scratch) {
 }
 
 int main(int argc, char** argv) {
+  setenv("YOUGAME_AGENT_COPY", "1", 1);  // the AGENT TEST app's flag: agent_test::load ignores the file without it
   CHECK(argc == 2);
   policy();
   injection();

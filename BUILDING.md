@@ -1,8 +1,12 @@
-# Building Melee Unlocked 0.9.92 for YouGame
+# Building Melee Unlocked 0.9.118 for YouGame
 
-This source tree corresponds to build 46, row `0.9.92-online-test.46`.
-It is the Windows and Linux build on the main listing
-(Linux row `0.9.92-linux-experimental.46`).
+This source tree corresponds to build 98, row `0.9.118-online-test.98`.
+
+Build 98 is the main configuration, with all three online modes: the Friends 4-seat lobby, online Doubles (2v2,
+with YouGame parties) and Squad Strike. It configures the CMake options `MELEE_DOUBLES` and `MELEE_SQUAD_STRIKE`
+ON for the game library and the program; both options are off by default, and the Linux build passes
+`--doubles --squad-strike`. The Doubles and Squad Strike files and their terms are listed in NOTICE.
+It is a proposed build on YouGame (labelled "Not tested yet"), not the main listing build.
 Original project: https://github.com/Hero88go/melee-unlocked. Retain LICENSE,
 NOTICE and third-party attribution when redistributing this GPL-3.0-or-later
 project. The two pinned submodules are recorded as gitlinks; obtain their public
@@ -29,7 +33,7 @@ of runtime resources. A source scan passing does not validate reconstruction.
 
 The retained manual CI workflow and tools/ci instructions describe an older
 release. They depend on omitted patch inputs and the former source-only CMake
-change; do not dispatch them as a build-26 recipe. Use the integrated sources,
+change; do not dispatch them as a build-98 recipe. Use the integrated sources,
 not those patches. The commands below describe current source targets, not a
 validated disc-free build or a complete packaging recipe.
 
@@ -44,9 +48,9 @@ before configuring the host. The native game library and host are separate:
 
 ```powershell
 python tools/prepare_native_sources.py
-cmake -S sourceport/game -B build-sourceport-gcc -G Ninja "-DCMAKE_TOOLCHAIN_FILE=../cmake/mingw-w64-x86_64.cmake" "-DMELEE_MINGW_ROOT=C:/toolchains/mingw64" -DYOUGAME_RANKED_BRANCH=ON -DYOUGAME_AGENT_TEST_HOOK=OFF
+cmake -S sourceport/game -B build-sourceport-gcc -G Ninja "-DCMAKE_TOOLCHAIN_FILE=../cmake/mingw-w64-x86_64.cmake" "-DMELEE_MINGW_ROOT=C:/toolchains/mingw64" -DYOUGAME_RANKED_BRANCH=ON -DYOUGAME_AGENT_TEST_HOOK=OFF -DMELEE_DOUBLES=ON -DMELEE_SQUAD_STRIKE=ON
 cmake --build build-sourceport-gcc --target melee_game --parallel
-cmake -S . -B build-review -G "Visual Studio 17 2022" -A x64 -DMELEE_BUILD_EXPERIMENTAL_PORT=ON -DYOUGAME_RANKED_BRANCH=ON -DYOUGAME_AGENT_TEST_HOOK=OFF
+cmake -S . -B build-review -G "Visual Studio 17 2022" -A x64 -DMELEE_BUILD_EXPERIMENTAL_PORT=ON -DYOUGAME_RANKED_BRANCH=ON -DYOUGAME_AGENT_TEST_HOOK=OFF -DMELEE_DOUBLES=ON -DMELEE_SQUAD_STRIKE=ON
 cmake --build build-review --config Release --target melee_source --parallel
 ```
 
@@ -64,7 +68,7 @@ headers; pass them explicitly:
 
 ```sh
 python3 tools/prepare_native_sources.py
-python3 tools/build_linux.py --port-gen port/generated --ranked-branch
+python3 tools/build_linux.py --port-gen port/generated --ranked-branch --doubles --squad-strike
 ```
 
 This driver passes `YOUGAME_RANKED_BRANCH=ON` to both game and host and keeps
@@ -97,5 +101,5 @@ Supply your own uncompressed Melee NTSC 1.02 ISO using `--iso`, with the matchin
 game library and lawfully reconstructed runtime resources beside the host.
 The public source does not include a disc, DOL, extracted Nintendo assets or a
 complete runtime package. The YouGame app supplies its own launch arguments.
-Do not infer that build 46 is reproducible from this snapshot alone: resource
+Do not infer that build 98 is reproducible from this snapshot alone: resource
 provenance, missing inputs and platform builds still need verification.

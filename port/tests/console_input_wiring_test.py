@@ -74,7 +74,7 @@ PadState g_ui_pad{},g_ui_pads[4]{},g_ui_navigation_pads[4]{},g_last_pads[4]{};
 bool g_ui_has_pad=false,g_ui_gamecube=false,g_ui_settings_chord_held[4]{},g_ui_practice_chord_held[4]{};
 std::atomic<bool> g_ui_capture{false},g_settings_toggle{false},g_practice_toggle{false};
 std::atomic<int> g_settings_controller_port{-1};
-void* g_hwnd=(void*)1; bool window_focused(void*) { return true; }
+void* g_hwnd=(void*)1; bool window_focused(void*) { return true; } bool g_background_input=true;
 double now_seconds() { return 1; }
 struct Overlay {
  int tick(uint64_t) { ++publishes; return 0; }

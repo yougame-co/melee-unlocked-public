@@ -71,20 +71,20 @@ std::vector<CatalogMod> default_catalog() {
       "name": "Training Mode CE",
       "credits": "By UnclePunch, Aitch and contributors",
       "license": "Shared by its authors",
-      "page": "https://github.com/AlexanderHarrison/TrainingMode-CommunityEdition/releases/tag/CE-v1.4-dev1",
+      "page": "https://github.com/AlexanderHarrison/TrainingMode-CommunityEdition/releases/tag/CE-v1.4-dev2",
       "repo": "AlexanderHarrison/TrainingMode-CommunityEdition",
-      "tag": "CE-v1.4-dev1",
+      "tag": "CE-v1.4-dev2",
       "asset_pattern": "TM-CE.zip",
       "kind": "xdelta_zip",
       "one_click": true,
-      "version": "v1.4 d1",
-      "url": "https://github.com/AlexanderHarrison/TrainingMode-CommunityEdition/releases/download/CE-v1.4-dev1/TM-CE.zip",
-      "sha256": "75091be9b402b1dea378a2ef3bc741baae3a11e0324b614cf5ee9da99d2e2d0f",
+      "version": "v1.4 d2",
+      "url": "https://github.com/AlexanderHarrison/TrainingMode-CommunityEdition/releases/download/CE-v1.4-dev2/TM-CE.zip",
+      "sha256": "7d09a2ba854fa8507988ace819ccbfbf0a6bfd305a44a659369176ecc9689325",
       "policy": "permission_granted",
       "tool_sha256": "d81f59b2fe5e8589c0ee9782e231c805084f4d23dfade413903a4cad63b4e342",
-      "patch_sha256": "6c21aac1e7c0d41b0f97f22c4cacd99f4dadae8b80507cfea6a7b47cead72e1f",
-      "output_md5": "a5312a822ff958b967da45a43ce50d09",
-      "output_sha256": "6e753b8f9c3178a9581f3c5d73ed4a75565160254f4f58c6e8c9568ea3e2a02e",
+      "patch_sha256": "16e07afc9625bbed2b66d2b348fee4d9390708524d4e4be74083ac1226eab5af",
+      "output_md5": "1ea2f1de37952f333e40737fcd212147",
+      "output_sha256": "585ac2c73e760d140b471c232b104d487b54bf8004a21ee881d13ee6770b57b9",
       "note": "Runs on the Source Port."
     },
     {
@@ -211,6 +211,48 @@ std::vector<CatalogMod> default_catalog() {
       "output_md5": "c9de1ad05dc28502a44fa8dcdb46f982",
       "output_sha256": "518d02bc9a3c38551427a48af4d7e2ac4626b2cf5db4838e5b190b0877a82ed9",
       "note": "Runs on the Source Port, offline. Download the .xdelta from its page, then drop it here."
+    },
+    {
+      "id": "animelee",
+      "name": "Animelee: Complete Edition",
+      "credits": "By the Animelee team",
+      "license": "Not stated",
+      "page": "https://www.animelee.xyz",
+      "repo": "animelee/complete-edition",
+      "tag": "1.0",
+      "asset_pattern": "ANIMELEE - COMPLETE EDITION - PATCH 1.0.zip",
+      "kind": "xdelta_zip",
+      "one_click": false,
+      "version": "1.0",
+      "url": "https://www.mediafire.com/file/2ztqob93nrug8yg/ANIMELEE_-_COMPLETE_EDITION_-_PATCH_1.0.zip/file",
+      "sha256": "8ed24c56cbcb46a7030fd56560563b85836cd7f44fc547de23fa5aa7a1621a3c",
+      "policy": "link_only",
+      "tool_sha256": "d81f59b2fe5e8589c0ee9782e231c805084f4d23dfade413903a4cad63b4e342",
+      "patch_sha256": "4a3fde4a2119ce57e7894de99fce640063052f051c2395168c492fcc606d5b76",
+      "output_md5": "1f91a05c09d65d2f20ff17551e532e76",
+      "output_sha256": "77607e4624f6576f2da35584e71116809db44863ecd768c9d94c0e742da1a94d",
+      "note": "Runs on either engine. Download the patch zip from its page, then drop it here: the launcher builds the disc (no .bat needed)."
+    },
+    {
+      "id": "animelee-dbz",
+      "name": "Animelee: Dragon Ball Z",
+      "credits": "By the Animelee team",
+      "license": "Not stated",
+      "page": "https://www.animelee.xyz",
+      "repo": "animelee/dragon-ball-z",
+      "tag": "1.0",
+      "asset_pattern": "ANIMELEE - CE - DRAGON BALL Z v1.0.zip",
+      "kind": "xdelta_zip",
+      "one_click": false,
+      "version": "1.0",
+      "url": "https://www.mediafire.com/file/pr8in3kum9kkvg4/ANIMELEE_-_CE_-_DRAGON_BALL_Z_v1.0.zip/file",
+      "sha256": "8c5d7c091b3ba261dbd6cc9ebc46f8a6ce3d9ed4add25c3f5b35d9f26765b41c",
+      "policy": "link_only",
+      "tool_sha256": "d81f59b2fe5e8589c0ee9782e231c805084f4d23dfade413903a4cad63b4e342",
+      "patch_sha256": "18a63bd7d46eb516ffd7415b26e46abc31df6ad0e8dbf2c07d6c979a76a54d78",
+      "output_md5": "",
+      "output_sha256": "ecc4750c121c948bb7bff7818dcc037e12b20f39e42ffc76496d72ea8b648bc3",
+      "note": "Runs on either engine. Download the patch zip from its page, then drop it here: the launcher builds the disc (no .bat needed)."
     }
   ]
 })catalog", &mods, &error);
@@ -556,6 +598,40 @@ void install_file_job(std::wstring file, std::string id, const std::string& iso,
   const fs::path mods = fs::u8path(mods_dir());
   std::string error; std::error_code ec;
   const std::string previous = [&] { const auto f = installed(); const auto it = f.find(id); return it == f.end() ? std::string() : it->second.path; }();
+  // Dolphin's RVZ or WIA image: unpacked once to the full ISO it was made from. The 1.02 disc becomes
+  // the game disc (Disc folder beside the game); a modded disc goes into Mods as a finished .iso.
+  if (disc_rvz::detect(fs::path(file)) != disc_rvz::Format::NotCompressed) {
+    disc_rvz::Info info;
+    if (!disc_rvz::probe(fs::path(file), &info, &error)) { set_status(key, error); return; }
+    if (!enough_space(info.iso_size + 256 * kMiB, &error)) { set_status(key, error); return; }
+    const fs::path staged = mods / ".downloads" / ("rvz-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()) + ".iso");
+    set_status(key, std::string("Unpacking the ") + (info.format == disc_rvz::Format::Rvz ? "RVZ" : "WIA") + " disc image to a full ISO...");
+    int shown = -1;
+    const bool converted = disc_rvz::convert(fs::path(file), staged, [&](uint64_t done, uint64_t total) {
+      const int percent = total ? (int)(done * 100 / total) : 0;
+      if (percent != shown) { shown = percent; set_percent(key, percent); }
+      return !cancelled(cancel);
+    }, &error);
+    set_percent(key, -1);
+    if (!converted) { set_status(key, cancelled(cancel) ? "Cancelled. Nothing was installed." : error); return; }
+    struct Drop { fs::path p; ~Drop() { std::error_code e; fs::remove(p, e); } } drop{staged};   // nothing once placed
+    const fs::path name = fs::path(file).stem().concat(L".iso");
+    if (hash_file(staged.wstring(), BCRYPT_MD5_ALGORITHM) == kVanillaMd5) {
+      const fs::path target = fs::u8path(work_dir()) / "Disc" / name;
+      if (!place(staged, target, &error)) { set_status(key, error); return; }
+      PostMessageW(g_main, WM_APP_GAME_DISC, 0, (LPARAM) new std::string(target.u8string()));
+      set_status(key, "Melee 1.02 unpacked from the image. It is now your game disc.");
+      return;
+    }
+    fs::path out = mods / "Discs" / name;
+    for (unsigned suffix = 2; fs::exists(out, ec); ++suffix)
+      out = mods / "Discs" / fs::u8path(name.stem().u8string() + " (" + std::to_string(suffix) + ").iso");
+    if (!place(staged, out, &error)) { set_status(key, error); return; }
+    scan_installed();
+    if (!id.empty()) enable_installed(id);
+    set_status(key, "Unpacked and added to Mods. Online compatibility is unverified; different builds can desync.");
+    return;
+  }
   if (ends(L".gci") || ends(L".iso") || ends(L".gcm")) {
     set_status(key, "Copying into Mods...");
     if (cancelled(cancel)) { set_status(key, "Cancelled. Nothing was installed."); return; }
@@ -608,8 +684,13 @@ void install_file_job(std::wstring file, std::string id, const std::string& iso,
       if (seven.empty()) { set_status(key, "The 7-Zip tool is missing from the launcher's tools folder (tools\\7zr.exe). Reinstall Melee Unlocked to get it."); return; }
       code = run_hidden(seven.wstring(), L"x -y -bd \"-o" + work.wstring() + L"\" \"" + file + L"\"", work.wstring(), cancel);
     } else {
-      wchar_t sys[MAX_PATH]; GetSystemDirectoryW(sys, MAX_PATH);
-      code = run_hidden(std::wstring(sys) + L"\\tar.exe", L"-xf \"" + file + L"\" -C \"" + work.wstring() + L"\"", work.wstring(), cancel);
+      // In process first (entries outside the folder refused): Windows before 10 1803 has no tar.exe,
+      // and some installs cannot start it (a player's Animelee build, 11-12). tar only if that fails.
+      if (host::updater::unpack_download(fs::path(file).u8string(), work.u8string())) code = 0;
+      else {
+        wchar_t sys[MAX_PATH]; GetSystemDirectoryW(sys, MAX_PATH);
+        code = run_hidden(std::wstring(sys) + L"\\tar.exe", L"-xf \"" + file + L"\" -C \"" + work.wstring() + L"\"", work.wstring(), cancel);
+      }
     }
     if (cancelled(cancel)) { set_status(key, "Cancelled. Nothing was installed."); return; }
     if (code != 0) { set_status(key, "The archive could not be unpacked. Nothing was installed."); return; }
@@ -781,8 +862,30 @@ bool same_version(std::string a, std::string b) {
   auto norm = [](std::string s) { std::string o; for (char c : s) if (c != ' ' && c != 'v' && c != 'V') o += (char)tolower((unsigned char)c); return o; };
   return norm(a) == norm(b);
 }
+// The mod buttons skip Windows' own clear before they are drawn (it showed as a flash of the plain
+// button colour on every scroll step): draw_item paints every pixel of them.
+LRESULT CALLBACK button_no_erase(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+  if (msg == WM_ERASEBKGND) return 1;
+  return DefSubclassProc(w, msg, wp, lp);
+}
+
+// A button's label and visibility only change when they actually do: setting the same label again
+// repainted the button on its own, and hiding and showing it again flashed it.
+void set_label(HWND h, const std::wstring& text) {
+  wchar_t now[128]{};
+  GetWindowTextW(h, now, (int)std::size(now));
+  if (text != now) SetWindowTextW(h, text.c_str());
+}
+void set_shown(HWND h, bool shown) {
+  if ((IsWindowVisible(h) != FALSE) != shown) ShowWindow(h, shown ? SW_SHOWNA : SW_HIDE);
+}
+
 void refresh_window() {
   if (!g_window) return;
+  // Scrolling moves every visible button: with drawing paused until the whole page is laid out,
+  // the page and its buttons repaint once, together, instead of each button flashing on its own at
+  // its old place and then its new one (0.9.97 report).
+  SendMessageW(g_window, WM_SETREDRAW, FALSE, 0);
   const View current = view();
   const auto& found = current.installed;
   std::vector<CatalogMod> catalog;
@@ -804,7 +907,9 @@ void refresh_window() {
     auto make = [&](int id) {
       HWND h = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | BS_OWNERDRAW, 0, 0, S(10), S(10), g_window,
                                (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
-      SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE); return h;
+      SendMessageW(h, WM_SETFONT, (WPARAM)g_font, TRUE);
+      SetWindowSubclass(h, button_no_erase, 1, 0);
+      return h;
     };
     g_buttons.push_back(make(ID_MOD_BUTTON + i)); g_updates.push_back(make(ID_MOD_UPDATE + i));
     g_removes.push_back(make(ID_MOD_REMOVE + i)); g_toggles.push_back(make(ID_MOD_TOGGLE + i));
@@ -817,19 +922,19 @@ void refresh_window() {
   for (size_t i = 0; i < g_buttons.size(); ++i) {
     const bool visible = i < g_rows.size() && (int)i >= g_top && (int)i < g_top + shown;
     HWND controls[] = {g_buttons[i], g_updates[i], g_removes[i], g_toggles[i], g_skins[i]};
-    if (!visible) { for (HWND h : controls) ShowWindow(h, SW_HIDE); continue; }
+    if (!visible) { for (HWND h : controls) set_shown(h, false); continue; }
     const RECT card = card_rect((int)i - g_top);
     const int right = units(card.right) - 16, top = units(card.top);
-    MoveWindow(g_toggles[i], S(right - 84), S(top + 12), S(84), S(28), TRUE);
-    MoveWindow(g_removes[i], S(right - 84), S(top + 92), S(84), S(28), TRUE);
-    MoveWindow(g_updates[i], S(right - 176), S(top + 92), S(84), S(28), TRUE);
-    MoveWindow(g_buttons[i], S(right - 308), S(top + 92), S(124), S(28), TRUE);
-    MoveWindow(g_skins[i], S(right - 428), S(top + 92), S(112), S(28), TRUE);
+    MoveWindow(g_toggles[i], S(right - 84), S(top + 12), S(84), S(28), FALSE);
+    MoveWindow(g_removes[i], S(right - 84), S(top + 92), S(84), S(28), FALSE);
+    MoveWindow(g_updates[i], S(right - 176), S(top + 92), S(84), S(28), FALSE);
+    MoveWindow(g_buttons[i], S(right - 308), S(top + 92), S(124), S(28), FALSE);
+    MoveWindow(g_skins[i], S(right - 428), S(top + 92), S(112), S(28), FALSE);
     const auto& row = g_rows[i]; const auto& m = row.catalog; const auto& f = row.installed;
     // "Choose skins" opens the Settings window on the Mods tab, where the disc's costumes are picked.
     // Only once the game has listed them (disc-skins.txt), so the button never leads to an empty list.
     const bool has_skins = row.found && view_skins(current, f.path, nullptr) > 0;
-    SetWindowTextW(g_skins[i], launcher::lang::txw(L"Choose skins").c_str());
+    set_label(g_skins[i], launcher::lang::txw(L"Choose skins"));
     EnableWindow(g_skins[i], has_skins && !g_playing);
     const bool busy = is_busy(m.id), playable = row.found && runs_here(f);
     std::string primary; bool enabled = true; LONG_PTR style = 0;
@@ -837,20 +942,26 @@ void refresh_window() {
     else if (row.found) { primary = playable ? "Play" : scanning() ? "Checking..." : "Not supported yet"; enabled = playable && !g_playing; style = STYLE_ACCENT; }
     else if (m.one_click) { primary = "Get"; style = STYLE_ACCENT; enabled = !m.url.empty() || !m.repo.empty(); }
     else { primary = "Open download page"; enabled = !m.page.empty(); }
-    SetWindowTextW(g_buttons[i], widen(tx(primary)).c_str());
+    set_label(g_buttons[i], widen(tx(primary)));
     SetWindowLongPtrW(g_buttons[i], GWLP_USERDATA, style);
     EnableWindow(g_buttons[i], enabled);
     const bool current = row.found && !m.version.empty() && same_version(m.version, f.version);
-    SetWindowTextW(g_updates[i], launcher::lang::txw(current ? L"Up to date" : L"Update").c_str());
-    EnableWindow(g_updates[i], row.found && !busy && m.one_click && !m.version.empty() && !current && !g_playing);
-    SetWindowTextW(g_removes[i], launcher::lang::txw(L"Remove").c_str());
+    // A mod that is not one click and not installed yet: this slot picks the downloaded file (the same
+    // as dropping it on the window, which players did not find; 0.9.116 Animelee report).
+    const bool add_file = !row.found && !m.one_click;
+    set_label(g_updates[i], launcher::lang::txw(add_file ? L"Add file..." : current ? L"Up to date" : L"Update"));
+    SetWindowLongPtrW(g_updates[i], GWLP_USERDATA, add_file ? STYLE_ACCENT : 0);
+    EnableWindow(g_updates[i], add_file ? !busy && !g_playing
+                                        : row.found && !busy && m.one_click && !m.version.empty() && !current && !g_playing);
+    set_label(g_removes[i], launcher::lang::txw(L"Remove"));
     EnableWindow(g_removes[i], row.found && !busy && !g_playing);
-    SetWindowTextW(g_toggles[i], launcher::lang::txw(f.enabled && row.found ? L"On" : L"Off").c_str());
+    set_label(g_toggles[i], launcher::lang::txw(f.enabled && row.found ? L"On" : L"Off"));
     SetWindowLongPtrW(g_toggles[i], GWLP_USERDATA, row.found && f.enabled ? STYLE_ON : 0);
     EnableWindow(g_toggles[i], playable && !busy && !g_playing);
-    for (HWND h : controls) { ShowWindow(h, h == g_skins[i] && !has_skins ? SW_HIDE : SW_SHOW); InvalidateRect(h, nullptr, FALSE); }
+    for (HWND h : controls) set_shown(h, !(h == g_skins[i] && !has_skins));
   }
-  InvalidateRect(g_window, nullptr, FALSE);
+  SendMessageW(g_window, WM_SETREDRAW, TRUE, 0);
+  RedrawWindow(g_window, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
 void draw_check(HDC dc, int x, int y, bool on) {
   RECT box = LR(x, y, 18, 18);
@@ -934,7 +1045,7 @@ void paint_page(HDC dc) {
       if (runs_here(f)) state += " | " + tx(f.enabled ? "On" : "Off");
       if (f.status == "untested") state += " | " + tx("Untested");
       state_color = f.status == "supported" ? C_OK : C_WARN;
-    } else state = tx(m.one_click ? "Not installed" : "Not installed. Put the file in the Mods folder.");
+    } else state = tx(m.one_click ? "Not installed" : "Not installed. Download it from its page, then press Add file.");
     draw_text(dc, widen(state), LR(x + 44, y + 50, text_w, 18), g_font, state_color, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
     // Last line: what is happening now, else what runs this mod.
     std::string line; COLORREF line_color = C_DIM;
@@ -961,8 +1072,10 @@ void paint_page(HDC dc) {
         line = tx(m.note.empty() ? "Plays on the Static Recomp, offline (no online play or replays)." : m.note);
         line_color = C_DIM;
       } else {
-        line = tx(f.needs_engine == "recomp" ? "Direct and Teams. Same mod required for every player; different builds can desync. Launch vanilla for Unranked."
-                                           : "Direct needs matching mods; different builds can desync. Source Port uses vanilla for Unranked and Teams.");
+        // Unranked and Party play the standard game with the mod's looks on both engines (the Source
+        // Port switches its files, the Static Recomp restarts into that form); Direct keeps the mod
+        // against the same build.
+        line = tx("Unranked and Party: the standard game with this mod's looks. Direct: the same mod on both sides.");
         line_color = C_WARN;
       }
 #endif
@@ -985,7 +1098,29 @@ void paint_page(HDC dc) {
   else if (!g_tools_ok) { note = tx("The mod tools are missing (tools\\xdelta3.exe, tools\\7zr.exe). Reinstall Melee Unlocked to use Get."); note_color = C_WARN; }
   draw_text(dc, widen(note), LR(kPad, height - kFooter + 10, width - 2 * kPad, 30), g_font_small, note_color, DT_LEFT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX);
 }
+void draw_item_direct(DRAWITEMSTRUCT* di);
+// A button is drawn whole in memory and then copied to the screen at once: drawn straight onto the
+// screen, its background, shape and label showed one after another while the list scrolled.
 void draw_item(DRAWITEMSTRUCT* di) {
+  const RECT r = di->rcItem;
+  const int w = r.right - r.left, h = r.bottom - r.top;
+  if (w <= 0 || h <= 0) return;
+  HDC mem = CreateCompatibleDC(di->hDC);
+  HBITMAP bmp = CreateCompatibleBitmap(di->hDC, w, h);
+  HGDIOBJ old_bmp = SelectObject(mem, bmp);
+  HGDIOBJ old_font = SelectObject(mem, GetCurrentObject(di->hDC, OBJ_FONT));
+  SetViewportOrgEx(mem, -r.left, -r.top, nullptr);
+  DRAWITEMSTRUCT copy = *di;
+  copy.hDC = mem;
+  draw_item_direct(&copy);
+  SetViewportOrgEx(mem, 0, 0, nullptr);
+  BitBlt(di->hDC, r.left, r.top, w, h, mem, 0, 0, SRCCOPY);
+  SelectObject(mem, old_font);
+  SelectObject(mem, old_bmp);
+  DeleteObject(bmp);
+  DeleteDC(mem);
+}
+void draw_item_direct(DRAWITEMSTRUCT* di) {
   RECT wr; GetWindowRect(di->hwndItem, &wr); MapWindowPoints(nullptr, g_window, (POINT*)&wr, 2);
   RECT client{}; GetClientRect(g_window, &client);
   const int base = (int)(di->CtlID / 1000) * 1000;
@@ -1038,13 +1173,35 @@ void choose_link() {
     scan_installed(); set_status("drop", "Linked. Your disc stays where it is.");
   }).detach();
 }
+// "Add file..." on a mod's card: the downloaded patch zip, .xdelta or disc, installed as a drop is.
+void choose_mod_file(const std::string& id) {
+  wchar_t file[32768]{}; OPENFILENAMEW ofn{sizeof ofn}; ofn.hwndOwner = g_main;
+  ofn.lpstrFilter = L"Mod download (*.zip;*.7z;*.xdelta;*.iso;*.gcm;*.rvz;*.wia) *.zip;*.7z;*.xdelta;*.iso;*.gcm;*.rvz;*.wia All files *.* ";
+  ofn.lpstrFile = file; ofn.nMaxFile = (DWORD)std::size(file); ofn.Flags = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+  if (!GetOpenFileNameW(&ofn)) return;
+  (void)id;
+  std::thread(install_file, std::wstring(file), std::string(), g_iso).detach();
+}
 void cancel_job(const std::string& id) {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (g_jobs.count(id)) g_jobs[id]->store(true);
 }
 LRESULT CALLBACK proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
   switch (msg) {
-    case WM_APP + 41: capture_test_client(w, "mods-capture.bmp"); return 0;
+    case WM_APP + 41: {
+      capture_test_client(w, "mods-capture.bmp");
+      // Test runs: each shown card's mod and its button labels, as the controls hold them now.
+      if (FILE* out = _wfopen((launcher_dir() / "mods-buttons.txt").wstring().c_str(), L"w")) {
+        for (size_t i = 0; i < g_rows.size() && i < g_buttons.size(); ++i) {
+          if (!IsWindowVisible(g_buttons[i])) continue;
+          wchar_t a[128]{}, b[128]{}; GetWindowTextW(g_buttons[i], a, 128); GetWindowTextW(g_updates[i], b, 128);
+          fprintf(out, "%s | %ls (%s) | %ls (%s)\n", g_rows[i].catalog.id.c_str(), a, IsWindowEnabled(g_buttons[i]) ? "on" : "off",
+                  b, IsWindowEnabled(g_updates[i]) ? "on" : "off");
+        }
+        fclose(out);
+      }
+      return 0;
+    }
     case WM_PRINTCLIENT: paint_page((HDC)wp); print_client_children(w, (HDC)wp); return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
@@ -1095,6 +1252,7 @@ LRESULT CALLBACK proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         g_mod_launch_engine = catalog_core::play_engine(row.installed, g_engine == ENGINE_SOURCE ? "source" : "recomp");
         select_tab(0); start_game(); return 0;
       }
+      if (base == ID_MOD_UPDATE && !row.found && !row.catalog.one_click) { if (!g_playing) choose_mod_file(row.catalog.id); return 0; }
       if (base == ID_MOD_BUTTON || base == ID_MOD_UPDATE) {
         if (base == ID_MOD_UPDATE && row.found && same_version(row.catalog.version, row.installed.version)) return 0;
         if (row.catalog.one_click) {
@@ -1153,6 +1311,19 @@ bool is_mod_file(const std::wstring& path) {
 // Test runs only (MELEE_LAUNCHER_TEST_GET=<catalog id>): Get that mod at startup, as its button
 // does; every status line lands in mods-status.log beside the launcher.
 void test_get() {
+  // MELEE_LAUNCHER_TEST_MODS_CAPTURE_MS=<ms>: the Mods page opens, and after that long it is saved as
+  // mods-capture.bmp beside the launcher.
+  if (const char* ms = g_launcher_test ? std::getenv("MELEE_LAUNCHER_TEST_MODS_CAPTURE_MS") : nullptr) {
+    select_tab(4);
+    // MELEE_LAUNCHER_TEST_MODS_PAGES=<n> scrolls that many pages down first.
+    const char* pages = std::getenv("MELEE_LAUNCHER_TEST_MODS_PAGES");
+    std::thread([ms = std::atoi(ms), pages = pages ? std::atoi(pages) : 0] {
+      Sleep(ms);
+      for (int i = 0; i < pages && g_window; ++i) PostMessageW(g_window, WM_VSCROLL, SB_PAGEDOWN, 0);
+      Sleep(500);
+      if (g_window) PostMessageW(g_window, WM_APP + 41, 0, 0);
+    }).detach();
+  }
   // MELEE_LAUNCHER_TEST_DROP=<file>: that file is dropped on the launcher at startup.
   if (const char* drop = std::getenv("MELEE_LAUNCHER_TEST_DROP"); g_launcher_test && drop && *drop) {
     std::thread(install_file, widen(drop), std::string(), g_iso).detach();

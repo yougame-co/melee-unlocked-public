@@ -205,7 +205,8 @@ bool Assets::prepare(const Config& config, const Disc& disc, std::string& error)
       if (!shipped(config.sys_dir, name).empty()) continue;
       if (std::none_of(files.begin(), files.end(), [&](const File& f) {
             return f.target == name && std::find(f.sys.begin(), f.sys.end(), active) != f.sys.end();
-          })) return fail(error, name + ": missing delta manifest entry for active Sys directory");
+          })) return fail(error, name + ": missing delta manifest entry for active Sys directory " +
+                      config.sys_dir.u8string() + (has_manifest ? "" : " (no deltas/manifest.json beside it)"));
     }
     std::map<std::string, std::filesystem::path> pending;
     bool verified = false;

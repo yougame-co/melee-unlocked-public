@@ -119,6 +119,9 @@ static void lifecycle() {
   CHECK(!keys.swallows(true, 'K')); // Modifiers alone cannot reserve an unpressed primary.
   CHECK(!keys.swallows(true, 13));
   CHECK(!keys.swallows(true, 'A'));
+  expect(keys.event(true, 13, true, 0, false), false); // Plain Enter still reaches Start.
+  CHECK(!keys.swallows(true, 13));
+  expect(keys.event(true, 13, false, 0, false), false);
   expect(keys.event(true, 'K', true, 7, false), true, kDown);
   expect(keys.event(true, 13, true, 7, false), true, nullptr, kChatDown);
   expect(keys.event(true, 13, true, 7, true), true);

@@ -57,9 +57,20 @@ class EmbedViewWiringTest(unittest.TestCase):
                           r'#else\s*inline constexpr const char\* kCaps = ("[^\n]+?");\s*#endif', header)
         self.assertIsNotNone(match)
         supported, mac = (json.loads(json.loads(value)[3:])["caps"] for value in match.groups())
-        self.assertEqual(supported, ["ready", "overlay", "join", "notice", "pads", "rumble", "chat", "settings", "view", "volume"])
-        self.assertEqual(mac, ["ready", "overlay", "join", "notice", "pads", "rumble", "chat", "settings"])
+        self.assertEqual(supported, ["ready", "overlay", "join", "notice", "pads", "rumble", "chat", "settings", "view", "volume", "match", "fullscreen"])
+        self.assertEqual(mac, ["ready", "overlay", "join", "notice", "pads", "rumble", "chat", "settings", "match", "fullscreen"])
+        toplevel = re.search(r'const char\* kToplevelCaps = ("[^\n]+?");', header)
+        self.assertIsNotNone(toplevel)
+        self.assertEqual(json.loads(json.loads(toplevel.group(1))[3:])["caps"],
+                         ["ready", "overlay", "join", "notice", "pads", "rumble", "chat", "settings", "view", "volume", "toplevel", "match", "fullscreen"])
         self.assertEqual(header.count('kCaps ='), 2)
+
+    def test_stdio_init_logs_nothing(self):
+        # init runs before --log-file opens; a line here sends the run log to the default file.
+        link = source("port/runtime/hle/yougame_link.cpp")
+        block = link.split("  if (g_stdio) {\n    std::thread(read_stdin).detach();", 1)[1].split("\n  }\n", 1)[0]
+        self.assertIn("parity::signals.sync_match(-1);", block)
+        self.assertNotIn("log(", block)
 
     def test_proof_logs(self):
         for path in ("port/runtime/host/window.cpp", "port/linux/embed/yougame_embed_x11.c"):

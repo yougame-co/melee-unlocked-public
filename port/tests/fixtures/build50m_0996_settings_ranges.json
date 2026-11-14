@@ -1,0 +1,34 @@
+[
+ {
+  "before": "  options.freeze_fd = false;\n  options.hide_ko_explosions = false;\n  options.unlock_all = true;   // a file without the key: on\n  options.results_screen = true;\n",
+  "after": "  options.freeze_fd = false;\n  options.hide_ko_explosions = false;\n  options.hide_hud_emblems = false;\n  options.unlock_all = true;   // a file without the key: on\n  options.results_screen = true;\n"
+ },
+ {
+  "before": "      else if (key == \"freeze_fd\") options.freeze_fd = value == \"1\";\n      else if (key == \"hide_ko_explosions\") options.hide_ko_explosions = value == \"1\";\n      else if (key == \"unlock_all\") options.unlock_all = value != \"0\";\n      else if (key == \"results_screen\") options.results_screen = value != \"0\";\n",
+  "after": "      else if (key == \"freeze_fd\") options.freeze_fd = value == \"1\";\n      else if (key == \"hide_ko_explosions\") options.hide_ko_explosions = value == \"1\";\n      else if (key == \"hide_hud_emblems\") options.hide_hud_emblems = value == \"1\";\n      else if (key == \"unlock_all\") options.unlock_all = value != \"0\";\n      else if (key == \"results_screen\") options.results_screen = value != \"0\";\n"
+ },
+ {
+  "before": "  host::g_freeze_fd.store(options.freeze_fd, std::memory_order_relaxed);\n  host::g_hide_ko_explosions.store(options.hide_ko_explosions, std::memory_order_relaxed);\n  RenderOptions::live_unlock_all() = options.unlock_all;\n  RenderOptions::live_results_screen() = options.results_screen;\n",
+  "after": "  host::g_freeze_fd.store(options.freeze_fd, std::memory_order_relaxed);\n  host::g_hide_ko_explosions.store(options.hide_ko_explosions, std::memory_order_relaxed);\n  host::g_hide_hud_emblems.store(options.hide_hud_emblems, std::memory_order_relaxed);\n  RenderOptions::live_unlock_all() = options.unlock_all;\n  RenderOptions::live_results_screen() = options.results_screen;\n"
+ },
+ {
+  "before": "       << \"\\nfreeze_fd \" << (options.freeze_fd ? 1 : 0)\n       << \"\\nhide_ko_explosions \" << (options.hide_ko_explosions ? 1 : 0)\n       << \"\\nunlock_all \" << (options.unlock_all ? 1 : 0)\n       << \"\\nresults_screen \" << (options.results_screen ? 1 : 0)\n",
+  "after": "       << \"\\nfreeze_fd \" << (options.freeze_fd ? 1 : 0)\n       << \"\\nhide_ko_explosions \" << (options.hide_ko_explosions ? 1 : 0)\n       << \"\\nhide_hud_emblems \" << (options.hide_hud_emblems ? 1 : 0)\n       << \"\\nunlock_all \" << (options.unlock_all ? 1 : 0)\n       << \"\\nresults_screen \" << (options.results_screen ? 1 : 0)\n"
+ },
+ {
+  "before": "#endif\n    if (ImGui::IsItemHovered())\n      ImGui::SetTooltip(\"Prevents horizontal screen tearing; may add display latency.\\n\"\n                        \"With VSync off, tearing is possible when automatic variable-refresh detection is unavailable.\");\n    // Display: one choice. Borderless and exclusive fullscreen were two switches that turned each\n    // other off; the same two settings are written, so the renderers see no difference.\n",
+  "after": "#endif\n    if (ImGui::IsItemHovered())\n      ImGui::SetTooltip(\"On prevents tearing but can add display latency. Off favors lower latency.\\n\"\n                        \"G-Sync/FreeSync must be enabled in your monitor and driver; the game keeps\\n\"\n                        \"the frame rate below refresh when it detects VRR. Fixed-refresh displays\\n\"\n                        \"can tear with Off. Driver VSync settings may override this switch.\");\n    // Display: one choice. Borderless and exclusive fullscreen were two switches that turned each\n    // other off; the same two settings are written, so the renderers see no difference.\n"
+ },
+ {
+  "before": "      int linux_index = options.api == RenderApi::Vulkan ? 1 : 0;\n      if (vulkan_available()) {\n        if (settings_combo(\"Graphics backend\", &linux_index, linux_backends, 2)) { options.api = linux_index ? RenderApi::Vulkan : RenderApi::D3D12; changed = true; }\n        settings_hint(\"Takes effect at the next launch: save settings, then restart.\");\n      } else ImGui::TextUnformatted(\"Graphics backend: OpenGL\");\n",
+  "after": "      int linux_index = options.api == RenderApi::Vulkan ? 1 : 0;\n      if (vulkan_available()) {\n        if (settings_combo(\"Graphics backend\", &linux_index, linux_backends, 2)) {\n          options.api = linux_index ? RenderApi::Vulkan : RenderApi::D3D12; changed = true;\n          if (linux_index) vulkan_forget_failed_starts();\n        }\n        settings_hint(\"Takes effect at the next launch: save settings, then restart.\");\n      } else ImGui::TextUnformatted(\"Graphics backend: OpenGL\");\n"
+ },
+ {
+  "before": "    if (settings_combo(\"Graphics backend\", &api_index, backends, vulkan_available() ? 3 : 2)) {\n      options.api = api_index == 1 ? RenderApi::D3D11 : api_index == 2 ? RenderApi::Vulkan : RenderApi::D3D12; changed = true;\n    }\n    settings_hint(\"Takes effect at the next launch: save settings, then restart.\");\n",
+  "after": "    if (settings_combo(\"Graphics backend\", &api_index, backends, vulkan_available() ? 3 : 2)) {\n      options.api = api_index == 1 ? RenderApi::D3D11 : api_index == 2 ? RenderApi::Vulkan : RenderApi::D3D12; changed = true;\n      if (api_index == 2) vulkan_forget_failed_starts();\n    }\n    settings_hint(\"Takes effect at the next launch: save settings, then restart.\");\n"
+ },
+ {
+  "before": "                        \"The match is exactly the same, so it also works online and in replays.\\n\"\n                        \"Picture only, yours alone. Both engines. Takes effect from the next KO.\");\n\n\n",
+  "after": "                        \"The match is exactly the same, so it also works online and in replays.\\n\"\n                        \"Picture only, yours alone. Both engines. Takes effect from the next KO.\");\n    if (settings_toggle(\"Hide emblems behind percents\", &options.hide_hud_emblems)) {\n      host::g_hide_hud_emblems.store(options.hide_hud_emblems, std::memory_order_relaxed);\n      changed = true;\n    }\n    if (ImGui::IsItemHovered())\n      ImGui::SetTooltip(\"No character emblem behind each player's damage percent.\\n\"\n                        \"Picture only, yours alone: the match is the same, online and in replays too. Both engines.\");\n\n\n"
+ }
+]

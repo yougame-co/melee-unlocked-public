@@ -17,7 +17,9 @@ with a single effect choice per DAT migrate that choice to its move slot.
 Stage replacements are checked against the exact ISO. Texture-only replacements and supported
 model replacements with matching gameplay data can remain active online. The model check preserves
 collision, platform transforms, stage parameters, and animation data. Unsupported archive layouts
-and replacements that change gameplay remain available offline. Online
+and replacements that change gameplay remain available offline. A conversion must retain every
+mesh in the skin: incomplete conversions use the standard stage online and show the retained mesh
+count in the Mods tab, rather than displaying missing geometry. Online
 disc reads for those stage slots use the clean resource. Profile changes are frozen while an online
 search or match is active, and all changes require a restart to affect the running asset snapshot.
 
@@ -117,6 +119,23 @@ and the `.dat` otherwise. An import for such a slot replaces both, each checked 
 file for the online rule. The importer accepts a file named `.usd` wherever it accepts a `.dat`,
 alone or inside a ZIP.
 
+### Optional pause screens
+
+**Settings > Mods > Import / Refresh** accepts a pause-screen ZIP with `GmPause.usd` and an optional
+`GmPauseNoHUD.usd`, or either file on its own. Choose the imported style in **Mods > Pause screen**
+and restart. The two-style pack leaves the original selected until you choose one. Its optional
+`tex1_108x20_c68e0bb8472069de_14.png` label texture is enabled only with the selected style; the
+general texture-pack toggle can remain off. **Vanilla** or **Restore Vanilla** removes both the
+pause archive and its label replacement. The ISO stays untouched.
+
+The supplied Minimal pause pack has a **PAUSE label** style and a **no pause overlay** style.
+The latter removes the label as well. These names describe the pause overlay; the game's own
+pause camera still controls the match HUD.
+
+Imports validate the scene symbol, required controls joints, bounded texture data and archive
+pointers. Unsupported joint trees and mixed pause/gameplay archives are refused before changing
+the catalog. A pause style changes presentation; it does not change whether pausing is allowed.
+
 ### Portraits and stock icons without a costume file
 
 A portrait (the character select picture) or a stock icon can be given to a costume on its own:
@@ -142,6 +161,37 @@ rows): from a PNG, or copied from another skin or costume of the same fighter, a
 again there. A picture added to the costume fills in where a skin has none, and on the original
 costume. This also holds for skins from a mod disc or a files pack; the picture is kept in the
 catalog and stays with the skin when the pack is scanned again.
+
+On Source Port character select, place the character token and press **L/R** to cycle that fighter's
+native colors and installed skins, including skins imported into other color slots. The costume
+index, portrait and model follow the choice together without restarting. **X/Y** still changes
+color normally. A color occupied by another player of the same fighter is skipped. Online and Teams
+keep L/R within the selected color; queued matches keep the cosmetic profile locked. Static Recomp
+also keeps L/R within the selected color. With 20XX TE shield colors enabled, L/R belongs to that
+option; turn it off to use skin cycling.
+
+**Mods → Costume packs** keeps every scanned ISO or folder under one source name. Its **Costume set**
+picker lists its original and m-ex sets inside that pack; **Apply set** previews the selections it
+will replace before applying them. Sets are choices within a pack, not separate ISO imports.
+
+When scanning an m-ex ISO or extracted files pack, `MxDt.dat` identifies each retail fighter's
+costume files, including extra filenames such as `PlMsNr2.dat`. A costume whose model roots name
+a supported retail slot becomes another skin choice for that slot; select it in Mods or cycle it
+with L/R on character select. The importer reads `mexSelectChr`'s CSP stride and the costume's
+external fighter ID and index to attach its matching portrait automatically. Reduced-size CI8
+and CI4 portraits and independent image/palette animation tracks are supported. The pack's code
+is never executed. This imports costumes of existing fighters; it does not add custom fighter code.
+For added colors that rename their skeleton and material exports, the importer uses the pack's
+declared visibility slot and export symbols to adapt those names for the existing native slot.
+Model bytes and source files stay unchanged. The original source hash is verified before adapting
+the served archive, including after a restart. A separate `mexSelectChr.dat` takes precedence over
+the older character-select archive when the pack supplies both.
+
+Existing disc catalogs rescan once after this update, preserving selections and manually assigned
+portraits. An alternate without an explicit mapping keeps the standard picture. Unsupported model
+roots or malformed metadata are not guessed. The eight-costume Marth regression covers the model,
+portrait, live cycling and catalog upgrade paths; compatibility with an unprovided custom ISO still
+requires testing that ISO.
 
 The active runtime map owns immutable byte buffers and is published before the guest initializes
 DVD. Settings changes affect only the desired on-disk profile. Restarting drops guest RAM, DVD

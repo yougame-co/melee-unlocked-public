@@ -30,7 +30,9 @@ for dirty in melee_source melee_linux; do
   for marker in 'agent-test.json' 'padBack' 'netDelayMs' 'netJitterMs' \
     'agent-test: key escape' 'agent-test: script' 'agent-test: captureEvery not supported on Linux; ignored' \
     'padTrace' 'agent-test: padTrace output capability refused; ignored' 'port %d src %s buttons %04X stick %d,%d' \
-    'present_log' 'present_frames' 'present-log v1' 'agent-test: present output'; do
+    'present_log' 'present_frames' 'present-log v1' 'agent-test: present output' \
+    'YOUGAME_TEST_CSS_STATE' 'css-state roundtrip hash_before=' 'css-state bytes=' \
+    'YOUGAME_TEST_CSS_ORIGIN' 'css-origin hash=' 'css-origin reset_ms='; do
     printf '\177ELF\0clean\0' > "$scratch/melee_source"
     printf '\177ELF\0clean\0' > "$scratch/melee_linux"
     sh "$scanner" "$scratch/melee_source" "$scratch/melee_linux"

@@ -139,7 +139,7 @@ void state() {
     "pads: relayed pads have no rumble yet",
     "pads: relay lag p50 3 ms p95 5 ms over 5 lines"}));
   state.flush(); CHECK(logs.size() == 10);
-  // The pad's name never reaches the log: only the app's opaque id and the kind (pack-platform).
+  // The pad's name never reaches the log: only the app's opaque id and the kind.
   for (const auto& l : logs) CHECK(l.find("DualSense Wireless Controller") == std::string::npos);
   State empty([](const std::string&) {});
   CHECK(empty.accept(line(j), 1)); CHECK(empty.active()); // initial empty snapshot latches too

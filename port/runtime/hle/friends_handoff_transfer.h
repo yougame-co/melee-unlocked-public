@@ -63,6 +63,7 @@ class Chunks {
     total_ += b.size(); chunks_[index] = std::move(b); ++received_; return true;
   }
   bool complete() const { return received_ && received_ == chunks_.size(); }
+  size_t percent() const { return chunks_.empty() ? 0 : received_*100/chunks_.size(); }
   std::shared_ptr<const Buffer> finish() const {
     if (!complete()) return {};
     auto b = std::make_shared<Buffer>(); b->reserve(total_);
@@ -209,10 +210,16 @@ void transfer(IO& io, bool host, const std::string& peer, const SessionConfig& c
     return failure.empty();
   };
   auto receive_bytes = [&](const char* kind,uint64_t until) -> std::shared_ptr<const Buffer> {
-    Chunks chunks; bool budgeted = false;
+    Chunks chunks; bool budgeted = false; size_t shown = SIZE_MAX;
     while (failure.empty() && io.clock() < until) {
       Json d; if (!take(kind,d,int(std::min<uint64_t>(10,until-io.clock())))) continue;
       if (!chunks.receive(d)) { failure = "invalid-chunks"; break; }
+      // The base is MBs at the room's byte cap (tens of seconds); say how far along it is, in 5% steps.
+      if (io.waiting && !std::strcmp(kind,"mu-hj-base") && chunks.percent()/5 != shown) {
+        shown = chunks.percent()/5;
+        io.waiting("Getting the match from your friend... " + std::to_string(shown*5) + "%",false);
+        if (io.progress) io.progress(int(shown*5));
+      }
       if (!budgeted) {
         const size_t bound = std::min(stored_limit,d["n"].get<size_t>()*kCardChunk);
         const auto budget = transfer_budget(bound); until = io.clock()+budget; budgeted = true;

@@ -90,6 +90,25 @@ int dolphin_folder_as_root(const fs::path& root) {
   return 0;
 }
 
+// macOS (com.project-slippi.dolphin): stable keeps Slippi/user.json at the root, mainline keeps
+// netplay<beta>/User/Slippi/user.json one folder down. Linux mainline: slippi-dolphin/netplay<beta>/Slippi.
+int mac_and_mainline_folders(const fs::path& root) {
+  const fs::path local = root / "MU" / "User" / "Slippi";
+  const fs::path mac = root / "Library" / "Application Support" / "com.project-slippi.dolphin";
+  write(mac / "netplay-beta" / "User" / "Slippi" / "user.json", profile("Mac beta", "MACB#1"));
+  auto found = slippi::account::resolve(local, {mac});
+  CHECK(found && slippi::account::text(found.data, "connectCode") == "MACB#1");
+  write(mac / "Slippi" / "user.json", profile("Mac stable", "MACS#1"));
+  found = slippi::account::resolve(local, {mac});
+  CHECK(found && slippi::account::text(found.data, "connectCode") == "MACS#1");
+  const fs::path linux_mainline = root / "config" / "slippi-dolphin";
+  write(linux_mainline / "netplay" / "Slippi" / "user.json", profile("Linux mainline", "LNXM#1"));
+  found = slippi::account::resolve(local, {linux_mainline});
+  CHECK(found && slippi::account::text(found.data, "connectCode") == "LNXM#1");
+  fs::remove_all(root);
+  return 0;
+}
+
 int main() {
   const fs::path root = fs::current_path() / ("slippi-login-fixture-" + std::to_string(_getpid()));
   // The folder is named after this process and removed at the end. A run that died left its folder
@@ -99,6 +118,7 @@ int main() {
   struct Cleanup { fs::path folder; ~Cleanup() { std::error_code ec; fs::remove_all(folder, ec); } } cleanup{root};
   if (const int failed = moved_build_and_reasons(root / "moved")) return failed;
   if (const int failed = dolphin_folder_as_root(root / "dolphin")) return failed;
+  if (const int failed = mac_and_mainline_folders(root / "mac")) return failed;
   CHECK(!fs::exists(root / "moved"));
   fs::remove_all(root);
   const fs::path local = root / "MU" / "User" / "Slippi";
@@ -162,11 +182,21 @@ int main() {
   version_reply = "{\"latestVersion\":\"99.0.0\"}";
   CHECK(!user.CheckOnlineCompatibility(&compatibility_error, fetch_version));
   CHECK(compatibility_error.find("Update Melee Unlocked") != std::string::npos && version_requests == 2);
+  // That answer is kept: with the server unreadable afterwards, it still blocks.
+  const auto version_cache = fs::path(user.dir()) / "version-check.json";
+  CHECK(fs::exists(version_cache));
+  version_transport_ok = false;
+  user.OverwriteLatestVersion(slippi::SLIPPI_SEMVER);
+  CHECK(!user.CheckOnlineCompatibility(&compatibility_error, fetch_version) &&
+        compatibility_error.find("Update Melee Unlocked") != std::string::npos);
+  version_transport_ok = true;
+  fs::remove(version_cache);
   for (const auto* reply : {"{}", "null", "[]", "{broken", "{\"latestVersion\":123}",
                            "{\"latestVersion\":\"\"}", "{\"latestVersion\":\"garbage\"}",
                            "{\"latestVersion\":\"3.6.4-beta\"}", "{\"latestVersion\":\"3.6.4.0.1\"}"}) {
     user.OverwriteLatestVersion(slippi::SLIPPI_SEMVER);
     version_reply = reply;
+    fs::remove(version_cache);
     CHECK(user.CheckOnlineCompatibility(&compatibility_error, fetch_version) && compatibility_error.empty());
     user.OverwriteLatestVersion("99.0.0");
     CHECK(!user.CheckOnlineCompatibility(&compatibility_error, fetch_version) &&
@@ -176,6 +206,7 @@ int main() {
   }
   user.OverwriteLatestVersion(slippi::SLIPPI_SEMVER);
   version_reply = nlohmann::json{{"latestVersion", slippi::SLIPPI_SEMVER}}.dump();
+  fs::remove(version_cache);
   version_http_status = 503;
   CHECK(user.CheckOnlineCompatibility(&compatibility_error, fetch_version));
   version_http_status = 200; version_transport_ok = false;
@@ -216,15 +247,47 @@ int main() {
   block_version_fetch = false;
   CHECK(poll() == -1 && version_requests == before_cancelled_check + 2);
 
+  // Queue entry, peer connection and the first ready screen share one request. The next match
+  // still fetches again and rejects a newly incompatible server version.
+  user.ResetOnlineCompatibility();
+  version_reply = nlohmann::json{{"latestVersion", slippi::SLIPPI_SEMVER}}.dump();
+  const int before_search = version_requests;
+  CHECK(user.CheckSessionCompatibility(&compatibility_error, fetch_version));
+  CHECK(user.CheckSessionCompatibility(&compatibility_error, fetch_version));
+  CHECK(poll() == 1 && version_requests == before_search + 1);
+  user.ResetOnlineCompatibility();
+  version_reply = "{\"latestVersion\":\"99.0.0\"}";
+  CHECK(!user.CheckSessionCompatibility(&compatibility_error, fetch_version));
+  CHECK(poll() == -1 && version_requests == before_search + 2);
+
+  // A polling worker and the matchmaking thread arriving together still issue one request.
+  user.ResetOnlineCompatibility();
+  version_reply = nlohmann::json{{"latestVersion", slippi::SLIPPI_SEMVER}}.dump();
+  block_version_fetch = true;
+  const int before_shared_check = version_requests;
+  CHECK(user.PollOnlineCompatibility(&compatibility_error, fetch_version) == 0);
+  for (int i = 0; i < 2000 && version_requests == before_shared_check; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  auto peer_check = std::async(std::launch::async, [&] {
+    std::string error;
+    return user.CheckSessionCompatibility(&error, fetch_version) && error.empty();
+  });
+  block_version_fetch = false;
+  CHECK(peer_check.get() && poll() == 1);
+  CHECK(version_requests == before_shared_check + 1);
+
   // A complete portable login takes priority. Logout/re-login and refresh read its current contents.
   const auto portable = profile("Portable test", "LOCAL#123");
   write(local / "user.json", portable);
   CHECK(user.AttemptLogin(true) && user.GetUserInfo().connect_code == "LOCAL#123");
   CHECK(slippi::account::resolve(local).file == local / "user.json");
+  CHECK(user.CheckSessionCompatibility(&compatibility_error, fetch_version));
   user.LogOut();
   CHECK(!user.IsLoggedIn() && user.GetUserInfo().play_key.empty());
   const int requests_before_logout_check = version_requests;
   CHECK(!user.CheckOnlineCompatibility(&compatibility_error, fetch_version));
+  CHECK(version_requests == requests_before_logout_check);
+  CHECK(!user.CheckSessionCompatibility(&compatibility_error, fetch_version));
   CHECK(version_requests == requests_before_logout_check);
   CHECK(user.AttemptLogin() && user.GetUserInfo().connect_code == "LOCAL#123");
   write(local / "user.json", profile("Changed", "LOCAL#456"));

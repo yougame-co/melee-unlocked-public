@@ -47,7 +47,7 @@ PadState g_ds4_pads[4]{},g_last_pads[4]{};
 uint16_t g_ds4_buttons[4]{}; void* g_ds4_devices[4]{};
 void log(const char*,...) {}
 uint32_t gcadapter_poll(PadState*) { ++reads; return 0; }
-void apply_family_options(PadFamily,PadState&) {}
+void apply_family_options(PadFamily,PadState&,int=-1,int=0) {}  // v0.9.113: slot and lane (snapback filter)
 void apply_known_box_layout(int) {}
 std::string hidpad_name(int) { return {}; }
 bool xinput_state(int idx,XINPUT_STATE* out) {
@@ -115,13 +115,20 @@ int main() {
    CHECK(pads[0].err==-1 && pads[1].err==0);
    g_port_sources=default_port_sources();real={};
  }
- // Ordinary Online/menu read still has its existing page-pad routing.
+ // The ordinary Online/menu read routes held window keys past the idle page pad too: on Windows
+ // the embedded game window has focus, and the page pad stayed idle while Down/Enter went nowhere.
  InputDebugSnapshot debug{};for(auto& p:pads){p={};p.err=-1;}
  read_devices(pads,debug,true);
- CHECK(debug.feeding[0].kind==DeviceKind::XInputPad && pads[0].button==0);
+ CHECK(debug.feeding[0].kind==DeviceKind::Keyboard && pads[0].button==0x1100 && pads[0].stick_x==127);
+ // With no key held the menu read still takes the page pad's own relayed keys.
+ for(auto& key:g_keys) key=false;
+ v.buttons=0x10;for(auto& p:pads){p={};p.err=-1;}
+ read_devices(pads,debug,true);
+ CHECK(debug.feeding[0].kind==DeviceKind::XInputPad && pads[0].button==0x1000);
+ v.buttons=0;
  relay={};focused=false;input_read_console_devices(pads);
  CHECK(pads[0].button==0 && pads[0].stick_x==0);
- CHECK(reads==13 && native_reads==0);
+ CHECK(reads==14 && native_reads==0);
  CHECK(controller_relay::poll_serial==12 && !controller_relay::game_poll);
  std::printf("relay console keyboard: %d checks, %d device reads, default Enter/Z/arrows, all real families\n",checks,reads);
 }

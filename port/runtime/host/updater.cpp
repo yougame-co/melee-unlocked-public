@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <filesystem>
 #include <iterator>
 #include <mutex>
@@ -108,9 +109,42 @@ void download_progress(const char* what, size_t got, size_t total) {
   else set_message(std::string(what) + " " + mb(got) + " MB");
 }
 
+// SHA-256 over data that arrives in pieces (a download written straight to disk).
+struct Sha256Stream {
+  BCRYPT_ALG_HANDLE algorithm = nullptr;
+  BCRYPT_HASH_HANDLE hash = nullptr;
+  bool ok = false;
+  Sha256Stream() {
+    ok = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0 &&
+         BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0) >= 0;
+  }
+  ~Sha256Stream() {
+    if (hash) BCryptDestroyHash(hash);
+    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+  }
+  void add(const char* data, size_t size) { if (ok && size) ok = BCryptHashData(hash, (PUCHAR)data, (ULONG)size, 0) >= 0; }
+  std::string hex() {
+    unsigned char digest[32]{};
+    if (!ok || BCryptFinishHash(hash, digest, sizeof digest, 0) < 0) return {};
+    ok = false;
+    static const char* digits = "0123456789abcdef";
+    std::string out;
+    for (unsigned char b : digest) { out += digits[b >> 4]; out += digits[b & 15]; }
+    return out;
+  }
+};
+
+// Where a download's bytes go when they are not kept in memory: `sink` takes each piece (false stops the
+// download), `on_progress` hears (bytes so far, total or 0) about four times a second.
+struct HttpSink {
+  std::function<bool(const char*, size_t)> sink;
+  std::function<void(size_t, size_t)> on_progress;
+};
+
 // GET with redirects (GitHub release assets redirect to a CDN). Returns the body. `progress` names
 // the download in the status line ("Downloading update..."); null for the small API requests.
-bool http_get(const std::string& url, std::string* out, int* status, const char* progress = nullptr) {
+bool http_get(const std::string& url, std::string* out, int* status, const char* progress = nullptr,
+              const HttpSink* stream = nullptr) {
   std::wstring wurl = widen(url);
   URL_COMPONENTS uc{}; uc.dwStructSize = sizeof uc;
   wchar_t host[256]{}, path[4096]{}, extra[1024]{};
@@ -138,19 +172,27 @@ bool http_get(const std::string& url, std::string* out, int* status, const char*
         bool have_length = WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
             WINHTTP_HEADER_NAME_BY_INDEX, &expected, &expected_size, WINHTTP_NO_HEADER_INDEX) != FALSE;
         bool complete = false;
-        if (have_length) body.reserve(expected);
+        if (have_length && !stream) body.reserve(expected);
         // One 1 MiB buffer, read until the response ends: asking for what is available first
         // handed back a few KB per call, and each call allocated a fresh chunk.
         std::vector<char> chunk(1u << 20);
         ULONGLONG shown = 0;
+        size_t total = 0;
+        const bool good_status = code == 200;   // an error page is never handed to a sink
         for (;;) {
           DWORD got = 0;
           if (!WinHttpReadData(req, chunk.data(), (DWORD)chunk.size(), &got)) break;
           if (!got) { complete = true; break; }
-          body.append(chunk.data(), got);
-          if (progress && GetTickCount64() - shown >= 250) { shown = GetTickCount64(); download_progress(progress, body.size(), have_length ? expected : 0); }
+          total += got;
+          if (stream && good_status) { if (!stream->sink(chunk.data(), got)) break; }
+          else body.append(chunk.data(), got);
+          if (GetTickCount64() - shown >= 250) {
+            shown = GetTickCount64();
+            if (progress) download_progress(progress, total, have_length ? expected : 0);
+            if (stream && stream->on_progress) stream->on_progress(total, have_length ? expected : 0);
+          }
         }
-        ok = complete && (!have_length || body.size() == expected);
+        ok = complete && (!have_length || total == expected);
         if (out && ok) *out = std::move(body);
       }
       WinHttpCloseHandle(req);
@@ -323,7 +365,10 @@ bool archive_paths_safe(const std::filesystem::path& zip, const std::string& roo
   return zip_entries(zip, entries) && zip_paths_safe(entries, root);
 }
 // Unpacks every entry under `dest` (stored or deflated, CRC checked). Callers check the paths first.
+// Why the last unpack_zip failed on this thread: empty for a damaged archive, else the file it could not write.
+thread_local std::string g_unpack_write_error;
 bool unpack_zip(const std::filesystem::path& zip, const std::filesystem::path& dest) {
+  g_unpack_write_error.clear();
   if (!is_zip(zip)) return tar_unpack(zip, dest);
   std::vector<ZipEntry> entries;
   if (!zip_entries(zip, entries)) return false;
@@ -362,7 +407,7 @@ bool unpack_zip(const std::filesystem::path& zip, const std::filesystem::path& d
     std::ofstream o(target, std::ios::binary | std::ios::trunc);
     if (data.size()) o.write((const char*)data.data(), (std::streamsize)data.size());
     o.close();
-    if (!o) return false;
+    if (!o) { g_unpack_write_error = target.u8string(); return false; }
   }
   return true;
 }
@@ -842,6 +887,91 @@ void download_and_install() {
   });
 }
 
+// ---------------- placing downloaded files ----------------
+// Downloads unpack in a work folder of the player's own (LOCALAPPDATA\MeleeUnlocked\downloads), away
+// from the game's folder: a game kept on the Desktop, in Documents or Downloads can sit in a folder
+// Windows protects (Ransomware protection), and antivirus can hold a file it is still scanning. Only the
+// finished files go beside the game, and that move is tried for a few seconds before it gives up.
+std::filesystem::path download_work(const char* name) {
+#ifdef _WIN32
+  wchar_t buf[MAX_PATH] = {};
+  const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
+  std::filesystem::path base = n && n < MAX_PATH ? std::filesystem::path(buf) : std::filesystem::temp_directory_path();
+#else
+  const char* data = std::getenv("XDG_DATA_HOME");
+  const char* home = std::getenv("HOME");
+  std::filesystem::path base = data && *data ? std::filesystem::path(data)
+                             : home && *home ? std::filesystem::path(home) / ".local" / "share" : std::filesystem::temp_directory_path();
+#endif
+  return base / "MeleeUnlocked" / "downloads" / name;
+}
+// The plain reason for a failed write beside the game, with what to do about the usual one.
+std::string place_error(const std::string& what, const std::filesystem::path& dir, const std::error_code& ec) {
+  std::string m = what + " in " + dir.u8string() + " (" + (ec ? ec.message() : std::string("Windows refused the write")) + ").";
+  if (!ec || ec.value() == ERROR_ACCESS_DENIED || ec == std::errc::permission_denied || ec.value() == ERROR_SHARING_VIOLATION ||
+      ec.value() == ERROR_LOCK_VIOLATION)
+    m += " Windows or an antivirus did not let the game write in its folder: move the Melee Unlocked folder out of "
+         "Program Files, Desktop, Documents and Downloads (for example to C:\\Games), or allow the game under "
+         "Windows Security > Ransomware protection, then try again.";
+  return m;
+}
+// One file into place beside the game: a rename, else a copy, tried for about 5 s while a scanner holds it.
+bool place_file(const std::filesystem::path& from, const std::filesystem::path& to, std::error_code& ec) {
+  namespace fs = std::filesystem;
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    ec.clear();
+    fs::rename(from, to, ec);
+    if (!ec) return true;
+    ec.clear();
+    fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
+    if (!ec) { std::error_code ignore; fs::remove(from, ignore); return true; }
+    Sleep(250);
+  }
+  return false;
+}
+// A whole folder into place (the RTX Pack's RTX and Remix): the same, file by file when a rename fails.
+bool place_folder(const std::filesystem::path& from, const std::filesystem::path& to, std::error_code& ec) {
+  namespace fs = std::filesystem;
+  ec.clear();
+  fs::rename(from, to, ec);
+  if (!ec) return true;
+  for (const auto& e : fs::recursive_directory_iterator(from, ec)) {
+    const fs::path target = to / fs::relative(e.path(), from);
+    if (e.is_directory()) { fs::create_directories(target, ec); if (ec) return false; continue; }
+    fs::create_directories(target.parent_path(), ec);
+    if (!place_file(e.path(), target, ec)) return false;
+  }
+  return !ec;
+}
+std::string last_unpack_write_error() { return g_unpack_write_error; }
+std::string unpack_failure(const std::string& label) {
+  if (g_unpack_write_error.empty()) return label + ": the download is damaged; try again";
+  return label + ": cannot write the unpacked files (" + g_unpack_write_error + "). Check the free space on that drive.";
+}
+
+// ---------------- one verified file ----------------
+bool fetch_verified(const std::string& url, const std::string& sha256, const std::string& dest_utf8, std::string* why) {
+  namespace fs = std::filesystem;
+  std::string body;
+  int status = 0;
+  const auto fail = [&](const std::string& m) { if (why) *why = m; return false; };
+  if (!http_get(url, &body, &status) || status != 200)
+    return fail(status ? "HTTP " + std::to_string(status) : std::string("no connection"));
+  if (sha256.size() != 64 || sha256_hex(body) != sha256) return fail("the file does not match its published SHA-256");
+  const fs::path dest = fs::u8path(dest_utf8);
+  const fs::path part = fs::u8path(dest_utf8 + ".part");
+  std::error_code ec;
+  fs::create_directories(dest.parent_path(), ec);
+  {
+    std::ofstream f(part, std::ios::binary);
+    f.write(body.data(), (std::streamsize)body.size());
+    if (!f) { f.close(); fs::remove(part, ec); return fail("cannot write " + part.u8string()); }
+  }
+  fs::rename(part, dest, ec);
+  if (ec) { fs::remove(part, ec); return fail("cannot put the file in place"); }
+  return true;
+}
+
 // ---------------- DLSS 5 model ----------------
 namespace {
 // NVIDIA's DLSS 5 model (RTX Remix 1.6.1's package, version 310.9.16), carried by the 0.9.57 release
@@ -872,7 +1002,7 @@ void dlss5_model_download(const std::string& game_dir_utf8) {
   g_model_thread = std::thread([game_dir_utf8] {
     namespace fs = std::filesystem;
     const fs::path dir = fs::u8path(game_dir_utf8);
-    const fs::path work = dir / "dlss5-download";
+    const fs::path work = download_work("dlss5");
     std::error_code ec;
     auto fail = [&](const std::string& why) {
       fs::remove_all(work, ec);
@@ -887,9 +1017,9 @@ void dlss5_model_download(const std::string& game_dir_utf8) {
     fs::remove_all(work, ec);
     fs::create_directories(work, ec);
     const fs::path zip = work / "model.zip";
-    { std::ofstream f(zip, std::ios::binary); f.write(body.data(), (std::streamsize)body.size()); if (!f) return fail("DLSS 5: cannot write the download"); }
+    { std::ofstream f(zip, std::ios::binary); f.write(body.data(), (std::streamsize)body.size()); if (!f) return fail("DLSS 5: cannot save the download in " + work.u8string() + ". Check the free space on that drive."); }
     body.clear(); body.shrink_to_fit();
-    if (!unpack_zip(zip, work / "files")) return fail("DLSS 5: the download is damaged");
+    if (!unpack_zip(zip, work / "files")) return fail(unpack_failure("DLSS 5"));
     fs::path found;
     for (const auto& e : fs::recursive_directory_iterator(work / "files", ec))
       if (e.is_regular_file(ec) && e.path().filename() == kModelFile) { found = e.path(); break; }
@@ -898,9 +1028,7 @@ void dlss5_model_download(const std::string& game_dir_utf8) {
     { std::ifstream f(found, std::ios::binary); data.assign(std::istreambuf_iterator<char>(f), {}); }
     if (sha256_hex(data) != kModelSha256) return fail("DLSS 5: the model does not match NVIDIA's file; not installed");
     data.clear(); data.shrink_to_fit();
-    fs::rename(found, dir / kModelFile, ec);
-    if (ec) { ec.clear(); fs::copy_file(found, dir / kModelFile, fs::copy_options::overwrite_existing, ec); }
-    if (ec) return fail("DLSS 5: cannot put the model beside the game (" + ec.message() + ")");
+    if (!place_file(found, dir / kModelFile, ec)) return fail(place_error("DLSS 5: the model could not be put", dir, ec));
     fs::remove_all(work, ec);
     model_message("DLSS 5 is installed. It starts with the game's next start.");
     host::log("dlss5 download: NVIDIA's model installed beside the game");
@@ -915,9 +1043,342 @@ ModelState dlss5_model_state(const std::string& game_dir_utf8) {
 }
 std::string dlss5_model_message() { std::lock_guard<std::mutex> lk(g_mutex); return g_model_message; }
 
+// ---------------- optional parts: the older-processor build and Intel XeSS ----------------
+namespace {
+// One optional part's download: a zip from a release, checked against `zip_sha256` when one is known,
+// unpacked in a work folder beside the game, then put in place by `install`.
+struct PartFetch {
+  std::atomic<bool> busy{false}, failed{false};
+  std::string message;
+  std::thread thread;
+};
+// Never destroyed: a download still running at exit is detached (shutdown) and may touch its
+// PartFetch until the process ends.
+PartFetch& g_compat = *new PartFetch;
+PartFetch& g_xess = *new PartFetch;
+PartFetch& g_fsr = *new PartFetch;
+PartFetch& g_rtx_pack = *new PartFetch;
+void part_message(PartFetch& p, const std::string& m) { std::lock_guard<std::mutex> lk(g_mutex); p.message = m; }
+std::string part_message(PartFetch& p) { std::lock_guard<std::mutex> lk(g_mutex); return p.message; }
+
+using PartInstall = std::function<std::string(const std::filesystem::path& files, const std::filesystem::path& dir)>;
+void fetch_part(PartFetch& p, const std::string& label, const std::string& size, const std::string& url,
+                const std::string& zip_sha256, const std::string& game_dir_utf8, const char* work_name,
+                PartInstall install) {
+  if (p.busy.exchange(true)) return;
+  if (p.thread.joinable()) p.thread.join();
+  p.failed = false;
+  part_message(p, "Downloading " + label + " (" + size + ")...");
+  p.thread = std::thread([&p, label, url, zip_sha256, game_dir_utf8, work_name, install] {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::u8path(game_dir_utf8), work = download_work(work_name);
+    std::error_code ec;
+    auto fail = [&](const std::string& why) {
+      fs::remove_all(work, ec);
+      part_message(p, why);
+      host::log("%s download: %s", label.c_str(), why.c_str());
+      p.failed = true;
+      p.busy = false;
+    };
+    // Written to disk as it arrives, hashed on the way, with its progress in the status line: the RTX
+    // Pack is about 470 MB, which held that much memory and showed one unmoving line for minutes.
+    fs::remove_all(work, ec);
+    fs::create_directories(work, ec);
+    const fs::path zip = work / "part.zip";
+    int status = 0;
+    std::string stop_reason;
+    {
+      std::ofstream f(zip, std::ios::binary);
+      if (!f) return fail(label + ": cannot save the download in " + work.u8string() + ". Check the free space on that drive.");
+      Sha256Stream sha;
+      bool space_checked = false;
+      HttpSink sink;
+      sink.sink = [&](const char* data, size_t size) {
+        f.write(data, (std::streamsize)size);
+        if (!f) { stop_reason = label + ": cannot save the download in " + work.u8string() + ". Check the free space on that drive."; return false; }
+        sha.add(data, size);
+        return stop_reason.empty();
+      };
+      sink.on_progress = [&](size_t got, size_t total) {
+        if (total && !space_checked) {
+          space_checked = true;
+          // The zip, its unpacked files and the copy in the game folder: about three times its size.
+          const auto room = fs::space(work, ec);
+          if (!ec && room.available < (uintmax_t)total * 3)
+            stop_reason = label + " needs about " + std::to_string(((uintmax_t)total * 3) >> 20) + " MB free on " +
+                          work.root_path().u8string() + " (" + std::to_string(room.available >> 20) + " MB free now)";
+        }
+        const auto mb = [](size_t bytes) { return std::to_string((bytes + (1u << 19)) >> 20); };
+        part_message(p, total ? "Downloading " + label + ": " + std::to_string(got * 100 / total) + "% (" + mb(got) + " of " + mb(total) + " MB)"
+                              : "Downloading " + label + ": " + mb(got) + " MB");
+      };
+      const bool got_it = http_get(url, nullptr, &status, nullptr, &sink);
+      f.close();
+      if (!stop_reason.empty()) return fail(stop_reason);
+      if (!got_it || status != 200)
+        return fail(status && status != 200 ? label + " download failed (HTTP " + std::to_string(status) + ")" : label + " download failed (no connection or cut off); try again");
+      if (!f) return fail(label + ": cannot save the download in " + work.u8string() + ". Check the free space on that drive.");
+      if (!zip_sha256.empty() && sha.hex() != zip_sha256) return fail(label + ": the download does not match the release; not installed");
+    }
+    part_message(p, "Unpacking " + label + "...");
+    if (!unpack_zip(zip, work / "files")) return fail(unpack_failure(label));
+    const std::string why = install(work / "files", dir);
+    if (!why.empty()) return fail(why);
+    fs::remove_all(work, ec);
+    p.busy = false;
+  });
+}
+
+std::string read_small(const std::filesystem::path& path) {
+  std::ifstream f(path, std::ios::binary);
+  std::string s((std::istreambuf_iterator<char>(f)), {});
+  while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ')) s.pop_back();
+  return s;
+}
+
+// compat.sha256: "<sha256> MeleeUnlocked-<version>-compat-win64.zip", written by the packager.
+bool compat_record(const std::string& game_dir_utf8, std::string* sha, std::string* file) {
+  const std::string line = read_small(std::filesystem::u8path(game_dir_utf8) / "compat.sha256");
+  const size_t space = line.find(' ');
+  if (space != 64 || line.size() <= 65) return false;
+  *sha = line.substr(0, 64);
+  *file = line.substr(65);
+  const std::string prefix = "MeleeUnlocked-", suffix = "-compat-win64.zip";
+  if (sha->find_first_not_of("0123456789abcdef") != std::string::npos ||
+      file->rfind(prefix, 0) != 0 || file->size() <= prefix.size() + suffix.size() ||
+      file->compare(file->size() - suffix.size(), suffix.size(), suffix) != 0) return false;
+  const std::string version = file->substr(prefix.size(), file->size() - prefix.size() - suffix.size());
+  return version.find_first_not_of("0123456789.") == std::string::npos &&
+         std::count(version.begin(), version.end(), '.') == 2 && version.front() != '.' && version.back() != '.';
+}
+
+// Intel's XeSS runtime as this release was built with it (XeSS SDK, port/third_party/xess).
+constexpr const char* kXessUrl = "https://github.com/hero88go/melee-unlocked/releases/download/v0.9.98/MeleeUnlocked-XeSS.zip";
+constexpr const char* kXessSha256 = "251659dd84a3e84de67c886a4186e01f3eca49b00641906fe38bb6b807e5d5b7";
+
+// AMD's signed FSR DLLs as the game was built with them (AMD FSR SDK 2.4.0, port/third_party/fsr).
+constexpr const char* kFsrBase = "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v2.4.0/Kits/FidelityFX/signedbin/";
+struct FsrFile { const char* name; const char* sha256; };
+constexpr FsrFile kFsrFiles[] = {
+    {"amd_fidelityfx_loader_dx12.dll", "e2191d3c0828be45eb8affd4e3ec0378f2293adc345b772a7170edcf3b021ecb"},
+    {"amd_fidelityfx_upscaler_dx12.dll", "aad4fccccb29084a655f9a4f9f613bd22c8c03fb4a0f8840148cc6543b4ccace"},
+    {"amd_fidelityfx_framegeneration_dx12.dll", "e6843252f58b0341a0d80f6a20bc0d840643ee95bc48c22cac08745344577bb6"},
+    {"amd_fidelityfx_loader_vk.dll", "38a56a01fb3565c0757d9f5c1e4e69de4b65e5f2e5769b323b200dc1f142bab9"},
+    {"amd_fidelityfx_upscaler_vk.dll", "4a7e895af6e0b615d40a84d59eb8c2b1054ad91cdd0c739567940270d51bdab7"},
+    {"amd_fidelityfx_framegeneration_vk.dll", "d002dabff8c5e71eaa715fc99438cd4dc81230262a7897b16bc402efec3498b4"},
+};
+}  // namespace
+
+bool compat_build_needed(const std::string& game_dir_utf8) {
+  std::string sha, file;
+  if (!compat_record(game_dir_utf8, &sha, &file)) return false;   // a package with the build inside, or a source build
+  const auto dir = std::filesystem::u8path(game_dir_utf8);
+  if (read_small(dir / "compat.installed") != sha) return true;
+  for (const char* name : {"melee_port_compat.exe", "melee_source_compat.exe", "melee_game_compat.dll", "melee_game_compat.snapexcl"}) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(dir / name, ec)) return true;
+  }
+  return false;
+}
+
+void compat_build_download(const std::string& game_dir_utf8) {
+  std::string sha, file;
+  if (!compat_record(game_dir_utf8, &sha, &file)) return;
+  // MeleeUnlocked-<version>-compat-win64.zip comes from that version's release.
+  const std::string version = file.substr(14, file.find("-compat-") - 14);
+  const std::string url = "https://github.com/hero88go/melee-unlocked/releases/download/v" + version + "/" + file;
+  fetch_part(g_compat, "the build for your processor", "about 80 MB", url, sha, game_dir_utf8, "compat-download",
+             [sha](const std::filesystem::path& files, const std::filesystem::path& dir) -> std::string {
+               namespace fs = std::filesystem;
+               std::error_code ec;
+               for (const char* name : {"melee_port_compat.exe", "melee_source_compat.exe", "melee_game_compat.dll", "melee_game_compat.snapexcl"})
+                 if (!fs::is_regular_file(files / name, ec)) return std::string("The build for your processor is incomplete; not installed");
+               int placed = 0;
+               for (const auto& e : fs::directory_iterator(files, ec)) {
+                 if (!e.is_regular_file(ec)) continue;
+                 const fs::path to = dir / e.path().filename();
+                 if (!place_file(e.path(), to, ec)) return place_error("The build for your processor could not be put", dir, ec);
+                 ++placed;
+               }
+               if (!placed) return std::string("The build for your processor was empty; not installed");
+               { std::ofstream marker(dir / "compat.installed", std::ios::binary);
+                 marker << sha << "\n";
+                 marker.close();
+                 if (!marker) return std::string("Cannot record the installed build for your processor"); }
+               part_message(g_compat, "The build for your processor is installed.");
+               host::log("compat download: %d files installed", placed);
+               return {};
+             });
+}
+
+ModelState compat_build_state(const std::string& game_dir_utf8) {
+  if (g_compat.busy.load()) return ModelState::Downloading;
+  if (!compat_build_needed(game_dir_utf8)) return ModelState::Present;
+  return g_compat.failed.load() ? ModelState::Failed : ModelState::Missing;
+}
+std::string compat_build_message() { return part_message(g_compat); }
+
+bool xess_present(const std::string& game_dir_utf8) {
+  std::error_code ec;
+  return std::filesystem::is_regular_file(std::filesystem::u8path(game_dir_utf8) / "libxess.dll", ec);
+}
+
+void xess_download(const std::string& game_dir_utf8) {
+  fetch_part(g_xess, "Intel XeSS", kXessSize, kXessUrl, "", game_dir_utf8, "xess-download",
+             [](const std::filesystem::path& files, const std::filesystem::path& dir) -> std::string {
+               namespace fs = std::filesystem;
+               std::error_code ec;
+               const fs::path found = files / "libxess.dll";
+               std::string data;
+               { std::ifstream f(found, std::ios::binary); data.assign(std::istreambuf_iterator<char>(f), {}); }
+               if (data.empty()) return std::string("Intel XeSS: the download has no libxess.dll in it");
+               if (sha256_hex(data) != kXessSha256) return std::string("Intel XeSS: the file does not match Intel's build; not installed");
+               if (!place_file(found, dir / "libxess.dll", ec)) return place_error("Intel XeSS could not be put", dir, ec);
+               part_message(g_xess, "Intel XeSS is installed. It starts with the game's next start.");
+               host::log("xess download: libxess.dll installed beside the game");
+               return {};
+             });
+}
+
+// rtxpack.sha256: "<sha256> MeleeUnlocked-<version>-RTX-Pack.zip", written by the packager when the
+// release has an RTX Pack. The pack is built for that exact game (its renderer checks the interface).
+bool rtx_pack_record(const std::string& game_dir_utf8, std::string* sha, std::string* file) {
+  const std::string line = read_small(std::filesystem::u8path(game_dir_utf8) / "rtxpack.sha256");
+  const size_t space = line.find(' ');
+  if (space != 64 || line.size() <= 65) return false;
+  *sha = line.substr(0, 64);
+  *file = line.substr(65);
+  const std::string prefix = "MeleeUnlocked-", suffix = "-RTX-Pack.zip";
+  if (sha->find_first_not_of("0123456789abcdef") != std::string::npos ||
+      file->rfind(prefix, 0) != 0 || file->size() <= prefix.size() + suffix.size() ||
+      file->compare(file->size() - suffix.size(), suffix.size(), suffix) != 0) return false;
+  const std::string version = file->substr(prefix.size(), file->size() - prefix.size() - suffix.size());
+  return version.find_first_not_of("0123456789.") == std::string::npos &&
+         std::count(version.begin(), version.end(), '.') == 2 && version.front() != '.' && version.back() != '.';
+}
+
+bool rtx_pack_offered(const std::string& game_dir_utf8) {
+  std::string sha, file;
+  return rtx_pack_record(game_dir_utf8, &sha, &file);
+}
+
+bool rtx_pack_present(const std::string& game_dir_utf8) {
+  std::string sha, file;
+  if (!rtx_pack_record(game_dir_utf8, &sha, &file)) return false;
+  const auto dir = std::filesystem::u8path(game_dir_utf8);
+  if (read_small(dir / "rtxpack.installed") != sha) return false;
+  std::error_code ec;
+  return std::filesystem::is_regular_file(dir / "RTX" / "melee_rtx_nvidia.dll", ec) &&
+         std::filesystem::is_regular_file(dir / "Remix" / "d3d9.dll", ec);
+}
+
+// The RTX Pack: NVIDIA's renderer (RTX folder) and NVIDIA's RTX Remix runtime (Remix folder), each
+// replaced whole. The game loads them at its next start.
+void rtx_pack_download(const std::string& game_dir_utf8) {
+  std::string sha, file;
+  if (!rtx_pack_record(game_dir_utf8, &sha, &file)) return;
+  const std::string version = file.substr(14, file.find("-RTX-Pack") - 14);
+  const std::string url = "https://github.com/hero88go/melee-unlocked/releases/download/v" + version + "/" + file;
+  fetch_part(g_rtx_pack, "the RTX Pack", kRtxPackSize, url, sha, game_dir_utf8, "rtxpack-download",
+             [sha](const std::filesystem::path& files, const std::filesystem::path& dir) -> std::string {
+               namespace fs = std::filesystem;
+               std::error_code ec;
+               for (const char* folder : {"RTX", "Remix"})
+                 if (!fs::is_directory(files / folder, ec)) return std::string("The RTX Pack download has no ") + folder + " folder; not installed";
+               if (!fs::is_regular_file(files / "RTX" / "melee_rtx_nvidia.dll", ec) || !fs::is_regular_file(files / "Remix" / "d3d9.dll", ec))
+                 return std::string("The RTX Pack download is incomplete; not installed");
+               fs::remove(dir / "rtxpack.installed", ec);
+               for (const char* folder : {"RTX", "Remix"}) {
+                 const fs::path to = dir / folder, old = dir / (std::string(folder) + ".old");
+                 fs::remove_all(old, ec);
+                 if (fs::exists(to, ec)) { fs::rename(to, old, ec); if (ec) return "Cannot replace the " + std::string(folder) + " folder (" + ec.message() + "); close the game and try again"; }
+                 if (!place_folder(files / folder, to, ec)) return place_error("The RTX Pack's " + std::string(folder) + " folder could not be put", dir, ec);
+                 fs::remove_all(old, ec);
+               }
+               { std::ofstream marker(dir / "rtxpack.installed", std::ios::binary);
+                 marker << sha << "\n";
+                 marker.close();
+                 if (!marker) return std::string("Cannot record the installed RTX Pack"); }
+               part_message(g_rtx_pack, "The RTX Pack is installed. NVIDIA RTX and RTX Remix start with the game's next start.");
+               host::log("rtx pack download: installed");
+               return {};
+             });
+}
+
+ModelState rtx_pack_state(const std::string& game_dir_utf8) {
+  if (g_rtx_pack.busy.load()) return ModelState::Downloading;
+  if (rtx_pack_present(game_dir_utf8)) return ModelState::Present;
+  return g_rtx_pack.failed.load() ? ModelState::Failed : ModelState::Missing;
+}
+std::string rtx_pack_message() { return part_message(g_rtx_pack); }
+
+bool fsr_present(const std::string& game_dir_utf8) {
+  std::error_code ec;
+  for (const FsrFile& f : kFsrFiles)
+    if (!std::filesystem::is_regular_file(std::filesystem::u8path(game_dir_utf8) / f.name, ec)) return false;
+  return true;
+}
+
+// Each file on its own (AMD publishes them loose, not as a zip), checked, written beside the game
+// under a temporary name and then renamed, so a cut download never leaves half a DLL in place.
+void fsr_download(const std::string& game_dir_utf8) {
+  if (g_fsr.busy.exchange(true)) return;
+  if (g_fsr.thread.joinable()) g_fsr.thread.join();
+  g_fsr.failed = false;
+  part_message(g_fsr, std::string("Downloading AMD FSR (") + kFsrSize + ")...");
+  g_fsr.thread = std::thread([game_dir_utf8] {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::u8path(game_dir_utf8);
+    std::error_code ec;
+    auto fail = [&](const std::string& why) {
+      part_message(g_fsr, why);
+      host::log("fsr download: %s", why.c_str());
+      g_fsr.failed = true;
+      g_fsr.busy = false;
+    };
+    for (const FsrFile& f : kFsrFiles) {
+      std::string body; int status = 0;
+      if (!http_get(std::string(kFsrBase) + f.name, &body, &status) || status != 200)
+        return fail(status ? "AMD FSR download failed (HTTP " + std::to_string(status) + ")" : std::string("AMD FSR download failed (no connection)"));
+      if (sha256_hex(body) != f.sha256) return fail(std::string("AMD FSR: ") + f.name + " does not match AMD's build; not installed");
+      const fs::path part = dir / (std::string(f.name) + ".part"), to = dir / f.name;
+      const fs::path staged = download_work("fsr") / f.name;
+      fs::create_directories(staged.parent_path(), ec);
+      { std::ofstream o(staged, std::ios::binary); o.write(body.data(), (std::streamsize)body.size()); if (!o) return fail("AMD FSR: cannot save the download in " + staged.parent_path().u8string() + ". Check the free space on that drive."); }
+      if (!place_file(staged, to, ec) || !fs::is_regular_file(to, ec)) return fail(place_error("AMD FSR could not be put", dir, ec));
+    }
+    part_message(g_fsr, "AMD FSR is installed. It starts with the game's next start.");
+    host::log("fsr download: AMD's FSR DLLs installed beside the game");
+    g_fsr.busy = false;
+  });
+}
+
+ModelState fsr_state(const std::string& game_dir_utf8) {
+  if (g_fsr.busy.load()) return ModelState::Downloading;
+  if (fsr_present(game_dir_utf8)) return ModelState::Present;
+  return g_fsr.failed.load() ? ModelState::Failed : ModelState::Missing;
+}
+std::string fsr_message() { return part_message(g_fsr); }
+
+ModelState xess_state(const std::string& game_dir_utf8) {
+  if (g_xess.busy.load()) return ModelState::Downloading;
+  if (xess_present(game_dir_utf8)) return ModelState::Present;
+  return g_xess.failed.load() ? ModelState::Failed : ModelState::Missing;
+}
+std::string xess_message() { return part_message(g_xess); }
+
 void shutdown() {
   join();
   if (g_rollback_thread.joinable()) g_rollback_thread.join();
   if (g_model_thread.joinable()) g_model_thread.join();
+  // Every part download, the RTX Pack included: a std::thread still joinable when its static is
+  // destroyed at exit calls std::terminate (B-905: quitting after the RTX Pack downloaded aborted).
+  // A finished download is joined; one still running is left to end with the process, so quitting
+  // never waits minutes for a 467 MB download.
+  for (PartFetch* p : {&g_compat, &g_xess, &g_fsr, &g_rtx_pack}) {
+    if (!p->thread.joinable()) continue;
+    if (p->busy.load()) p->thread.detach();
+    else p->thread.join();
+  }
 }
 }  // namespace host::updater

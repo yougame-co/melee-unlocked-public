@@ -77,6 +77,12 @@ void busy_retry() {
   CHECK(fresh.delay(header) == 5);
   header["retryAfter"] = 0;
   CHECK(fresh.delay(header) == 5);
+  // The local channel host's "no page yet" answer retries the same way, on its own retryAfter.
+  search_policy::BusyRetry local;
+  CHECK(local.delay({{"ok", false}, {"code", "notHere"}, {"retryAfter", 2}}) == 2 && local.tries() == 1);
+  CHECK(local.delay({{"ok", false}, {"code", "unknown_build"}}) == 0 && local.tries() == 1);
+  CHECK(local.delay({{"ok", false}, {"code", "old_build"}}) == 0 && local.tries() == 1);
+  CHECK(local.delay({{"ok", false}, {"code", "notYet"}}) == 0);
   ++groups;
 }
 void cancel_busy_wait() {

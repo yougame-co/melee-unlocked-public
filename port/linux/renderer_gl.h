@@ -12,7 +12,7 @@ namespace linux_renderer {
 // The caller creates an SDL_WINDOW_OPENGL window after requesting a 4.5 core context.
 // GX FIFO decoding and presentation run on the thread that calls create().
 std::unique_ptr<gx::Backend> create(SDL_Window* window, const std::filesystem::path& shader_cache,
-                                    int scale = 1, bool vsync = true);
+                                    int scale = 1, bool vsync = true, bool prewarm_only = false);
 // Exercises the actual generated GX shader translator and render path without a disc image.
 // The result is a PPM from the OpenGL EFB, suitable for a headless Mesa/Xvfb build check.
 bool smoke_test(gx::Backend& backend, const std::filesystem::path& capture);

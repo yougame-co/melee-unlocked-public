@@ -12,6 +12,8 @@ class SlippiLinkWiringTest(unittest.TestCase):
         link = source('port/runtime/hle/yougame_link.cpp')
         self.assertIn('presentation.enabled = take("YOUGAME_SLIPPI_LINKABLE") == "1";', function(link, 'start'))
         self.assertEqual(link.count('take("YOUGAME_SLIPPI_LINKABLE")'), 1)
+        self.assertNotIn('slippi_off', link)
+        self.assertLess(link.index('slippi_linking::presentation.linked = linked;'), link.index('if (line == sent) return;'))
         self.assertIn('return bridge(request, timeout, cancelled);', function(link, 'request_slippi_link'))
         self.assertIn('if (body.value("type", "") == "slippiLink") return j;', function(link, 'bridge'))
         online = source('port/runtime/hle/slippi_online.cpp')
@@ -23,6 +25,8 @@ class SlippiLinkWiringTest(unittest.TestCase):
         self.assertIn('slippi::online::slippi_link_tick(major, minor, online_mode());', source('port/runtime/hle/native_practice.cpp'))
         net = source('port/runtime/hle/slippi_net.cpp')
         self.assertIn('!yougame::slippi_linking::presentation.later', function(net, 'startMatchmaking'))
+        self.assertIn('fail("Sign in to Slippi to play Direct, Teams and Party");', function(net, 'startMatchmaking'))
+        self.assertNotIn('kSlippiLockedError', net)
         self.assertIn('yougame::begin_search()', net)
         command = online[online.index('case CMD_YOUGAME_SLIPPI_LINK:'):online.index('case CMD_YOUGAME_FRIENDS_MENU:')]
         for guard in ('yougame::active()', 'host::gameplay::vanilla_only()', '!g_in_online_match', 'friend_room.empty()', 'Screen::None'):
@@ -47,6 +51,25 @@ class SlippiLinkWiringTest(unittest.TestCase):
         resolve = function(account, 'resolve')
         self.assertLess(resolve.index('return read(app);'), resolve.index('for (const auto& root'))
 
+    def test_agent_copy_logs_the_grant_without_reading_it(self):
+        net = source('port/runtime/hle/slippi_net.cpp')
+        start = net.index('static void note_agent_grant() {')
+        branch = net[start:net.index('\n}\n', start)]
+        self.assertIn('symlink_status(grant, ec)', branch)
+        self.assertIn('"slippi: app sign-in file %s (agent copy, not used)"', branch)
+        login = net[net.index('bool User::AttemptLogin('):]
+        self.assertLess(login.index('if (yougame::active() && agent_lock::blocked(agent_lock::Operation::Login)) note_agent_grant();'),
+                        login.index('if (agent_lock::blocked(agent_lock::Operation::Login)) return false;'))
+        for reading in ('account::read(', 'resolve(', 'ifstream'):
+            self.assertNotIn(reading, branch)
+
+    def test_mac_and_linux_mainline_sign_in_folders_are_searched(self):
+        roots = function(source('port/runtime/hle/slippi_account.h'), 'launcher_roots')
+        self.assertIn('/ ".config" / "slippi-dolphin"', roots)
+        apple = roots[roots.index('#ifdef __APPLE__'):]
+        self.assertIn('/ "Library" / "Application Support" / "com.project-slippi.dolphin"', apple[:apple.index('#endif')])
+        self.assertLess(roots.index('if (host::test_env::agent_copy()) return roots;'), roots.index('#ifdef __APPLE__'))
+
     def test_search_and_refusal_buttons_never_start_setup_or_practice(self):
         css = source('sourceport/game/shim/mu_slippi_css.c')
         inputs = menu.fixture.extract(css, 'mu_slippi_css_inputs')
@@ -63,7 +86,8 @@ MU_SLP_MODE_DIRECT=2,MU_SLP_MODE_TEAMS=3,MU_SLP_MODE_PARTY=4,MU_SLP_WINNER_NULL=
 HSD_PAD_Z=0x10,HSD_PAD_X=0x400,HSD_PAD_Y=0x800,HSD_PAD_START=0x1000,SB_RAND=-2,
 MU_YG_PRACTICE_START=1,MU_YG_PRACTICE_STOP=2 };
 struct MuMatchState { u8 connection_state,local_ready; };
-struct { MuMatchState msrb; u8 prev_lock_in,prev_connected; int chat_window_opened; } dt;
+struct { MuMatchState msrb; u8 prev_lock_in,prev_connected; int chat_window_opened; u8 doubles_searched; } dt;
+int doubles_teams() { return 0; } void mu_slippi_sss_find_match() { std::abort(); }   // the 4-peer Doubles CSS: off here
 int starts,searches,setups,requests,cleanups; unsigned char chosen=1;unsigned char* char_chosen=&chosen;
 void lbAudioAx_80024030(int) {} int mu_online_p2p_menus() { return 0; }
 int mu_slippi_practice_available() { return 0; }
@@ -71,6 +95,8 @@ int mu_ranked_practice_control(int) { ++starts; return 1; }
 int gm_801A4BB8() { return 1; }
 void lock_in_and_search(int) { ++searches; } void load_code_entry() { ++setups; }
 void mu_slippi_cleanup_connections() { ++cleanups; }
+int mu_slippi_yougame_pick() { return 0; }   // the app: never a launcher YouGame row (upstream 0.9.97)
+void mu_slippi_yougame_restart_older() { std::abort(); }
 int mu_slippi_cmd(unsigned cmd,const void* p,unsigned,void*,unsigned,unsigned*) {
  if(cmd!=0xE7 || *(const u8*)p!=1)std::abort();++requests;return 0;
 }

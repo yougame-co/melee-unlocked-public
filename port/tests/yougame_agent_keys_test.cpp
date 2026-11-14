@@ -193,6 +193,7 @@ static void gating_and_late_pump() {
 }
 
 int main(int argc, char** argv) {
+  setenv("YOUGAME_AGENT_COPY", "1", 1);  // the AGENT TEST app's flag: agent_test::load ignores the file without it
   CHECK(argc == 2);
   parsing(std::filesystem::u8path(argv[1]));
   schedule();

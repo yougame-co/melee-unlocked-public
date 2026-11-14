@@ -58,6 +58,10 @@ is also in game (F1). Replays lists your replays and the Slippi Launcher's; Watc
 broadcast you open in the Slippi Launcher's Spectate tab. Online is the Melee Unlocked lobby, shared
 with Windows players on the same version.
 
+For Steam Game Mode, add the launch option --play to open the game directly without a launcher
+window. It uses the ISO and replay choices saved in launcher.ini and picks the compatibility
+game on older processors. You can also run ./MeleeUnlocked --play --iso "/path/to/melee.iso".
+
 Requirements
 
   - An x86-64 Linux desktop and an OpenGL 4.5 graphics driver (Mesa or NVIDIA). Processors without
@@ -167,6 +171,25 @@ def package_snapexcl(source: Path, library: Path, original: Path):
         for line in lines) + '\n')
 
 
+def ship_vulkan_cache(source, target):
+    """The warmed Vulkan SPIR-V and its recipes (as tools/package_release.py ships them for Windows):
+    SPIR-V is the same on every GPU and driver, so a first Linux session on Vulkan builds its common
+    pipelines before the first frame. The recipes ship as vk_recipes.shipped.bin, which an extracted
+    update never writes over the player's own vk_recipes.bin."""
+    recipes = source / 'vk_recipes.bin'
+    if not recipes.is_file():
+        print(f'vulkan cache: none at {source} (first Vulkan sessions compile their shaders)')
+        return 0
+    target.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for spv in sorted(source.glob('*.spv')):
+        shutil.copy2(spv, target / spv.name)
+        count += 1
+    shutil.copy2(recipes, target / 'vk_recipes.shipped.bin')
+    print(f'vulkan cache: {count} SPIR-V files and {recipes.stat().st_size} bytes of recipes from {source}')
+    return count
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--build-dir', type=Path, default=ROOT / 'build-linux/port/linux/full')
@@ -178,6 +201,10 @@ def main():
     parser.add_argument('--out', type=Path, default=ROOT / 'release')
     parser.add_argument('--ghost-ai-dir', type=Path, default=None,
                         help='ghost_ai_<pro>.bin for each released pro plus ghost_ai_models.json (Fight a pro)')
+    parser.add_argument('--pro-ai-dir', type=Path,
+                        default=None,   # opt-in: third-party models and onnxruntime ship only when asked for
+                        help='Fight a pro: a ProAI folder from tools/ghost_ai/phillip_catalog.py; '
+                             'libonnxruntime.so comes from port/third_party/onnxruntime/bin (tools/fetch_onnxruntime.py)')
     args = parser.parse_args()
     if sys.platform != 'linux':
         parser.error('run this inside Linux (WSL is fine)')
@@ -250,6 +277,28 @@ def main():
     # lib/: the bundled libraries and their license files.
     lib = folder / 'lib'
     lib.mkdir()
+    # Fight a pro with Phillip's policies: ProAI/ beside the game and onnxruntime in lib/ (dlopen).
+    if args.pro_ai_dir:
+        catalog = json.loads((args.pro_ai_dir / 'catalog.json').read_text())
+        if catalog.get('version') != 1 or not catalog.get('models'):
+            raise SystemExit(f'{args.pro_ai_dir}/catalog.json: no policies')
+        (folder / 'ProAI').mkdir()
+        for model in catalog['models']:
+            source = args.pro_ai_dir / model['file']
+            if not source.is_file():
+                if model['kind'] == 'imitation' or not model.get('source'):   # ours have nowhere to download from
+                    raise SystemExit(f'missing Fight a pro policy: {source}')
+                continue
+            if hashlib.sha256(source.read_bytes()).hexdigest() != model['sha256']:
+                raise SystemExit(f'Fight a pro policy changed: {source}')
+            shutil.copy2(source, folder / 'ProAI' / source.name)
+        shutil.copy2(args.pro_ai_dir / 'catalog.json', folder / 'ProAI' / 'catalog.json')
+        ort = ROOT / 'port/third_party/onnxruntime/bin/libonnxruntime.so'
+        if not ort.is_file():
+            raise SystemExit(f'missing {ort} (py -3.12 tools/fetch_onnxruntime.py --linux)')
+        shutil.copy2(ort, lib / 'libonnxruntime.so')
+        os.chmod(lib / 'libonnxruntime.so', 0o755)
+        print(f"Fight a pro: {len(catalog['models'])} Phillip policies")
     # bin/: the shader tools the OpenGL renderer runs (renderer_gl.cpp looks in bin/ first). Without
     # them the game stopped on its first frame ("Cannot run spirv-cross") on systems lacking them.
     tools_dir = folder / 'bin'
@@ -262,6 +311,14 @@ def main():
         shutil.copy2(os.path.realpath(found), tools_dir / tool)
         os.chmod(tools_dir / tool, 0o755)
         shader_tools.append(tools_dir / tool)
+    # DXC (libdxcompiler.so, the same compiler Windows uses): the Vulkan renderer compiles its shaders
+    # with it from bin/ (gx_dxc_linux.cpp), with glslangValidator as the fallback.
+    dxc = ROOT / 'port/third_party/dxc/linux/libdxcompiler.so'
+    if not dxc.is_file():
+        raise SystemExit(f'missing {dxc}')
+    shutil.copy2(dxc, tools_dir / 'libdxcompiler.so')
+    os.chmod(tools_dir / 'libdxcompiler.so', 0o755)
+    shader_tools.append(tools_dir / 'libdxcompiler.so')
     libraries = {}
     for binary in (exe, launcher, game, compat_exe, compat_game, *shader_tools):
         libraries.update(ldd(binary))
@@ -278,6 +335,8 @@ def main():
             owner = subprocess.run(['dpkg', '-S', path], capture_output=True, text=True).stdout
         if owner:
             packages.add(owner.split(':')[0].strip())
+    for dxc_licence in ('LICENSE-LLVM.txt', 'LICENSE-MS.txt'):
+        shutil.copy2(ROOT / 'port/third_party/dxc' / dxc_licence, licenses / f'directx-shader-compiler-{dxc_licence[8:]}')
     for package in sorted(packages):
         copyright_file = Path('/usr/share/doc') / package / 'copyright'
         if copyright_file.is_file():
@@ -342,7 +401,7 @@ def main():
         shutil.copytree(playback, folder / 'SysPlayback', ignore=shutil.ignore_patterns('README.md', '.git*'))
         (folder / 'SysPlayback/GC').mkdir(exist_ok=True)
         shutil.copy2(coef, folder / 'SysPlayback/GC/dsp_coef.bin')
-    # Two of Slippi's Sys files are mostly Nintendo's own disc assets (compliance-lead, 10-25): they never ship. The
+    # Two of Slippi's Sys files are mostly Nintendo's own disc assets (compliance review, 10-25): they never ship. The
     # host rebuilds them from the player's disc (host/sysgen.cpp reads deltas/ beside the program), as on the Mac.
     deltas = json.loads((ROOT / 'port/sys_deltas/manifest.json').read_text())
     for target in {f['target'] for f in deltas['files']}:
@@ -374,17 +433,24 @@ def main():
                      (ROOT / 'port/third_party/enet/LICENSE', 'enet.txt'),
                      (ROOT / 'port/third_party/imgui/LICENSE.txt', 'imgui.txt'),
                      (ROOT / 'port/third_party/stb/LICENSE', 'stb.txt'),
+                     (ROOT / 'port/third_party/zstd/LICENSE', 'zstd.txt'),
+                     (ROOT / 'port/third_party/bzip2/LICENSE', 'bzip2.txt'),
+                     (ROOT / 'port/third_party/lzma/lzma-sdk.txt', 'lzma-sdk.txt'),
                      (ROOT / 'port/third_party/earcut/LICENSE', 'earcut.txt'),
                      (ROOT / 'port/third_party/librashader/LICENSE.md', 'librashader-MPL-2.0.md'),
                      (ROOT / 'docs/licenses/dsp-coefficients.txt', 'dsp-coefficients.txt'),
                      (ROOT / 'docs/licenses/hps_decode-MIT.txt', 'hps_decode.txt'),
                      (ROOT / 'docs/licenses/slippilab-MIT.txt', 'slippilab.txt'),
+                     (ROOT / 'docs/licenses/slippi-ai-MIT.txt', 'phillip-slippi-ai-MIT.txt'),
+                     (ROOT / 'port/third_party/onnxruntime/LICENSE', 'onnxruntime.txt'),
+                     (ROOT / 'port/third_party/onnxruntime/ThirdPartyNotices.txt', 'onnxruntime-third-party.txt'),
                      (ROOT / 'port/runtime/gx/ui_sources/gd_melee/assets/kit/SourceSans3-OFL.md', 'source-sans-3-OFL.md'),
                      (ROOT / 'docs/third-party-ui-attribution.md', 'ui-attribution.md'),
                      (ROOT / 'docs/third-party-training-mode-ce.txt', 'training-mode-ce.txt')):
         if not src.is_file():
             raise SystemExit(f'missing license text: {src}')
         shutil.copy2(src, licenses / dst)
+    ship_vulkan_cache(ROOT / 'shadercache/vulkan-v1', folder / 'shadercache/vulkan-v1')
     # Mod import tools: the system's 7-Zip and xdelta3, as the Windows release carries its own.
     tools = folder / 'tools'
     tools.mkdir()

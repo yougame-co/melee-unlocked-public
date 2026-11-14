@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 #endif
 #include "host_services.h"
+#include "mu_host_aram.h"
 #include "../runtime/host/session_logs.h"
 #include "input_script.h"
 #include "ax_ucode.h"
@@ -55,7 +56,7 @@ namespace {
 constexpr uintptr_t locked_cache_base = 0xE0000000u;
 constexpr uint32_t locked_cache_bytes = 16u << 10;
 constexpr uint64_t ticks_per_frame = MU_TB_HZ / 60;
-constexpr uint32_t aram_bytes = 32u << 20;
+constexpr uint32_t aram_bytes = MU_HOST_ARAM_BYTES;
 using Clock = std::chrono::steady_clock;
 Config cfg;
 Counters count;

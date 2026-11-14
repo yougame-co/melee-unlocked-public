@@ -1,5 +1,5 @@
 // YouGame display defaults: V-Sync off on Windows; FPS hidden for players, visible by default
-// Applied when a game test runs. Every staging package carries the configuration.
+// when an agent test runs the game (10-31). Every staging zip carries the
 // agent hook, so the build flag cannot tell an agent run from a player: main() sets
 // agent_test_run when it read an agent-test.json from the game's data folder.
 // SPDX-License-Identifier: GPL-2.0-or-later
@@ -13,7 +13,7 @@ namespace yougame::display_defaults {
 // YouGame reads and writes only the old keys, exactly as before.
 
 // V-Sync on Windows inside YouGame: off unless the player turned it on there. In the app's full
-// screen V-Sync on measured 11.5 ms input to screen against 3.4 ms off (perf-lead, 10-30).
+// screen V-Sync on measured 11.5 ms input to screen against 3.4 ms off (measured 10-30).
 constexpr bool own_vsync_key(bool yougame, bool windows) { return yougame && windows; }
 constexpr bool vsync(bool yougame, bool windows, bool saved, int saved_yougame) {
   return own_vsync_key(yougame, windows) ? saved_yougame == 1 : saved;

@@ -56,7 +56,9 @@ class YouGame0983MergeTest(unittest.TestCase):
         for path, prefix in (('port/app/main.cpp', 'gfx'), ('port/runtime/gx/threaded_backend.cpp', 'options')):
             text = source(path)
             prefer = text.index('host::window_prefer_vulkan(' + prefix + '.api')
-            self.assertLess(text.index('vulkan_available()', text.rfind('if (', 0, prefer) - 300), prefer)
+            # The availability check sits just above the window choice (0.9.96 added a failed-starts check between;
+            # 0.9.99 made its limit per-OS).
+            self.assertGreater(text.rfind('vulkan_available()', 0, prefer), prefer - 1000)
             self.assertLess(prefer, text.index('host::window_create(', prefer))
         window = source('port/linux/window_sdl.inl')
         self.assertIn('(g_vulkan_window ? SDL_WINDOW_VULKAN : SDL_WINDOW_OPENGL)', window)
@@ -110,7 +112,8 @@ class YouGame0983MergeTest(unittest.TestCase):
     def test_vulkan_ready_requires_successful_real_present(self):
         text = source('port/runtime/gx/gx_vulkan.cpp')
         self.assertIn('end_frame(presented, frame.test_fill < 0)', text)
-        start = text.index('const VkResult r = vkQueuePresentKHR')
+        # v0.9.104 times the present call (host::perf Wait scope) around the same vkQueuePresentKHR.
+        start = text.index('const VkResult r = [&] { host::perf::Scope wait_cost(host::perf::Stage::Wait); return vkQueuePresentKHR(queue_, &p); }();')
         tail = text[start:text.index('acquired_ = false;', start)]
         self.assertIn('if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)', tail)
         self.assertIn('yougame::parity::signals.presented(real_frame)', tail)
@@ -127,8 +130,16 @@ class YouGame0983MergeTest(unittest.TestCase):
                 self.assertEqual(new, old + delta + (old_n == 0) - (new_n == 0), section.splitlines()[0])
                 delta += new_n - old_n
                 count += 1
-        # Build 28 plus upstream v0.9.87 has 10067 hunks.
-        self.assertEqual(count, 10067)
+        # Build 28 + v0.9.87: 10067; Phase B adds 6; Build 49.1 GX layouts add 2.
+        # Optional Squad Strike adds 11 guarded hook hunks.
+        # Build 53: upstream v0.9.97's community codes add 4 (V-cancel sound 1, full FoD reflections 3).
+        # Build 56: upstream v0.9.99 adds 6 (stage skins in mnstagesw 4, Training fixes in gmtrainingmode 2).
+        # Build 57: upstream v0.9.101 adds 3 net (lbcollision +3, itfreeze +1, hsd_3A76 -1).
+        # Build 58: upstream v0.9.102 adds 1 (grizumi, the live Fountain of Dreams scenery).
+        # Build 65: upstream v0.9.104 adds 9 (render semantics in cobj/dobj/lobj/tobj 6, Kirby hats in ftparts 2, gm_1601 1).
+        # The 4-player Friends select adds 2 (the host-only Rules and Teams guards in mncharsel).
+        # Build 95: upstream v0.9.112 adds 1 (gricemt: the Ice Climbers come on Icicle Mountain again).
+        self.assertEqual(count, 10113)  # build 97: v0.9.117's itzako hunk
 
 
 if __name__ == '__main__':

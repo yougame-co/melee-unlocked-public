@@ -144,6 +144,40 @@ int mu_arcade_camera(void);
 #define MU_DISPLAY_NO_KO_EXPLOSIONS 0x400u
 #define MU_KO_EXPLOSION_HIDDEN_Y (-1.0e7f)
 int mu_ko_explosions_hidden(void);
+/* "Hide emblems behind percents" (MU_DISPLAY_OPTION_NO_HUD_EMBLEMS): the character emblem behind
+ * each player's damage percent is not drawn (if/ifstatus.c ifStatus_802F5E50). Picture only. */
+#define MU_DISPLAY_NO_HUD_EMBLEMS 0x800u
+int mu_hud_emblems_hidden(void);
+/* Community codes (HUD tab, MU_DISPLAY_OPTION_* in mu_host.h), the native versions of the players' favourite Gecko codes. All are
+ * picture or sound only: never in a replay, never sent to an opponent. */
+#define MU_DISPLAY_HUD_FADE           0x00001000u   /* HUD Transparency: a player's HUD fades while a fighter is behind it */
+#define MU_DISPLAY_ANGEL_STOCK_COLORS 0x00002000u   /* the respawn platform's colour by the stocks left */
+#define MU_DISPLAY_NANA_PERCENT       0x00004000u   /* Nana's damage shown under Popo's */
+#define MU_DISPLAY_ALLY_INDICATORS    0x00008000u   /* online: YOU over your fighter; teams: a heart over your teammate */
+#define MU_DISPLAY_NO_GO_TEXT         0x00010000u   /* no GO! graphic at the start of a match (its sound stays) */
+#define MU_DISPLAY_HITBOX_ID_COLORS   0x00020000u   /* shown hitboxes coloured by id: 0 red, 1 green, 2 cyan, 3 purple */
+#define MU_DISPLAY_HITBOX_ID_ORDER    0x00040000u   /* shown hitboxes drawn 3 to 0, so id 0 (the highest priority) is on top */
+#define MU_DISPLAY_HITBOX_ANGLES      0x00080000u   /* shown hitboxes carry a line along their knockback angle */
+#define MU_DISPLAY_HQ_FOD_REFLECTIONS 0x00100000u   /* Fountain of Dreams reflections at full resolution with full models */
+#define MU_DISPLAY_VCANCEL_SOUND      0x00200000u   /* the menu's confirm sound on a successful V-cancel */
+#define MU_DISPLAY_CODES_ALL         0x003FF000u
+/* shim/mu_code_features.c: nonzero while the player has that community code on. */
+int mu_code_feature(unsigned int bit);
+/* Offline community codes (HUD tab): they change menu timing and the pause, so the host sends them
+ * only outside network play (source_host.cpp h_display_options). */
+#define MU_DISPLAY_INSTANT_MELEE      0x00400000u   /* Instant Melee: faster stage, stage select and character select loads; pause during the countdown */
+#define MU_DISPLAY_FREE_PAUSE_CAMERA  0x00800000u   /* Unrestricted pause camera: no angle limits, zoom 2.5 to 32768 */
+int mu_instant_melee(void);
+int mu_free_pause_camera(void);
+/* shim/mu_code_features.c: the knockback angle line of a hitbox bubble just drawn (ftdrawcommon.c). */
+struct HitCapsule;
+void mu_hitbox_angle(struct HitCapsule* hit, float fighter_scale, float facing);
+/* shim/mu_hud_scale.c: HUD Transparency, from a HUD part's draw callback (damage, stocks, emblem). */
+struct HSD_GObj;
+void mu_hud_fade(struct HSD_GObj* gobj);
+/* shim/mu_code_features.c: the respawn platform coloured by the stocks left, as it is made. */
+struct Fighter;
+void mu_angel_platform_colors(struct Fighter* fp);
 /* "Shield colours" (MuHostApi.shield_color): this player's own colour for its shield bubble and KO
  * blast, from the player's settings (shim/mu_te_menus.c). Nonzero with *rgb set; zero keeps the game's.
  * Team matches keep the team colours. */
@@ -531,6 +565,13 @@ int mu_online_pending(void);                       /* shim/mu_online.c */
 void mu_online_record_state(int* stable_finalized, int* game_over, int* disconnected);
 struct gm_80479D58_t* mu_gm_engine_state(void);    /* gm/gmscene.c */
 
+/* Same-process scene continuation for the canonical Friends CSS origin. */
+void mu_css_origin_arm(void** context);
+int mu_css_origin_resume(int bit);
+int mu_css_origin_skip_draw(void);
+int mu_css_join_locked(void);
+void mu_css_origin_boot(unsigned char* mode);
+
 /* Rollback snapshot exclusions (shim/mu_exclusions.c). A file that owns state outside the
  * simulation (audio driver and mixer state, host plumbing, renderer bridges) names it with
  * MU_EXCLUSIONS(name, MU_EXCLUDE(sym), ...); a rename is then a compile error, not a silent gap.
@@ -609,7 +650,21 @@ void mu_pad_motor(int port, int on);                                 /* shim/mu_
 #define MU_OPTION_SLIPPI_MENUS 0x8u
 enum { MU_SLP_MODE_RANKED, MU_SLP_MODE_UNRANKED, MU_SLP_MODE_DIRECT, MU_SLP_MODE_TEAMS,
        MU_SLP_MODE_PARTY };
-enum { MU_SLP_OPT_LOGIN = 5, MU_SLP_OPT_LOGOUT = 6, MU_SLP_OPT_UPDATE = 7, MU_SLP_OPT_FRIENDS = 8, MU_SLP_OPT_SLIPPI = 9, MU_SLP_OPT_TOURNAMENT = 10, MU_SLP_OPT_COUNT = 11 };
+enum { MU_SLP_OPT_LOGIN = 5, MU_SLP_OPT_LOGOUT = 6, MU_SLP_OPT_UPDATE = 7, MU_SLP_OPT_FRIENDS = 8, MU_SLP_OPT_SLIPPI = 9, MU_SLP_OPT_TOURNAMENT = 10,
+#ifdef MELEE_DOUBLES
+       MU_SLP_OPT_DOUBLES = 11, MU_SLP_OPT_COUNT = 12
+#else
+       MU_SLP_OPT_COUNT = 11
+#endif
+};
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
+#ifdef MELEE_DOUBLES
+#define MU_SLP_OPT_SQUAD 12
+#else
+#define MU_SLP_OPT_SQUAD 11
+#endif
+#endif
 enum { MU_SLP_APP_LOGGED_OUT, MU_SLP_APP_LOGGED_IN, MU_SLP_APP_UPDATE };
 enum { MU_SLP_MM_IDLE, MU_SLP_MM_INITIALIZING, MU_SLP_MM_MATCHMAKING, MU_SLP_MM_OPPONENT_CONNECTING,
        MU_SLP_MM_CONNECTION_SUCCESS, MU_SLP_MM_ERROR };
@@ -633,6 +688,21 @@ typedef struct MuSlippiMenuState {
     unsigned char code_scratch[64];
 } MuSlippiMenuState;
 
+/* An opponent's live pick on the online character screen (the host's 0xED read, display only:
+ * the match is still set up from the exchanged selections). By remote index, as the host numbers
+ * remote players; `port` is that player's in-game port. valid is 0 until a preview arrives on this
+ * character screen, and again once that player leaves or the game starts. */
+typedef struct MuOpponentPick {
+    unsigned char valid, port;
+    unsigned char char_id;      /* external fighter id while their coin is down, else 0xFF */
+    unsigned char color;        /* the costume their portrait shows */
+    unsigned char team_id;      /* 0-2 in Teams, else 0xFF */
+    unsigned char squad_count;  /* Squad Strike slots filled, 0-3 (0 outside Squad Strike) */
+    unsigned char kinds[3];     /* 0xFF past squad_count */
+    unsigned char colors[3];
+    unsigned char locked;       /* 1 once they locked in */
+} MuOpponentPick;
+
 typedef struct MuMatchState {
     unsigned char connection_state, local_ready, remote_ready, local_index, remote_index;
     unsigned int rng_offset;
@@ -648,6 +718,7 @@ typedef struct MuMatchState {
     char match_id[51];
     unsigned char alt_stage_mode;
     unsigned char raw[962];
+    MuOpponentPick opp_picks[3]; /* not part of the MSRB: filled from the 0xED read beside it */
 } MuMatchState;
 
 typedef struct MuSlippiSelections {
@@ -677,6 +748,8 @@ int mu_slippi_fetch_app_state(void);                      /* B9 (and FA: is Rank
  * A NULL output asks whether the hidden Ranked row is offered; a text output reads its header.
  * available() allows the YouGame random-stage flow even while the menu row stays hidden. */
 int mu_slippi_ranked_available(void);
+int mu_slippi_yougame_pick(void);   /* the online mode was picked from a YouGame row (split menu) */
+void mu_slippi_yougame_restart_older(void);   /* the offer's Start: the launcher restarts in YouGame's release */
 int mu_slippi_friends_available(void);
 int mu_slippi_yougame_menu(void);
 int mu_slippi_menu_option(int row);
@@ -704,6 +777,10 @@ int mu_slippi_load_match_state(MuMatchState* out);        /* B3; 0 on success */
 const MuMatchState* mu_slippi_match_state(void);
 void mu_slippi_find_opponent(int mode, const unsigned char* code_sjis18);   /* B4 */
 void mu_slippi_set_selections(const MuSlippiSelections* s);                /* B5 */
+/* ED send: the local live pick, every online character-screen frame (the host sends on change). */
+void mu_pick_preview_send(unsigned char char_id, unsigned char color, unsigned char team_id,
+                          unsigned char squad_count, const unsigned char kinds[3],
+                          const unsigned char colors[3], unsigned char locked);
 void mu_slippi_cleanup_connections(void);                                   /* BA */
 unsigned int mu_slippi_new_seed(void);                                      /* BC */
 void mu_slippi_send_chat(int message_id);                                   /* BB */
@@ -741,6 +818,7 @@ void mu_slippi_switch_to_online_menu(void);               /* 1P menu, row 2 */
 int mu_slippi_menu_clear_check(int menus_differ);         /* fn_8022AFEC */
 void mu_slippi_online_menu_think(struct HSD_GObj* gp);
 int mu_slippi_css_text_heap(void);                        /* preloadState: 0 = vanilla size */
+void mu_slippi_log_online_rows(void);
 void mu_mnmain_install_online_menu(void);                 /* mn/mnmain.c */
 
 #endif
@@ -784,7 +862,7 @@ void mu_slippi_sss_set_slpcss(void* root);   /* CSS: the slpCSS symbol after Sce
 void* mu_slippi_sss_slpcss(void);            /* NULL until the CSS registered it */
 int mu_slippi_sss_frozen(void);              /* frozen Stadium cave byte */
 void mu_slippi_sss_frozen_flip(void);        /* CursorOnHoverStadium Z */
-void mu_slippi_sss_lock_in(int stage_behavior);          /* FN_TX_LOCK_IN: -2 random, -1 unset, 0+ pick */
+int mu_slippi_sss_lock_in(int stage_behavior);           /* FN_TX_LOCK_IN: -2 random, -1 unset, 0+ pick; 1 sent, 0 refused, -1 held */
 void mu_slippi_sss_find_match(void);                     /* FN_TX_FIND_MATCH (B4, typed code) */
 void mu_slippi_sss_run_callback(int stage_behavior);     /* r13-0x5018 lock-in callback */
 #endif
@@ -796,10 +874,30 @@ struct CSSData;
 struct HSD_JObj;
 int mu_slippi_css_online(void);              /* flag on and major 8 state 0 */
 int mu_slippi_css_teams(void);               /* ... and the Teams mode */
+/* The 4-player Friends lobby's 4-door select (shim/mu_slippi_menu.c; screen in mu_friends4_css.inc,
+ * wire in port/runtime/abi/mu_lobby_wire.h). mu_slippi_css_online() is 0 there: it is Melee's VS select. */
+struct MuLobbyView;
+enum { MU_LOBBY_EXIT_NONE = 0, MU_LOBBY_EXIT_SSS = 1, MU_LOBBY_EXIT_SPLASH = 2 };
+int mu_lobby_css(void);                      /* the online major's select is the lobby's 4-door one */
+const struct MuLobbyView* mu_lobby_read(void);   /* this frame's view (READ), NULL when there is none */
+int mu_lobby_send(const unsigned char* request, unsigned int size);   /* 1 queued */
+void mu_lobby_css_exit(int where);           /* MU_LOBBY_EXIT_*: why the select is about to leave */
+int mu_lobby_curtain(void);                  /* the stage is picked: the select is passed through, hidden */
+void mu_lobby_curtain_frame(const struct MuLobbyView* v);
+int mu_lobby_watch_pads(struct PADStatus* status);   /* PADRead: a guest on the host's stage select only watches */
+void mu_lobby_watch_stage(void);
+int mu_lobby_partner_source(void); /* physical controller for the owned local partner, else -1 */
+/* Doubles: the partner door's tab, this machine's alone (never on the wire): FIND each home. */
+enum { MU_LOBBY_WANT_FIND = 0, MU_LOBBY_WANT_INVITE = 1, MU_LOBBY_WANT_P2 = 2, MU_LOBBY_WANT_CPU = 3, MU_LOBBY_WANTS = 4 };
+int mu_lobby_partner_want(void);
+void mu_lobby_set_partner_want(int want);
+void mu_lobby_pads(struct PADStatus* status);   /* PADRead: only this player's pad, on its own seat's door */
 void mu_slippi_css_enter(struct CSSData** css, unsigned char* char_chosen, signed char* ctrl_port,
                          unsigned char* scene_request, signed char* name_entry_port,
                          struct HSD_JObj** single_menu_root);   /* SceneLoadCSS */
 void mu_slippi_css_poll(void);               /* FetchMatchInfo: B3 per cursor think */
+/* mncharsel.c (mu_css_transfer.inc): door `door`'s live pick, fighter 0xFF while the coin is carried. */
+void mu_css_pick_preview(int door, int port, unsigned char* ck, unsigned char* color);
 int mu_slippi_css_inputs(unsigned int trigger);   /* HandleInputsOnCSS: 1 = both ready, start */
 void mu_slippi_css_text_init(void);          /* LoadCSSText */
 int mu_slippi_css_skip_return_sound(void);   /* SkipReturnToCssSound: 1 = skip the voice */
@@ -842,5 +940,6 @@ void mu_tmce_on_scene_change(void);         /* TM-CE OnSceneChange / OnStartMele
 void mu_tmce_on_start_melee(void);
 int mu_tmce_active(void);                    /* enabled and loaded: the hooks run */
 int mu_test_classic_stage(void);             /* MELEE_TEST_CLASSIC_STAGE, -1 when unset (tests only) */
+int mu_test_vs_stage(void);                  /* MELEE_TEST_VS_STAGE, -1 when unset (tests only) */
 int mu_test_adventure_scene(void);           /* MELEE_TEST_ADVENTURE_SCENE, -1 when unset (tests only) */
 #endif

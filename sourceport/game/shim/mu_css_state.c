@@ -10,6 +10,15 @@ void free(void* ptr);
 
 static int previous_doors[4][4];
 static int previous_valid;
+static int previous_squad = -1;
+
+#if MU_SQUAD
+/* shim/mu_squad_css.c: fighters picked on the online Squad Strike CSS (0-4), -1 elsewhere. */
+int gmSquad_CssPickCount(void);
+#define css_squad_count() gmSquad_CssPickCount()
+#else
+#define css_squad_count() (-1)
+#endif
 
 void mu_css_state_reset(void)
 {
@@ -54,7 +63,8 @@ void mu_css_state_log(int major, int minor, const int doors[4][4], const char* c
 {
     size_t capacity = 512;
     char *line, *out;
-    int i;
+    int i, squad = css_squad_count();
+    if (squad != previous_squad) previous_valid = 0; /* a new squad pick count is a change too */
     if (previous_valid && memcmp(previous_doors, doors, sizeof previous_doors) == 0) return;
     if (mu_host == NULL || mu_host->log == NULL) return;
     for (i = 0; i < 4; ++i) {
@@ -83,12 +93,15 @@ void mu_css_state_log(int major, int minor, const int doors[4][4], const char* c
         }
         *out++ = '}';
     }
+    /* Only while the online Squad Strike CSS is live: how many of its four fighters are picked. */
+    if (squad >= 0) out += snprintf(out, capacity - (out - line), ",\"squad\":{\"count\":%d}", squad);
     *out++ = '}';
     *out = 0;
     /* Same host log path as OSReport (mu_os.c), without its 512-byte truncation. */
     mu_host->log(line);
     free(line);
     memcpy(previous_doors, doors, sizeof previous_doors);
+    previous_squad = squad;
     previous_valid = 1;
 }
 #endif

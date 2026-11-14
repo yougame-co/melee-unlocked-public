@@ -108,6 +108,10 @@ public:
     std::unique_lock<std::mutex> lock(mutex);
     return changed.wait_for(lock, wait, [&] { return finished || !frames.empty(); }) && !frames.empty();
   }
+  void discard_pending() {
+    std::lock_guard<std::mutex> lock(mutex);
+    frames.clear(); recycled.clear(); changed.notify_all();
+  }
   void finish(bool discard = false) {
     std::lock_guard<std::mutex> lock(mutex);
     finished = true;

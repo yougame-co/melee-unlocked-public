@@ -12,6 +12,44 @@ static unsigned checks = 0;
 #define CHECK(x) do { ++checks; if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
 using namespace yougame::agent_test;
 
+static void ui_click(const char* scratch) {
+  using json = nlohmann::json;
+  for (auto engine : {Engine::Source, Engine::Static}) {
+    for (const json& click : {json{{"frame", 1}, {"x", 0}, {"y", 16384}},
+                              json{{"frame", 36000}, {"x", 16384}, {"y", 0}}}) {
+      const auto s = map_keys({{"uiClick", click}}, engine);
+      CHECK(s.ui_click.frame == click["frame"] && s.ui_click.x == click["x"] && s.ui_click.y == click["y"]);
+      CHECK(s.log == "agent-test.json applied default keys: uiClick");
+    }
+    const json valid = {{"frame", 20}, {"x", 151}, {"y", 131}};
+    for (const char* key : {"frame", "x", "y"}) {
+      for (const json& bad : {json(-1), json(36001), json(1.5), json(true), json("1"),
+                             json(nullptr), json(UINT64_MAX)}) {
+        auto click = valid; click[key] = bad;
+        const auto s = map_keys({{"uiClick", click}}, engine);
+        CHECK(s.ui_click.frame == 0);
+        CHECK(s.log == "agent-test: uiClick invalid value; ignored");
+      }
+      auto click = valid; click.erase(key);
+      CHECK(map_keys({{"uiClick", click}}, engine).log == "agent-test: uiClick invalid value; ignored");
+    }
+    for (const json& bad : {json(1), json::array({20, 151, 131}), json::object(),
+                            json{{"frame", 0}, {"x", 0}, {"y", 0}},
+                            json{{"frame", 1}, {"x", 16385}, {"y", 0}},
+                            json{{"frame", 1}, {"x", 0}, {"y", 16385}},
+                            json{{"frame", 1}, {"x", 0}, {"y", 0}, {"extra", 0}}})
+      CHECK(map_keys({{"uiClick", bad}}, engine).log == "agent-test: uiClick invalid value; ignored");
+  }
+  const auto path = std::filesystem::u8path(scratch) / "agent-test.json";
+  { std::ofstream file(path); file << R"({"uiClick":{"frame":20,"x":151,"y":131}})"; }
+  const auto s = load(true, scratch);
+  CHECK(s.ui_click.frame == 20 && !yougame::agent_paths::session.path.empty());
+  CHECK(ui_click_frame.load() == 20 && ui_click_x.load() == 151 && ui_click_y.load() == 131);
+  load(false, scratch);
+  CHECK(ui_click_frame.load() == 0 && ui_click_x.load() == 0 && ui_click_y.load() == 0);
+  std::filesystem::remove(path);
+}
+
 static std::string environment(const Settings& s, const char* key) {
   for (const auto& [name, value] : s.environment) if (name == key) return value;
   return {};
@@ -232,8 +270,10 @@ static void drain() {
 }
 
 int main(int argc, char** argv) {
+  setenv("YOUGAME_AGENT_COPY", "1", 1);  // the AGENT TEST app's flag: agent_test::load ignores the file without it
   CHECK(argc == 2);
   mapping(argv[1]);
+  ui_click(argv[1]);
   adapter();
   events();
   drain();

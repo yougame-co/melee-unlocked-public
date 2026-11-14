@@ -58,10 +58,26 @@ int main() {
     CHECK(!direct_code_from_game("AB-C#1", &code));
   }
 #if defined(_WIN32) || defined(__linux__)
-  CHECK(std::string(yougame::parity::kCaps) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\"]}");
+  CHECK(std::string(yougame::parity::kCaps) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"view\",\"volume\",\"match\",\"fullscreen\"]}");
 #else
-  CHECK(std::string(yougame::parity::kCaps) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\"]}");
+  CHECK(std::string(yougame::parity::kCaps) == "yg {\"caps\":[\"ready\",\"overlay\",\"join\",\"notice\",\"pads\",\"rumble\",\"chat\",\"settings\",\"match\",\"fullscreen\"]}");
 #endif
+  {
+    // The match state follows caps once, even when 0, then only changes reach the app.
+    static std::vector<std::string> lines;
+    lines.clear();
+    yougame::parity::Signals signals;
+    CHECK(signals.sync_match(1) == -1);   // no app yet: remembered, not written
+    signals.start(true, [](const char* line) { lines.push_back(line); });
+    CHECK(signals.sync_match(-1) == 1);
+    CHECK(lines.size() == 2 && lines[1] == "yg {\"match\":1}");
+    CHECK(signals.sync_match(1) == -1 && signals.sync_match(-1) == -1);
+    CHECK(signals.sync_match(0) == 0 && lines.back() == "yg {\"match\":0}");
+    yougame::parity::Signals fresh;
+    fresh.start(true, [](const char* line) { lines.push_back(line); });
+    CHECK(fresh.sync_match(-1) == 0 && lines.back() == "yg {\"match\":0}");   // 0 is still sent once
+    CHECK(fresh.sync_match(0) == -1);
+  }
 
   for (int mode : {0, 1, 2, 3, 4}) {
     std::string code = "stale";
@@ -149,6 +165,48 @@ int main() {
   CHECK(own.push({{"type","notice"},{"kind","invite"},{"from","Friend"},{"text","Play again"},{"room","Ab12"}},12));
   CHECK(own.push({{"type","join"},{"room","Ab12"}},13));
   CHECK(own.take_join(true) == "Ab12");
+  // The invite's room size (a hint for the first try): 4, or the Friends lobby's compatibility key; none
+  // said is 0. The room decides (room_kind below).
+  CHECK(own.push({{"type","join"},{"room","Size4Room"},{"players",4}},14));
+  CHECK(own.take_join(true) == "Size4Room" && own.join_players() == 4);
+  CHECK(own.push({{"type","join"},{"room","Size0Room"}},15));
+  CHECK(own.take_join(true) == "Size0Room" && own.join_players() == 0 && !own.join_doubles());   // bare: 1v1 first
+  CHECK(own.push({{"type","join"},{"room","CompatRoom"},{"compatibility","mu:friends-lobby-1"}},16));
+  CHECK(own.take_join(true) == "CompatRoom" && own.join_players() == 4);
+  CHECK(own.push({{"type","join"},{"room","OtherCompat"},{"compatibility","mu-0.9.105"}},17));
+  CHECK(own.take_join(true) == "OtherCompat" && own.join_players() == 0);
+  CHECK(own.push({{"type","join"},{"room","Size2Room"},{"players",2},{"compatibility","friends-lobby-1"}},18));
+  CHECK(own.take_join(true) == "Size2Room" && own.join_players() == 2);   // the page's size wins
+  // The room decides lobby or 1v1: nothing heard is -1; a room the search joined the wrong way queues its
+  // join again with its kind (even a room retired or tracked as current), and its kind stays known.
+  CHECK(own.room_kind("Size0Room") == -1);
+  own.room_decided("Size0Room", true);                 // an invite with no size, into a Friends lobby room
+  CHECK(own.room_kind("Size0Room") == 1);
+  CHECK(own.take_join(true) == "Size0Room" && own.join_players() == 4);
+  own.room_decided("Size4Room", false);                // said 4, but the room is a 1v1 friend room
+  CHECK(own.take_join(true) == "Size4Room" && own.join_players() == 2 && own.room_kind("Size4Room") == 0);
+  own.room_seen("Size2Room", false);                   // seen as it was joined: recorded, nothing queued
+  CHECK(own.room_kind("Size2Room") == 0 && own.take_join(true).empty());
+  own.room_decided("", true);                          // no room: nothing
+  CHECK(own.take_join(true).empty());
+  // lobby_mismatch is also a different build's refusal: a 1v1 invite that said players:2 (or carried any
+  // compatibility key) fails with it and is never tried the other way; only an invite that said nothing is.
+  CHECK(own.push({{"type","join"},{"room","Mm2Room"},{"players",2}},19));
+  CHECK(own.take_join(true) == "Mm2Room" && !own.mismatch_reroutes("Mm2Room"));
+  CHECK(own.push({{"type","join"},{"room","MmKeyRoom"},{"compatibility","mu-0.9.105"}},20));
+  CHECK(own.take_join(true) == "MmKeyRoom" && own.join_players() == 0 && !own.mismatch_reroutes("MmKeyRoom"));
+  CHECK(own.push({{"type","join"},{"room","Mm4Room"},{"compatibility","mu:friends-lobby-1"}},21));
+  CHECK(own.take_join(true) == "Mm4Room" && !own.mismatch_reroutes("Mm4Room"));
+  CHECK(own.push({{"type","join"},{"room","MmBareRoom"}},22));
+  CHECK(own.take_join(true) == "MmBareRoom" && own.mismatch_reroutes("MmBareRoom"));
+  own.room_decided("MmBareRoom", true);                // rerouted once: known now, and the requeue is hinted
+  CHECK(own.take_join(true) == "MmBareRoom" && !own.mismatch_reroutes("MmBareRoom"));
+  CHECK(!own.mismatch_reroutes(""));
+  {
+    yougame::friends::Events many;                     // bounded: the 33rd room starts the record over
+    for (int i = 0; i < 33; ++i) many.room_seen("Room" + std::to_string(i), true);
+    CHECK(many.room_kind("Room32") == 1 && many.room_kind("Room0") == -1);
+  }
   own.current_room("Ab12"); // discard an own-room push queued just before ticket request
   CHECK(own.take_join(true).empty());
   own.hello({{"room", "Ab12"}});
@@ -309,5 +367,27 @@ int main() {
   host.request_host();
   host.online_menu(false); // Back/cancel must not host a room later
   CHECK(!host.take_host());
+
+  // A full room. The invite route's code wins; without one (the app may drop it) only its words decide.
+  const std::string site = "This room is full. Invite again when a seat opens.";
+  CHECK(invite_room_full("room_full", site) == site);
+  CHECK(invite_room_full("refused", site) == site && invite_room_full("", site) == site);
+  CHECK(invite_room_full("room_full", "") == kRoomFull && invite_room_full("room_full", kRequestFailed) == kRoomFull);
+  CHECK(invite_room_full("seat_mismatch", site).empty());   // another code: not a full room
+  CHECK(invite_room_full("room_full", std::string(300, 'x')).size() == 120);
+  CHECK(invite_room_full("refused", "Your friend is offline").empty() && invite_room_full("", "Cancelled").empty());
+  CHECK(room_full_line("Ada") == "Ada's room is full." && room_full_line("") == "This room is full.");
+  try { throw RoomFull(site); } catch (const std::runtime_error& e) { CHECK(e.what() == site); }
+  Events guest;
+  CHECK(guest.inviter("abcdef").empty());
+  CHECK(guest.push({{"type", "notice"}, {"kind", "invite"}, {"from", "Ada"}, {"text", "invited you"}, {"room", "abcdef"}}, 1));
+  guest.current_room("abcdef");   // accepting clears the invite, never who sent it
+  CHECK(guest.inviter("abcdef") == "Ada" && guest.inviter("zzzzzz").empty() && guest.inviter("").empty());
+  guest.room_full(room_full_line(guest.inviter("abcdef")), 1000);
+  CHECK(guest.toast(1000) == "Ada's room is full." && guest.toast(7000).empty());
+  CHECK(!guest.take_full_return(false, 2000));   // waits for the online character select
+  CHECK(guest.take_full_return(true, 3000) && !guest.take_full_return(true, 3001));   // once
+  guest.room_full(kRoomFull, 10000);
+  CHECK(!guest.take_full_return(true, 25000) && !guest.take_full_return(true, 25001));   // expired, never late
   std::puts("YouGame friends passed");
 }

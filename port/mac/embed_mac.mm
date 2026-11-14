@@ -260,7 +260,7 @@ SDL_Window* create(int w, int h, const char* title, bool allowed_visible) {
     // The panel's GL surface stays in points, as SDL_CreateWindowFrom left it: SDL 2.30 never marks a foreign window
     // high-DPI, so SDL_GL_GetDrawableSize, present()'s letterbox and ImGui's viewport all count in points. Asking for a
     // Retina surface here made it twice that size, and on a 2x display the picture drew half-size in its lower left in
-    // theater and black in full screen (d0017/d0018). present() logs the window and surface sizes.
+    // theater and black in full screen (d0017/d0018, 10-26). present() logs the window and surface sizes.
     std::weak_ptr<Inbox> inbox = s.inbox;
     yougame::set_box_handler([inbox](const std::string& line) {
       const auto command = parse_command(line);

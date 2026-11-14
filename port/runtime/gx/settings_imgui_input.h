@@ -2,8 +2,33 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 #include "imgui.h"
+#ifdef YOUGAME_AGENT_TEST_HOOK
+#include "imgui_internal.h"
+#include <cmath>
+#endif
 
 namespace gx::settings_input {
+#ifdef YOUGAME_AGENT_TEST_HOOK
+struct Click { ImVec2 pos; ImU32 down = 0, up = 0; };
+inline Click click(ImGuiIO& io, int x, int y, float scale) {
+  Click result{ImVec2(float(std::lround(x / scale)), float(std::lround(y / scale)))};
+  auto& g = *ImGui::GetCurrentContext();
+  io.AddMouseSourceEvent(ImGuiMouseSource_Mouse);
+  io.AddMousePosEvent(result.pos.x, result.pos.y);
+  const ImU32 down = g.InputEventsNextEventId;
+  io.AddMouseButtonEvent(0, true);
+  if (g.InputEventsNextEventId != down) result.down = down;
+  const ImU32 up = g.InputEventsNextEventId;
+  io.AddMouseButtonEvent(0, false);
+  if (g.InputEventsNextEventId != up) result.up = up;
+  return result;
+}
+inline bool click_event_seen(ImU32 id) {
+  if (id) for (const auto& event : ImGui::GetCurrentContext()->InputEventsTrail)
+    if (event.EventId == id) return true;
+  return false;
+}
+#endif
 inline void navigation(ImGuiIO& io, bool open) {
   constexpr int flags = ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
   if (open) io.ConfigFlags |= flags;

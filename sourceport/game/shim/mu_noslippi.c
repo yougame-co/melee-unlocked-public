@@ -129,7 +129,8 @@ void mu_replay_frame_begin(void) {}
 int mu_replay_terminated(void) { return 0; }
 int mu_replay_stock_steal(int pad_port) { (void) pad_port; return 0; }
 void mu_replay_input(Fighter* fp) { (void) fp; }
-void mu_replay_post_frame(Fighter* fp) { (void) fp; }
+void mu_ghost_post_frame(Fighter* fp);
+void mu_replay_post_frame(Fighter* fp) { mu_ghost_post_frame(fp); }
 int mu_replay_ps_frozen(void) { return mu_stadium_frozen_option(); }   /* no playback: the offline option */
 void mu_replay_online_start(StartMeleeData* data, const unsigned char* msrb) { (void) data; (void) msrb; }
 void mu_replay_flush_frame(void) {}
@@ -137,6 +138,9 @@ void mu_replay_lcancel_reset(Fighter* fp) { (void) fp; }
 void mu_replay_lcancel_landing(Fighter* fp) { (void) fp; }
 void mu_replay_record_whispy(int direction) { (void) direction; }
 void mu_replay_record_fountain(const HSD_JObj* platform, float height) { (void) platform; (void) height; }
+/* The pro AI's match frame and Fountain heights: none without the replay layer (shim/mu_replay.c). */
+int mu_replay_match_frame(void) { return 0; }
+void mu_replay_fountain_heights(float* left, float* right) { *left = *right = 0.0f; }
 void mu_replay_record_stadium(int state, int kind) { (void) state; (void) kind; }
 int mu_replay_abi_active(void) { return 0; }
 /* mu_exclusions.c lists this provider; there is no replay data cache to leave out here. */
@@ -144,14 +148,20 @@ unsigned int mu_exclusions_replay_abi(const MuExclusion** out) { *out = NULL; re
 
 /* ---- practice matchmaking: none ---- */
 
-int mu_practice_resolve_pending_mode(int requested) { return requested; }
-void mu_practice_enter_mode(int mode) { (void) mode; }
+int mu_boot_match_resolve(int requested);
+int mu_practice_resolve_pending_mode(int requested) { return mu_boot_match_resolve(requested); }
+void mu_boot_match_enter_mode(int mode);
+void mu_practice_enter_mode(int mode) { mu_boot_match_enter_mode(mode); }
 
 /* The game API's scene query stays (the host asks which mode is running); the operations that
  * moved a practice match into the online menus are refused. */
 int mu_practice_bridge(int op, int* a, int n)
 {
     if (op == 15) return mu_yougame_page_pause(a, n);   /* MU_PRACTICE_PAGE_PAUSE */
+    if (op == 35) {   /* MU_PRACTICE_BOOT_MATCH (agent test, shim/mu_boot_match.c) */
+        int mu_boot_match_boot(void);
+        return mu_boot_match_boot();
+    }
     if (op == 0 && n >= 2) {   /* MU_PRACTICE_SCENE */
         a[0] = gm_GetCurrentGameMode();
         a[1] = gm_GetCurrentSceneIndex();
@@ -167,10 +177,45 @@ static MuSlippiMenuState menu_state;   /* read by name entry and stage select; s
 int mu_slippi_menus_enabled(void) { return 0; }
 int mu_slippi_friends_available(void) { return 0; }
 int mu_slippi_yougame_menu(void) { return 0; }
+#if MU_SQUAD
+/* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+ * The no-Slippi build keeps label/CPU callers but no command transport or title. */
+int mu_slippi_cmd(unsigned int cmd, const void* payload, unsigned int size,
+                  void* reply, unsigned int capacity, unsigned int* got)
+{
+    (void) cmd; (void) payload; (void) size; (void) reply; (void) capacity;
+    if (got) *got = 0;
+    return -1;
+}
+int mu_slippi_title_active(void) { return 0; }
+/* Shared with mu_replay.c: CPU observations still require the real fighter flags. */
+#define FLAG(v, n) ((u8) ((v) ? 0x80 >> (n) : 0))
+void mu_replay_fighter_flags(const Fighter* fp, unsigned char out[5])
+{
+    out[0] = FLAG(fp->allow_interrupt, 0) | FLAG(fp->x2218_b1, 1) | FLAG(fp->x2218_b2, 2) |
+              FLAG(fp->reflecting, 3) | FLAG(fp->x2218_b4, 4) | FLAG(fp->x2218_b5, 5) |
+              FLAG(fp->x2218_b6, 6) | FLAG(fp->x2218_b7, 7);
+    out[1] = FLAG(fp->x221A_b0, 0) | FLAG(fp->x221A_b1, 1) | FLAG(fp->allow_sdi, 2) |
+              FLAG(fp->x221A_b3, 3) | FLAG(fp->fall_fast, 4) | FLAG(fp->x221A_b5, 5) |
+              FLAG(fp->x221A_b6, 6) | FLAG(fp->x221A_b7, 7);
+    out[2] = FLAG(fp->x221B_b0, 0) | FLAG(fp->x221B_b1, 1) | FLAG(fp->x221B_b2, 2) |
+            FLAG(fp->x221B_b3, 3) | FLAG(fp->x221B_b4, 4) | FLAG(fp->x221B_b5, 5) |
+            FLAG(fp->x221B_b6, 6) | FLAG(fp->x221B_b7, 7);
+    out[3] = FLAG(fp->x221C_b0, 0) | FLAG(fp->x221C_b1, 1) | FLAG(fp->x221C_b2, 2) |
+              FLAG(fp->x221C_b3, 3) | FLAG(fp->x221C_b4, 4) | FLAG(fp->x221C_b5, 5) |
+              FLAG(fp->x221C_b6, 6) | FLAG((fp->x221C_u16_y >> 2) & 1, 7);
+    out[4] = FLAG(fp->x221F_b0, 0) | FLAG(fp->x221F_b1, 1) | FLAG(fp->x221F_b2, 2) |
+              FLAG(fp->is_sleeping, 3) | FLAG(fp->is_sub_fighter, 4) | FLAG(fp->x221F_b5, 5) |
+              FLAG(fp->x221F_b6, 6) | FLAG(fp->x221F_b7, 7);
+}
+#undef FLAG
+#endif
 int mu_slippi_menu_count(void) { return 8; }
 int mu_slippi_menu_option(int row) { return row; }
 int mu_slippi_menu_label_kind(int row) { (void) row; return 0; }
+#if !MU_SQUAD
 void mu_slippi_signin_notice(HSD_GObj* menu) { (void) menu; }
+#endif
 MuSlippiMenuState* mu_slippi_state(void) { return &menu_state; }
 int mu_slippi_code_suggestion(const MuCodeSuggestionReq* in, MuCodeSuggestion* out)
 {
@@ -217,6 +262,18 @@ void mu_slippi_online_menu_think(HSD_GObj* gp) { (void) gp; }
 void mu_slippi_scene_install(void) {}
 
 int mu_slippi_css_online(void) { return 0; }
+int mu_lobby_css(void) { return 0; }
+const struct MuLobbyView* mu_lobby_read(void) { return NULL; }
+int mu_lobby_send(const unsigned char* request, unsigned int size) { (void) request; (void) size; return 0; }
+void mu_lobby_css_exit(int where) { (void) where; }
+int mu_lobby_curtain(void) { return 0; }
+void mu_lobby_curtain_frame(const struct MuLobbyView* v) { (void) v; }
+void mu_lobby_watch_stage(void) {}
+void mu_lobby_pads(struct PADStatus* status) { (void) status; }
+int mu_lobby_partner_source(void) { return -1; }
+int mu_lobby_partner_want(void) { return 0; }
+void mu_lobby_set_partner_want(int want) { (void) want; }
+int mu_lobby_watch_pads(struct PADStatus* status) { (void) status; return 0; }
 int mu_slippi_css_teams(void) { return 0; }
 void mu_slippi_css_enter(struct CSSData** css, unsigned char* char_chosen, signed char* ctrl_port,
                          unsigned char* scene_request, signed char* name_entry_port,

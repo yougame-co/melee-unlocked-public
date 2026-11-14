@@ -29,7 +29,7 @@ yougame::relay_pads::State g_relay_state([](const std::string&) {});
 controller_relay::Snapshot relayed_snapshot() { return yougame::relay_pads::controller_snapshot(g_relay_state.snapshot()); }
 
 std::ifstream fixture(const char* name) {
-  // Copied verbatim from controller-lead's controller/{gap-run-lines.txt,fixtures/ps.jsonl}.
+  // Copied verbatim from the controller gap-run fixtures (gap-run-lines.txt, fixtures/ps.jsonl).
   std::ifstream stream(std::filesystem::path(__FILE__).parent_path() / "fixtures" / "relay" / name);
   CHECK(stream.is_open());
   return stream;

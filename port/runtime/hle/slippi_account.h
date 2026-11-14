@@ -91,6 +91,15 @@ inline std::vector<std::filesystem::path> launcher_roots() {
       roots.emplace_back(std::filesystem::path(home) / kind / "SlippiDolphin");
     roots.emplace_back(std::filesystem::path(home) / ".var" / "app" / "com.project_slippi.Launcher" / "config" / "SlippiDolphin");
     roots.emplace_back(std::filesystem::path(home) / ".var" / "app" / "com.project_slippi.Launcher" / "data" / "SlippiDolphin");
+    // The Launcher's mainline netplay build on Linux: ~/.config/slippi-dolphin/netplay<beta>/Slippi/user.json
+    // (slippi-launcher src/dolphin/install/mainline_installation.ts).
+    roots.emplace_back(std::filesystem::path(home) / ".config" / "slippi-dolphin");
+#ifdef __APPLE__
+    // macOS: both builds keep the sign-in under ~/Library/Application Support/com.project-slippi.dolphin,
+    // stable at Slippi/user.json, mainline at netplay<beta>/User/Slippi/user.json (slippi-launcher
+    // ishiiruka_installation.ts and mainline_installation.ts; Mac has its own branch, not netplay/User).
+    roots.emplace_back(std::filesystem::path(home) / "Library" / "Application Support" / "com.project-slippi.dolphin");
+#endif
   }
   for (const char* name : {"XDG_DATA_HOME", "XDG_CONFIG_HOME"})
     if (const char* base = std::getenv(name); base && *base)

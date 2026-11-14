@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #define NOMINMAX
 #include "cosmetic_mods.h"
+#include "disc_costume_metadata.h"
+#include "stage_dat_safety.h"
 #include "../runtime/gx/companion_texture_match.h"
 
 #include <windows.h>
@@ -373,6 +375,114 @@ std::vector<uint8_t> skeleton_dat(uint32_t root_flags, float child_y, bool extra
   return out;
 }
 
+// m-ex's published MxDt costume tables and mexSelectChr portrait layout. Use a non-retail stride,
+// reduced non-block-aligned portraits, and palette keys independent of the image keys.
+std::vector<uint8_t> mex_archive(std::vector<uint8_t> out, const std::vector<uint32_t>& pointers, const std::string& name) {
+  const uint32_t size = (uint32_t)out.size() - 32;
+  const size_t table = out.size();
+  out.resize(table + pointers.size() * 4 + 8 + name.size() + 1);
+  be32(out, 0, (uint32_t)out.size()); be32(out, 4, size); be32(out, 8, (uint32_t)pointers.size()); be32(out, 12, 1);
+  for (size_t i = 0; i < pointers.size(); ++i) be32(out, table + i * 4, pointers[i]);
+  const size_t root = table + pointers.size() * 4;
+  be32(out, root, 0); be32(out, root + 4, 0);
+  std::memcpy(out.data() + root + 8, name.c_str(), name.size() + 1);
+  return out;
+}
+
+std::vector<uint8_t> mex_marth_metadata(const std::vector<std::string>& files, bool renamed = false) {
+  std::vector<uint8_t> out(32 + 0x1000);
+  std::vector<uint32_t> pointers;
+  auto point = [&](uint32_t at, uint32_t to) { be32(out, 32 + at, to); pointers.push_back(at); };
+  point(0, 0x40); point(8, 0x80);
+  out[32 + 0x40] = 1; be32(out, 32 + 0x44, 33); be32(out, 32 + 0x48, 33);
+  point(0x8C, 0xA0); point(0x90, 0x110); point(0x94, 0x1A0);
+  std::fill(out.begin() + 32 + 0xA0, out.begin() + 32 + 0xA0 + 33 * 3, 0xFF);
+  out[32 + 0xA0 + 9 * 3] = 18;   // external Marth -> internal Marth
+  out[32 + 0x110 + 9 * 4] = (uint8_t)files.size();
+  point(0x1A0 + 18 * 4, 0x240);
+  for (uint32_t i = 0; i < files.size(); ++i) {
+    point(0x240 + i * 16, 0x400 + i * 32);
+    std::memcpy(out.data() + 32 + 0x400 + i * 32, files[i].c_str(), files[i].size() + 1);
+    if (renamed && i >= 5) {
+      const std::string symbol = "PlyMars5K" + std::string(i == 5 ? "Ye" : i == 6 ? "La" : "Or") + "_Share_joint";
+      point(0x240 + i * 16 + 4, 0x600 + i * 64);
+      std::memcpy(out.data() + 32 + 0x600 + i * 64, symbol.c_str(), symbol.size() + 1);
+    }
+  }
+  return mex_archive(std::move(out), pointers, "mexData");
+}
+
+uint16_t mex_portrait_color(uint32_t i) { return uint16_t(0x8000 | ((i + 1) * 3 << 10) | ((i + 1) * 2 << 5) | i); }
+
+std::vector<uint8_t> mex_marth_portraits() {
+  std::vector<uint8_t> out(32 + 0x1800);
+  std::vector<uint32_t> pointers;
+  auto point = [&](uint32_t at, uint32_t to) { be32(out, 32 + at, to); pointers.push_back(at); };
+  point(12, 0x20); be32(out, 32 + 16, 33); point(0x28, 0x40);
+  point(0x48, 0x60); point(0x4C, 0x200); point(0x50, 0x240);
+  out[32 + 0x55] = out[32 + 0x57] = 8;
+  point(0x68, 0x80); point(0x80, 0xA0);
+  for (uint32_t t = 0; t < 2; ++t) {
+    const uint32_t track = t ? 0xA0 : 0x80, keys = t ? 0x140 : 0x100;
+    be32(out, 32 + track + 4, 20);
+    out[32 + track + 12] = (uint8_t)(t + 1); out[32 + track + 13] = 0x80;
+    point(track + 16, keys);
+    out[32 + keys] = 0x01; out[32 + keys + 2] = 9; out[32 + keys + 3] = 0x71;
+    for (uint32_t i = 0; i < 8; ++i) {
+      out[32 + keys + 4 + i * 2] = (uint8_t)(t ? i : 7 - i);
+      out[32 + keys + 5 + i * 2] = 33;
+    }
+  }
+  for (uint32_t i = 0; i < 8; ++i) {
+    const uint32_t image = 0x300 + i * 24, palette = 0x400 + i * 16;
+    point(0x200 + i * 4, image); point(0x240 + i * 4, palette);
+    point(image, 0x800 + i * 0x100);
+    out[32 + image + 5] = 9; out[32 + image + 7] = 11;
+    be32(out, 32 + image + 8, i == 0 ? 8 : 9);  // the final costume uses CI4 instead of CI8
+    std::fill_n(out.begin() + 32 + 0x800 + i * 0x100, 0x100, (uint8_t)(i == 0 ? 0x11 : 1));
+    point(palette, 0x500 + i * 32); be32(out, 32 + palette + 4, 2); out[32 + palette + 13] = 16;
+    const uint16_t color = mex_portrait_color(i);
+    for (uint32_t c = 0; c < 16; ++c) {
+      out[32 + 0x500 + i * 32 + c * 2] = uint8_t(color >> 8);
+      out[32 + 0x500 + i * 32 + c * 2 + 1] = uint8_t(color);
+    }
+  }
+  return mex_archive(std::move(out), pointers, "mexSelectChr");
+}
+
+std::vector<uint8_t> cosmetic_test_iso(const std::vector<std::pair<std::string, std::vector<uint8_t>>>& files) {
+  std::vector<uint8_t> fst((files.size() + 1) * 12);
+  be32(fst, 0, 0x01000000); be32(fst, 8, (uint32_t)files.size() + 1);
+  std::vector<uint8_t> iso(0x1000);
+  uint32_t name_at = 0;
+  for (size_t i = 0; i < files.size(); ++i) {
+    be32(fst, (i + 1) * 12, name_at); be32(fst, (i + 1) * 12 + 4, (uint32_t)iso.size());
+    be32(fst, (i + 1) * 12 + 8, (uint32_t)files[i].second.size());
+    fst.insert(fst.end(), files[i].first.begin(), files[i].first.end()); fst.push_back(0);
+    name_at += (uint32_t)files[i].first.size() + 1;
+    iso.insert(iso.end(), files[i].second.begin(), files[i].second.end());
+  }
+  be32(iso, 0x424, 0x500); be32(iso, 0x428, (uint32_t)fst.size());
+  std::copy(fst.begin(), fst.end(), iso.begin() + 0x500);
+  return iso;
+}
+
+std::vector<uint8_t> pause_screen_dat(bool no_hud = false) {
+  std::vector<uint8_t> out(32 + 0x600);
+  std::vector<uint32_t> pointers;
+  auto point = [&](uint32_t at, uint32_t to) { be32(out, 32 + at, to); pointers.push_back(at); };
+  point(0, 0x20); point(0x20, 0x40); point(0x40, 0x100);
+  for (uint32_t i = 0; i < 12; ++i) {
+    const uint32_t at = 0x100 + i * 64;
+    if (i < 2) point(at + 8, at + 64);
+    else if (i < 11) point(at + 12, at + 64);
+    be32(out, 32 + at + 4, no_hud ? 0x10 : 0);
+  }
+  point(0x60, 0x420); point(0x420, 0x500);
+  be32(out, 32 + 0x424, 0x00080008);  // an 8x8 I4 label texture
+  return mex_archive(std::move(out), pointers, "ScGamPause_scene_data");
+}
+
 // The same three joints with a mesh on the root: one display object, one envelope polygon object,
 // one envelope that blends joint 1 and joint 2 with `weight` each. Joint 1 always has an inverse
 // bind matrix; joint 2 has one only when `bound`. The game asserts on a blended joint without one.
@@ -467,6 +577,70 @@ int main(int argc, char** argv) {
       (L"melee-cosmetic-test-" + std::to_wstring(GetCurrentProcessId()));
   std::error_code ec; fs::remove_all(folder, ec); fs::create_directories(folder, ec);
   check(!ec, "create temporary directory");
+
+  if (argc == 5 && std::string(argv[1]) == "--build-looks") {
+    host::cosmetics::configure((folder / L"settings.ini").string());
+    std::string message;
+    const bool ok = host::cosmetics::build_look_packs(argv[2], argv[3], argv[4], &message);
+    std::printf("Diet look build: %s\n", message.c_str());
+    fs::remove_all(folder, ec);
+    return ok ? 0 : 1;
+  }
+  if (argc == 5 && std::string(argv[1]) == "--install-official") {
+    host::cosmetics::configure((folder / L"settings.ini").string());
+    const int which = std::atoi(argv[2]);
+    const std::string mods = (folder / L"Mods").u8string();
+    host::cosmetics::install_official_look(which, argv[3], argv[4], mods);
+    host::cosmetics::OfficialLookState state;
+    for (int tick = 0; tick < 9000; ++tick) {
+      state = host::cosmetics::official_look_state(which, mods);
+      if (!state.busy) break;
+      Sleep(100);
+    }
+    std::printf("Official look install: %s\n", state.message.c_str());
+    const bool ok = !state.busy && state.installed;
+    if (!state.busy) fs::remove_all(folder, ec);
+    return ok ? 0 : 1;
+  }
+
+  if ((argc == 3 || argc == 4) && std::string(argv[1]) == "--patch-tool") {
+    host::cosmetics::configure((folder / L"settings.ini").string());
+    const fs::path cache = folder / L"CosmeticMods" / L"tools" / L"xdelta3.exe";
+    fs::create_directories(cache.parent_path(), ec);
+    if (argc == 3) write_file(cache, read_file(fs::u8path(argv[2])));
+    const fs::path source = folder / L"source with spaces.bin", patch = folder / L"test patch.xdelta";
+    write_file(source, {'h','e','l','l','o',' ','w','o','r','l','d'});
+    write_file(patch, {0xD6,0xC3,0xC4,0,0,1,11,0,17,14,0,7,4,1,' ','t','h','e','r','e','!',21,7,0,3,0});
+    const std::string expected = "hello there!!!";
+    for (int fault = 0; fault < 2; ++fault) {
+      const fs::path bad = folder / (fault ? L"broken tool.exe" : L"missing tool.exe");
+      if (fault) write_file(bad, {'n','o','t',' ','a','n',' ','e','x','e'});
+      const fs::path output = folder / (fault ? L"repaired output.bin" : L"installed output.bin");
+      std::string error;
+      const bool ok = host::cosmetics::testing::apply_look_patch(bad.u8string(), source.u8string(), patch.u8string(), output.u8string(), &error);
+      if (!ok) std::fprintf(stderr, "patch-tool diagnostic: %s\n", error.c_str());
+      const auto bytes = read_file(output);
+      check(ok && std::string(bytes.begin(), bytes.end()) == expected,
+            "a missing or unstartable packaged tool recovers and applies the real delta, including paths with spaces");
+    }
+    fs::remove_all(folder, ec);
+    if (failures) return 1;
+    std::puts("patch-tool recovery diagnostic passed");
+    return 0;
+  }
+
+  if (argc == 3 && std::string(argv[1]) == "--pause-pack") {
+    host::cosmetics::configure((folder / L"settings.ini").string());
+    const auto imported = host::cosmetics::import_file(argv[2]);
+    const auto assets = host::cosmetics::assets();
+    check(imported.ok && assets.size() == 2, "real supplied pause ZIP imports both styles");
+    for (const auto& asset : assets)
+      check(asset.kind == "pause_screen" && asset.available && asset.target_path == "GmPause.usd",
+            "real pause archive has a valid pause-screen identity");
+    if (failures) return 1;
+    std::puts("real minimal pause pack passed");
+    return 0;
+  }
 
   if (argc == 5 && std::string(argv[1]) == "--prepare-stage") {
     host::cosmetics::configure(argv[3]);
@@ -674,6 +848,9 @@ int main(int argc, char** argv) {
     check(costume_draw_safe(envelope_dat(true), &why), "costume mesh: blended bones with bind matrices are drawn");
     // A stage's models are drawn by the same code: the same defect in a stage file is refused too.
     using host::cosmetics::stage_draw_safe;
+    check(online_reason_short("stage joint hierarchy differs; incomplete visual conversion (19 of the skin's 54 meshes retained); using the standard stage online") ==
+              "incomplete visual conversion (19 of the skin's 54 meshes retained); using the standard stage online",
+          "stage conversion: missing geometry is explained in the Mods tab");
     check(stage_draw_safe(envelope_dat(true, 0.5f, true), &why), "stage mesh: blended bones with bind matrices are drawn");
     check(!stage_draw_safe(envelope_dat(false, 0.5f, true), &why) && why.find("no bind matrix") != std::string::npos,
           "stage mesh: a blended bone without a bind matrix is refused");
@@ -966,6 +1143,13 @@ int main(int argc, char** argv) {
   check(host::cosmetics::set_random_stage_skins(false,&error), "disable random stage skins");
   pick=host::cosmetics::plan_stage_skin(stage_fst.data(),(uint32_t)stage_fst.size(),"GrNBa.dat",102);
   check(pick.ok && host::cosmetics::applied_asset(stage_start)==stage_id, "disabling random restores saved fixed stage");
+  // A lockstep (Friends) session serves the game's own stage over a saved pick, and the pick comes back after.
+  host::cosmetics::set_lockstep_probe([] { return true; });
+  pick=host::cosmetics::plan_stage_skin(stage_fst.data(),(uint32_t)stage_fst.size(),"GrNBa.dat",103);
+  check(pick.ok && host::cosmetics::applied_asset(stage_start).empty(), "a lockstep session serves the standard stage over the saved one");
+  host::cosmetics::set_lockstep_probe(nullptr);
+  pick=host::cosmetics::plan_stage_skin(stage_fst.data(),(uint32_t)stage_fst.size(),"GrNBa.dat",104);
+  check(pick.ok && host::cosmetics::applied_asset(stage_start)==stage_id, "after the lockstep session the saved stage is back");
   g_disc_bytes.clear();
   g_disc_bytes = visual_dat();
   g_disc_target = "EfFxData.dat";
@@ -1108,7 +1292,8 @@ int main(int argc, char** argv) {
   check(!host::cosmetics::import_stage_dat(named_stage_path.string(), "NotAStage.dat").ok,
         "manual stage import rejects an unknown target");
   auto disguised = visual_dat();
-  const auto name_at = std::search(disguised.begin(), disguised.end(), "map_head", "map_head" + 8);
+  static constexpr char stage_symbol[] = "map_head";
+  const auto name_at = std::search(disguised.begin(), disguised.end(), stage_symbol, stage_symbol + 8);
   if (name_at != disguised.end()) *name_at = 'x';
   write_file(folder / "not a stage.dat", disguised);
   check(!host::cosmetics::import_stage_dat((folder / "not a stage.dat").string(), "GrNBa.dat").ok,
@@ -1641,6 +1826,146 @@ int main(int argc, char** argv) {
     g_disc_table.clear(); g_disc_bytes.clear();
   }
 
+  // A dynamic alternate stages disc (m-ex): GrNBa.dat is a stub with the stage code (grFunction) and no
+  // collision data, and the real stages are in a GrNBa folder named for a button: GrNBa-neon(L).dat,
+  // GrNBa-dark(R).dat. The stub is never a stage skin; the alternates are. With the disc as the
+  // session's stage pack, every match picks among them with random stage skins off: the held button
+  // names one, as the disc's own stage code does.
+  {
+    fs::path stage_folder = folder / L"dynamic-alts";
+    fs::create_directories(stage_folder, ec);
+    host::cosmetics::configure((stage_folder / L"port-settings.ini").string());
+    const auto retail_stage = visual_dat();
+    auto neon = visual_dat(); neon[0x20 + 0x20] = 3;
+    auto dark = visual_dat(); dark[0x20 + 0x20] = 4;
+    const auto stub = rooted_dat({"map_head", "grGroundParam", "grFunction"});
+    constexpr uint32_t retail_at = 0x100, fst_at = 0x600, stub_at = 0x800, neon_at = 0x1000, dark_at = 0x1800;
+    g_disc_bytes.assign(0x1000, 0);
+    std::copy(retail_stage.begin(), retail_stage.end(), g_disc_bytes.begin() + retail_at);
+    g_disc_table = {{"GrNBa.dat", {retail_at, (uint32_t)retail_stage.size()}}};
+    // Root, the stub, the GrNBa folder (entries 2 to 4), its two alternates.
+    const std::string names = std::string("GrNBa.dat\0GrNBa\0GrNBa-neon(L).dat\0GrNBa-dark(R).dat\0", 52);
+    std::vector<uint8_t> fst(5 * 12, 0);
+    be32(fst, 0, 0x01000000); be32(fst, 8, 5);
+    be32(fst, 12, 0); be32(fst, 16, stub_at); be32(fst, 20, (uint32_t)stub.size());
+    be32(fst, 24, 0x01000000 | 10); be32(fst, 28, 0); be32(fst, 32, 5);
+    be32(fst, 36, 16); be32(fst, 40, neon_at); be32(fst, 44, (uint32_t)neon.size());
+    be32(fst, 48, 34); be32(fst, 52, dark_at); be32(fst, 56, (uint32_t)dark.size());
+    fst.insert(fst.end(), names.begin(), names.end());
+    std::vector<uint8_t> image(0x2000, 0);
+    be32(image, 0x424, fst_at); be32(image, 0x428, (uint32_t)fst.size());
+    std::copy(fst.begin(), fst.end(), image.begin() + fst_at);
+    std::copy(stub.begin(), stub.end(), image.begin() + stub_at);
+    std::copy(neon.begin(), neon.end(), image.begin() + neon_at);
+    std::copy(dark.begin(), dark.end(), image.begin() + dark_at);
+    const fs::path iso_path = stage_folder / L"alts.iso";
+    write_file(iso_path, image);
+
+    const auto scan = host::cosmetics::scan_disc_skins(iso_path.string(), "Alts Disc", &error);
+    std::string neon_id, dark_id;
+    bool stub_listed = false;
+    for (const auto& asset : host::cosmetics::assets()) {
+      if (asset.kind != "stage_visual") continue;
+      if (asset.variant == "neon(L)") neon_id = asset.id;
+      else if (asset.variant == "dark(R)") dark_id = asset.id;
+      else stub_listed = true;
+    }
+    check(scan.ok && !neon_id.empty() && !dark_id.empty() && !stub_listed,
+          "a dynamic alternates disc lists its two alternates as stage skins and not its stub");
+    check(host::cosmetics::disc_pack_name(iso_path.string()) == "Alts Disc", "the disc's pack name is found by its path");
+
+    static uint32_t held = 0;
+    host::cosmetics::set_stage_button_probe([]() -> uint32_t { return held; });
+    host::cosmetics::set_session_stage_pack(iso_path.string());
+    auto game_fst = one_file_fst(retail_at, (uint32_t)retail_stage.size(), "GrNBa.dat");
+    host::cosmetics::apply_to_fst(game_fst.data(), (uint32_t)game_fst.size());
+    check(!host::cosmetics::random_stage_skins(), "random stage skins stay off for this case");
+    check(!host::cosmetics::cycle_stage_live("GrNBa.dat", 1).changed,
+          "the stage select does not step a stage whose alternates the held button picks");
+    held = 0x20;   // R
+    auto pick = host::cosmetics::plan_stage_skin(game_fst.data(), (uint32_t)game_fst.size(), "GrNBa.dat", 21);
+    check(pick.ok && host::cosmetics::applied_asset(retail_at) == dark_id, "holding R picks the alternate named (R)");
+    held = 0x40;   // L
+    pick = host::cosmetics::plan_stage_skin(game_fst.data(), (uint32_t)game_fst.size(), "GrNBa.dat", 22);
+    check(pick.ok && host::cosmetics::applied_asset(retail_at) == neon_id, "holding L picks the alternate named (L)");
+    held = 0x20 | 0x40;
+    pick = host::cosmetics::plan_stage_skin(game_fst.data(), (uint32_t)game_fst.size(), "GrNBa.dat", 23);
+    check(pick.ok && host::cosmetics::applied_asset(retail_at) == neon_id, "L comes before R when both are held, as on the disc");
+    host::cosmetics::set_lockstep_probe([] { return true; });
+    held = 0x20;
+    pick = host::cosmetics::plan_stage_skin(game_fst.data(), (uint32_t)game_fst.size(), "GrNBa.dat", 30);
+    check(pick.ok && host::cosmetics::applied_asset(retail_at).empty(),
+          "in a lockstep session no alternate is picked, by button or at random: both games load the standard stage");
+    host::cosmetics::set_lockstep_probe(nullptr);
+    held = 0;
+    pick = host::cosmetics::plan_stage_skin(game_fst.data(), (uint32_t)game_fst.size(), "GrNBa.dat", 24);
+    const std::string any = host::cosmetics::applied_asset(retail_at);
+    check(pick.ok && (any == neon_id || any == dark_id), "with nothing held one of the alternates plays, never the stub");
+    host::cosmetics::set_session_stage_pack("");
+    pick = host::cosmetics::plan_stage_skin(game_fst.data(), (uint32_t)game_fst.size(), "GrNBa.dat", 25);
+    check(pick.ok && host::cosmetics::applied_asset(retail_at).empty(),
+          "without the disc as the session's stage pack the standard stage plays");
+    host::cosmetics::set_stage_button_probe(nullptr);
+    g_disc_table.clear(); g_disc_bytes.clear();
+  }
+
+  // A well-formed DAT container can still have an invalid stage model table. It remains an explicit
+  // choice, but must never be selected at random when the retail stage is understood by the reader.
+  {
+    const fs::path stage_folder = folder / L"broken-stage-tables";
+    fs::create_directories(stage_folder, ec);
+    host::cosmetics::configure((stage_folder / L"port-settings.ini").string());
+    const uint32_t size = 0x400;
+    const std::vector<uint32_t> reloc{8, 0x50, 0x54, 0x60, 0x90, 0x100, 0x340};
+    const std::vector<std::pair<std::string, uint32_t>> roots{
+        {"map_head", 0}, {"coll_data", 0x3c0}, {"grGroundParam", 0x3d0}};
+    const size_t table = 32 + size + reloc.size() * 4, strings = table + roots.size() * 8;
+    auto clean = visual_dat();
+    clean.resize(32 + size);
+    clean.resize(strings, 0);
+    for (const auto& root : roots) clean.insert(clean.end(), root.first.c_str(), root.first.c_str() + root.first.size() + 1);
+    be32(clean, 0, (uint32_t)clean.size()); be32(clean, 4, size);
+    be32(clean, 8, (uint32_t)reloc.size()); be32(clean, 12, (uint32_t)roots.size());
+    be32(clean, 40, 0x60); be32(clean, 44, 1);
+    be32(clean, 32 + 0x60, 0x80); be32(clean, 32 + 0x90, 0xe0);
+    for (size_t i = 0; i < reloc.size(); ++i) be32(clean, 32 + size + i * 4, reloc[i]);
+    uint32_t name = 0;
+    for (size_t i = 0; i < roots.size(); ++i) {
+      be32(clean, table + i * 8, roots[i].second); be32(clean, table + i * 8 + 4, name);
+      name += (uint32_t)roots[i].first.size() + 1;
+    }
+    auto broken = clean;
+    be32(broken, 44, 300); // map_head claims more model entries than the file holds
+    check(host::cosmetics::stage_safety::Archive{clean}.parse() &&
+              !host::cosmetics::stage_safety::Archive{broken}.parse(), "stage table regression fixture");
+    constexpr uint32_t retail_at = 0x100, fst_at = 0x600, asset_at = 0x800;
+    g_disc_bytes.assign(0x1800, 0);
+    std::copy(clean.begin(), clean.end(), g_disc_bytes.begin() + retail_at);
+    g_disc_table = {{"GrNBa.dat", {retail_at, (uint32_t)clean.size()}}};
+    const auto mod_fst = one_file_fst(asset_at, (uint32_t)broken.size(), "GrNBa.dat");
+    std::vector<uint8_t> image(0x1800, 0);
+    be32(image, 0x424, fst_at); be32(image, 0x428, (uint32_t)mod_fst.size());
+    std::copy(mod_fst.begin(), mod_fst.end(), image.begin() + fst_at);
+    std::copy(broken.begin(), broken.end(), image.begin() + asset_at);
+    const auto iso = stage_folder / L"broken.iso";
+    write_file(iso, image);
+    check(host::cosmetics::scan_disc_skins(iso.string(), "Broken Stage", &error).ok, "scan stage with broken model table");
+    auto game_fst = one_file_fst(retail_at, (uint32_t)clean.size(), "GrNBa.dat");
+    host::cosmetics::apply_to_fst(game_fst.data(), (uint32_t)game_fst.size());
+    check(host::cosmetics::set_random_stage_skins(true, &error), "enable random stage regression");
+    const auto pick = host::cosmetics::plan_stage_skin(game_fst.data(), (uint32_t)game_fst.size(), "GrNBa.dat", 99);
+    check(pick.ok && host::cosmetics::applied_asset(retail_at).empty(), "random never chooses a malformed stage table");
+    check(!host::cosmetics::assets().empty(), "the rejected random skin remains listed for explicit selection");
+    host::cosmetics::set_random_stage_skins(false, &error);
+    const auto malformed_assets = host::cosmetics::assets();
+    check(host::cosmetics::select_variant("GrNBa.dat", malformed_assets.front().id, &error),
+          "a malformed skin's existing selection can be loaded");
+    const auto fixed_pick = host::cosmetics::republish_stage(game_fst.data(), (uint32_t)game_fst.size(), "GrNBa.dat");
+    check(fixed_pick.ok && host::cosmetics::applied_asset(retail_at).empty(),
+          "an explicitly selected malformed stage also serves the standard stage");
+    g_disc_table.clear(); g_disc_bytes.clear();
+  }
+
   // A pack's alternate costumes: PlFxNr.lat and PlFxNr.rat beside PlFxNr.dat, the way the 20XX
   // Hack Pack keeps its L and R sets. Each differing one is its own choice for the slot.
   {
@@ -1737,9 +2062,9 @@ int main(int argc, char** argv) {
       std::ifstream in(state, std::ios::binary);
       std::string text((std::istreambuf_iterator<char>(in)), {});
       in.close();
-      const size_t at = text.find("\"rules\": 8");
+      const size_t at = text.find("\"rules\": 11");
       check(at != std::string::npos, "the scan records the rules it used");
-      if (at != std::string::npos) text.replace(at, 10, "\"rules\": 5");
+      if (at != std::string::npos) text.replace(at, 11, "\"rules\": 5");
       std::ofstream out(state, std::ios::binary); out << text;
     }
     host::cosmetics::configure((alt_folder / L"port-settings.ini").string());
@@ -1878,6 +2203,38 @@ int main(int argc, char** argv) {
     step = host::cosmetics::cycle_slot_live("PlFxNr.dat", 1);
     check(!last.empty() && step.asset_id.empty(), "the other direction steps back the same way");
     check(!host::cosmetics::cycle_slot_live("PlFxGr.dat", 1).changed, "a costume with no skins has nothing to cycle");
+
+    // Source Port L/R can reach imports in every native color slot. Returning from another
+    // color must follow the actual on-screen costume, rather than another slot's saved choice.
+    check(host::cosmetics::select_variant_live("PlFxNr.dat", "", &error), "start fighter cycling on standard Fox");
+    std::map<std::string, bool> fighter_seen;
+    int color = 0;
+    for (int i = 0; i < 7; ++i) {
+      const auto choice = host::cosmetics::cycle_character_live(2, color, 1);
+      check(choice.pick.ok && choice.pick.changed && choice.costume >= 0 && choice.costume < 4,
+            "every fighter cycle gives the game the real native costume index");
+      color = choice.costume;
+      check(choice.target == host::cosmetics::costume_slot_file(2, color), "cycled model keeps its original costume slot");
+      fighter_seen[std::to_string(color) + ":" + choice.pick.asset_id] = true;
+    }
+    check(fighter_seen.size() == 7 && color == 0, "all three installed skins and four native colors cycle once before wrapping");
+    auto back = host::cosmetics::cycle_character_live(2, color, -1);
+    check(back.pick.changed && back.costume == 3, "reverse cycling wraps to the last native color");
+    back = host::cosmetics::cycle_character_live(2, back.costume, 1);
+    check(back.pick.changed && back.costume == 0 && back.pick.asset_id.empty(), "reversing direction returns to the same choice");
+    back = host::cosmetics::cycle_character_live(2, 3, -1, 1u);
+    check(back.pick.changed && back.costume == 0, "colors occupied by another player are skipped");
+    host::cosmetics::set_online_probe([] { return true; });
+    check(!host::cosmetics::cycle_character_live(2, 0, 1).pick.changed, "fighter-wide cycling cannot change an online color");
+    host::cosmetics::set_online_probe(nullptr);
+    host::cosmetics::freeze_for_online_session();
+    check(!host::cosmetics::cycle_character_live(2, 0, 1).pick.changed, "fighter cycling cannot change a queued online profile");
+    host::cosmetics::thaw_after_online_session();
+    check(!host::cosmetics::cycle_character_live(26, 0, 1).pick.changed, "added fighters do not borrow another fighter's skins");
+    check(!host::cosmetics::cycle_character_live(1, 0, 1).pick.changed, "a fighter without installed skins leaves L/R alone");
+    const auto from_extra = host::cosmetics::cycle_character_live(2, 6, 1);
+    check(from_extra.pick.changed && from_extra.costume >= 0 && from_extra.costume < 4,
+          "an m-ex added color can enter the installed-skin cycle on a real native slot");
 
     // The character select's fighter numbers and costume order.
     check(host::cosmetics::costume_slot_file(2, 0) == "PlFxNr.dat" && host::cosmetics::costume_slot_file(2, 3) == "PlFxGr.dat" &&
@@ -2195,7 +2552,248 @@ int main(int argc, char** argv) {
     }
     check(other_scan.ok && odd_scan.ok && other_listed && odd_listed && !extra_picture,
           "a picture equal to the game's is not stored, and a file that is not a character select file gives none");
+
+    // A common m-ex setup: five original Marth slots and three cloned neutral costumes, with
+    // filenames that the stock-only scanner never considered and a portrait stride of 33, not 30.
+    const std::vector<std::string> files{"PlMsNr.dat", "PlMsRe.dat", "PlMsGr.dat", "PlMsBk.dat", "PlMsWh.dat",
+                                          "PlMsNr2.dat", "PlMsNr3.dat", "PlMsNr4.dat"};
+    const std::vector<std::string> colors{"", "Re", "Gr", "Bk", "Wh"};
+    const auto metadata = mex_marth_metadata(files);
+    const auto mex_screen = mex_marth_portraits();
+    std::vector<std::pair<std::string, std::vector<uint8_t>>> members{{"MxDt.dat", metadata}, {"MnSlChr.usd", mex_screen}};
+    std::vector<std::vector<uint8_t>> costumes;
+    constexpr uint32_t marth_screen_at = 0x1000;
+    g_disc_table.clear(); g_disc_bytes.assign(marth_screen_at + retail_screen.size(), 0);
+    std::copy(retail_screen.begin(), retail_screen.end(), g_disc_bytes.begin() + marth_screen_at);
+    g_disc_table["MnSlChr.usd"] = {marth_screen_at, (uint32_t)retail_screen.size()};
+    for (uint32_t i = 0; i < files.size(); ++i) {
+      const std::string symbol = "PlyMars5K" + colors[i < 5 ? i : 0] + "_Share_joint";
+      const auto clean = skeleton_dat(0x2, 5.0f, false, symbol);
+      if (i < 5) {
+        const uint32_t at = 0x100 + i * 0x200;
+        std::copy(clean.begin(), clean.end(), g_disc_bytes.begin() + at);
+        g_disc_table[files[i]] = {at, (uint32_t)clean.size()};
+      }
+      auto skin = skeleton_dat(0x2 | 0x10, 5.0f, false, symbol);
+      skin.push_back((uint8_t)(i + 1)); be32(skin, 0, (uint32_t)skin.size());
+      costumes.push_back(skin); members.push_back({files[i], skin});
+    }
+    // A valid model not named by the metadata must never become a costume just because it is a DAT.
+    members.push_back({"Unlisted.dat", costumes[0]});
+    const fs::path mex_folder = portrait_folder / L"mex";
+    fs::create_directories(mex_folder, ec);
+    for (const auto& file : members) write_file(mex_folder / fs::u8path(file.first), file.second);
+    host::cosmetics::configure((portrait_folder / L"mex-profile" / L"settings.ini").string());
+    auto mex_scan = host::cosmetics::scan_disc_skins(mex_folder.string(), "Eight Marths", &error);
+    auto marths = host::cosmetics::assets();
+    check(mex_scan.ok && marths.size() == 8 && mex_scan.message.find("8 skins from ") == 0,
+          "m-ex imports and reports all eight Marth costumes, excluding an unlisted DAT");
+    const auto mex_packs = host::cosmetics::packs();
+    check(mex_packs.size() == 1 && mex_packs[0].name == "Eight Marths" && mex_packs[0].skins == 8 &&
+              mex_packs[0].variants.size() == 4 && std::all_of(marths.begin(), marths.end(),
+                  [&](const auto& skin) { return skin.pack == mex_packs[0].key; }),
+          "original and extra m-ex costumes stay in one source pack, with sets inside that pack");
+    std::vector<std::string> ids(8), pictures(8);
+    for (size_t i = 0; i < files.size(); ++i) {
+      for (const auto& skin : marths) {
+        if ((i < 5 && skin.target_path == files[i] && skin.variant.empty()) ||
+            (i >= 5 && skin.variant == "m-ex costume " + std::to_string(i + 1))) {
+          ids[i] = skin.id; pictures[i] = skin.preview_path;
+        }
+      }
+      check(!ids[i].empty() && !pictures[i].empty(), "each Marth costume has its own imported portrait");
+      if (ids[i].empty() || pictures[i].empty()) continue;
+      const auto image = read_file(fs::u8path(pictures[i]));
+      const uint32_t color = mex_portrait_color((uint32_t)i), r = (color >> 10) & 31, g = (color >> 5) & 31, b = color & 31;
+      check(image.size() > 53 && read_be32(image.data() + 16) == 9 && read_be32(image.data() + 20) == 11 &&
+                image[49] == (r << 3 | r >> 2) && image[50] == (g << 3 | g >> 2) &&
+                image[51] == (b << 3 | b >> 2) && image[52] == 255,
+            "m-ex uses its own stride and palette track, preserving reduced CI8/CI4 portrait pixels");
+      check(host::cosmetics::restore_vanilla(&error) &&
+                host::cosmetics::select_variant(i < 5 ? files[i] : files[0], ids[i], &error),
+            "each of the eight Marth skins is selectable on its existing native costume slot");
+      const std::string target = i < 5 ? files[i] : files[0];
+      auto skin_fst = one_file_fst(g_disc_table[target].first, g_disc_table[target].second, target);
+      host::cosmetics::apply_to_fst(skin_fst.data(), (uint32_t)skin_fst.size());
+      const auto active = host::cosmetics::active_companions();
+      std::vector<uint8_t> model(costumes[i].size());
+      check(active.size() == 1 && active[0].target_path == target && active[0].path == pictures[i] &&
+                host::cosmetics::read(g_disc_table[target].first, 0, model.data(), (uint32_t)model.size()) ==
+                    host::cosmetics::OverrideRead::Success && model == costumes[i],
+            "the runtime serves each Marth model together with that model's matching portrait");
+    }
+    check(host::cosmetics::restore_vanilla(&error), "restore standard before live m-ex cycling");
+    auto marth_fst = one_file_fst(g_disc_table[files[0]].first, g_disc_table[files[0]].second, files[0]);
+    host::cosmetics::apply_to_fst(marth_fst.data(), (uint32_t)marth_fst.size());
+    std::set<std::string> cycled;
+    for (int i = 0; i < 5; ++i) {
+      const auto step = host::cosmetics::cycle_slot_live(files[0], 1);
+      const auto republished = host::cosmetics::republish_slot(marth_fst.data(), (uint32_t)marth_fst.size(), files[0]);
+      const auto active = host::cosmetics::active_companions();
+      cycled.insert(step.asset_id);
+      const auto skin = std::find_if(marths.begin(), marths.end(), [&](const auto& item) { return item.id == step.asset_id; });
+      check(step.ok && step.changed && republished.ok &&
+                (step.asset_id.empty() ? active.empty() : skin != marths.end() && active.size() == 1 && active[0].path == skin->preview_path),
+            "live L/R cycling switches the cloned Marth portraits with their skins and restores stock on wraparound");
+    }
+    check(cycled.size() == 5 && cycled.count(""), "live cycling includes all three extra neutral Marths and the original choices");
+
+    // Exercise the disc reader as well as extracted folders, then simulate an existing catalog
+    // written by the old rules. No manual reimport should be needed when the updated game boots.
+    const fs::path mex_iso = portrait_folder / L"eight-marths.iso";
+    write_file(mex_iso, cosmetic_test_iso(members));
+    const fs::path iso_settings = portrait_folder / L"mex-iso-profile" / L"settings.ini";
+    host::cosmetics::configure(iso_settings.string());
+    check(host::cosmetics::scan_disc_skins(mex_iso.string(), "Eight Marths ISO", &error).ok && host::cosmetics::assets().size() == 8,
+          "all eight costumes and portraits import directly from the ISO");
+    std::string iso_extra;
+    bool all_portraits = true;
+    for (const auto& skin : host::cosmetics::assets()) {
+      all_portraits &= !skin.preview_path.empty();
+      if (skin.variant == "m-ex costume 6") iso_extra = skin.id;
+    }
+    check(all_portraits && !iso_extra.empty(), "the ISO's extra costume entries also carry their portraits");
+    const fs::path custom_picture = portrait_folder / L"custom.png";
+    write_file(custom_picture, png(136, 188));
+    check(host::cosmetics::set_skin_portrait(iso_extra, custom_picture.string(), "csp").ok &&
+              host::cosmetics::select_variant(files[0], iso_extra, &error), "a player's picture and selected extra skin can be saved");
+    const fs::path state = iso_settings.parent_path() / L"CosmeticMods" / L"state.json";
+    auto state_bytes = read_file(state);
+    std::string state_text(state_bytes.begin(), state_bytes.end());
+    const auto rule = state_text.find("\"rules\": 11");
+    check(rule != std::string::npos, "m-ex scan writes its new rule version");
+    if (rule != std::string::npos) state_text.replace(rule, 11, "\"rules\": 9");
+    write_file(state, std::vector<uint8_t>(state_text.begin(), state_text.end()));
+    host::cosmetics::configure(iso_settings.string());
+    const auto upgraded = host::cosmetics::scan_disc_skins(mex_iso.string(), "Eight Marths ISO", &error);
+    bool choice_preserved = false;
+    for (const auto& skin : host::cosmetics::assets()) if (skin.id == iso_extra)
+      choice_preserved = skin.selected && skin.preview_path.find("csp-") != std::string::npos;
+    check(upgraded.ok && !upgraded.already_present && choice_preserved &&
+              host::cosmetics::scan_disc_skins(mex_iso.string(), "Eight Marths ISO", &error).already_present,
+          "old disc catalogs rescan once, preserving the selected extra costume and player's portrait");
+
+    // One held image with different palette-only keys is also a distinct portrait per costume.
+    auto held_screen = mex_screen;
+    be32(held_screen, 32 + 0x84, 3); held_screen[32 + 0x101] = 7;
+    write_file(mex_folder / L"MnSlChr.usd", held_screen);
+    host::cosmetics::configure((portrait_folder / L"mex-held-image" / L"settings.ini").string());
+    const auto held_scan = host::cosmetics::scan_disc_skins(mex_folder.string(), "Held image", &error);
+    std::set<std::vector<uint8_t>> held_pictures;
+    for (const auto& skin : host::cosmetics::assets()) if (!skin.preview_path.empty()) held_pictures.insert(read_file(fs::u8path(skin.preview_path)));
+    check(held_scan.ok && held_pictures.size() == 8, "palette-only keys keep eight distinct costume portraits while the image track holds");
+
+    auto bad_metadata = metadata;
+    be32(bad_metadata, 32 + 0x1A0 + 18 * 4, 0xFFFFFFF0);
+    host::cosmetics::disc_metadata::MexCostumes bad_rows;
+    check(!host::cosmetics::disc_metadata::mex_costumes(bad_metadata, &bad_rows) && bad_rows.empty(),
+          "out-of-bounds m-ex costume tables are rejected without partial mappings");
+    auto bad_screen = mex_screen;
+    be32(bad_screen, 32 + 0x84, 19);   // last wait is outside the track's declared length, but inside the archive
+    write_file(mex_folder / L"MnSlChr.usd", bad_screen);
+    host::cosmetics::configure((portrait_folder / L"mex-invalid-track" / L"settings.ini").string());
+    const auto bad_scan = host::cosmetics::scan_disc_skins(mex_folder.string(), "Bad portrait track", &error);
+    bool no_bad_pictures = true;
+    for (const auto& skin : host::cosmetics::assets()) no_bad_pictures &= skin.preview_path.empty();
+    check(bad_scan.ok && host::cosmetics::assets().size() == 8 && no_bad_pictures,
+          "a truncated portrait animation is refused while the eight valid costumes remain available");
+
+    // Akaneia-style colors rename internal exports too. The native file is a read-time view of
+    // the same model with the existing slot's export names, never a write to the pack.
+    write_file(mex_folder / L"MxDt.dat", mex_marth_metadata(files, true));
+    write_file(mex_folder / L"MnSlChr.usd", retail_screen);
+    write_file(mex_folder / L"mexSelectChr.dat", mex_screen);
+    for (uint32_t i = 5; i < 8; ++i) {
+      const std::string symbol = "PlyMars5K" + std::string(i == 5 ? "Ye" : i == 6 ? "La" : "Or") + "_Share_joint";
+      write_file(mex_folder / fs::u8path(files[i]), skeleton_dat(0x2 | 0x10, 5.0f, false, symbol));
+    }
+    const auto original_extra = read_file(mex_folder / fs::u8path(files[5]));
+    const fs::path renamed_settings = portrait_folder / L"mex-renamed" / L"settings.ini";
+    host::cosmetics::configure(renamed_settings.string());
+    const auto renamed_scan = host::cosmetics::scan_disc_skins(mex_folder.string(), "Renamed colors", &error);
+    std::string renamed_id;
+    size_t renamed_pictures = 0;
+    for (const auto& skin : host::cosmetics::assets()) {
+      renamed_pictures += !skin.preview_path.empty();
+      if (skin.variant == "m-ex costume 6") renamed_id = skin.id;
+    }
+    check(renamed_scan.ok && host::cosmetics::assets().size() == 8 && renamed_pictures == 8 && !renamed_id.empty(),
+          "renamed m-ex colors import with all eight portraits from the authoritative symbol file");
+    check(host::cosmetics::select_variant(files[0], renamed_id, &error), "select an extra costume with renamed exports");
+    host::cosmetics::configure(renamed_settings.string());   // aliases and the choice survive a restart
+    auto renamed_fst = one_file_fst(g_disc_table[files[0]].first, g_disc_table[files[0]].second, files[0]);
+    host::cosmetics::apply_to_fst(renamed_fst.data(), (uint32_t)renamed_fst.size());
+    std::vector<uint8_t> renamed_model(read_be32(renamed_fst.data() + 20));
+    const auto renamed_read = host::cosmetics::read(g_disc_table[files[0]].first, 0, renamed_model.data(), (uint32_t)renamed_model.size());
+    const auto renamed_identity = host::cosmetics::testing::inspect_dat(renamed_model);
+    check(renamed_read == host::cosmetics::OverrideRead::Success && renamed_identity.ok && renamed_identity.target_path == files[0] &&
+              std::equal(original_extra.begin() + 32, original_extra.begin() + 32 + read_be32(original_extra.data() + 4), renamed_model.begin() + 32) &&
+              read_file(mex_folder / fs::u8path(files[5])) == original_extra && host::cosmetics::active_companions().size() == 1,
+          "after restart, the renamed model is served with its portrait, preserving every model byte and the source file");
+    auto changed_extra = original_extra;
+    changed_extra[32 + 4] ^= 1;
+    write_file(mex_folder / fs::u8path(files[5]), changed_extra);
+    std::string thumbnail;
+    check(!host::cosmetics::costume_file(renamed_id, &renamed_model, &thumbnail),
+          "renamed costumes still verify the original source hash before adapting exports");
     g_disc_table.clear(); g_disc_bytes.clear();
+  }
+
+  // Optional pause-screen packs keep both supplied styles and their text texture in the cosmetic
+  // profile. Only the selected archive is served, including after a restart and online.
+  {
+    host::cosmetics::thaw_after_online_session();
+    host::cosmetics::set_online_probe(nullptr);
+    const fs::path pause_folder = folder / L"pause-screens";
+    fs::create_directories(pause_folder, ec);
+    const fs::path settings = pause_folder / L"settings.ini";
+    host::cosmetics::configure(settings.string());
+    const auto keep_hud = pause_screen_dat(), no_hud = pause_screen_dat(true);
+    const fs::path pack = pause_folder / L"Minimal-pause-screen.zip";
+    write_file(pack, stored_zip({{"GmPause.usd", keep_hud}, {"GmPauseNoHUD.usd", no_hud},
+        {"Pause Text HD Texture/tex1_108x20_c68e0bb8472069de_14.png", png(432, 80)},
+        {"preview1.png", png(1920, 1080)}, {"README.txt", {'t','e','x','t'}}}));
+    const auto imported = host::cosmetics::import_file(pack.string());
+    auto assets = host::cosmetics::assets();
+    if (!imported.ok) std::fprintf(stderr, "pause pack import: %s\n", imported.message.c_str());
+    check(imported.ok && assets.size() == 2 &&
+              std::none_of(assets.begin(), assets.end(), [](const auto& a) { return a.selected; }),
+          "a two-style pause pack imports both choices without silently enabling either");
+    std::string no_hud_id;
+    for (const auto& asset : assets) if (asset.name.find("no pause overlay") != std::string::npos) no_hud_id = asset.id;
+    check(!no_hud_id.empty() && host::cosmetics::select_variant("GmPause.usd", no_hud_id, &error),
+          "the no-HUD pause style can be selected independently of stage and character skins");
+    host::cosmetics::configure(settings.string());
+    g_disc_target = "GmPause.usd"; g_disc_bytes = keep_hud;
+    auto fst = one_file_fst(0, (uint32_t)keep_hud.size(), g_disc_target);
+    host::cosmetics::apply_to_fst(fst.data(), (uint32_t)fst.size());
+    std::vector<uint8_t> served(no_hud.size());
+    check(host::cosmetics::read(0, 0, served.data(), (uint32_t)served.size()) == host::cosmetics::OverrideRead::Success && served == no_hud,
+          "after reload, the selected pause DAT is served without altering its model data");
+    const auto pictures = host::cosmetics::active_companions();
+    check(pictures.size() == 1 && pictures[0].kind == "pause_text" && pictures[0].target_path == "GmPause.usd",
+          "the pause label's HD texture accompanies only the selected pause-screen style");
+    check(host::cosmetics::import_file(pack.string()).ok && host::cosmetics::assets().size() == 2,
+          "reimporting the pause pack is idempotent");
+    check(host::cosmetics::restore_vanilla(&error), "pause style can be restored to Vanilla");
+    fst = one_file_fst(0, (uint32_t)keep_hud.size(), g_disc_target);
+    host::cosmetics::apply_to_fst(fst.data(), (uint32_t)fst.size());
+    check(host::cosmetics::read(0, 0, served.data(), 4) == host::cosmetics::OverrideRead::NotOverridden &&
+              host::cosmetics::active_companions().empty(), "Restore Vanilla removes the pause archive and HD label together");
+    const fs::path malformed_pack = pause_folder / L"malformed.zip";
+    auto missing_joint = no_hud;
+    be32(missing_joint, 32 + 0x140 + 8, 0xFFFFFFF0);
+    write_file(malformed_pack, stored_zip({{"GmPause.usd", keep_hud}, {"GmPauseNoHUD.usd", missing_joint}}));
+    check(!host::cosmetics::import_file(malformed_pack.string()).ok && host::cosmetics::assets().size() == 2,
+          "a malformed second pause style cannot partially change the catalog");
+    auto cycle = no_hud; be32(cycle, 32 + 0x180 + 12, 0x140);
+    write_file(pause_folder / L"GmPause.usd", cycle);
+    check(!host::cosmetics::import_file((pause_folder / L"GmPause.usd").string()).ok,
+          "pause archives with cyclic controls joints are refused");
+    write_file(malformed_pack, stored_zip({{"GmPause.usd", keep_hud}, {"PlFxNr.dat", skeleton_dat(2, 5, false)}}));
+    check(!host::cosmetics::import_file(malformed_pack.string()).ok,
+          "a ZIP cannot smuggle unrelated costume or gameplay DATs into a pause-screen import");
+    g_disc_target.clear(); g_disc_bytes.clear();
   }
 
   // Voice mods: a skin's own fighter sound bank, one zip per mod (docs/voice-mods.md).

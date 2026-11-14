@@ -19,6 +19,7 @@
 #include "yougame_box_present.h"
 #include "yougame_link.h"
 #include <windows.h>
+#include "gx_cache_prune.h"
 #include <d3d11_1.h>
 #include <dxgi1_6.h>
 #include "dxgi_paced_mode.h"
@@ -186,6 +187,14 @@ class DynamicBuffer {
     mapped_ = true;
     return (uint8_t*)m.pData;
   }
+  // Maps without discarding, for writing only bytes no draw already recorded reads (past the end
+  // of what was written since the last begin): the rest of the buffer keeps its contents.
+  uint8_t* begin_append() {
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(ctx_->Map(buffer_.Get(), 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &m))) return nullptr;
+    mapped_ = true;
+    return (uint8_t*)m.pData;
+  }
   void end() { if (mapped_) { ctx_->Unmap(buffer_.Get(), 0); mapped_ = false; } }
   ID3D11Buffer* get() const { return buffer_.Get(); }
   size_t size() const { return size_; }
@@ -286,6 +295,20 @@ class D3D11Backend : public Backend {
     save_pipeline_recipes();
     if (context_) context_->ClearState();
     if (present_timer_) CloseHandle(present_timer_);
+  }
+  bool supports_game_reset() const override { return true; }
+  void reset_game_state() override {
+    context_->ClearState();
+    D3D11_QUERY_DESC desc{D3D11_QUERY_EVENT, 0};
+    ComPtr<ID3D11Query> idle;
+    if (FAILED(device_->CreateQuery(&desc, &idle))) host::die("d3d11: reset fence failed");
+    context_->End(idle.Get()); context_->Flush();
+    while (context_->GetData(idle.Get(), nullptr, 0, 0) == S_FALSE) Sleep(0);
+    textures_.clear(); efb_copies_.clear();
+    for (auto& t : video_textures_) t = {};
+    std::fill(std::begin(video_serial_), std::end(video_serial_), 0);
+    create_efb();
+    plan_cache_valid_ = false; plans_.clear(); ps_cache_.clear(); reset_bound();
   }
   const RenderOptions& options() const { return opts_; }
   const RenderOptions* presentation_options() const override { return &opts_; }
@@ -533,6 +556,11 @@ class D3D11Backend : public Backend {
   size_t plan_cache_draws_ = 0;
   int plan_cache_scale_ = 0, plan_cache_effects_ = 0;
   bool plan_cache_lab_ = false, plan_cache_valid_ = false;
+  // What the vertex and index buffers hold: a game frame's vertices are uploaded by its first
+  // present and stay; its in-between presents append only their re-posed vertices after them
+  // (vb_cursor_, in vertices). Same for its indices, which do not change between those presents.
+  const void* vb_frame_ = nullptr; uint64_t vb_sequence_ = 0; size_t vb_statics_ = 0; uint32_t vb_cursor_ = 0; bool vb_valid_ = false;
+  const void* ib_frame_ = nullptr; uint64_t ib_sequence_ = 0; bool ib_valid_ = false;
   std::vector<uint8_t> decode_scratch_;
   void execute_draw(const DrawCall& dc, const DrawPlan& plan);
 
@@ -688,6 +716,9 @@ void D3D11Backend::init() {
   shader_cache_root_ = opts_.shader_cache;
   opts_.shader_cache += "/" GX_SHADER_CACHE_VERSION;
   CreateDirectoryA(opts_.shader_cache.c_str(), nullptr);
+  if (const unsigned long long freed =
+          opts_.shader_cache_shared ? 0 : gx::prune_old_shader_caches(shader_cache_root_, GX_SHADER_CACHE_VERSION))
+    host::log("shaders: removed the shader caches of earlier builds (%.0f MB)", freed / 1048576.0);
 
   if (!vertex_buffer_.init(device_.Get(), context_.Get(), 8 << 20, D3D11_BIND_VERTEX_BUFFER)) host::die("D3D11: vertex buffer");
   if (!index_buffer_.init(device_.Get(), context_.Get(), 4 << 20, D3D11_BIND_INDEX_BUFFER)) host::die("D3D11: index buffer");
@@ -859,7 +890,9 @@ void D3D11Backend::create_swapchain_targets(bool resize) {
 }
 
 void D3D11Backend::apply_fullscreen_mode() {
-  if (yougame::embed_toplevel()) opts_.exclusive_fullscreen = false;
+  // Every embedded window, child or toplevel: a settings change (Internal resolution) used to reach
+  // ResizeTarget/SetFullscreenState here in child embeds and leave the picture monitor-sized and cropped.
+  if (yougame::embedded()) opts_.exclusive_fullscreen = false;
   if (!swapchain_) return;
   BOOL was_exclusive = FALSE;
   swapchain_->GetFullscreenState(&was_exclusive, nullptr);
@@ -2058,7 +2091,7 @@ void D3D11Backend::update_variable_refresh() {
   if (!vrr_.add({st.PresentCount, st.SyncRefreshCount, (double)st.SyncQPCTime.QuadPart / qpc_hz}, vrr_nominal_hz_)) return;
   if (vrr_.state() == 1)
     host::log("display: variable refresh (G-Sync or FreeSync) is on: %.0f refreshes a second for %.0f frames on a %.0f Hz "
-              "display; frames are presented synced under %.0f a second, so they never tear", vrr_.refreshes(), vrr_.shown(),
+              "display; frame cap below %.0f fps, V-Sync follows the player's setting", vrr_.refreshes(), vrr_.shown(),
               vrr_nominal_hz_, vrr::under_refresh(vrr_nominal_hz_));
   else
     host::log("display: fixed refresh: %.0f refreshes a second for %.0f frames on a %.0f Hz display", vrr_.refreshes(),
@@ -2168,6 +2201,12 @@ void D3D11Backend::submit_frame(const Frame& frame, const DrawMatrices* override
   const bool reuse_plan = plan_matches && !plan_check;
   std::vector<DrawPlan> check_plans; std::vector<uint32_t> check_index; std::vector<PSConstants> check_ps;
   if (plan_matches && plan_check) { check_plans = plans_; check_index = index_scratch_; check_ps = ps_cache_; }
+  // This frame's vertices already in the vertex buffer (an in-between present): re-posed vertices
+  // go after the ones the earlier presents appended, nothing else is uploaded again.
+  static const bool upload_every_present = std::getenv("MELEE_UPLOAD_EVERY_PRESENT") != nullptr;   // comparison switch
+  const bool statics_resident = reuse_plan && !upload_every_present && vb_valid_ && vb_frame_ == &frame &&
+                                vb_sequence_ == frame.sequence && vb_statics_ == frame.vertices.size();
+  const uint32_t extras_base = statics_resident ? vb_cursor_ : (uint32_t)frame.vertices.size();
   if (reuse_plan) {
     for (const FrameCommand& cmd : frame.commands) {
       if (cmd.kind != FrameCommand::Draw || cmd.index >= frame.draws.size()) continue;
@@ -2175,7 +2214,7 @@ void D3D11Backend::submit_frame(const Frame& frame, const DrawMatrices* override
       if (!plan.valid) continue;
       const DrawCall& dc = frame.draws[cmd.index];
       const DrawMatrices* over = overrides ? overrides + cmd.index : nullptr;
-      if (over && over->vertices) { plan.base_vertex = (uint32_t)frame.vertices.size() + extra_vertices; extra_vertices += dc.vertex_count; }
+      if (over && over->vertices) { plan.base_vertex = extras_base + extra_vertices; extra_vertices += dc.vertex_count; }
       else plan.base_vertex = dc.first_vertex;
       if (uint8_t* dst = vs_constants_.slot(plan.vs_slot)) {
         VSConstants vs_constants;
@@ -2260,10 +2299,8 @@ void D3D11Backend::submit_frame(const Frame& frame, const DrawMatrices* override
   ps_constants_.end();
   g_prof[0] += sw.lap();   // index generation, planning and constants
 
-  const size_t vertex_bytes = (frame.vertices.size() + extra_vertices) * sizeof(Vertex);
-  if (uint8_t* dst = vertex_buffer_.begin(vertex_bytes)) {
-    if (!frame.vertices.empty()) std::memcpy(dst, frame.vertices.data(), frame.vertices.size() * sizeof(Vertex));
-    size_t at = frame.vertices.size();
+  // The re-posed vertices, written from `at` (in vertices) on.
+  auto copy_overrides = [&](uint8_t* dst, size_t at) {
     for (const FrameCommand& cmd : frame.commands) {
       if (cmd.kind != FrameCommand::Draw || cmd.index >= frame.draws.size() || !plans_[cmd.index].valid) continue;
       const DrawMatrices* over = overrides ? overrides + cmd.index : nullptr;
@@ -2271,17 +2308,52 @@ void D3D11Backend::submit_frame(const Frame& frame, const DrawMatrices* override
       std::memcpy(dst + at * sizeof(Vertex), over->vertices, (size_t)frame.draws[cmd.index].vertex_count * sizeof(Vertex));
       at += frame.draws[cmd.index].vertex_count;
     }
-    vertex_buffer_.end();
-  } else if (vertex_bytes) {
-    host::log("d3d11: vertex buffer allocation failed (%zu bytes)", vertex_bytes);
-    return;
+  };
+  bool appended = false;
+  if (statics_resident && (size_t)(extras_base + extra_vertices) * sizeof(Vertex) <= vertex_buffer_.size()) {
+    if (!extra_vertices) appended = true;
+    else if (uint8_t* dst = vertex_buffer_.begin_append()) {
+      copy_overrides(dst, extras_base);
+      vertex_buffer_.end();
+      appended = true;
+    }
+    if (appended) vb_cursor_ = extras_base + extra_vertices;
   }
-  if (uint8_t* dst = index_buffer_.begin(index_scratch_.size() * 4)) {
-    std::memcpy(dst, index_scratch_.data(), index_scratch_.size() * 4);
-    index_buffer_.end();
-  } else if (!index_scratch_.empty()) {
-    host::log("d3d11: index buffer allocation failed");
-    return;
+  if (!appended) {
+    // A full upload puts the re-posed vertices right after the frame's own: move the draws planned
+    // against the appending position there.
+    if (extras_base != (uint32_t)frame.vertices.size()) {
+      const uint32_t shift = extras_base - (uint32_t)frame.vertices.size();
+      for (const FrameCommand& cmd : frame.commands) {
+        if (cmd.kind != FrameCommand::Draw || cmd.index >= frame.draws.size() || !plans_[cmd.index].valid) continue;
+        const DrawMatrices* over = overrides ? overrides + cmd.index : nullptr;
+        if (over && over->vertices) plans_[cmd.index].base_vertex -= shift;
+      }
+    }
+    vb_valid_ = false;
+    const size_t vertex_bytes = (frame.vertices.size() + extra_vertices) * sizeof(Vertex);
+    if (uint8_t* dst = vertex_buffer_.begin(vertex_bytes)) {
+      if (!frame.vertices.empty()) std::memcpy(dst, frame.vertices.data(), frame.vertices.size() * sizeof(Vertex));
+      copy_overrides(dst, frame.vertices.size());
+      vertex_buffer_.end();
+      vb_valid_ = true; vb_frame_ = &frame; vb_sequence_ = frame.sequence; vb_statics_ = frame.vertices.size();
+      vb_cursor_ = (uint32_t)(frame.vertices.size() + extra_vertices);
+    } else if (vertex_bytes) {
+      host::log("d3d11: vertex buffer allocation failed (%zu bytes)", vertex_bytes);
+      return;
+    }
+  }
+  // Indices change only with the plan.
+  if (!(reuse_plan && !upload_every_present && ib_valid_ && ib_frame_ == &frame && ib_sequence_ == frame.sequence)) {
+    ib_valid_ = false;
+    if (uint8_t* dst = index_buffer_.begin(index_scratch_.size() * 4)) {
+      std::memcpy(dst, index_scratch_.data(), index_scratch_.size() * 4);
+      index_buffer_.end();
+      ib_valid_ = true; ib_frame_ = &frame; ib_sequence_ = frame.sequence;
+    } else if (!index_scratch_.empty()) {
+      host::log("d3d11: index buffer allocation failed");
+      return;
+    }
   }
   g_prof[1] += sw.lap();   // vertex/index upload
 
@@ -2408,8 +2480,8 @@ void D3D11Backend::submit_frame(const Frame& frame, const DrawMatrices* override
     }
     }
     present_wait_ = Stopwatch::now() - wait_start;
-    // Synced with V-Sync on, and on a display that follows the frames (tear_free_, from the
-    // presentation loop), where a frame starts its own refresh and syncing costs nothing.
+    // Sync by the player's choice or the explicit scanline-sync diagnostic. VRR detection
+    // controls the cap; it must leave the interval-0/ALLOW_TEARING path available with V-Sync off.
     const bool synced = opts_.vsync || tear_free_;
     // Keep the existing deadline timer, simulation-locked path and DXGI queue limit.
     // A subframe without a timer deadline may rely on Reflex/vblank pacing: keep interval 1.

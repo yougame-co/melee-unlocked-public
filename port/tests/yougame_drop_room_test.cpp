@@ -342,6 +342,7 @@ static void environment_bounds() {
 }
 #endif
 int main(int argc, char** argv) {
+  setenv("YOUGAME_AGENT_COPY", "1", 1);  // the AGENT TEST app's flag: agent_test::load ignores the file without it
   CHECK(argc == 2);
   mapping(argv[1]);
 #ifdef YOUGAME_AGENT_TEST_HOOK

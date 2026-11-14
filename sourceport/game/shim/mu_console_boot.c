@@ -1,17 +1,23 @@
 /* Load the agreed session card without entering the memory-card scene. */
+#if !defined(__x86_64__) && !defined(_M_X64)
+#error "CSS origin scene continuation requires x86-64 GCC/Clang builtin setjmp/longjmp; port both ends together"
+#endif
+#include <mu_native.h>
 #include <melee/gm/gmmain_lib.h>
+#include "mu_doubles_game.h"
 #include <melee/lb/lbcardgame.h>
 #include <melee/lb/lbcardnew.h>
 #include <sysdolphin/baselib/debug.h>
 
 int mu_console_active(void);
+int mu_css_origin_host(int operation);
 int mu_console_has_save(void);
 void mu_console_log(const char* text);
 
 void mu_console_load_save(void)
 {
     lbCardResult result;
-    if (!mu_console_active() || !mu_console_has_save()) {
+    if ((!mu_console_active() && !mu_css_origin_host(32)) || !mu_console_has_save()) {
         return;
     }
     /* gmmain has initialized card/save state already. Reuse GS_MEMCARD's work
@@ -28,4 +34,29 @@ void mu_console_load_save(void)
         mu_console_log("console: the session save could not be read; starting with defaults");
     }
     gmMainLib_8015FA34(result);
+}
+
+/* The context belongs to gm_801A4510, which stays live across every scene. Never longjmp
+ * into a returned CSS frame. The host returns before the C-only unwind begins. */
+static void** mu_css_origin_context;
+MU_EXCLUSIONS(console_boot, MU_EXCLUDE(mu_css_origin_context))
+int mu_css_origin_host(int operation);
+void mu_css_origin_arm(void** context) { mu_css_origin_context = context; }
+int mu_css_origin_resume(int bit) { return mu_css_origin_host(bit); }
+int mu_css_origin_skip_draw(void) { return mu_css_origin_host(8); }
+void mu_css_origin_boot(unsigned char* mode)
+{
+    if (mu_css_origin_host(0)) {
+        if (!mu_console_active()) mu_console_load_save();
+#ifdef MELEE_DOUBLES
+        mu_doubles_boot();
+#endif
+        *mode = 2;
+    } /* canonical origin */
+    /* GM_VS, same first scene as console relaunch */
+}
+void mu_css_origin_restart(void)
+{
+    if (!mu_css_origin_context) __builtin_trap();
+    __builtin_longjmp(mu_css_origin_context, 1);
 }

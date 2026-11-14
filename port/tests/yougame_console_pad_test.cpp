@@ -7,6 +7,9 @@
 #include <cstring>
 extern "C" {
 int mu_online_motor_port(s32 port, u32) { return port; }
+int mu_lobby_css(void) { return 0; }   // the Friends lobby select (shim/mu_slippi_menu.c): never here
+void mu_lobby_pads(PADStatus*) {}
+int mu_lobby_watch_pads(PADStatus*) { return 0; }
 int mu_console_rollback_active(void);
 void mu_apply_seed(uint32_t);
 void OSSetArenaLo(void*) {}
@@ -14,6 +17,7 @@ void OSSetArenaHi(void*) {}
 #include "../../sourceport/game/shim/mu_os.c"
 #include "../../sourceport/game/shim/mu_vi.c"
 #include "../../sourceport/game/shim/mu_pad.c"
+extern "C" void mu_css_origin_restart() { std::abort(); }
 #include "../../sourceport/game/shim/mu_console_pad.c"
 PadLibData HSD_PadLibData{};
 }

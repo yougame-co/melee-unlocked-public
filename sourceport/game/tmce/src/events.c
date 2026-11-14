@@ -284,7 +284,7 @@ EventDesc LaserLand = {
 // Combo Training
 EventDesc Combo = {
     .eventName = "Combo Training\n",
-    .eventDescription = "L+DPad adjusts percent | DPadDown moves CPU\nDPad right/left saves and loads positions.",
+    .eventDescription = "L+DPad adjusts percent.\nDPad down moves the CPU.",
     .eventFile = 0,
     .jumpTableIndex = JUMP_COMBO,
     .CSSType = SLCHRKIND_TRAINING,
@@ -1754,7 +1754,6 @@ void Message_Init(void)
 }
 GOBJ *Message_Display(int msg_kind, int queue_num, int msg_color, char *format, ...)
 {
-
     va_list args;
 
     MsgMngrData *mgr_data = stc_msgmgr->userdata;
@@ -1788,6 +1787,12 @@ GOBJ *Message_Display(int msg_kind, int queue_num, int msg_color, char *format, 
     msg_text->align = 1;
     msg_text->use_aspect = 1;
     msg_text->color = stc_msg_colors[msg_color];
+
+    Playerblock *source = Fighter_GetPlayerblock(queue_num);
+    if (source && source->p_kind != PKIND_HMN) {
+        JOBJ_SetFlagsAll(msg_jobj, JOBJ_HIDDEN);
+        msg_text->hidden = true;
+    }
 
     // adjust scale
     Vec3 scale = msg_jobj->scale;
@@ -1852,7 +1857,9 @@ GOBJ *Message_Display(int msg_kind, int queue_num, int msg_color, char *format, 
         // print line
         int y_base = (line_num - 1) * (-MSGTEXT_YOFFSET / 2);
         int y_delta = i * MSGTEXT_YOFFSET;
-        Text_AddSubtext(msg_text, 0, y_base + y_delta, msg_line);
+        // The line is already formatted: passed as the format again, a "%" in it (the L-cancel rate
+        // "L-Cancel 85%") was read as a conversion and dropped by the PC's formatter.
+        Text_AddSubtext(msg_text, 0, y_base + y_delta, "%s", msg_line);
     }
 
     // Add to queue
@@ -2348,7 +2355,7 @@ int Tip_Display(int lifetime, char *fmt, ...)
 
         // print line
         int y_delta = i * MSGTEXT_YOFFSET;
-        Text_AddSubtext(tip_text, 0, y_delta, msg_line);
+        Text_AddSubtext(tip_text, 0, y_delta, "%s", msg_line);   // already formatted (a "%" in a tip was dropped)
     }
 
     return 1; // tip created

@@ -16,6 +16,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 struct _XINPUT_STATE;
@@ -24,6 +25,7 @@ struct _XINPUT_STATE;
 #endif
 
 namespace yougame {
+namespace lobby { struct Plan; class Control; }   // yougame_lobby_setup.h, yougame_lobby.h
 namespace relay_pads {
 // After the host selects --log-file; releases controller messages buffered during startup.
 void logging_ready();
@@ -48,6 +50,54 @@ void start();
 
 // Launched by the YouGame desktop app (including Slippi-routed Unranked).
 bool active();
+// Melee Unlocked's own launcher holds the YouGame account and serves the same loopback bridge
+// (YOUGAME_BRIDGE + YOUGAME_TOKEN + MELEE_YOUGAME_LAUNCHER=1). The game keeps all its normal
+// GitHub behaviour (Slippi, mods, spectator, settings); only the YouGame rows of the online menu
+// use the bridge, one search at a time.
+bool launcher();
+// YouGame is not open yet (MELEE_YOUGAME_COMING_SOON): the GitHub build's YouGame rows show greyed out
+// as Coming soon and cannot be picked. Never in a game the YouGame app started (active()). Hidden test
+// runs reopen them with MELEE_TEST_YOUGAME_OPEN=1 (the end-to-end runs).
+bool coming_soon();
+// coming_soon() without the local channel: true for the whole run when the GitHub build's rows wait
+// and the app did not start the game. The menu file is built from this (greyed and open copies).
+bool coming_soon_build();
+// YouGame's online rows can be offered: the app started the game, or the launcher's bridge is up.
+bool available();
+// The local channel (yougame_channel.h): a game nothing started finds a running YouGame app on this
+// computer. start_channel probes once on its own thread, after the log is open (main, after
+// logging_ready); `automated` (--hidden/--headless) runs never probe unless MELEE_TEST_YOUGAME_CHANNEL=1,
+// and MELEE_NO_YOUGAME_CHANNEL=1 turns it off. While a verified channel is up, launcher() and
+// available() are true and coming_soon() is false, so the YouGame rows open as under the launcher.
+void start_channel(bool automated);
+// The Online menu opened: probe again (at most once every 5 s). Never waits; returns at once.
+void online_menu_opened();
+// The online menu's first row while YouGame is not found (coming_soon()). When the YouGame app is
+// installed (its yougame-staging link type: the registry on Windows, xdg-mime on Linux) it reads
+// "Open YouGame": picking it, or entering the Online menu once per run, opens the app on the game's page
+// and looks for it every second for 25 s ("Opening YouGame..."). Otherwise "Get YouGame" opens
+// https://staging.yougame.co/desktop in the player's browser. Hidden or headless runs only log, unless
+// MELEE_TEST_YOUGAME_GET_PAGE=1. Never waits on the game's frame.
+void open_get_page();
+void first_row_picked();
+const char* first_row_text();
+bool channel_connected();
+// The current search or match is a YouGame one: always in the app, and under the launcher from the
+// moment a YouGame row is picked until a Slippi row is picked.
+bool session();
+// The online menu's choice, before its character select: true for a YouGame row. Ignored in the app.
+void set_launcher_session(bool yougame);
+// Launcher only: YouGame is on another (older) release than this build. Asks the launcher again
+// (a local answer, under 2 s). Empty when this build is allowed or nothing is known.
+std::string behind_version_now();
+// Asks the launcher to start that release once this game closes, in `mode` ("ranked" or "direct").
+bool restart_older(const std::string& mode, std::string* error);
+// --online-mode ranked|direct: the launcher started this game for that YouGame mode. 1 ranked,
+// 2 direct, 0 none; answered once.
+void set_online_mode_arg(int mode);
+int take_online_mode_arg();
+// This build's version as YouGame and the rooms see it.
+std::string build_version();
 // The bridge is this process's stdin/stdout (the app's sandboxed launch): stdout carries only
 // bridge lines (the log goes to stderr), and the GameCube adapter comes from the app's pad mirror.
 bool stdio_bridge();
@@ -113,14 +163,25 @@ void pause_event(bool pausable, bool paused, const char* reason);
 
 // The host picker runs off the simulation thread while code entry remains visible.
 // Throws on cancellation, a page error, or an invalid answer; opens no room.
-std::string pick_friend_room(const std::function<bool()>& cancelled, const std::string& held = {});
+std::string pick_friend_room(const std::function<bool()>& cancelled, const std::string& held = {}
+#ifdef MELEE_DOUBLES
+                             , bool doubles = false, std::string* invited = nullptr // who the list invited, when it names them
+#endif
+                             );
+// The Friends lobby's invite (the empty door's A): the app's multi-invite picker for the lobby's room,
+// up to three friends, who take seats in the order they accept. Off the simulation thread; throws on
+// cancellation, a page error (RoomFull: the site's own words) or an invalid room.
+void lobby_invite(const std::string& room, const std::function<bool()>& cancelled);
+// The Doubles home's invite (the partner door's A): the app's single-friend Teams picker for the home.
+void doubles_invite(const std::string& room, const std::function<bool()>& cancelled);
 std::string slippi_link_status(const std::string& status);
 void blend_slippi_stopped(uint64_t epoch, const std::string& reason);
 
 // Retire any previous YouGame room before selecting plain UDP for a Slippi search.
 bool prepare_slippi_match(const std::function<bool()>& cancelled, uint64_t epoch = 0);
-// Reserve a generation on the caller before launching a helper. Retires the previous room.
-uint64_t begin_search();
+// Reserve a generation on the caller before launching a helper. Retires the previous room, except a
+// Friends lobby room parked between matches when keep_lobby (the lobby's own next search adopts it).
+uint64_t begin_search(bool keep_lobby = false);
 // Serialize a blend commit with the helper's guarded global effects.
 bool guard_search(uint64_t epoch, const std::function<void()>& commit);
 
@@ -137,6 +198,11 @@ void slippi_link(bool linked, const std::string& tag);
 // One matchmaking search: the game's online menu choice.
 struct Search {
   uint64_t epoch = 0;        // reserved before launching a blend helper; 0: reserve on entry
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  bool squad = false;
+  std::string squad_budget;
+#endif
   int mode = 1;               // Slippi's ids: 0 ranked, 1 unranked, 2 direct, 3 teams
   std::string direct_code;    // the opponent's connect code (Direct)
   std::string friend_room;    // internal invite; never an opponent connect code
@@ -147,6 +213,18 @@ struct Search {
   std::function<void(int waiting)> on_searching;
   std::function<bool()> claim;
   std::string status;         // the status line while it searches (yougame_blend.h kSearch*); empty: "searching"
+  // The 4-player Friends lobby (yougame_lobby.h): hold a room (lobby_room empty) or join the code a
+  // friend's invite carries. The search waits in the room's lobby until its host starts a match, and
+  // the screen drives the lobby through lobby_control (picks, CPUs, rules, Start).
+  bool friends_lobby = false;
+  std::string lobby_room;
+  std::shared_ptr<lobby::Control> lobby_control;
+  // The Doubles home's match (G2, set only by find_match itself): matchmaking placed the home in this room,
+  // joined with the queue's own ticket, while the home stays parked. Its setup is the match's; its renewals
+  // ask for a match-admission ticket (friends::doubles_match_ticket), never the queue's.
+  struct DoublesMatch {
+    std::string url, ticket, room, home;
+  } doubles_match;
 };
 
 struct Player {
@@ -175,6 +253,31 @@ Match find_match(const Search& search, const std::function<bool()>& cancelled);
 
 // Room slot == Slippi player index (controller port - 1). Unknown or no room: -1.
 int seat_team(int player_idx);
+// The Doubles match room (a 4-seat Teams room; yougame_doubles_teams.h): each slot's team and the
+// stage seed, from the room's start (its console session) when Rooms sent one, else from the room's
+// nativeTeams seats (a room made before seeds takes one derived from its code). open: in such a room.
+// refusal: in one, but neither named the teams (the match is refused on screen, never slot order).
+// consistent: every roster participant the seats name sits in that seat's slot (matched by connection).
+struct DoublesRoom {
+  std::array<int, 4> team{{-1, -1, -1, -1}};
+  uint64_t seed = 0;
+  bool open = false, consistent = true;
+  const char* refusal = nullptr;
+};
+DoublesRoom doubles_room();
+// The 4-player Friends lobby's match (yougame_lobby_setup.h): the plan built from the setup the room froze
+// at Start. open: the current room plays one; the match is then built from the plan alone (ports, CPUs,
+// rules, stage, seed), never from the netplay selections.
+struct FriendsLobby {
+  bool open = false;
+  std::shared_ptr<const lobby::Plan> plan;
+};
+FriendsLobby friends_lobby();
+// The game refused the Friends lobby's frozen setup before frame 1: a guest ends that match in the room
+// (lobby::Session::refuse_setup); the host's own call-off follows the park (next_match).
+void lobby_refuse_setup();
+// The Friends lobby's key: friends-lobby-1 ahead of this build's own compatibility key (64 at most).
+std::string friends_lobby_compatibility();
 
 // The online game the room is recording started (the host asks the room to start a match).
 void game_started(int64_t rng, int stage);
@@ -190,6 +293,7 @@ struct GameEnd {
   int stage = -1, frames = -1;  // the game's stage id and length, for the ranked report's detail
   int characters[2] = {-1, -1};
   int64_t rng = -1;             // the match's rng offset (both games agree on it): the report's id
+  unsigned gone = 0;            // ports whose game the netcode dropped (disconnected), by Slippi player index
 };
 void game_ended(const GameEnd& end);
 // Ranked: one best-of-3 set per room (yougame_ranked.h), decided from the games the room settles.
@@ -218,7 +322,12 @@ uint8_t local_rank();
 
 // Why the game leaves the room. Quit: the local player left (leaving the online menus, holding Z,
 // a new search); Lost: the connection to the opponent broke; Over: the ranked set is decided.
-enum class Leave { Quit, Lost, Over };
+// Next: a Friends lobby match is over and everyone is back on the lobby's select: its room, links and
+// lobby stay up (parked) for the next lobby search; anything but that search closes them. A Friends
+// lobby room parks on Lost too (a friend's game dropped: back to the select); only Quit closes it.
+enum class Leave { Quit, Lost, Over, Next };
+// A Friends lobby room is parked (close_room Next or Lost) for the lobby's next search to adopt.
+bool lobby_parked();
 // Leaves the room: the session is over (the game's online cleanup). Only Ranked reads `why`.
 void end_session(Leave why);
 

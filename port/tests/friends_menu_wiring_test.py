@@ -15,7 +15,7 @@ class FriendsMenuWiringTest(unittest.TestCase):
         overlay = window.index("g_overlay_pad.poll(yougame::stdio_bridge(), i,")
         strip = window.index("if (!(menu_buttons & 0x1000)) pads[i].button")
         self.assertLess(overlay, poll)
-        # Regression report, 11-01 ("I just pressed A on friends and nothing happened"): the Friends A press does not
+        # 11-01 report ("I just pressed A on friends and nothing happened"): the Friends A press does not
         # wait for window focus, since app-relayed pads move the game's menu while the page has focus.
         self.assertNotIn("invite_focused, menu_buttons);", window)
         self.assertLess(poll, strip)
@@ -37,13 +37,30 @@ class FriendsMenuWiringTest(unittest.TestCase):
         self.assertIn("if (g_friend_picker.valid() && (!picker_scene || !safe || !yougame::friends::events.picker_context()))", tick)
         self.assertIn("if (picker_scene && host_friend && !g_friend_picker.valid() && room.empty() && !yougame::console::entry.active())", tick)
 
-    def test_source_friends_hands_room_to_console_and_reuses_waiting_panel(self):
+    def test_source_friends_meets_known_peer_from_local_menus(self):
+        # Friends: menus local, picks as messages. Each player keeps their own CSS and the pair
+        # meets as known peers in the friend room; the shared-menu console engine stays compiled
+        # but no Friends press or room reaches it.
+        policy = source("port/runtime/hle/" + "yougame_mode_policy.h")
+        self.assertIn("constexpr bool friends_shared_menus = false;", policy)
         native = source("port/runtime/hle/native_practice.cpp")
-        handoff = native[native.index("if (!room.empty()) {", native.index("void tick()")):]
+        tick = native[native.index("void tick() {"):]
+        calls = [m.start() for m in re.finditer(r"yougame::console::friends_entry\(", tick)]
+        self.assertEqual(len(calls), 3)  # held reenter, host "new", joined room
+        for at in calls:  # each sits inside an if that requires the shared-menu policy
+            self.assertIn("yougame::mode_policy::friends_shared_menus", tick[at - 300:at])
+        handoff = tick[tick.index("if (!room.empty()) {"):]
         console = handoff.index("yougame::console::friends_entry(room);")
-        self.assertIn("if (g_bridge)", handoff[:console])
-        self.assertLess(console, handoff.index("} else {"))
-        self.assertLess(console, handoff.index("slippi::online::native_start_match"))
+        self.assertIn("if (yougame::mode_policy::friends_shared_menus && g_bridge) {", handoff[:console])
+        local = handoff[handoff.index("} else {", console):]
+        first = local.index("int32_t a[1] = {yougame::friends::kFirstCssWinner}; g_bridge(OP_DIRECT_FIRST_MATCH, a, 1);")
+        start = local.index("slippi::online::native_start_match(2, {}, 0, 0, &error, room);")
+        self.assertLess(local.index("set_online_mode(2);"), first)
+        self.assertLess(first, start)
+        self.assertLess(start, local.index("request_major(kOnlineMajor);"))
+        # The host's Friends press opens the page picker on both engines.
+        picker = tick.index("if (picker_scene && host_friend && !g_friend_picker.valid() && room.empty()")
+        self.assertIn("yougame::pick_friend_room", tick[picker:picker + 600])
         panel = source("port/runtime/gx/pc_settings.cpp")
         self.assertIn('ImGui::Begin("##yougame_friend_waiting"', panel)
         self.assertIn("yougame::console::waiting_status()", panel)
@@ -110,7 +127,8 @@ class FriendsMenuWiringTest(unittest.TestCase):
         self.assertIn('!slippi_submenu && !ranked_offered ? MU_YG_ROW_UNRANKED : 0', menu)
         think = menu[menu.index('void mu_slippi_online_menu_think'):menu.index('/* ---- the online major')]
         self.assertEqual(think.count('mu_slippi_menu_count() - 1'), 2)
-        self.assertEqual(think.count('while (!mn_80229938(MENU_KIND_8, mn_804A04F0.hovered_selection))'), 2)
+        self.assertEqual(think.count('while (!mn_80229938(MENU_KIND_8, mn_804A04F0.hovered_selection) && --steps > 0)'), 2)
+        self.assertEqual(think.count('steps = mu_slippi_menu_count();'), 2)
         self.assertIn('if ((buttons & MenuInput_Confirm) && friends_visible &&', think)
         self.assertIn('mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_FRIENDS)', think)
 

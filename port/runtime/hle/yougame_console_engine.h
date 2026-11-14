@@ -15,13 +15,35 @@ struct EngineHooks {
   std::function<void()> responsive; // window/app events only; never advance the game
   std::function<void(const std::string&)> log;
   std::function<void(const char*)> notice;
+  std::function<uint64_t()> host_ticks; // the host timebase, read at End
+  // At End, when the engine clock is ahead of the host timebase: move the host forward by this many
+  // ticks. Alarms set during the session (the pad alarm) are due on the engine clock, and the host
+  // clock fires them after End; left behind, it took the gap (~10% of the session) to reach them.
+  // May be called off the game thread.
+  std::function<void(uint64_t)> host_catch_up;
+  // Once when a session begins and once when it ends: host state that lives for one session forgets
+  // it (Friends' squad costume rule). May be called off the game thread (End at exit).
+  std::function<void()> session_edge;
 };
 
 // Independently instantiable so two engines can be exercised without a host or a network.
 class Engine {
 public:
-  bool begin(std::unique_ptr<SessionLink>, const SessionConfig&, EngineHooks = {},
+  bool can_begin(const SessionConfig& c) const { return !active_ && !started_ && valid(c); }
+  bool begin(std::unique_ptr<SessionLink>&&, const SessionConfig&, EngineHooks = {},
              bool rollback = kConsoleRollbackDefault);
+  bool adopt_css_clock(uint64_t ticks, uint32_t retraces) {
+    if (!active_ || started_ || match_) return false;
+    ticks_ = service_ticks_ = ticks;
+    retraces_ = service_retraces_ = retraces;
+    next_retrace_ = service_next_retrace_ = ticks + frame_ticks;
+    return true;
+  }
+  void css_join_message(const nlohmann::json& m) { if (active_ && link_) link_->css_join_message(m); }
+  bool css_join_release() {
+    if (!active_ || !link_ || link_->lost()) return false;
+    link_->css_join_release(); return true;
+  }
   bool active() const { return active_; }
   const SessionConfig& config() const { return config_; }
   uint32_t frame() const { return frame_; }

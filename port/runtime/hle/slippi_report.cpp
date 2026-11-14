@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "slippi_agent_lock.h"
 #include "slippi_report.h"
 #include "slippi_net.h"
 #include "host.h"
@@ -45,6 +46,12 @@ thread_local HttpFailure http_failure{"http-get", 0};
 bool http(const char* method, const std::string& url, const std::wstring& headers, const std::string& body, int* status, std::string* response) {
   http_failure = {"http-get", 0};
   if (status) *status = 0;
+  // Every caller of this private HTTP client is Slippi-only, including signed replay uploads.
+  if (agent_lock::blocked(agent_lock::Operation::Http)) {
+    http_failure = {"agent-locked", 0};
+    if (response) response->clear();
+    return false;
+  }
   const auto failed = [](const char* step) {
     const DWORD code = GetLastError(); // capture before closing handles changes it
     http_failure = {step, code};
@@ -56,7 +63,14 @@ bool http(const char* method, const std::string& url, const std::wstring& header
   wchar_t host[256]{}, path[2048]{};
   uc.lpszHostName = host; uc.dwHostNameLength = 256; uc.lpszUrlPath = path; uc.dwUrlPathLength = 2048;
   if (!WinHttpCrackUrl(wurl.c_str(), 0, 0, &uc)) return failed("crack-url");
-  HINTERNET session = WinHttpOpen(USER_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+  // Windows' own proxy and auto-configuration, as browsers and the Slippi Launcher use them:
+  // WinHTTP's default ignores both, and behind such a network every request timed out (error
+  // 12002) while the launcher worked. Windows before 8.1 lacks the mode: the default there.
+  HINTERNET session = nullptr;
+#if defined(_WIN32) && defined(WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY)
+  session = WinHttpOpen(USER_AGENT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+#endif
+  if (!session) session = WinHttpOpen(USER_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
   if (!session) return failed("open-session");
   // TLS 1.2 and 1.3 asked for by name: on some Windows installs WinHTTP's default left them out,
   // and Slippi's servers take nothing older, so every request failed there.
@@ -281,6 +295,7 @@ void worker() {
 }  // namespace
 
 void init(const std::string& iso_path, const std::string& cache_dir) {
+  if (agent_lock::blocked(agent_lock::Operation::Reporting)) return;
   g_iso_path = iso_path; g_cache_dir = cache_dir;
   g_thread = std::thread(worker);
 }
@@ -292,6 +307,7 @@ void shutdown() {
 }
 
 void log_game(const GameReport& report) {
+  if (agent_lock::blocked(agent_lock::Operation::Reporting)) return;
   { std::lock_guard<std::mutex> lk(g_mutex); Job j; j.game = report; g_queue.push_back(std::move(j)); }
   g_cv.notify_all();
 }

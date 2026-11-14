@@ -1,0 +1,30 @@
+[
+ {
+  "before": "",
+  "after": "  // Test runs (MELEE_TEST_PANEL_NAV, hidden only): a D-pad press per 8 frames from the string\n  // (U D L R, A for the A button, B for B), each logged with where the focus went.\n  static int test_nav_step = -1;\n  {\n    static const char* test_nav = host::test_env::getenv(\"MELEE_TEST_PANEL_NAV\");\n    static int test_nav_frame = 0;\n    if (test_nav && state.open && test_nav_frame++ >= 120) {\n      const int step = (test_nav_frame - 120) / 8, phase = (test_nav_frame - 120) % 8;\n      auto& io = ImGui::GetIO();\n      io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;\n      io.BackendFlags |= ImGuiBackendFlags_HasGamepad;\n      const char c = step < (int)std::strlen(test_nav) ? test_nav[step] : 0;\n      const bool down = phase == 0;\n      io.AddKeyEvent(ImGuiKey_GamepadDpadUp, down && c == 'U');\n      io.AddKeyEvent(ImGuiKey_GamepadDpadDown, down && c == 'D');\n      io.AddKeyEvent(ImGuiKey_GamepadDpadLeft, down && c == 'L');\n      io.AddKeyEvent(ImGuiKey_GamepadDpadRight, down && c == 'R');\n      io.AddKeyEvent(ImGuiKey_GamepadFaceDown, down && c == 'A');\n      io.AddKeyEvent(ImGuiKey_GamepadFaceRight, down && c == 'B');\n      test_nav_step = c && phase == 6 ? step : -1;\n    }\n  }\n"
+ },
+ {
+  "before": "    const bool path_available = RenderOptions::kPathTracingAvailable && !d3d11 && options.dlss_mode >= 1 &&\n                                options.dlss_mode <= 5 && rtx_path_tracing_ready();\n    if (!path_available && options.path_tracing) { options.path_tracing = false; changed = true; }\n    const bool rr_available = path_available && options.path_tracing && streamline::ray_reconstruction_available();\n",
+  "after": "    // The launcher's settings window has no path tracer to ask (rtx_path_tracing_known() false): there the\n    // GPU is taken as able and nothing the player chose is switched off; the game decides when it starts.\n    const bool rtx_known = rtx_path_tracing_known();\n    const bool rtx_ready = !rtx_known || rtx_path_tracing_ready();\n    const bool path_available = RenderOptions::kPathTracingAvailable && !d3d11 && options.dlss_mode >= 1 &&\n                                options.dlss_mode <= 5 && rtx_ready;\n    if (!path_available && options.path_tracing) { options.path_tracing = false; changed = true; }\n    const bool rr_available = path_available && options.path_tracing &&\n                              (!rtx_known || streamline::ray_reconstruction_available());\n"
+ },
+ {
+  "before": "                    !rtx_path_tracing_ready() ? \"Needs an RTX (ray-tracing) GPU and the Source Port.\" :\n",
+  "after": "                    !rtx_ready ? \"Needs an RTX (ray-tracing) GPU and the Source Port.\" :\n"
+ },
+ {
+  "before": "      if (settings_slider(\"Brightness\", &options.rtx_brightness, 50, 200, \"%d%%\")) { changed = true; options.rtx_preset = 0; }\n",
+  "after": "      // Its own ID: the picture's Brightness slider further down this page has the same label, and two rows\n      // with one ID made controller navigation loop between them (Up never got past this group).\n      ImGui::PushID(\"rtx\");\n      const bool rtx_bright = settings_slider(\"Brightness\", &options.rtx_brightness, 50, 200, \"%d%%\");\n      ImGui::PopID();\n      if (rtx_bright) { changed = true; options.rtx_preset = 0; }\n"
+ },
+ {
+  "before": "",
+  "after": "  if (test_nav_step >= 0) {\n    const ImGuiContext& g = *ImGui::GetCurrentContext();\n    const ImGuiWindow* w = g.NavWindow;\n    host::log(\"panel nav: step %d nav id %08X active %08X window %s rect y %.0f..%.0f scroll %.0f/%.0f\", test_nav_step,\n              g.NavId, g.ActiveId, w ? w->Name : \"-\", w ? w->NavRectRel[0].Min.y : 0.f, w ? w->NavRectRel[0].Max.y : 0.f,\n              w ? w->Scroll.y : 0.f, w ? w->ScrollMax.y : 0.f);\n  }\n"
+ },
+ {
+  "before": "  ID3D12DescriptorHeap* heap = impl_->heap.Get(); list->SetDescriptorHeaps(1, &heap);\n  ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), list);\n",
+  "after": "  // A panel rebuilt this frame (HDR switched on or off) has not run a frame yet: nothing to draw.\n  ImDrawData* data = ImGui::GetCurrentContext() ? ImGui::GetDrawData() : nullptr;\n  if (!data) return;\n  ID3D12DescriptorHeap* heap = impl_->heap.Get(); list->SetDescriptorHeaps(1, &heap);\n  ImGui_ImplDX12_RenderDrawData(data, list);\n"
+ },
+ {
+  "before": "",
+  "after": "bool rtx_path_tracing_known() { return true; }\n"
+ }
+]

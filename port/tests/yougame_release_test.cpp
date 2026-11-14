@@ -68,6 +68,14 @@ int main() {
   CHECK(update::current({{"current", 123}}) == "unknown");
   CHECK(update::current(json()) == "unknown");
   CHECK(std::string(update::Required().what()) == update::kMessage);
+  // update_required's own words (the app may swap in its line, desktop PR 1145), shown as given; bad text is dropped.
+  CHECK(update::error_text({{"ok", false}, {"code", "update_required"}, {"error", "Getting the latest version. Online opens when it's ready."}}) ==
+        "Getting the latest version. Online opens when it's ready.");
+  CHECK(update::error_text({{"ok", true}, {"result", {{"code", "update_required"}, {"error", "Update first"}}}}) == "Update first");
+  CHECK(update::error_text({{"code", "update_required"}}).empty());
+  CHECK(update::error_text({{"code", "update_required"}, {"error", "two\nlines"}}).empty());
+  CHECK(update::error_text({{"code", "update_required"}, {"error", std::string(201, 'x')}}).empty());
+  CHECK(update::error_text({{"code", "update_required"}, {"error", 7}}).empty());
 
   // Keep keyboard folding coverage; Direct pool selection no longer depends on code shape.
   std::string folded;

@@ -12,6 +12,8 @@ HWND g_replays[16]{};            // list, browse, watch, refresh, back, prev, ne
                                  // search, sort, "hide short games", watch queue, clear queue, "save replays",
                                  // "watch live", "replay folder"
 HWND g_replay_stats=nullptr;     // the scrolling stats page
+std::atomic<bool> g_replay_compressing{false};   // "Compress all replays now" is running
+void compress_replay_folder();
 // Everything the scan found, newest first. A replay's place in these two is its index everywhere on
 // this page (the stats page, the loader's late results, playback). Only the list box counts in rows.
 std::vector<std::filesystem::path> g_replay_files;
@@ -104,6 +106,79 @@ int replay_row_of(int index) {
   return index<0||it==g_replay_visible.end()?-1:int(it-g_replay_visible.begin());
 }
 int replay_selected() { return replay_at_row(g_replays[0]?(int)SendMessageW(g_replays[0],LB_GETCURSEL,0,0):-1); }
+
+void refresh_replays(const std::filesystem::path& selected);
+// A replay (and its session trace) to the Recycle Bin, never deleted outright, so a slip can be undone.
+void replay_delete(int index) {
+  if(index<0||index>=(int)g_replay_files.size()) return;
+  const std::filesystem::path file=g_replay_files[index];
+  std::wstring from=file.wstring(); from.push_back(L'\0');   // double-NUL list
+  SHFILEOPSTRUCTW op{}; op.hwnd=g_main; op.wFunc=FO_DELETE; op.pFrom=from.c_str();
+  op.fFlags=FOF_ALLOWUNDO|FOF_NOCONFIRMATION|FOF_SILENT;
+  if(SHFileOperationW(&op)==0&&!op.fAnyOperationsAborted) {
+    std::filesystem::path trace_path=file; trace_path.replace_extension(L".trace");   // .slp or .slpz
+    std::wstring trace=trace_path.wstring(); trace.push_back(L'\0');
+    std::error_code te; if(std::filesystem::exists(std::filesystem::path(trace.c_str()),te)) { op.pFrom=trace.c_str(); SHFileOperationW(&op); }
+    refresh_replays({});
+  }
+}
+// The delete pill on a card asks once: the first click arms it on that row ("Sure?"), the second deletes.
+int g_replay_delete_armed=-1;   // the row whose delete pill is armed, -1 none
+// Right-click on a replay card (Wiseman's request, 11-08): show the file in Explorer, or move it to the
+// Recycle Bin (never deleted outright, so a slip can be undone).
+void replay_context_menu(int x, int y) {
+  HWND list=g_replays[0];
+  if(!list) return;
+  POINT pt{x,y};
+  if(x==-1&&y==-1) { RECT r{}; GetWindowRect(list,&r); pt={r.left+20,r.top+20}; }   // the keyboard's menu key
+  else { POINT client=pt; ScreenToClient(list,&client);
+    const LRESULT hit=SendMessageW(list,LB_ITEMFROMPOINT,0,MAKELPARAM(client.x,client.y));
+    if(HIWORD(hit)==0) SendMessageW(list,LB_SETCURSEL,LOWORD(hit),0); }
+  const int index=replay_selected();
+  if(index<0||index>=(int)g_replay_files.size()) return;
+  const std::filesystem::path file=g_replay_files[index];
+  HMENU menu=CreatePopupMenu();
+  AppendMenuW(menu,MF_STRING,1,L"Show in folder");
+  AppendMenuW(menu,MF_STRING,2,L"Delete (to the Recycle Bin)");
+  // .slpz (replay_slpz.h): the same replay 8 to 12 times smaller; this library and the game play both.
+  AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+  AppendMenuW(menu,MF_STRING|(g_compress_replays?MF_CHECKED:MF_UNCHECKED),3,L"Keep replays compressed (.slpz)");
+  AppendMenuW(menu,MF_STRING|(g_replay_compressing.load()?MF_GRAYED:0),4,L"Compress all replays now (.slpz)");
+  const int pick=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,pt.x,pt.y,0,g_main,nullptr);
+  DestroyMenu(menu);
+  if(pick==1) {
+    const std::wstring args=L"/select,\""+file.wstring()+L"\"";
+    ShellExecuteW(g_main,L"open",L"explorer.exe",args.c_str(),nullptr,SW_SHOWNORMAL);
+  } else if(pick==2) {
+    replay_delete(index);
+  } else if(pick==3) {
+    g_compress_replays=!g_compress_replays;   // the game compresses earlier sessions' replays as it starts
+    save_ini();
+  } else if(pick==4) {
+    compress_replay_folder();
+  }
+}
+
+// "Compress all replays now": every finished .slp in the replay folder becomes a .slpz on one idle
+// thread, each checked to read back as the same replay before its .slp is removed. Unfinished
+// recordings and any written in the last minute (a game may still have it open) stay .slp.
+void compress_replay_folder() {
+  if(g_replay_compressing.exchange(true)) return;
+  std::thread([folder=replay_folder()]{
+    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_IDLE);
+    namespace fs=std::filesystem;
+    const auto cutoff=fs::file_time_type::clock::now()-std::chrono::minutes(1);
+    std::error_code ec;
+    for(fs::recursive_directory_iterator it(fs::u8path(folder),fs::directory_options::skip_permission_denied,ec),end;!ec&&it!=end;it.increment(ec)) {
+      if(it.depth()>3) { it.disable_recursion_pending(); continue; }
+      std::error_code fe;
+      if(!it->is_regular_file(fe)||fe||it->path().extension()!=L".slp"||it->last_write_time(fe)>=cutoff) continue;
+      slpz::compress_file(it->path().u8string());
+    }
+    g_replay_compressing=false;
+    PostMessageW(g_main,WM_COMMAND,MAKEWPARAM(ID_REPLAY_REFRESH,0),0);
+  }).detach();
+}
 
 // "Show it as it was played": an online match leaves a session trace beside its replay, the same
 // name with the extension .trace (what the player actually got: waits, rollbacks, long frames). The
@@ -202,7 +277,7 @@ void replay_view_build(int select,bool keep_scroll=false) {
   if(row>=0) SendMessageW(list,LB_SETCURSEL,row,0);
   if(keep_scroll) SendMessageW(list,LB_SETTOPINDEX,top,0);
   SendMessageW(list,WM_SETREDRAW,TRUE,0); InvalidateRect(list,nullptr,TRUE);
-  g_replay_hot=-1; g_replay_hot_zone=0;
+  g_replay_hot=-1; g_replay_hot_zone=0; g_replay_delete_armed=-1;
   // With nothing to list the box is hidden: the page says why in its place (paint_replays).
   ShowWindow(list,g_tab==3&&g_replay_view<0&&!g_replay_visible.empty()?SW_SHOW:SW_HIDE);
   replay_buttons(); replay_trace_changed();
@@ -336,13 +411,25 @@ void refresh_replays(const std::filesystem::path& selected={}) {
         std::transform(extension.begin(),extension.end(),extension.begin(),::towlower);
 #ifndef MELEE_NO_SLIPPI   // nothing is a replay there
         std::error_code fe;
-        if(extension==L".slp"&&it->is_regular_file(fe)) found.emplace_back(it->last_write_time(fe),it->path());
+        if((extension==L".slp"||extension==L".slpz")&&it->is_regular_file(fe)) found.emplace_back(it->last_write_time(fe),it->path());
 #endif
         it.increment(ec);
       }
     }
-    std::sort(found.begin(),found.end(),[](const auto& a,const auto& b){return a.second<b.second;});
-    found.erase(std::unique(found.begin(),found.end(),[](const auto& a,const auto& b){return a.second==b.second;}),found.end());
+    // One file reached through two of the folders (the chosen folder inside Documents\Slippi, or the same
+    // folder written with / and \) was listed twice: compare resolved, lower-case paths.
+    auto same_file=[](const std::filesystem::path& p){
+      std::error_code ce; auto key=std::filesystem::weakly_canonical(p,ce).wstring();
+      if(ce) key=p.lexically_normal().wstring();
+      std::transform(key.begin(),key.end(),key.begin(),::towlower);
+      return key;
+    };
+    std::vector<std::pair<std::wstring,size_t>> keyed;
+    for(size_t i=0;i<found.size();++i) keyed.emplace_back(same_file(found[i].second),i);
+    std::sort(keyed.begin(),keyed.end());
+    std::vector<std::pair<std::filesystem::file_time_type,std::filesystem::path>> unique_found;
+    for(size_t i=0;i<keyed.size();++i) if(i==0||keyed[i].first!=keyed[i-1].first) unique_found.push_back(found[keyed[i].second]);
+    found.swap(unique_found);
     if(!choice.empty()&&std::none_of(found.begin(),found.end(),[&](const auto& f){return f.second==choice;})) {
       std::error_code fe; found.emplace_back(std::filesystem::last_write_time(choice,fe),choice);
     }
@@ -435,7 +522,7 @@ void browse_replay() {
   OPENFILENAMEW dialog{sizeof dialog}; dialog.hwndOwner=g_main;
   const std::wstring dialog_title=launcher::lang::txw(L"Open replay");
 #ifndef MELEE_NO_SLIPPI
-  dialog.lpstrFilter=L"Slippi replays (*.slp)\0*.slp\0";
+  dialog.lpstrFilter=L"Slippi replays (*.slp, *.slpz)\0*.slp;*.slpz\0";
 #endif
   dialog.lpstrTitle=dialog_title.c_str();
   dialog.lpstrFile=file; dialog.nMaxFile=32768; dialog.lpstrInitialDir=folder.c_str();
@@ -452,6 +539,17 @@ enum class ReplayStart { Started, Skipped, Failed };
 ReplayStart replay_start(const std::filesystem::path& file,int place=0,int count=0) {
   if(g_playing||g_building) { replay_status("Close the running game before opening a replay."); return ReplayStart::Failed; }
   if(g_iso.empty()||!file_exists(g_iso)) { replay_status("Choose your Melee disc image on the Play page first."); return ReplayStart::Failed; }
+  if (wants_compat_build() && host::updater::compat_build_needed(active_dir())) {
+    settings_standby_stop();
+    g_replay_after_compat = file;
+    g_replay_after_compat_place = place;
+    g_replay_after_compat_count = count;
+    g_launch_after_compat = false;
+    if (host::updater::compat_build_state(active_dir()) != host::updater::ModelState::Downloading)
+      host::updater::compat_build_download(active_dir());
+    replay_status(host::updater::compat_build_message());
+    return ReplayStart::Started;   // the timer starts this replay when the build is installed
+  }
   const std::string name=file.filename().u8string();
   // A queued replay can be gone by the time its turn comes.
   if(std::error_code ec;!std::filesystem::is_regular_file(file,ec)) {
@@ -468,7 +566,7 @@ ReplayStart replay_start(const std::filesystem::path& file,int place=0,int count
     }
   }
   std::string exe;
-  if(g_engine==ENGINE_SOURCE&&!source_exe_dir().empty()) exe=source_exe_dir()+"\\melee_source.exe";
+  if(g_engine==ENGINE_SOURCE&&!source_exe_dir().empty()) exe=source_exe_in(source_exe_dir());
   else {
     std::vector<std::string> candidates{active_dir()+"\\melee_port_playback.exe"};
 #ifndef MELEE_NO_SLIPPI
@@ -477,7 +575,7 @@ ReplayStart replay_start(const std::filesystem::path& file,int place=0,int count
 #endif
     for(const auto& path:candidates) if(file_exists(path)) { exe=path; break; }
     // A release has no separate playback program: the Source Port plays replays itself.
-    if(exe.empty()&&!source_exe_dir().empty()) exe=source_exe_dir()+"\\melee_source.exe";
+    if(exe.empty()&&!source_exe_dir().empty()) exe=source_exe_in(source_exe_dir());
   }
   if(exe.empty()||!file_exists(exe)) { replay_status("Replay playback is not installed for this build."); return ReplayStart::Failed; }
   auto sys=active_dir()+"\\SysPlayback";
@@ -642,10 +740,11 @@ int draw_player_chip(HDC dc,const launcher::replay::Player& p,bool winner,int x,
   if(winner) { RECT crown{pill.right-S(9),pill.top-S(12),pill.right+S(9),pill.top+S(4)}; draw_text(dc,L"\x265B",crown,replay_symbols(13),C_GOLD,DT_CENTER|DT_VCENTER|DT_SINGLELINE); }
   return pill.right;
 }
-void card_zones(RECT card,RECT* stats,RECT* watch,RECT* queue) {
+void card_zones(RECT card,RECT* stats,RECT* watch,RECT* queue,RECT* del) {
   *watch={card.right-S(46),card.top+S(12),card.right-S(16),card.top+S(42)};
   *stats={card.right-S(118),card.top+S(14),card.right-S(56),card.top+S(40)};
   *queue={card.right-S(156),card.top+S(13),card.right-S(128),card.top+S(41)};
+  *del={card.right-S(222),card.top+S(14),card.right-S(166),card.top+S(40)};
 }
 void draw_replay_card(DRAWITEMSTRUCT* item,HDC dc);
 void draw_replay(DRAWITEMSTRUCT* item) {
@@ -668,11 +767,11 @@ void draw_replay_card(DRAWITEMSTRUCT* item,HDC dc) {
   hgrad(dc,card,hot?RGB(0x18,0x21,0x35):C_CARD,lerp(C_CARD,stage_tint(replay.stage_id),hot?75:60,100));
   RestoreDC(dc,inner); DeleteObject(rgn);
   round_rect(dc,card,8,NO_FILL,NO_FILL,selected?C_ACC_HI:(hot?C_BTN_BORDER:RGB(0x24,0x2E,0x46)));
-  RECT stats,watch,queue; card_zones(card,&stats,&watch,&queue);
+  RECT stats,watch,queue,del; card_zones(card,&stats,&watch,&queue,&del);
   // Players. Four of them with long names would run under the buttons on the right: cut off before those.
   int x=card.left+S(16); const int cy=card.top+S(28);
-  const int players=SaveDC(dc); IntersectClipRect(dc,card.left,card.top,queue.left-S(8),card.bottom);
-  if(replay.players.empty()) draw_text(dc,widen(replay.path.stem().u8string()),RECT{x,cy-S(12),queue.left-S(8),cy+S(12)},replay_font(13,FW_SEMIBOLD),C_TEXT,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
+  const int players=SaveDC(dc); IntersectClipRect(dc,card.left,card.top,del.left-S(8),card.bottom);
+  if(replay.players.empty()) draw_text(dc,widen(replay.path.stem().u8string()),RECT{x,cy-S(12),del.left-S(8),cy+S(12)},replay_font(13,FW_SEMIBOLD),C_TEXT,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
   for(size_t i=0;i<replay.players.size();++i) {
     if(i) { const bool vs=replay.players.size()==2; draw_text(dc,vs?L"vs":L"\x00B7",RECT{x+S(4),cy-S(10),x+S(30),cy+S(10)},replay_font(12,FW_SEMIBOLD),C_DIM,DT_CENTER|DT_VCENTER|DT_SINGLELINE); x+=S(34); }
     x=draw_player_chip(dc,replay.players[i],replay.winner==(int)i,x,cy,C_CARD);
@@ -694,6 +793,11 @@ void draw_replay_card(DRAWITEMSTRUCT* item,HDC dc) {
     round_rect(dc,queue,radius,RGB(0x1B,0x24,0x38),RGB(0x1B,0x24,0x38),hq?C_ACC_HI:C_BTN_BORDER);
     draw_text(dc,L"+",queue,replay_font(14,FW_SEMIBOLD),hq?C_TEXT:C_DIM,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
   }
+  // Delete: armed by a first click on this row (red, "Sure?"), a second click sends it to the Recycle Bin.
+  const bool hd=hot&&g_replay_hot_zone==4, armed=(int)item->itemID==g_replay_delete_armed;
+  const COLORREF red=RGB(0xD9,0x4A,0x4A);
+  round_rect(dc,del,13,armed?red:(hd?RGB(0x3A,0x1E,0x24):RGB(0x1B,0x24,0x38)),armed?red:(hd?RGB(0x3A,0x1E,0x24):RGB(0x1B,0x24,0x38)),hd||armed?red:C_BTN_BORDER);
+  draw_text(dc,armed?L"Sure?":L"Delete",del,replay_font(11,FW_SEMIBOLD),armed?C_TEXT:(hd?red:C_DIM),DT_CENTER|DT_VCENTER|DT_SINGLELINE);
   // Stats and Watch
   const bool hs=hot&&g_replay_hot_zone==1, hw=hot&&g_replay_hot_zone==2;
   round_rect(dc,stats,13,hs?C_BTN:RGB(0x1B,0x24,0x38),hs?C_BTN:RGB(0x1B,0x24,0x38),hs?C_ACC_HI:C_BTN_BORDER);
@@ -711,8 +815,8 @@ LRESULT CALLBACK replay_list_proc(HWND h,UINT m,WPARAM w,LPARAM l,UINT_PTR,DWORD
     if(*row<0||*row>=(int)g_replay_visible.size()) { *row=-1; return 0; }
     RECT r{}; SendMessageW(h,LB_GETITEMRECT,*row,(LPARAM)&r);
     RECT card=r; InflateRect(&card,-S(4),-S(4)); card.right-=S(4);
-    RECT stats,watch,queue; card_zones(card,&stats,&watch,&queue);
-    return PtInRect(&watch,p)?2:(PtInRect(&stats,p)?1:(PtInRect(&queue,p)?3:0));
+    RECT stats,watch,queue,del; card_zones(card,&stats,&watch,&queue,&del);
+    return PtInRect(&watch,p)?2:(PtInRect(&stats,p)?1:(PtInRect(&queue,p)?3:(PtInRect(&del,p)?4:0)));
   };
   switch(m) {
     case WM_MOUSEMOVE: {
@@ -729,6 +833,7 @@ LRESULT CALLBACK replay_list_proc(HWND h,UINT m,WPARAM w,LPARAM l,UINT_PTR,DWORD
     case WM_MOUSELEAVE:
       if(g_replay_hot>=0) { RECT r{}; if(SendMessageW(h,LB_GETITEMRECT,g_replay_hot,(LPARAM)&r)!=LB_ERR) InvalidateRect(h,&r,FALSE); }
       g_replay_hot=-1; g_replay_hot_zone=0;
+      if(g_replay_delete_armed>=0) { g_replay_delete_armed=-1; InvalidateRect(h,nullptr,FALSE); }
       break;
     case WM_SETCURSOR: { POINT p; GetCursorPos(&p); ScreenToClient(h,&p); int row; zone_at(p,&row); if(row>=0) { SetCursor(LoadCursorW(nullptr,IDC_HAND)); return TRUE; } break; }
     case WM_LBUTTONUP: {
@@ -737,7 +842,14 @@ LRESULT CALLBACK replay_list_proc(HWND h,UINT m,WPARAM w,LPARAM l,UINT_PTR,DWORD
       if(row>=0) {
         SendMessageW(h,LB_SETCURSEL,row,0);
         // Watch plays the selection just made. The badge only queues: the card does not open.
-        if(zone==2) watch_replay(); else if(zone==3) replay_queue_toggle(replay_at_row(row)); else replay_open_stats(replay_at_row(row));
+        // Delete asks first: the first click arms it on this row, the second deletes.
+        const int was_armed=g_replay_delete_armed;
+        g_replay_delete_armed=-1;
+        if(was_armed>=0&&was_armed!=row) InvalidateRect(h,nullptr,FALSE);
+        if(zone==4) {
+          if(was_armed==row) replay_delete(replay_at_row(row));
+          else { g_replay_delete_armed=row; RECT rr{}; if(SendMessageW(h,LB_GETITEMRECT,row,(LPARAM)&rr)!=LB_ERR) InvalidateRect(h,&rr,FALSE); }
+        } else if(zone==2) watch_replay(); else if(zone==3) replay_queue_toggle(replay_at_row(row)); else replay_open_stats(replay_at_row(row));
       }
       return r;
     }
