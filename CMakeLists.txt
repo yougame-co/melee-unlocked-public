@@ -445,6 +445,14 @@ add_test(NAME port_yougame_rank_badge_source COMMAND "${Python3_EXECUTABLE}" -B 
 
 # YouGame's rows show as Coming soon and nothing YouGame runs from the launcher, until YouGame opens.
 option(MELEE_YOUGAME_COMING_SOON "Show YouGame's online rows as Coming soon (launcher YouGame off)" ON)
+option(MELEE_YOUGAME_START_STAGING "Start and link YouGame Staging (test builds) instead of YouGame" OFF)
+if(MELEE_YOUGAME_START_STAGING)
+  add_compile_definitions(MELEE_YOUGAME_START_STAGING=1)
+endif()
+set(MELEE_YOUGAME_PROD_TRAY_FROM "" CACHE STRING "Windows: first YouGame (production) version that starts hidden in the tray")
+if(NOT "${MELEE_YOUGAME_PROD_TRAY_FROM}" STREQUAL "")
+  add_compile_definitions(MELEE_YOUGAME_PROD_TRAY_FROM="${MELEE_YOUGAME_PROD_TRAY_FROM}")
+endif()
 if(MELEE_YOUGAME_COMING_SOON)
   add_compile_definitions(MELEE_YOUGAME_COMING_SOON=1)
 endif()

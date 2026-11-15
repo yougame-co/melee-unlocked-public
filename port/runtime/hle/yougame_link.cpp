@@ -2711,34 +2711,53 @@ bool open_outside(const char* target) {
   return true;
 #endif
 }
-// The installed YouGame app (staging) registers this link type; the one link shape it accepts
+// Which YouGame this build looks for. The GitHub build (MELEE_YOUGAME_START_STAGING off) uses YouGame
+// itself and falls back to YouGame Staging only on a computer that has just the staging app (testers);
+// a test build (on) uses staging only, as before.
+#ifdef MELEE_YOUGAME_START_STAGING
+constexpr bool kStartStaging = true;
+#else
+constexpr bool kStartStaging = false;
+#endif
+// The installed app registers this link type; the one link shape it accepts
 // (desktop/src/security-policy.ts deepLinkUrl) brings it up on the game's page.
-constexpr const char kAppLink[] = "yougame-staging://g/melee-unlocked";
+const char* app_link(bool staging) { return staging ? "yougame-staging://g/melee-unlocked" : "yougame://g/melee-unlocked"; }
 std::atomic<int> g_app_installed{-1};       // -1 not looked yet, 0 no, 1 yes (app_installed_now)
+std::atomic<bool> g_app_staging{kStartStaging};   // the installed app app_installed_now found is staging
 std::atomic<bool> g_app_opening{false};     // open_app's 25 s wait for the app's channel
 std::atomic<bool> g_app_auto_opened{false}; // the Online menu opens the app by itself once per run
 std::atomic<int64_t> g_app_opened_at{0};
 std::atomic<bool> g_app_stale{false};       // the registered app did not open or answer: Get YouGame for this run
 // Off the game's frame: the registry (Windows) or xdg-mime (Linux) answer whether YouGame is installed.
-bool app_installed_now() {
-  if (g_app_stale.load()) { g_app_installed = 0; return false; }
-  bool yes = false;
+bool app_registered(bool staging) {
+  const std::string scheme = staging ? "yougame-staging" : "yougame";
 #ifdef _WIN32
   HKEY h = nullptr;
-  if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Classes\\yougame-staging\\shell\\open\\command", 0, KEY_READ, &h) == ERROR_SUCCESS ||
-      RegOpenKeyExA(HKEY_CLASSES_ROOT, "yougame-staging\\shell\\open\\command", 0, KEY_READ, &h) == ERROR_SUCCESS) {
+  const std::string user = "Software\\Classes\\" + scheme + "\\shell\\open\\command", root = scheme + "\\shell\\open\\command";
+  if (RegOpenKeyExA(HKEY_CURRENT_USER, user.c_str(), 0, KEY_READ, &h) == ERROR_SUCCESS ||
+      RegOpenKeyExA(HKEY_CLASSES_ROOT, root.c_str(), 0, KEY_READ, &h) == ERROR_SUCCESS) {
     RegCloseKey(h);
-    yes = true;
+    return true;
   }
+  return false;
 #elif defined(__APPLE__)
-  yes = false;   // Mac: the Get YouGame row until the LaunchServices lookup lands
+  (void)scheme;
+  return false;   // Mac: the Get YouGame row until the LaunchServices lookup lands
 #else
-  if (FILE* f = popen("xdg-mime query default x-scheme-handler/yougame-staging 2>/dev/null", "r")) {
+  bool yes = false;
+  if (FILE* f = popen(("xdg-mime query default x-scheme-handler/" + scheme + " 2>/dev/null").c_str(), "r")) {
     char line[256] = {};
     yes = fgets(line, sizeof line, f) && line[0] && line[0] != '\n';
     pclose(f);
   }
+  return yes;
 #endif
+}
+bool app_installed_now() {
+  if (g_app_stale.load()) { g_app_installed = 0; return false; }
+  bool yes = app_registered(kStartStaging), staging = kStartStaging;
+  if (!yes && !kStartStaging && app_registered(true)) yes = staging = true;   // a tester with only YouGame Staging
+  g_app_staging = staging;
   g_app_installed = yes ? 1 : 0;
   return yes;
 }
@@ -2751,7 +2770,7 @@ bool open_app(const char* why) {
   if (!g_app_opening.compare_exchange_strong(idle, true)) return false;   // one opener at a time
   if (!may_open_outside("YouGame app is installed")) { g_app_opening = false; return false; }
   g_app_opened_at = now;
-  const bool ok = open_outside(kAppLink);
+  const bool ok = open_outside(app_link(g_app_staging.load()));
   host::log((std::string("yougame: opening the YouGame app (") + why + "): " + (ok ? "asked" : "could not be opened")).c_str());
   if (!ok) { g_app_stale = true; g_app_installed = 0; g_app_opening = false; return false; }
   std::thread([] {
@@ -2799,26 +2818,57 @@ const char* start_result_name(int r) {
 // an older one gets the small window saying it needs an update (a standalone game never
 // brings up YouGame's client window). Blocks while YouGame's window is up, so it never runs on the
 // game's frame.
-int run_start_hook(const char* why, bool automated) {
-  yg_start_options o{};
-  o.game = "melee-unlocked";
-  o.staging = 1;
-  o.quiet = 1;   // first only look
+// The first version of each app that starts hidden in the tray (production and staging number their
+// releases apart). NULL = never start that app; its small window says it needs an update.
+const char* tray_from(bool staging) {
 #ifdef __APPLE__
   // The Windows floor does not imply Mac argv support. Supply the first shipped Mac build.
+  if (staging) {
 #ifdef MELEE_YOUGAME_MAC_TRAY_FROM
-  o.tray_from = MELEE_YOUGAME_MAC_TRAY_FROM;
+    return MELEE_YOUGAME_MAC_TRAY_FROM;
 #endif
+  } else {
+#ifdef MELEE_YOUGAME_MAC_PROD_TRAY_FROM
+    return MELEE_YOUGAME_MAC_PROD_TRAY_FROM;
 #else
-  o.tray_from = "0.13.1407"; // the first Windows YouGame that starts hidden in the tray
+    return "0.13.25";   // the first Mac YouGame that starts hidden (11-15)
 #endif
-  int r = yg_start(&o);
-  const bool quiet = start_hook_quiet(automated);
-  if ((r == YG_START_MISSING || r == YG_START_INSTALLED) && !quiet) {
-    o.quiet = 0;
-    r = yg_start(&o);
   }
-  host::log("yougame: start hook (%s): %s%s", why, start_result_name(r), quiet ? " (quiet run)" : "");
+  return nullptr;
+#else
+  if (staging) return "0.13.1407";   // the first Windows YouGame Staging that starts hidden in the tray
+#ifdef MELEE_YOUGAME_PROD_TRAY_FROM
+  return MELEE_YOUGAME_PROD_TRAY_FROM;
+#else
+  return "0.13.25";   // the first Windows YouGame that starts hidden in the tray (11-15)
+#endif
+#endif
+}
+int start_once(bool staging, bool quiet) {
+  yg_start_options o{};
+  o.game = "melee-unlocked";
+  o.staging = staging ? 1 : 0;
+  o.quiet = quiet ? 1 : 0;
+  o.tray_from = tray_from(staging);
+  return yg_start(&o);
+}
+int run_start_hook(const char* why, bool automated) {
+  bool staging = kStartStaging;
+  int r = start_once(staging, true);   // first only look
+  if (!kStartStaging && (r == YG_START_MISSING || r == YG_START_INSTALLED)) {
+    // YouGame is not running. A running (or updating) YouGame Staging is the tester's app: use it.
+    // With no YouGame at all, an installed YouGame Staging is used too.
+    const int rs = start_once(true, true);
+    if (rs == YG_START_RUNNING || rs == YG_START_UPDATING || (r == YG_START_MISSING && rs == YG_START_INSTALLED)) {
+      staging = true;
+      r = rs;
+    }
+  }
+  g_app_staging = staging;
+  const bool quiet = start_hook_quiet(automated);
+  if ((r == YG_START_MISSING || r == YG_START_INSTALLED) && !quiet) r = start_once(staging, false);
+  host::log("yougame: start hook (%s, %s): %s%s", why, staging ? "staging" : "production", start_result_name(r),
+            quiet ? " (quiet run)" : "");
   return r;
 }
 }  // namespace
@@ -2847,7 +2897,7 @@ void online_menu_opened() {
 }
 void open_get_page() {
   // A fixed https address, opened in the player's own browser; the game downloads and starts nothing.
-  static const char kUrl[] = "https://staging.yougame.co/desktop";
+  const char* kUrl = kStartStaging ? "https://staging.yougame.co/desktop" : "https://yougame.co/desktop";
   static std::atomic<int64_t> last{0};
   const int64_t now = (int64_t)now_ms();
   if (now - last.load() < 3000) return;   // one page per press, not one per repeated confirm

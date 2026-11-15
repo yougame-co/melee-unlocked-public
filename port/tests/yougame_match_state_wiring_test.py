@@ -43,7 +43,9 @@ class MatchStateWiring(unittest.TestCase):
         link = (ROOT / 'port/runtime/hle/yougame_link.cpp').read_text()
         self.assertIn('#if defined(_WIN32) || defined(__APPLE__)\n#define YOUGAME_START_IMPLEMENTATION', link)
         self.assertIn('#if !defined(_WIN32) && !defined(__APPLE__)\nextern "C" yg_start_result yg_start', link)
-        self.assertIn('o.tray_from = MELEE_YOUGAME_MAC_TRAY_FROM;', link)
+        self.assertIn('return MELEE_YOUGAME_MAC_TRAY_FROM;', link)
+        self.assertIn('return MELEE_YOUGAME_MAC_PROD_TRAY_FROM;', link)
+        self.assertIn('o.tray_from = tray_from(staging);', link)
         build = (ROOT / 'port/mac/build_full.py').read_text()
         for framework in ['CoreServices', 'CoreFoundation']:
             self.assertIn("'-framework','" + framework + "'", build)
