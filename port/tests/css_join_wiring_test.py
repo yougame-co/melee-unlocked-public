@@ -29,7 +29,7 @@ class CssJoinWiring(unittest.TestCase):
         # Build 58: upstream v0.9.102 adds 1 (grizumi, the live Fountain of Dreams scenery).
         # Build 65: upstream v0.9.104 adds 9 (render semantics in cobj/dobj/lobj/tobj 6, Kirby hats in ftparts 2, gm_1601 1).
         # The 4-player Friends select adds 2 (the host-only Rules and Teams guards in mncharsel).
-        self.assertEqual(len(re.findall(r'^@@ ',patch,re.M)),10115)  # build 101: v0.9.120's two new patch hunks (97: v0.9.117's itzako hunk)
+        self.assertEqual(len(re.findall(r'^@@ ',patch,re.M)),10117)  # build 103: two more (results screen and main menu); build 101: v0.9.120's two new patch hunks (97: v0.9.117's itzako hunk)
 
     def test_apply_validates_all_ports_before_any_setter(self):
         apply=body(read('sourceport/game/include/mu_css_transfer.inc'),'mu_css_transfer')

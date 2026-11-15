@@ -139,7 +139,7 @@ class YouGame0983MergeTest(unittest.TestCase):
         # Build 65: upstream v0.9.104 adds 9 (render semantics in cobj/dobj/lobj/tobj 6, Kirby hats in ftparts 2, gm_1601 1).
         # The 4-player Friends select adds 2 (the host-only Rules and Teams guards in mncharsel).
         # Build 95: upstream v0.9.112 adds 1 (gricemt: the Ice Climbers come on Icicle Mountain again).
-        self.assertEqual(count, 10115)  # build 101: v0.9.120's two new patch hunks (97: v0.9.117's itzako hunk)
+        self.assertEqual(count, 10117)  # build 103: two more (results screen and main menu); build 101: v0.9.120's two new patch hunks (97: v0.9.117's itzako hunk)
 
 
 if __name__ == '__main__':

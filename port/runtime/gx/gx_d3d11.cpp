@@ -2504,6 +2504,7 @@ void D3D11Backend::submit_frame(const Frame& frame, const DrawMatrices* override
     }
     // Ready includes a real hidden Present (DXGI_STATUS_OCCLUDED), but never a probe.
     yougame::parity::signals.presented(!test_only && SUCCEEDED(present_result) && frame.test_fill < 0);
+    if (!test_only && SUCCEEDED(present_result) && frame.test_fill < 0) host::startup_first_frame();
     // A synced Present blocks until the display takes the previous frame: waiting, not drawing.
     // Counted as drawing it inflated the render-time estimate to a whole refresh under synced
     // pacing, and the presentation loop then aimed every frame one refresh too late.

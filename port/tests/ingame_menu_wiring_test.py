@@ -23,11 +23,13 @@ class IngameMenuTest(unittest.TestCase):
         focus = between('  agent_menu_state();\n  {\n    static ImGuiID last_focus', '\n#endif\n  if (!state.fill_window')
         visuals = (ROOT / 'port/runtime/gx/pc_settings_visuals.inl').read_text()
         helpers = ('static bool settings_nav_frame_on_item() {' + body(visuals, 'settings_nav_frame_on_item') + '}\n' +
-                   'static ImU32 settings_mix_color(ImU32 a, ImU32 b, float amount) {' + body(visuals, 'settings_mix_color') + '}\n')
+                   'static ImU32 settings_mix_color(ImU32 a, ImU32 b, float amount) {' + body(visuals, 'settings_mix_color') + '}\n' +
+                   'static ImFont* settings_heading_font() {' + body(visuals, 'settings_heading_font') + '}\n')
         harness = r'''
 #include "imgui.h"
 #include "imgui_internal.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -63,6 +65,7 @@ struct Options {
 static bool g_settings_custom_color_enabled, g_hud_match;
 static int g_settings_palette;
 static ImVec4 g_settings_custom_color;
+static ImFont* g_settings_heading_font;
 static ImU32 settings_accent(int) { return IM_COL32(120,60,180,255); }
 ''' + helpers + r'''
 static void reset_settings_home(const char*) {}
@@ -185,6 +188,24 @@ int main() {
       tap(ImGuiKey_Enter); CHECK(!state.menu_open && exits==0);
     }
   }
+  // Build 103: the bar scales with the window height (720p units, 1.5x at 1080p), stays inside the
+  // window, and its background is near-opaque so the game does not show through it.
+  for (bool quit : {false,true}) {
+    struct Size { float w,h, menu_w,menu_h; } sizes[] = {{1280,720,760,172},{1920,1080,1140,258},{1000,1080,976,220},
+                                                       {640,480,616,172}};
+    for (const auto& z : sizes) {
+      io.DisplaySize=ImVec2(z.w,z.h); app=true;
+      if (quit) open_confirm(); else open_main();
+      auto* bar=ImGui::FindWindowByName("##esc_menu");
+      CHECK(std::fabs(bar->Size.x-z.menu_w)<0.6f && std::fabs(bar->Size.y-z.menu_h)<0.6f);
+      CHECK(bar->Pos.x>=0 && bar->Pos.y>=0 && bar->Pos.x+bar->Size.x<=z.w && bar->Pos.y+bar->Size.y<=z.h);
+      CHECK(vertices(IM_COL32(8,10,20,242))>0);
+      for (const auto& v:bar->DrawList->VtxBuffer) CHECK(v.pos.x>=bar->Pos.x-1 && v.pos.x<=bar->Pos.x+bar->Size.x+1 &&
+                                                          v.pos.y>=bar->Pos.y-1 && v.pos.y<=bar->Pos.y+bar->Size.y+1);
+      tap(ImGuiKey_Escape); state={}; frame();
+    }
+  }
+  io.DisplaySize=ImVec2(1280,720);
   ImGui::DestroyContext();
   std::printf("in-game menu: %d checks; real ImGui Right/Enter/KeypadEnter/pad A, safe Settings return, stale-state reset, activation log order\n",checks);
 }

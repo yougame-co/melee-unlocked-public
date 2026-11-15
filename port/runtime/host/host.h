@@ -62,6 +62,11 @@ void log(const char* fmt, ...);
 std::string cpu_power_line(const char* when);
 void log_guest_text(const char* data, size_t len);  // OSReport output
 void log_flush();   // writes every queued log line now (log() hands lines to a writer thread)
+// Startup timing: ms since this process was created, and the same as " (+1234 ms)" for the end of
+// a startup-phase log line (startup_clock.h).
+uint64_t startup_ms();
+std::string startup_mark();
+void startup_first_frame();   // logs "startup: first frame presented (+N ms)" once
 void log_memory();  // one line: this process's size and the memory Windows has left
 [[noreturn]] void die(const char* fmt, ...);
 // The body of a worker thread whose work the game can do without (a song, a video background, a

@@ -5843,6 +5843,8 @@ int run(void (*shutdown)(int)) {
                             : "resume: online ignored (Online boot menu unavailable)");
   apply_content_mode(-1);   // offline: the mod's files, if a profile is loaded
 #ifndef MELEE_NO_SLIPPI
+  // A YouGame start boots on the main menu unless the app asked for Online (build 103).
+  if (g_resume_online) slippi::online::request_boot_online();
   slippi::online::load_ranked_rules();
 #endif
   // The native game reads the retail DOL's data and the retail file formats; a modded disc (patched

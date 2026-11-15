@@ -133,6 +133,11 @@ class PacingDiagnosticsWiringTest(unittest.TestCase):
       host::log("present: vsync %s (settings)", options.vsync ? "on" : "off");
 #endif'''
         self.assertIn(addition, s)
+        # Build 103 scales the F1/Esc menu bar with the window height and makes it near-opaque: reverse
+        # exactly that block first.
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build103_f1menu_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
         # Build 101 merges upstream v0.9.120 (Gecko function patches, Boot to CSS, Center 2P HUD): reverse exactly
         # its pc_settings.cpp hunks (v0.9.119 -> v0.9.120) first.
         for approved in json.loads((ROOT / 'port/tests/fixtures/build101_0120_settings_ranges.json').read_text()):

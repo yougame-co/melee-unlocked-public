@@ -37,7 +37,7 @@ void prepare_sys_assets(const std::string& user_dir, const std::string& data_dir
     disc = sysgen::boot_disc(options.mod_base_iso, base, disc, kVanillaDolSize, vanilla_dol_image);
     std::string error;
     if (!assets.prepare(config, disc, error)) die("Sys generation failed: %s", error.c_str());
-    else if (!assets.status_message().empty()) host::log("%s", assets.status_message().c_str());
+    else if (!assets.status_message().empty()) host::log("%s%s", assets.status_message().c_str(), host::startup_mark().c_str());
   } catch (const std::exception&) {
     die("Sys generation failed: cannot prepare boot paths or read disc assets");
   }

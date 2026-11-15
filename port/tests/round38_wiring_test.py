@@ -72,8 +72,8 @@ int main() {
         self.assertIn('ImGui::PopStyleColor();', action)
         self.assertIn('const ImVec2 outline[] = {face[0], face[1], shadow[1], shadow[2], shadow[3], face[3]};', action)
         self.assertIn('if (settings_nav_frame_on_item()) {', action)
-        self.assertIn('draw->AddPolyline(outline, 6, settings_mix_color(accent, IM_COL32_WHITE, .75f), ImDrawFlags_Closed, 2.0f);', action)
-        self.assertIn('p.y + y - (hot ? 4.0f : 0.0f)', action)
+        self.assertIn('draw->AddPolyline(outline, 6, settings_mix_color(accent, IM_COL32_WHITE, .75f), ImDrawFlags_Closed, 2.0f * k);', action)
+        self.assertIn('p.y + y - (hot ? 4.0f * k : 0.0f)', action)
         for pin in ('ImGui::SetFocusID', 'ImGui::SetNavCursorVisible(true)', 'agent_menu_focus',
                     'agent_menu_label', 'state.menu_quit && enter', '!quit_button_focused'):
             self.assertIn(pin, action)

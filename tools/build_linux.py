@@ -100,7 +100,7 @@ def main():
         targets += ['linux_gc_adapter_test', 'linux_input_script_test', 'port_yougame_sysgen_test',
                     'port_gx_object_layout_test', 'port_css_join_test', 'port_css_origin_test', 'port_handoff_state_test', 'port_handoff_agent_hook_test', 'port_handoff_agent_off_test',
                     'port_handoff_delta_test', 'port_friends_handoff_join_test', 'port_friends_timing_test', 'port_friends_link_evidence_test',
-                    'port_sdl_video_thread_test',
+                    'port_sdl_video_thread_test', 'port_startup_clock_test',
                     'port_settings_mouse_test', 'port_keyboard_navigation_test', 'port_controller_profiles_test',
                     'port_settings_profile_bindings_test', 'port_dolphin_profile_test',
                     'port_yougame_embed_view_test', 'port_yougame_embed_volume_test',

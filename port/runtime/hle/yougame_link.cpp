@@ -2962,6 +2962,9 @@ void console_boot_ready() { parity::signals.console_boot_ready(); }
 void embed_window_ready(uintptr_t hwnd) {
   if (g_embed_toplevel) {
     parity::signals.start(g_stdio, [](const char* line) { write_line(line); }, true);
+    // How long after launch the app got its caps (it waits 30 s on a first run, 11-15).
+    static std::once_flag caps_timed;
+    if (g_stdio) std::call_once(caps_timed, [] { host::log("startup: toplevel caps sent%s", host::startup_mark().c_str()); });
     if (const int sent = parity::signals.sync_match(-1); sent >= 0) host::log("yougame: match %d", sent);
     // After the caps, once per created window (again if it is ever recreated).
     if (hwnd) parity::signals.emit(embed_toplevel_policy::hwnd_line(hwnd).c_str());

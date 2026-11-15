@@ -46,11 +46,12 @@ struct { int cooldown; } mn_804D6BC8;
 struct { int hovered_selection, cur_menu, buttons, entering_menu; } mn_804A04F0;
 struct AnimLoopSettings { int tag; };
 static AnimLoopSettings mn_803EB57C[] = {{0},{1},{2}}, mn_803EB5A0[] = {{3},{4},{5}}, mn_803EB5C4[] = {{6},{7}};
+static AnimLoopSettings mn_803EB444[] = {{100},{101},{102},{103},{104}};   // the 1P menu's previews
 struct { int selection_count; AnimLoopSettings* anim_loop; int start_frame; u16* description_indices; void(*think)(HSD_GObj*); } mn_803EB6B0[9];
 static u16 mn_803EB66C[3];
 void mu_slippi_online_menu_think(HSD_GObj*);
 static int agent_copy, local_peer, agent_lock_logged;
-static int ranked_supported, ranked_offered, friends_offered, slippi_submenu, boot_oneshot, p2p_auto_direct, friends_confirm_hold, slippi_link_notice, friends_return, friends_css_host;
+static int ranked_supported, ranked_offered, friends_offered, slippi_submenu, boot_oneshot, boot_main_menu, p2p_auto_direct, friends_confirm_hold, slippi_link_notice, friends_return, friends_css_host;
 static int pending_buttons, entered, last_mode = -1, published, installs, switched_menu, switched_row;
 static int p2p, cpu, granted = 1, grant_queries, notices, grant_error, grant_short;
 static int link_requests, link_leaves;
@@ -148,6 +149,10 @@ int main() {
         CHECK(mn_803EB6B0[8].description_indices[i] == descriptions[i]);
     }
     CHECK(mn_803EB6B0[8].start_frame == 140);
+    // Build 103: 1P > Online Play (retail's hidden row 2, a blank preview) shows the character select's,
+    // as Ranked does; the other 1P rows keep their own.
+    CHECK(mn_803EB444[SEL_1P_2].tag == mn_803EB57C[0].tag);
+    for (int i : {0, 1, 3, 4}) CHECK(mn_803EB444[i].tag == 100 + i);
     const int order[] = {0,1,8,9};
     for (int i = 0; i < 4; ++i) { CHECK(mu_slippi_menu_option(i) == order[i]); CHECK(mu_slippi_option_unlocked(i)); }
     CHECK(!mu_slippi_option_unlocked(4) && !mu_slippi_option_unlocked(-1));
@@ -239,6 +244,12 @@ int main() {
     // A new Online entry starts on Ranked, including boot.
     mu_slippi_switch_to_online_menu(); CHECK(switched_menu == 8 && switched_row == 0);
     boot_oneshot = 1; u8 menu, hovered; CHECK(mu_slippi_menu_enter(GM_BOOT, &menu, &hovered)); CHECK(hovered == 0);
+    // Build 103: a YouGame start for a local match (FA bit 5) leaves boot to the main menu, once.
+    boot_main_menu = boot_oneshot = 1; menu = hovered = 0xEE;
+    CHECK(!mu_slippi_menu_enter(GM_BOOT, &menu, &hovered) && menu == 0xEE && hovered == 0xEE && !boot_oneshot);
+    // A P2P session's players are known: it still opens Online first.
+    p2p = boot_oneshot = 1; CHECK(mu_slippi_menu_enter(GM_BOOT, &menu, &hovered) && menu == MENU_KIND_8 && !boot_oneshot);
+    p2p = boot_main_menu = p2p_auto_direct = 0; slippi_submenu = 0; mu_mnmain_install_online_menu();
     // A failed Friends start returns through boot: entry opens Online on Friends, never from the menu's OnEnter.
     friends_return = slippi_submenu = boot_oneshot = 1;
     CHECK(mu_slippi_menu_enter(GM_BOOT, &menu, &hovered));

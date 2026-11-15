@@ -2558,6 +2558,72 @@ static int melee_main(int argc, char** argv) {
 #endif
   if (o.iso.empty()) { usage(); return 2; }
   if (!host::disc_open(o.iso)) { std::fprintf(stderr, "cannot open ISO %s\n", o.iso.c_str()); return 1; }
+  // The window, and with it the YouGame app's caps line (a toplevel window's caps carry its handle),
+  // before the slow startup work: Sys generation, the retail-disc check, the card and the disc prefetch.
+  // On a PC with 0.6 GB free they took about 90 s (11-15, a test PC), past the 30 s the app gives a first run
+  // to send caps, and the app then kept the game in child mode with a frozen picture. The window stays
+  // black (its class brush) until the first frame. Only the render thread's window (every normal
+  // launch) moves: that thread answers the window's messages while this one works. Without it this
+  // thread owns the window and pumps it only once the game runs, so that window is still made below,
+  // just before the game. Window and renderer only: nothing here reads or writes game state.
+  {
+    const char* version = MELEE_PORT_VERSION;
+    std::wstring base = L"Melee Unlocked ";
+    for (const char* c = version; *c; ++c) base += (wchar_t)(unsigned char)*c;
+#ifdef MELEE_SOURCE_PORT
+    base += L"  |  Source Port";
+#else
+    base += L"  |  Static Recomp";
+#endif
+    host::window_title_base() = base;
+  }
+#ifdef _WIN32
+  // Embedded in YouGame (child or toplevel): the app owns placement and size; never change display
+  // modes under its window. A saved exclusive choice from a standalone run is ignored here.
+  if (yougame::embedded()) gfx.exclusive_fullscreen = false;
+#endif
+  std::unique_ptr<gx::Backend> backend;
+  bool window_made = false;
+  auto make_window = [&] {
+    window_made = true;
+    // Vulkan chosen but not usable here: choose the fallback before creating the SDL window. For both paths
+    // (upstream v0.9.86): the threaded renderer (every normal launch) makes its window too, and without this a
+    // Linux Vulkan choice got an OpenGL window whose Vulkan surface could not be created, so the game stopped.
+    if (!headless) {
+      prepare_render_backend(gfx);
+    }
+    if (!headless && threaded) {
+      backend = gx::create_threaded_backend(gfx, !hidden);
+    } else if (!headless) {
+#ifdef __APPLE__
+      // An app older than 0.13.1048 asks for the player box (YOUGAME_EMBED=1) but passes no parent window: the game
+      // can't embed there, so it starts in full screen on its own, as before.
+      const bool box_without_parent = yougame::embedded() && !std::getenv("YOUGAME_EMBED_PARENT");
+      const bool defer_fullscreen = (gfx.fullscreen || box_without_parent) && !hidden;
+      if (defer_fullscreen) host::window_prefer_simple_fullscreen();
+      void* hwnd = host::window_create(gfx.window_w, gfx.window_h, host::window_title_base().c_str(), !hidden && !defer_fullscreen);
+      if (defer_fullscreen) host::window_defer_fullscreen_show();
+#else
+      void* hwnd = host::window_create(gfx.window_w, gfx.window_h, host::window_title_base().c_str(), !hidden
+#ifdef _WIN32
+          , true
+#endif
+      );
+      if (gfx.fullscreen && !gfx.exclusive_fullscreen) host::window_set_fullscreen(true);
+#endif
+      int client_w = gfx.window_w, client_h = gfx.window_h;
+#ifdef _WIN32
+      if (yougame::embed_toplevel()) host::window_client_size(&client_w, &client_h);
+#endif
+      backend.reset(gx::create_render_backend(hwnd, client_w, client_h, gfx));
+      host::window_set_resize_callback([renderer = backend.get()](int w, int h) { gx::render_resize(renderer, w, h); });
+      host::g_has_window = true;
+    }
+    if (backend) host::log("startup: window and renderer ready%s", host::startup_mark().c_str());
+  };
+#ifdef _WIN32
+  if (threaded && !headless) make_window();
+#endif
 #ifndef MELEE_NO_SLIPPI
   // A bare run without --sys-dir gets the compiled default, a source-tree path relative to the working
   // folder. A packaged build carries its Sys beside the exe (the app and the launcher always pass it),
@@ -2634,7 +2700,7 @@ static int melee_main(int argc, char** argv) {
     source_port::mods::ScanOptions check;
     std::string verification;
     const auto disc = source_port::mods::identify_vanilla(std::filesystem::u8path(o.iso), check, &verification);
-    if (!verification.empty()) host::log("gameplay: %s", verification.c_str());
+    if (!verification.empty()) host::log("gameplay: %s%s", verification.c_str(), host::startup_mark().c_str());
     if (disc.kind != source_port::mods::Kind::Vanilla) {
       host::log("--vanilla-only requires an unmodified Melee NTSC 1.02 ISO. %s", disc.message.c_str());
       std::fprintf(stderr, "--vanilla-only requires an unmodified Melee NTSC 1.02 ISO. %s\n", disc.message.c_str());
@@ -2645,7 +2711,7 @@ static int melee_main(int argc, char** argv) {
     // without moving, copying or clearing any of the player's ordinary or modded card files.
     o.card_dir = (std::filesystem::u8path(o.card_dir) / "VanillaOnly").u8string();
     explicit_card_dir = true;
-    host::log("gameplay: verified retail disc; vanilla-only memory card %s", o.card_dir.c_str());
+    host::log("gameplay: verified retail disc; vanilla-only memory card %s%s", o.card_dir.c_str(), host::startup_mark().c_str());
   }
   remember_iso(o.iso);   // so the launcher can offer this disc without being told again
   // Controllers do not count as activity to Windows, so a session played only on a pad let the
@@ -2653,17 +2719,6 @@ static int melee_main(int argc, char** argv) {
   // Held by this thread for as long as the game runs; Windows drops it when the process exits.
   if (!hidden) SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
 
-  {
-    const char* version = MELEE_PORT_VERSION;
-    std::wstring base = L"Melee Unlocked ";
-    for (const char* c = version; *c; ++c) base += (wchar_t)(unsigned char)*c;
-#ifdef MELEE_SOURCE_PORT
-    base += L"  |  Source Port";
-#else
-    base += L"  |  Static Recomp";
-#endif
-    host::window_title_base() = base;
-  }
 #ifdef __APPLE__
   // Embedded launch belongs to YouGame, including when --fullscreen is also supplied.
   // Decide before hiding a regular fullscreen launch; the panel still needs permission to show.
@@ -2675,45 +2730,8 @@ static int melee_main(int argc, char** argv) {
     gx::RenderOptions::live_slippi_spectator() = false;
   }
 #endif
-#ifdef _WIN32
-  // Embedded in YouGame (child or toplevel): the app owns placement and size; never change display
-  // modes under its window. A saved exclusive choice from a standalone run is ignored here.
-  if (yougame::embedded()) gfx.exclusive_fullscreen = false;
-#endif
-  std::unique_ptr<gx::Backend> backend;
-  // Vulkan chosen but not usable here: choose the fallback before creating the SDL window. For both paths
-  // (upstream v0.9.86): the threaded renderer (every normal launch) makes its window too, and without this a
-  // Linux Vulkan choice got an OpenGL window whose Vulkan surface could not be created, so the game stopped.
-  if (!headless) {
-    prepare_render_backend(gfx);
-  }
-  if (!headless && threaded) {
-    backend = gx::create_threaded_backend(gfx, !hidden);
-  } else if (!headless) {
-#ifdef __APPLE__
-    // An app older than 0.13.1048 asks for the player box (YOUGAME_EMBED=1) but passes no parent window: the game
-    // can't embed there, so it starts in full screen on its own, as before.
-    const bool box_without_parent = yougame::embedded() && !std::getenv("YOUGAME_EMBED_PARENT");
-    const bool defer_fullscreen = (gfx.fullscreen || box_without_parent) && !hidden;
-    if (defer_fullscreen) host::window_prefer_simple_fullscreen();
-    void* hwnd = host::window_create(gfx.window_w, gfx.window_h, host::window_title_base().c_str(), !hidden && !defer_fullscreen);
-    if (defer_fullscreen) host::window_defer_fullscreen_show();
-#else
-    void* hwnd = host::window_create(gfx.window_w, gfx.window_h, host::window_title_base().c_str(), !hidden
-#ifdef _WIN32
-        , true
-#endif
-    );
-    if (gfx.fullscreen && !gfx.exclusive_fullscreen) host::window_set_fullscreen(true);
-#endif
-    int client_w = gfx.window_w, client_h = gfx.window_h;
-#ifdef _WIN32
-    if (yougame::embed_toplevel()) host::window_client_size(&client_w, &client_h);
-#endif
-    backend.reset(gx::create_render_backend(hwnd, client_w, client_h, gfx));
-    host::window_set_resize_callback([renderer = backend.get()](int w, int h) { gx::render_resize(renderer, w, h); });
-    host::g_has_window = true;
-  }
+  // Made here unless it was made right after the disc opened (above).
+  if (!window_made) make_window();
   // Texture packs: scan before the game starts so the settings list is right, and decode up front
   // when the player asked for that, with the wait shown in the title bar rather than as a silent
   // half minute. Decoding runs on its own thread, so the game keeps booting while it works.
@@ -2749,12 +2767,13 @@ static int melee_main(int argc, char** argv) {
     const auto backend_label = app::settings_backend_label(saved_backend,
         backend ? gx::started_render_backend() : "none (headless)");
     static const char* const subframes[] = {"off", "extrapolate", "interpolate", "authored", "authored + interpolate"};
-    host::log("settings: %s, frame cap %s, sub-frame %s, internal resolution %s, upscaler %d, vsync %s, %s",
+    host::log("settings: %s, frame cap %s, sub-frame %s, internal resolution %s, upscaler %d, vsync %s, %s%s",
               backend_label.c_str(),
               gfx.fps_cap < 0 ? "monitor" : gfx.fps_cap == 0 ? "off" : std::to_string((int)gfx.fps_cap).c_str(),
               subframes[std::min<size_t>((size_t)gfx.subframe, 4)],
               gfx.efb_scale ? ("x" + std::to_string(gfx.efb_scale)).c_str() : "auto", gfx.dlss_mode,
-              gfx.vsync ? "on" : "off", gfx.exclusive_fullscreen ? "exclusive fullscreen" : "windowed or borderless");
+              gfx.vsync ? "on" : "off", gfx.exclusive_fullscreen ? "exclusive fullscreen" : "windowed or borderless",
+              host::startup_mark().c_str());
   }
 
   // The Lossless adapter's lag test (Settings > Advanced, or --lag-test): the native game and the
@@ -2837,6 +2856,7 @@ static int melee_main(int argc, char** argv) {
         [](const std::string& text) { host::log("%s", text.c_str()); });
   }
   if (host::exit_requested()) { shutdown(0); host::end_process(0); }
+  host::log("startup: starting the game%s", host::startup_mark().c_str());
   const int source_code = source_port::run(shutdown);
   shutdown(source_code);
   host::end_process(source_code);   // everything is saved: do not run the libraries' unload code
@@ -2946,7 +2966,7 @@ static int melee_main(int argc, char** argv) {
       companions.push_back({item.kind, item.target_path, item.path});
     gx::texpack::set_cosmetic_companions(std::move(companions));
   }
-  host::log("boot: entering __start at %08X", 0x8000522Cu);
+  host::log("boot: entering __start at %08X%s", 0x8000522Cu, host::startup_mark().c_str());
   int code = 0;
   if (g_profile) g_profiler.start();
   try {

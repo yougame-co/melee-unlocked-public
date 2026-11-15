@@ -2238,6 +2238,8 @@ void set_local_build(const LocalBuild& build) {
   g_local_build = build;
 }
 const LocalBuild& local_build() { return g_local_build; }
+static std::atomic<bool> g_boot_online{false};
+void request_boot_online() { g_boot_online = true; }
 void load_ranked_rules() {
   if (g_ranked_rules_loaded) return;
   g_ranked_rules_loaded = true;
@@ -3163,6 +3165,10 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
       // Facts for the C menu, also in standalone. Read the real environment in agent_copy().
       if (host::test_env::agent_copy()) q[0] |= 8;
       if (Matchmaking::local_peer.enabled) q[0] |= 16;
+      // Bit 5: the first menu after boot is the main menu. A game the YouGame app started opens there for
+      // a local match; Online opens first only when the app asked for it (--resume online after an
+      // update). Standalone (the launcher, a bare run) keeps Slippi's boot to Online (boot.asm).
+      if (yougame::active() && !g_boot_online) q[0] |= 32;
       if (yougame::active()) {
         // Bit 2 is the presentation capability; bit 0 alone controls the hidden menu row.
         q[0] |= 4;

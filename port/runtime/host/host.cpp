@@ -20,6 +20,7 @@
 #include "memory_range.h"
 #include "guest_heap_trace.h"
 #include "disc_fst_paths.h"
+#include "startup_clock.h"
 #include <windows.h>
 #include <psapi.h>
 #include <bcrypt.h>
@@ -120,6 +121,32 @@ static void trace_ax_frame(const char* line) {
 }
 
 // ---------------- logging ----------------
+// Milliseconds since this process was created (Windows: the kernel's creation time, so the loader
+// and static initialisation count, as they do for the YouGame app's caps deadline). Elsewhere, since
+// this file's static initialisation, which runs before main.
+static const auto g_process_start = std::chrono::steady_clock::now();
+uint64_t startup_ms() {
+#ifdef _WIN32
+  static const uint64_t created = [] {
+    FILETIME c{}, e{}, k{}, u{};
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return uint64_t(0);
+    return (uint64_t(c.dwHighDateTime) << 32) | c.dwLowDateTime;
+  }();
+  if (created) {
+    FILETIME n{};
+    GetSystemTimeAsFileTime(&n);
+    const uint64_t now = (uint64_t(n.dwHighDateTime) << 32) | n.dwLowDateTime;
+    if (now >= created) return (now - created) / 10000;
+  }
+#endif
+  return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - g_process_start).count();
+}
+std::string startup_mark() { return startup::suffix(startup_ms()); }
+// Once, at the first real game frame on screen: where the startup timing ends.
+void startup_first_frame() {
+  static std::atomic<bool> told{false};
+  if (!told.exchange(true)) log("startup: first frame presented%s", startup_mark().c_str());
+}
 // Every line also goes to melee_port.log in the working directory (truncated at start), so a play
 // session can be inspected afterwards without the console window.
 static FILE* g_log_file = nullptr;
@@ -140,12 +167,14 @@ static void open_log_file() {
     char exe[MAX_PATH] = "";
     GetModuleFileNameA(nullptr, exe, MAX_PATH);
     const char* name = std::strrchr(exe, '\\');
-    std::fprintf(g_log_file, "Melee Unlocked %s, %s\n", MELEE_PORT_VERSION, name ? name + 1 : exe);
+    // The full YouGame build too (0.9.120-online-test.103), so a report says exactly which one.
+    std::fprintf(g_log_file, "%s\n", startup::log_header(MELEE_PORT_VERSION, name ? name + 1 : exe, MELEE_YOUGAME_BUILD).c_str());
     MEMORYSTATUSEX memory{};
     memory.dwLength = sizeof memory;
     if (GlobalMemoryStatusEx(&memory))
-      std::fprintf(g_log_file, "memory: %.1f GB installed, %.1f GB free, %.1f GB more the system can hand out\n",
-                   memory.ullTotalPhys / 1073741824.0, memory.ullAvailPhys / 1073741824.0, memory.ullAvailPageFile / 1073741824.0);
+      std::fprintf(g_log_file, "memory: %.1f GB installed, %.1f GB free, %.1f GB more the system can hand out%s\n",
+                   memory.ullTotalPhys / 1073741824.0, memory.ullAvailPhys / 1073741824.0, memory.ullAvailPageFile / 1073741824.0,
+                   startup_mark().c_str());
     std::fprintf(g_log_file, "%s\n", cpu_power_line("at start").c_str());
   }
 }
@@ -482,8 +511,8 @@ static void prefetch_disc_image(const std::string& path) {
     }
     std::fclose(f);
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
-    log("disc: image prefetched into the file cache (%llu MB in %.1f s)", (unsigned long long)(total >> 20),
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+    log("disc: image prefetched into the file cache (%llu MB in %.1f s)%s", (unsigned long long)(total >> 20),
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count(), startup_mark().c_str());
   }); }).detach();
 }
 

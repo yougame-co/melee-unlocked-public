@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.15)
 include(tests/friends_retire.cmake)
 include(tests/handoff_state.cmake)
 include(cmake/squad.cmake)
+include(cmake/yougame_build.cmake)
 
 if(WIN32)
   include(tests/yougame_agent_root_win.cmake)
@@ -103,6 +104,7 @@ if(MELEE_NO_SLIPPI)
   mu_squad_target(runtime_ns)
   target_include_directories(runtime_ns PUBLIC third_party/monocypher)
   target_compile_definitions(runtime_ns PRIVATE MELEE_NO_SLIPPI YOUGAME_COMPAT_TAG="${YOUGAME_COMPAT_TAG}" MELEE_PORT_VERSION="${MELEE_PORT_VERSION}"
+    MELEE_YOUGAME_BUILD="${MELEE_YOUGAME_BUILD}"
     MELEE_PLAYBACK_GCT_BASE=0u MELEE_PLAYBACK_GCT_SIZE=0u)
   if(WIN32)
     set(MELEE_ASIO_SOURCES third_party/asio/asio.cpp third_party/asio/asiodrivers.cpp third_party/asio/asiolist.cpp)
@@ -882,7 +884,8 @@ list(SUBLIST MELEE_VERSION_PARTS 0 4 MELEE_VERSION_PARTS)
 list(JOIN MELEE_VERSION_PARTS "," MELEE_VERSION_COMMAS)
 add_library(runtime STATIC ${RUNTIME_SOURCES} third_party/slippilib/SlippiGame.cpp)
 mu_squad_target(runtime)
-target_compile_definitions(runtime PRIVATE YOUGAME_COMPAT_TAG="${YOUGAME_COMPAT_TAG}" MELEE_PORT_VERSION="${MELEE_PORT_VERSION}")
+target_compile_definitions(runtime PRIVATE YOUGAME_COMPAT_TAG="${YOUGAME_COMPAT_TAG}" MELEE_PORT_VERSION="${MELEE_PORT_VERSION}"
+  MELEE_YOUGAME_BUILD="${MELEE_YOUGAME_BUILD}")
 # ASIO output (audio mode 3): the Steinberg ASIO SDK host files only, under the SDK's GPL Version 3
 # option (asio.cpp, asiodrivers.cpp, asiolist.cpp; see third_party/asio/README.txt). Windows only. The
 # SDK's registry helpers use the ANSI API, so these three build without UNICODE.

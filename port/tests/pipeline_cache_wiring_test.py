@@ -97,6 +97,16 @@ class PipelineCacheWiring(unittest.TestCase):
         constructor = between(d3d, "D3D12Backend(HWND hwnd", "~D3D12Backend()")
         self.assertLess(constructor.index("start_cache_saver();"), constructor.index("prewarm_pipelines();"))
         self.assertLess(constructor.index("prewarm_pipelines();"), constructor.index("recipes_ready_ = true;"))
+        # Saved once the prewarm is done, not only on a timed save or at exit.
+        self.assertLess(constructor.index("recipes_ready_ = true;"), constructor.index('cache_saver_.request_flush("prewarm");'))
+        # The start waits only for the variant this session draws with (build 103: a second start on
+        # an AMD iGPU waited for the never-used motion-vector half behind "first start only").
+        prewarm = body(d3d, "D3D12Backend::prewarm_pipelines")
+        self.assertIn("prewarm_variants::plan(session_upscaler, upscaler_possible, msaa, opts_.prewarm_only)", prewarm)
+        self.assertIn("if (variant.wait) {", prewarm)
+        self.assertIn("const size_t total = waited.size();", prewarm)
+        self.assertNotIn("streamline::available() || xess::available() || fsr::available() ? 2 : 1", prewarm)
+        self.assertIn("prewarm_variants::keeps_recipe(r.key.mvec)", body(d3d, "D3D12Backend::integrate_compiled_psos"))
         build = body(d3d, "D3D12Backend::build_pso")
         self.assertIn("++pipelines_loaded_;", build)
         self.assertIn("++pipelines_compiled_;", build)

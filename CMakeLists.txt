@@ -114,6 +114,8 @@ add_test(NAME port_console_watchdog COMMAND port_yougame_console_link_test --wat
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME port_agent_open_settings_wiring COMMAND "${Python3_EXECUTABLE}" -B
   "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/agent_open_settings_wiring_test.py")
+add_test(NAME port_startup_window_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/startup_window_wiring_test.py")
 add_test(NAME port_css_join_adoption COMMAND "${Python3_EXECUTABLE}" -B
   "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/css_join_adoption_test.py")
 add_test(NAME port_linux_test_targets COMMAND "${Python3_EXECUTABLE}" -B

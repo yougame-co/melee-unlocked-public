@@ -10941,11 +10941,17 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     }
   }
   // ---- the Esc menu ----
+  // Laid out in 720p units and scaled with the window height (k), so it reads the same at 720p, 1080p
+  // and up: at 1080 it is 1.5 times its 720 size, and above 1080 the frame's own ui scale carries it on
+  // (game_ui_scale). It never shrinks below its 720 size, and never grows wider than the window.
+  // Its background is near-opaque: the game showing through hurt reading it.
   if (state.menu_open && !state.open) {
     const ImVec2 screen = ImGui::GetIO().DisplaySize;
-    const float width = std::min(760.0f, screen.x - 24.0f);
-    const float height = 172.0f;
-    ImGui::SetNextWindowPos(ImVec2((screen.x - width) * 0.5f, screen.y - height - 18.0f), ImGuiCond_Always);
+    const float k = std::max(1.0f, std::min({screen.y / 720.0f, (screen.x - 24.0f) / 760.0f, 1.5f}));
+    // Whole pixels, as ImGui sizes the window: the background then fills it exactly.
+    const float width = std::floor(std::min(760.0f * k, screen.x - 24.0f));
+    const float height = std::floor(172.0f * k);
+    ImGui::SetNextWindowPos(ImVec2((screen.x - width) * 0.5f, screen.y - height - 18.0f * k), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(width, height), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.0f);
     ImGui::Begin("##esc_menu", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
@@ -10953,6 +10959,12 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                                          ImGuiWindowFlags_NoBackground);
     const ImVec2 p = ImGui::GetWindowPos();
     ImDrawList* draw = ImGui::GetWindowDrawList();
+    // Whole pixel sizes, so a window resize bakes few font sizes. Labels and the title use the
+    // heading font (the body font when it is missing); the explanation and hint use the body font.
+    ImFont* body_font = ImGui::GetFont();
+    ImFont* label_font = settings_heading_font();
+    const float body_size = std::round(ImGui::GetFontSize() * k);
+    const float label_size = std::round(ImGui::GetFontSize() * 1.25f * k);
     g_settings_palette = options.overlay_palettes[0];
     g_settings_custom_color_enabled = options.settings_custom_color_enabled;
     g_settings_custom_color = ImVec4(options.settings_custom_color[0], options.settings_custom_color[1],
@@ -10961,26 +10973,26 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     const ImVec4 accent_f = ImGui::ColorConvertU32ToFloat4(accent);
     const ImU32 accent_dark = ImGui::ColorConvertFloat4ToU32(
         ImVec4(accent_f.x * .48f, accent_f.y * .48f, accent_f.z * .48f, 1.0f));
-    draw->AddRectFilled(p, ImVec2(p.x + width, p.y + height), IM_COL32(8, 10, 20, 226), 8.0f);
-    draw->AddRectFilled(p, ImVec2(p.x + width, p.y + 4), accent);
+    draw->AddRectFilled(p, ImVec2(p.x + width, p.y + height), IM_COL32(8, 10, 20, 242), 8.0f * k);
+    draw->AddRectFilled(p, ImVec2(p.x + width, p.y + 4.0f * k), accent);
     // Under the YouGame app, quitting is going back to YouGame: its page is right behind this window.
     const bool app = yougame::stdio_bridge();
-    draw->AddText(ImVec2(p.x + 20, p.y + 17), IM_COL32(250, 244, 248, 255),
+    draw->AddText(label_font, label_size, ImVec2(p.x + 20 * k, p.y + 14 * k), IM_COL32(250, 244, 248, 255),
                   state.menu_quit ? (app ? "BACK TO YOUGAME?" : "QUIT MELEE UNLOCKED?") : "MELEE UNLOCKED");
     if (state.menu_quit)
-      draw->AddText(ImVec2(p.x + 20, p.y + 41), IM_COL32(183, 174, 190, 255),
+      draw->AddText(body_font, body_size, ImVec2(p.x + 20 * k, p.y + 41 * k), IM_COL32(183, 174, 190, 255),
                     !app || g_hud_match ? "The current match will end." : "Melee closes and your YouGame page is right behind it.");
-    const float gap = 10.0f;
+    const float gap = 10.0f * k;
     const int count = state.menu_quit ? 2 : 3;
-    const float button_w = (width - 40.0f - gap * (count - 1)) / count;
+    const float button_w = (width - 40.0f * k - gap * (count - 1)) / count;
     const bool enter = ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
     const ImGuiID nav_id = ImGui::GetCurrentContext()->NavId;
     const bool quit_button_focused = nav_id == ImGui::GetID("##confirm_quit") || nav_id == ImGui::GetID("##cancel_quit");
     auto action = [&](const char* id, const char* label, int index) {
-      const float x = 20.0f + index * (button_w + gap), y = 66.0f;
+      const float x = 20.0f * k + index * (button_w + gap), y = 66.0f * k;
       ImGui::SetCursorPos(ImVec2(x, y));
       ImGui::PushStyleColor(ImGuiCol_NavCursor, IM_COL32(0, 0, 0, 0));
-      const bool pressed = ImGui::InvisibleButton(id, ImVec2(button_w, 58.0f), ImGuiButtonFlags_EnableNav);
+      const bool pressed = ImGui::InvisibleButton(id, ImVec2(button_w, 58.0f * k), ImGuiButtonFlags_EnableNav);
       ImGui::PopStyleColor();
       if (state.menu_quit && index == 0 && state.menu_quit_focus_pending) {
         // The window stays open across views, so SetItemDefaultFocus cannot replace the old ID.
@@ -11010,23 +11022,27 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       if (activated)
         host::log("menu: activated %s", label);
       const bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
-      const ImVec2 q(p.x + x, p.y + y - (hot ? 4.0f : 0.0f));
-      const ImVec2 shadow[] = {ImVec2(q.x + 9, q.y + 7), ImVec2(q.x + button_w, q.y + 7),
-                               ImVec2(q.x + button_w - 9, q.y + 62), ImVec2(q.x, q.y + 62)};
-      const ImVec2 face[] = {ImVec2(q.x + 9, q.y), ImVec2(q.x + button_w, q.y),
-                             ImVec2(q.x + button_w - 9, q.y + 54), ImVec2(q.x, q.y + 54)};
-      draw->AddConvexPolyFilled(shadow, 4, hot ? accent_dark : IM_COL32(24, 13, 34, 245));
-      draw->AddConvexPolyFilled(face, 4, hot ? accent : IM_COL32(31, 20, 42, 245));
+      const float slant = 9.0f * k, face_h = 54.0f * k;
+      const ImVec2 q(p.x + x, p.y + y - (hot ? 4.0f * k : 0.0f));
+      const ImVec2 shadow[] = {ImVec2(q.x + slant, q.y + 7 * k), ImVec2(q.x + button_w, q.y + 7 * k),
+                               ImVec2(q.x + button_w - slant, q.y + 62 * k), ImVec2(q.x, q.y + 62 * k)};
+      const ImVec2 face[] = {ImVec2(q.x + slant, q.y), ImVec2(q.x + button_w, q.y),
+                             ImVec2(q.x + button_w - slant, q.y + face_h), ImVec2(q.x, q.y + face_h)};
+      draw->AddConvexPolyFilled(shadow, 4, hot ? accent_dark : IM_COL32(24, 13, 34, 252));
+      draw->AddConvexPolyFilled(face, 4, hot ? accent : IM_COL32(31, 20, 42, 252));
       if (settings_nav_frame_on_item()) {
         // Frame the whole button as players see it, face and the slab below it (report d6ad1693).
         const ImVec2 outline[] = {face[0], face[1], shadow[1], shadow[2], shadow[3], face[3]};
-        draw->AddPolyline(outline, 6, settings_mix_color(accent, IM_COL32_WHITE, .75f), ImDrawFlags_Closed, 2.0f);
+        draw->AddPolyline(outline, 6, settings_mix_color(accent, IM_COL32_WHITE, .75f), ImDrawFlags_Closed, 2.0f * k);
       }
-      const ImVec2 text_size = ImGui::CalcTextSize(label);
-      draw->AddText(ImVec2(q.x + (button_w - text_size.x) * .5f, q.y + (54.0f - text_size.y) * .5f),
+      const ImVec2 text_size = label_font->CalcTextSizeA(label_size, FLT_MAX, 0.0f, label);
+      draw->AddText(label_font, label_size,
+                    ImVec2(std::round(q.x + (button_w - text_size.x) * .5f), std::round(q.y + (face_h - text_size.y) * .5f)),
                     IM_COL32(255, 250, 253, 255), label);
       return activated;
     };
+    const ImVec2 hint_at(p.x + 20 * k, p.y + 140 * k);
+    const ImU32 hint_color = IM_COL32(167, 162, 178, 255);
     if (!state.menu_quit) {
       if (action("##resume", "BACK TO GAME", 0)) state.menu_open = false;
       ImGui::SetItemDefaultFocus();
@@ -11039,13 +11055,13 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         state.menu_quit = true;
         state.menu_quit_focus_pending = true;
       }
-      draw->AddText(ImVec2(p.x + 20, p.y + 144), IM_COL32(167, 162, 178, 255),
+      draw->AddText(body_font, body_size, hint_at, hint_color,
                     app ? yougame::parity::kMenuHint : "ESC  BACK TO GAME     F1  SETTINGS");
     } else {
       if (action("##confirm_quit", app ? "BACK TO YOUGAME" : "QUIT", 0)) { state.menu_open = false; state.menu_quit = false; host::request_user_exit(); }
       ImGui::SetItemDefaultFocus();
       if (action("##cancel_quit", "CANCEL", 1)) { state.menu_open = false; state.menu_quit = false; }
-      draw->AddText(ImVec2(p.x + 20, p.y + 144), IM_COL32(167, 162, 178, 255),
+      draw->AddText(body_font, body_size, hint_at, hint_color,
                     app ? yougame::parity::kMenuHint : "ENTER  SELECT     ESC  CANCEL");
     }
     ImGui::End();

@@ -40,6 +40,7 @@
 #include "gx_adapter.h"
 #include "gx_backend.h"   // solver_pair_counter, for the "gpu:" diagnostic line
 #include "pipeline_cache_store.h"
+#include "prewarm_variants.h"
 #include "gpu_readings.h"
 #ifdef MELEE_NO_SLIPPI
 #include "netplay_state.h"   // the same names, answered from the neutral netplay state
@@ -421,6 +422,9 @@ class D3D12Backend : public Backend {
     // the merged list goes to the cache root if the file there lacks some, and again whenever new
     // pipelines arrive.
     recipes_ready_ = true; cache_saver_.mark_dirty();
+    // A safe point: the prewarm's pipelines and the merged recipe list go to disk now, on the
+    // saver's thread, not only on a timed save or at exit (nothing is written when nothing changed).
+    cache_saver_.request_flush("prewarm");
     log_pipeline_stats("startup", cache_saver_.saved_bytes());
     prewarm_upscalers();
     host::loading_close();
@@ -2567,7 +2571,8 @@ void D3D12Backend::integrate_compiled_psos() {
     if (r.vs && !vs_blobs_[r.key.vs]) vs_blobs_[r.key.vs] = r.vs;
     if (r.ps && !ps_blobs_[r.key.ps]) ps_blobs_[r.key.ps] = r.ps;
     // Wireframe pipelines (Lightweight 5, cull bit 4) are not kept: the recipe holds the game's own state only.
-    if (r.pso && r.key.mvec == 0 && !(r.key.cull & 4) && pipeline_recipes_.size() < 16384) remember_recipe(r.recipe);
+    // Plain or upscaler, at any MSAA count (prewarm_variants.h): the next start builds it again from this recipe.
+    if (r.pso && prewarm_variants::keeps_recipe(r.key.mvec) && !(r.key.cull & 4) && pipeline_recipes_.size() < 16384) remember_recipe(r.recipe);
   }
 }
 
@@ -5828,6 +5833,7 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
         host::log(occluded_ ? "d3d12: window hidden, presents paused" : "d3d12: window visible, presents resumed");
       }
       yougame::parity::signals.presented(!test_only && SUCCEEDED(present_result) && frame.test_fill < 0);
+      if (!test_only && SUCCEEDED(present_result) && frame.test_fill < 0) host::startup_first_frame();
       present_wait_ += Stopwatch::now() - present_call;   // a synced Present waits for the display (see gx_d3d11.cpp)
       if (!test_only) pacing_diagnostics_.present(present_call, opts_.vsync,
           present.interval, present.flags, opts_.fps_cap, fullscreen_state_.exclusive_active);
@@ -6083,8 +6089,17 @@ void D3D12Backend::prewarm_pipelines() {
   std::unordered_set<PsoKey, PsoKeyHash> keys_seen;
   Stopwatch timer;
   // All recipes go to the compile workers at once (the pipeline library makes known ones cheap);
-  // the window title shows progress while the game waits to boot.
-  size_t queued = 0;
+  // the window title shows progress while the game waits to boot. The start waits only for the
+  // variant this session draws with (prewarm_variants.h): with an upscaler available, the other one
+  // (plain or with motion vectors for DLSS/XeSS/FSR) compiles behind it after the boot, so the first
+  // match with an upscaler switched on finds it built, and a start never waits for pipelines the
+  // previous session had no reason to save.
+  const bool session_upscaler = opts_.dlss_mode != 0 && upscaler_available() && !remix_mode_;   // configure_dlss's test
+  const bool upscaler_possible = streamline::available() || xess::available() || fsr::available();
+  const uint32_t msaa = msaa_samples_ > 1 && msaa_color_ && !opts_.path_tracing ? msaa_samples_ : 1u;   // msaa_on() without motion vectors
+  const prewarm_variants::Plan plan = prewarm_variants::plan(session_upscaler, upscaler_possible, msaa, opts_.prewarm_only);
+  std::unordered_set<PsoKey, PsoKeyHash> waited;   // queued pipelines the start waits for, until they arrive
+  std::vector<PsoJob> later;                       // the other variant: queued behind them, not waited for
   for (const auto& recipe : recipes) {
     if ((recipe.topology != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && recipe.topology != D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE) ||
         (recipe.xf[0x3F] & 15) > 8 || (recipe.xf[9] & 3) > 2) continue;
@@ -6093,29 +6108,37 @@ void D3D12Backend::prewarm_pipelines() {
     DrawCall draw{}; draw.components = recipe.components; draw.bp = recipe.bp;
     std::memcpy(draw.xf_regs, recipe.xf, sizeof(recipe.xf));
     auto topo = (D3D12_PRIMITIVE_TOPOLOGY_TYPE)recipe.topology;
-    // Both pipeline variants: plain, and with motion vectors for DLSS (otherwise the first match
-    // with DLSS on would compile everything again and skip draws meanwhile).
-    const int variants = streamline::available() || xess::available() || fsr::available() ? 2 : 1;
-    for (int mvec = 0; mvec < variants; ++mvec) {
+    for (int v = 0; v < plan.count; ++v) {
+      const prewarm_variants::Variant& variant = plan.variants[v];
       VSUid vsu = make_vs_uid(draw); PSUid psu = make_ps_uid(draw);
-      vsu.motion_vectors = psu.motion_vectors = (uint32_t)mvec;
-      PsoKey key{vsu.hash(), psu.hash(), draw.bp.blendmode() & 0xFFFF, draw.bp.zmode() & 0x1F, draw.bp.cullmode(), (uint32_t)topo, draw.bp.zcontrol() & 7, (uint32_t)mvec};
+      vsu.motion_vectors = psu.motion_vectors = prewarm_variants::motion_vectors(variant.mvec) ? 1u : 0u;
+      PsoKey key{vsu.hash(), psu.hash(), draw.bp.blendmode() & 0xFFFF, draw.bp.zmode() & 0x1F, draw.bp.cullmode(), (uint32_t)topo, draw.bp.zcontrol() & 7, variant.mvec};
       // One recipe per pipeline: recipes that only differ in state the pipeline key ignores are dropped.
-      if (psos_.count(key)) { if (mvec == 0 && keys_seen.insert(key).second) remember_recipe(recipe); continue; }
+      if (psos_.count(key)) { if (v == 0 && keys_seen.insert(key).second) remember_recipe(recipe); continue; }
       if (!psos_pending_.insert(key).second) continue;
-      if (mvec == 0) keys_seen.insert(key);
-      { std::lock_guard<std::mutex> lk(pso_mutex_); pso_jobs_.push_back(PsoJob{key, vsu, psu, topo, recipe}); }
-      ++queued;
+      if (v == 0) keys_seen.insert(key);
+      PsoJob job{key, vsu, psu, topo, recipe};
+      if (variant.wait) {
+        waited.insert(key);
+        std::lock_guard<std::mutex> lk(pso_mutex_); pso_jobs_.push_back(job);
+      } else {
+        later.push_back(job);
+      }
     }
   }
+  {  // behind every pipeline the start waits for; a draw that needs one goes ahead of them (get_pso)
+    std::lock_guard<std::mutex> lk(pso_mutex_);
+    for (auto& job : later) pso_jobs_.push_back(std::move(job));
+  }
   pso_cv_.notify_all();
-  const size_t total = psos_.size() + queued;
+  const size_t total = waited.size();
   // A cache that is already warm finishes in a moment; the progress panel only appears once the
   // wait is long enough to notice, so a normal launch never flashes it.
   const double panel_after = host::now_seconds() + 0.4;
   for (;;) {
     integrate_compiled_psos();
-    size_t pending = psos_pending_.size();
+    for (auto it = waited.begin(); it != waited.end();) it = psos_pending_.count(*it) ? std::next(it) : waited.erase(it);
+    const size_t pending = waited.size();
     wchar_t title[192]; swprintf_s(title, L"%ls  |  compiling shaders %zu / %zu", host::window_title_base().c_str(), total - pending, total);
     host::window_set_title(title);
     if (pending && host::now_seconds() >= panel_after)
@@ -6124,6 +6147,8 @@ void D3D12Backend::prewarm_pipelines() {
     { host::perf::Scope wait_cost(host::perf::Stage::Wait);
       std::this_thread::sleep_for(std::chrono::milliseconds(20)); }
   }
+  if (!later.empty())
+    host::log("d3d12: %zu pipelines for the other upscaler setting compile after the boot (not waited for)", later.size());
   host::loading_close();
   host::window_set_title(host::window_title_base().c_str());
   host::log("d3d12: prewarmed %zu pipelines from %zu recipes before guest startup in %.1f ms", psos_.size(), pipeline_recipes_.size(), timer.lap()*1000.0);

@@ -32,6 +32,9 @@ Config& config();
 
 void init();
 void load_ranked_rules();
+// The app asked for the Online menu first (--resume online after an update). Without it a game the
+// YouGame app started boots on the main menu; standalone keeps Slippi's boot to Online.
+void request_boot_online();
 std::string ranked_rules_digest(int mode); // only a verified YouGame remix Ranked session
 void shutdown();
 // Simulation tick: scene/mode changes and match starts cancel a linking sheet.

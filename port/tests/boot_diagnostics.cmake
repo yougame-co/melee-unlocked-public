@@ -11,3 +11,8 @@ add_executable(port_settings_log_test "${PROJECT_SOURCE_DIR}/port/tests/settings
 target_include_directories(port_settings_log_test PRIVATE "${PROJECT_SOURCE_DIR}/port/app")
 target_compile_features(port_settings_log_test PRIVATE cxx_std_17)
 add_test(NAME port_settings_log COMMAND port_settings_log_test)
+
+add_executable(port_startup_clock_test "${PROJECT_SOURCE_DIR}/port/tests/startup_clock_test.cpp")
+target_include_directories(port_startup_clock_test PRIVATE "${PROJECT_SOURCE_DIR}/port/runtime/host")
+target_compile_features(port_startup_clock_test PRIVATE cxx_std_17)
+add_test(NAME port_startup_clock COMMAND port_startup_clock_test)

@@ -216,7 +216,7 @@ static int reports;
 void OSReport(const char*, ...) { ++reports; }
 static struct { int mode, app_state; } slp;
 static int agent_lock_logged, friends_css_host, tournament_visible, slippi_submenu, ranked_supported, friends_return, doubles_home_return,
-  boot_oneshot, split_page, last_slot = -1, yg_open, auto_slot, p2p_auto_direct, installs, content = 99;
+  boot_oneshot, boot_main_menu, split_page, last_slot = -1, yg_open, auto_slot, p2p_auto_direct, installs, content = 99;
 void mu_mnmain_install_online_menu() { ++installs; }
 void mu_content_mode(int mode) { content = mode; }
 static int split_layout() { return 0; }

@@ -673,7 +673,7 @@ int mu_native_rtx_semantics(void)
         # Build 58: upstream v0.9.102 adds 1 (grizumi, the live Fountain of Dreams scenery).
         # Build 65: upstream v0.9.104 adds 9 (render semantics in cobj/dobj/lobj/tobj 6, Kirby hats in ftparts 2, gm_1601 1).
         # The 4-player Friends select adds 2 (the host-only Rules and Teams guards in mncharsel).
-        self.assertEqual(len(hunks), 10115)  # build 101: v0.9.120's two new patch hunks (97: v0.9.117's itzako hunk)
+        self.assertEqual(len(hunks), 10117)  # build 103: two more (results screen and main menu); build 101: v0.9.120's two new patch hunks (97: v0.9.117's itzako hunk)
         for i, h in enumerate(hunks):
             after = patch[h.end():hunks[i + 1].start() if i + 1 < len(hunks) else len(patch)]
             after = after.split('diff --git ')[0]

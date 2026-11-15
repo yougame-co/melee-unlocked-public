@@ -1,8 +1,10 @@
 // pipeline_cache_store.h and progress_frame.h: saves happen off the caller's thread, are atomic,
 // flush_all reaches every live saver and reports failed writes, holds and freezes stop timed saves
-// and every save, and the progress frame stays inside its target.
+// and every save, and the progress frame stays inside its target. prewarm_variants.h: a start waits
+// only for the pipelines this session draws with, so a second start never waits again.
 #include "pipeline_cache_store.h"
 #include "progress_frame.h"
+#include "prewarm_variants.h"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -392,6 +394,36 @@ int main(int argc, char** argv) {
     check(calls == 1);   // neither the flush nor the last save ran the producer again
     check(!cs::write_file_atomic(p.string(), "x", 1));
     check(slurp(p) == "old");
+  }
+
+  // prewarm_variants.h: the start waits for one variant, the one this session's draws use.
+  {
+    namespace pv = gx::prewarm_variants;
+    // Upscaler off on a PC that has one (XeSS on a test PC's AMD iGPU): plain waited for, motion vectors after.
+    auto p = pv::plan(false, true, 1, false);
+    check(p.count == 2);
+    check(p.variants[0].mvec == 0 && p.variants[0].wait);
+    check(p.variants[1].mvec == pv::kMotionVectors && !p.variants[1].wait);
+    // A session that saved only plain pipelines leaves nothing to wait for on the next start.
+    int waited_mvec = 0;
+    for (int i = 0; i < p.count; ++i) if (p.variants[i].wait && pv::motion_vectors(p.variants[i].mvec)) ++waited_mvec;
+    check(waited_mvec == 0);
+    // Upscaler on: the motion-vector variant is the one waited for.
+    p = pv::plan(true, true, 1, false);
+    check(p.count == 2 && p.variants[0].mvec == pv::kMotionVectors && p.variants[0].wait);
+    check(p.variants[1].mvec == 0 && !p.variants[1].wait);
+    // No upscaler on this PC: one variant only.
+    p = pv::plan(false, false, 1, false);
+    check(p.count == 1 && p.variants[0].mvec == 0 && p.variants[0].wait);
+    // MSAA: the plain key carries the sample count, as get_pso's does (msaa_samples_ << 8).
+    p = pv::plan(false, true, 4, false);
+    check(p.variants[0].mvec == (4u << 8) && p.variants[1].mvec == pv::kMotionVectors);
+    // The precompile pass ends after the prewarm: it waits for every variant.
+    p = pv::plan(false, true, 1, true);
+    check(p.count == 2 && p.variants[0].wait && p.variants[1].wait);
+    // Recipes kept: plain and upscaler at any MSAA count; never G-buffer, HUD-mask or Remix keys.
+    check(pv::keeps_recipe(0) && pv::keeps_recipe(1) && pv::keeps_recipe(4u << 8) && pv::keeps_recipe(8u << 8));
+    check(!pv::keeps_recipe(2) && !pv::keeps_recipe(8) && !pv::keeps_recipe(16 | 1) && !pv::keeps_recipe(32 | 16 | 1));
   }
 
   fs::remove_all(dir);

@@ -156,6 +156,24 @@ int main() {
         self.assertIn('boot_oneshot = 1;', boot)
         self.assertIn('return GM_MENU;', boot)
 
+    def test_yougame_start_boots_main_menu_unless_online_asked(self):
+        # Build 103: a YouGame start for a local match opens the main menu, not 1-P > Online Play.
+        # --resume online (the app's update relaunch) keeps the boot to Online.
+        host = source('port/app/source_host.cpp')
+        self.assertIn('if (g_resume_online) slippi::online::request_boot_online();', host)
+        online = source('port/runtime/hle/slippi_online.cpp')
+        query = online[online.index('case CMD_YOUGAME_RANKED:'):]
+        query = query[:query.index('if (yougame::active()) {')]
+        self.assertIn('if (yougame::active() && !g_boot_online) q[0] |= 32;', query)
+        shim = source('sourceport/game/shim/mu_slippi_menu.c')
+        for name in ('mu_slippi_ranked_line', 'mu_slippi_ranked_lines'):
+            self.assertIn('boot_main_menu = (r[0] & 32) != 0;', literal_function(shim, name))
+        enter = literal_function(shim, 'mu_slippi_menu_enter')
+        boot = enter[enter.index('if (previous_mode == GM_BOOT && boot_oneshot) {'):]
+        # Cleared before it can return, so a later menu entry never reopens Online.
+        self.assertLess(boot.index('boot_oneshot = 0;'), boot.index('if (boot_main_menu && !mu_online_p2p_menus())'))
+        self.assertLess(boot.index('mu_slippi_fetch_app_state();'), boot.index('if (boot_main_menu'))
+
     def test_refusal_precedes_generic_error(self):
         bridge = literal_function(source('port/runtime/hle/yougame_link.cpp'), 'bridge')
         self.assertLess(bridge.index('update::required(refused)'), bridge.index('if (!j.value("ok", false))'))

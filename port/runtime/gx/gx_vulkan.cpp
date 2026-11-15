@@ -1862,6 +1862,7 @@ class VulkanBackend final : public Backend {
       ++presented_;
       if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
         yougame::parity::signals.presented(real_frame);
+        if (real_frame) host::startup_first_frame();
 #ifndef _WIN32
         host::window_presented(presented_);
 #endif

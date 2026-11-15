@@ -113,6 +113,9 @@ static int installed;         /* the online major replaced GM_HANYU_CSS (main.as
 static int zelda_sheik;       /* between the online major's OnLoad and OnUnload */
 static unsigned online_loads;  /* OnLoad count: the chat shim's Sheik selector keeps its icon until the next one */
 static int boot_oneshot;      /* boot.asm's one-shot "first menu = online submenu" */
+/* FA bit 5: the host wants the main menu first (a YouGame start for a local match, build 103). The
+ * online submenu still opens first after an update's --resume online, in a P2P session and standalone. */
+static int boot_main_menu;
 static int ranked_supported;
 static int ranked_offered;
 static int friends_offered;   /* FA bit 1: YouGame Online > Friends is offered */
@@ -292,7 +295,8 @@ int mu_slippi_fetch_app_state(void)
 
 /* FA: flags, then six 128-byte presentation lines. Bit 0 offers the menu row; bit 2
  * supports YouGame Ranked text and random-stage play while the row stays hidden.
- * Bit 3 identifies an agent copy; bit 4 permits explicit local-peer test modes. */
+ * Bit 3 identifies an agent copy; bit 4 permits explicit local-peer test modes;
+ * bit 5 boots on the main menu (boot_main_menu). */
 int mu_slippi_ranked_line(unsigned int line, char* out, unsigned int cap)
 {
     u8 r[1 + 6 * 128];
@@ -305,6 +309,7 @@ int mu_slippi_ranked_line(unsigned int line, char* out, unsigned int cap)
     }
     agent_copy = (r[0] & 8) != 0;
     local_peer = (r[0] & 16) != 0;
+    boot_main_menu = (r[0] & 32) != 0;
     friends_offered = (r[0] & 2) != 0;
     ranked_supported = (r[0] & 4) != 0;
     if (out == NULL) return (r[0] & 1) != 0; /* menu visibility stays independent */
@@ -330,6 +335,7 @@ int mu_slippi_ranked_lines(char lines[6][128])
     }
     agent_copy = (r[0] & 8) != 0;
     local_peer = (r[0] & 16) != 0;
+    boot_main_menu = (r[0] & 32) != 0;
     friends_offered = (r[0] & 2) != 0;
     ranked_supported = (r[0] & 4) != 0;
     if (!ranked_supported) return 0;
@@ -855,6 +861,12 @@ int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned c
     if (previous_mode == GM_BOOT && boot_oneshot) {
         boot_oneshot = 0;
         mu_slippi_fetch_app_state();
+        /* Started from YouGame for a local match: the main menu, as the console boots (build 103).
+         * A P2P session's players are already known, so it still goes straight to Online. */
+        if (boot_main_menu && !mu_online_p2p_menus()) {
+            OSReport("online menu: boot opens the main menu (no online mode asked)\n");
+            return 0;
+        }
         *menu_kind = MENU_KIND_8;
         *hovered = (u8) mu_slippi_first_unlocked();
         if (split_layout() && yg_open) {
