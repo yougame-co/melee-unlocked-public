@@ -129,6 +129,7 @@ def main():
                     'port_yougame_pad_trace_off_test',
                     'port_yougame_console_integration_test', 'port_yougame_console_engine_test',
                     'port_yougame_console_pad_test', 'port_yougame_console_link_test', 'port_friends_retire_test', 'port_yougame_unranked_test', 'port_yougame_release_test',
+                    'port_yougame_start_test', 'port_yougame_match_state_test',
                     'port_phob_mirror_test', 'port_phob_mirror_hook_test',
                     'port_net_diagnostics_test', 'port_yg_enet_socket_test', 'port_yg_enet_posix_ring_test',
                     'port_yougame_udp_test', 'port_yougame_udp_enet_test',

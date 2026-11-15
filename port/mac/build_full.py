@@ -40,11 +40,16 @@ def main():
     parser.add_argument('--agent-test-hook', action='store_true', help='STAGING ONLY: enable agent-test.json hooks')
     parser.add_argument('--doubles', action='store_true', help='experimental console Doubles; requires a matching Doubles game library')
     parser.add_argument('--host-only', action='store_true', help='Compile and link the host without game assets or packaging')
+    parser.add_argument('--yougame-mac-tray-from', help='First shipped Mac YouGame version supporting --yougame-tray (X.Y.Z)')
     # Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
     parser.add_argument('--squad-strike', action='store_true',
                         default=squad_env(),
                         help='MELEE_SQUAD_STRIKE: enable squad host ABI (pair with an ON game library)')
     args = parser.parse_args()
+    if args.yougame_mac_tray_from:
+        parts = args.yougame_mac_tray_from.split('.')
+        if len(parts) != 3 or any(not p.isascii() or not p.isdigit() or len(p) > 5 or int(p) > 65535 for p in parts):
+            parser.error('--yougame-mac-tray-from must be three version components, each 0..65535')
     if args.squad_strike:
         os.environ['MELEE_SQUAD_STRIKE'] = 'ON'  # package_full (subprocess) resolves the same directory
     BUILD = build_dir(args.agent_test_hook, args.squad_strike)
@@ -97,6 +102,8 @@ def main():
            '-DIMGUI_IMPL_VULKAN_NO_PROTOTYPES']
     if args.doubles:
         cpp += ['-DMELEE_DOUBLES=1']
+    if args.yougame_mac_tray_from:
+        cpp += [f'-DMELEE_YOUGAME_MAC_TRAY_FROM="{args.yougame_mac_tray_from}"']
     if args.squad_strike:
         cpp += ['-DMU_SQUAD=1']
     for p in ['port/linux/compat','port/linux','port/app','port/runtime/ppc','port/runtime/hle','port/runtime/host',
@@ -155,7 +162,8 @@ def main():
         library.unlink()  # ar must not retain objects removed from the source list
     subprocess.run(['/usr/bin/ar', 'rcs', str(library), *[p for p in paths if p not in app_objects]], check=True)
     subprocess.run(['/usr/bin/clang++',*flags,*app_objects,str(library),'-L'+str(SDL/'lib'),'-lSDL2-2.0.0','-lcurl','-liconv',
-                    '-framework','OpenGL','-framework','AppKit','-framework','CoreGraphics','-framework','Security','-Wl,-pagezero_size,0x10000',
+                    '-framework','OpenGL','-framework','AppKit','-framework','CoreGraphics','-framework','Security',
+                    '-framework','CoreServices','-framework','CoreFoundation','-Wl,-pagezero_size,0x10000',
                     '-Wl,-rpath,@executable_path/../Frameworks','-Wl,-rpath,'+str(SDL/'lib'),
                     '-o',str(BUILD/'MeleeUnlocked')],check=True)
     (BUILD/'build-manifest.json').write_text(json.dumps({'version':version,

@@ -1,0 +1,24 @@
+--- a/.github/workflows/yougame-windows-build.yml
++++ b/.github/workflows/yougame-windows-build.yml
+@@ -180,6 +180,21 @@
+       - name: Prepare public native sources and build AVX2 and SSE2 game DLLs (MinGW)
+         run: ./tools/ci/build-windows.ps1 -Step dll
+ 
++      - name: Gecko function table check (reported, not fatal)
++        if: always()
++        continue-on-error: true
++        run: |
++          $Work = Join-Path $env:RUNNER_TEMP 'yougame-ci'
++          $Mingw = Join-Path $env:RUNNER_TEMP 'winlibs/mingw64'
++          $Logs = Join-Path $Work 'logs'
++          New-Item -ItemType Directory -Force $Logs | Out-Null
++          # clone_bases uses nm from PATH; DWARF uses this same verified toolchain's objdump.
++          $env:PATH = "$Mingw/bin;$env:PATH"
++          python tools/gecko_functions.py --check --objdump "$Mingw/bin/objdump.exe" "$Work/build-game/melee_game.dbg" "$Work/build-game-compat/melee_game.dbg" *> "$Logs/gecko-check.log"
++          if ($LASTEXITCODE -eq 0) { 'GECKO-CHECK OK' } else { 'GECKO-CHECK FAILED (see logs/gecko-check.log)' }
++          Get-Content "$Logs/gecko-check.log" -Tail 20
++          exit 0
++
+       - name: Build staging and production AVX2 and SSE2 hosts (MSVC, Source only)
+         run: ./tools/ci/build-windows.ps1 -Step host
+ 

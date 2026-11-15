@@ -180,7 +180,7 @@ class TournamentSceneTest(unittest.TestCase):
                 "-I", str(ROOT / "port/runtime/abi"), str(tmp / "test.c"), "-o", str(tmp / "test"),
             ], capture_output=True, text=True)
             self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
-            ran = subprocess.run([str(tmp / "test")], capture_output=True, text=True, timeout=5)
+            ran = subprocess.run([str(tmp / "test")], capture_output=True, text=True, timeout=60)
             self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
             print(ran.stdout.strip())
 

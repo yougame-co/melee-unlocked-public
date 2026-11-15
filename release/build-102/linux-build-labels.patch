@@ -1,0 +1,17 @@
+--- a/.github/workflows/yougame-linux-build.yml
++++ b/.github/workflows/yougame-linux-build.yml
+@@ -1,4 +1,4 @@
+-name: YouGame Linux package + nosp library (build 101)
++name: YouGame Linux package + nosp library (build 102)
+ 
+ # Runs only on a push to yg-ci-linux-* (one CI branch per build) or by hand. No disc, no game data: the full
+ # Source Port's two generated headers are the approved fact headers (tools/ci/linux-gen, the same bytes and
+@@ -72,7 +72,7 @@
+           readelf -p .comment $B/melee_game.so | grep GCC | sort -u
+           cp $B/melee_game.so $B/melee_game.snapexcl "$O/"
+           echo "digest: NOT RUN (library-only run)" > "$O/digest-nosp.txt.NOT-RUN"
+-          (cd "$O" && { echo "fork yougame-co/melee-unlocked ${{ github.ref_name }} ${{ github.sha }} (build 101 tip + CI files)"; sha256sum melee_game.so melee_game.snapexcl card-compile-line.txt nm-stack-chk.txt; } > SHA256SUMS)
++          (cd "$O" && { echo "fork yougame-co/melee-unlocked ${{ github.ref_name }} ${{ github.sha }} (build 102 tip + CI files)"; sha256sum melee_game.so melee_game.snapexcl card-compile-line.txt nm-stack-chk.txt; } > SHA256SUMS)
+           cat "$O/SHA256SUMS"
+       - uses: actions/upload-artifact@v4
+         with:

@@ -893,6 +893,9 @@ void handle_online_inputs(const uint8_t* payload, uint32_t size, std::vector<uin
   uint8_t delay = payload[12];
   const uint8_t* inputs = payload + 13;
   if (frame == 1) {
+    // A same-ticket rematch reopens presence even if its previous summary/report is still pending.
+    // Repeated frame 1 polls are deduplicated by the host worker's atomic edge counter.
+    if (!is_disconnected()) yougame::online_match_state(true);
     if (!g_summary.active && !is_disconnected()) {
 #ifdef MELEE_DOUBLES
       if (doubles_route()) {
@@ -1543,6 +1546,7 @@ std::atomic<bool> g_online_menu_visible{false};
 void prepare_online_match_state(std::vector<uint8_t>& q) {
   // The guest polls again on returning to CSS. End the match flag, retaining the peer and room.
   if (g_in_online_match && yougame::unranked::keep_css(yougame::active(), (int)g_last_search.mode)) {
+    yougame::online_match_state(false);
     g_in_online_match = false;
     host::log("yougame: match over, back to the character screen");
   }
@@ -2128,6 +2132,7 @@ void prepare_online_status(std::vector<uint8_t>& q) {
 
 static void finish_summary(const char* result) {
   if (!g_summary.active) return;
+  yougame::online_match_state(false);
   g_summary.active = false;
   host::log("%s", g_summary.line(g_rollbacks - g_match_rollbacks_start, g_match_stalls,
                                g_checksums_mismatched, result).c_str());

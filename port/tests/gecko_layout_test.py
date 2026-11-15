@@ -16,6 +16,15 @@ import gecko_targets  # noqa: E402
 
 
 class GeckoLayoutTest(unittest.TestCase):
+    def test_linux_neutral_respawn_clone_cannot_be_half_patched(self):
+        root = Path(__file__).resolve().parents[2]
+        shim = root / 'sourceport/game/shim'
+        entry = 'MU_GECKO_FN(0x8016719Cu, fn_8016719C, 0x00)'
+        self.assertNotIn(entry, (shim / 'mu_gecko_functions_linux.inc').read_text())
+        self.assertIn(entry, (shim / 'mu_gecko_functions.inc').read_text())
+        # The console symbol stays in the host map; only Linux's native patch eligibility changes.
+        self.assertIn('"fn_8016719C"', (root / 'port/runtime/host/user_gecko_targets.h').read_text())
+
     def test_results_upgrade_matches_new_generated_caves(self):
         header = Path(__file__).resolve().parents[1] / "runtime/hle/offline_results_code_policy.h"
         text = header.read_text()

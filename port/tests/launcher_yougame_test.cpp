@@ -92,6 +92,12 @@ int main(int argc, char** argv) {
     CHECK(parse_request("garbage\r\n\r\n", r) == -1);
   }
   Fake f;
+  // An older launcher may refuse best-effort match hints. Neither edge consumes a ticket.
+  for (bool open : {true, false, true, false}) {
+    const json hint = call(f, post(json{{"type", "matchState"}, {"open", open}}.dump()));
+    CHECK(hint["ok"] == false && hint["code"] == "unsupported");
+    CHECK(f.last_ticket.empty());
+  }
   // Refusals: wrong token, browser origin, another host name, wrong path.
   {
     int status = 0;

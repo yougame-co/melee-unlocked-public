@@ -6,7 +6,7 @@
  *
  *   yg_start_options o = {0};
  *   o.game = "your-game-slug";               the game's address on YouGame: yougame.co/g/<slug>
- *   o.tray_from = "0.13.1407";               Windows: the first YouGame version with the tray start
+ *   o.tray_from = "0.13.1407";               first shipped quiet-start version for the target OS
  *   yg_start(&o);                            then carry on starting the game, whatever it returns
  *
  * It never brings up YouGame's client window or a game page, and never brings a running YouGame
@@ -28,12 +28,15 @@
  *      its file version is at least `tray_from`, and the game does not run as administrator: it
  *      starts that same file (checked again once started, before it runs) with the tray link
  *      yougame[-staging]://tray, so YouGame starts with no window, only its tray icon.
+ *      macOS checks its bundle identity, version and Developer ID signature, then uses
+ *      /usr/bin/open -g -j -a <bundle> --args --yougame-tray: hidden, in the background, menu bar
+ *      icon only (Dock icon kept). The update-marker branch remains Windows-only.
  *      YG_START_OPENED. With `open_wait_ms` set and YouGame not up in that time, the small window
  *      below says "YouGame didn't open".
  *      Otherwise nothing is started and the small window says why: "YouGame needs an update" when
  *      the installed version is older than `tray_from` (or its file version cannot be read), else
- *      "YouGame isn't running" (also when its version texts cannot be read). macOS and Linux
- *      always take this path: the app has no tray start there yet.
+ *      "YouGame isn't running" (also when its identity cannot be read). Linux always takes this
+ *      path: a Linux desktop may have no tray.
  *   3. YouGame is not on this computer: the small window says "Play online with YouGame".
  * The small window is YouGame's own, with two buttons: "Get YouGame" opens YouGame's download page
  * in the browser (YG_START_OFFERED); "Not now" or closing it returns YG_START_DECLINED. It waits for
@@ -53,7 +56,7 @@
  *     there is no window and the result is YG_START_DECLINED.
  * It downloads nothing. The only programs it starts, after the player's answer or the checks above:
  * on Windows the signed YouGame program at its install location, with the tray link (never when
- * the game runs as administrator); everywhere the system's opener for one fixed https address (the
+ * the game runs as administrator); on Mac codesign and open for the verified bundle; everywhere the system's opener for one fixed https address (the
  * download page); on Linux also zenity or kdialog (the small window). All by absolute path. On macOS and Linux a game
  * that ignores SIGCHLD or reaps every child itself makes those answers read as failures.
  *
@@ -96,7 +99,7 @@ extern "C" {
 
 typedef enum yg_start_result {
   YG_START_RUNNING = 0,     /* YouGame is running: nothing was shown */
-  YG_START_OPENED = 1,      /* Windows: YouGame was installed and has been started in the tray */
+  YG_START_OPENED = 1,      /* Windows/macOS: installed YouGame was started quietly */
   YG_START_OFFERED = 2,     /* the small window was shown and the player pressed Get YouGame;
                                the download page is open */
   YG_START_DECLINED = 3,    /* the small window was shown and the player pressed Not now (or closed
@@ -178,8 +181,8 @@ static const char *const yg__start_texts[4][2] = {
 #define YG__START_WIDE_(s) L##s
 #define YG__START_WIDE(s) YG__START_WIDE_(s)
 
-/* What a tray start attempt came to (Windows; the test seam drives it everywhere). */
-#define YG__START_TRAY_STARTED 0 /* the verified program was started with the tray link */
+/* What a tray start attempt came to (Windows and macOS; the test seam drives it everywhere). */
+#define YG__START_TRAY_STARTED 0 /* the verified app was started with the tray link or Mac flag */
 #define YG__START_TRAY_OLD 1     /* its version is older than tray_from, or could not be read */
 #define YG__START_TRAY_REFUSED 2 /* no usable program, not the YouGame app, or not signed */
 #define YG__START_TRAY_FAILED 3  /* verified, but starting it failed */
@@ -657,11 +660,206 @@ static int yg__start_version_reached(const unsigned have[3], const char *to) {
 }
 #endif
 
+#if defined(__APPLE__) || defined(YOUGAME_START_TESTING)
+/* Pure Mac adapters are shared with the seam tests; no real helpers run in those tests. */
+#include <limits.h>
+#ifndef PATH_MAX /* MSVC builds of the seam tests */
+#define PATH_MAX 1024
+#endif
+/* codesign --strict on a large bundle on a cold disk may approach this 8 s deadline.
+   A timeout reads as FAILED; the game keeps running and can retry. */
+#define YG__START_CODESIGN_MS 8000u
+#define YG__START_OPEN_MS 5000u
+static void yg__start_sleep(unsigned ms);
+static unsigned long yg__start_ms(void);
+static int yg__start_running(int staging);
+
+/* LaunchServices may finish launching even after the open child was killed at its deadline; the
+   app's socket can take a moment more, so look up to three times, 250 ms apart. */
+static int yg__start_mac_opened(int waited, int staging) {
+  int tries;
+  if (waited == 1) return 1;
+  if (waited != -1) return 0;
+  for (tries = 0; tries < 3; ++tries) {
+    if (tries) yg__start_sleep(250);
+    if (yg__start_running(staging)) return 1;
+  }
+  return 0;
+}
+
+/* poll_child: 0 pending (including EINTR), 1 clean exit, -1 failed/reaped elsewhere.
+   stop_child kills and reaps. Return -1 only for a deadline, 0 for another failure. */
+static int yg__start_mac_wait(unsigned deadline, int (*poll_child)(void *),
+                              void (*stop_child)(void *), void *child) {
+  unsigned slept = 0;
+  unsigned long start = yg__start_ms();
+  for (;;) {
+    unsigned long elapsed = (yg__start_ms() - start) & 0xFFFFFFFFUL;
+    unsigned step;
+    int result;
+    if (elapsed >= deadline || slept >= deadline) {
+      stop_child(child);
+      return -1;
+    }
+    result = poll_child(child);
+    if (result) return result > 0;
+    elapsed = (yg__start_ms() - start) & 0xFFFFFFFFUL;
+    if (elapsed >= deadline) continue;
+    step = deadline - (unsigned)elapsed;
+    if (step > deadline - slept) step = deadline - slept;
+    if (step > 50) step = 50;
+    yg__start_sleep(step);
+    slept += step; /* also bounds the wait if the clock fails */
+  }
+}
+
+static int yg__start_mac_requirement(int staging, char *out, size_t cap) {
+  /* codesign -R reads its argument as requirement text only after a leading "=" (else a file path:
+     "invalid requirement specification", so every installed app read as unsigned). */
+  const char *base = "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists "
+    "and certificate leaf[field.1.2.840.113635.100.6.1.13] exists "
+    "and certificate leaf[subject.OU] = \"4894SAXKGG\" and identifier ";
+  int n = snprintf(out, cap, "%s%s", base,
+    staging ? "co.yougame.desktop.staging" : "co.yougame.desktop");
+  return n >= 0 && (size_t)n < cap;
+}
+
+static void yg__start_mac_verify_argv(char *path, char *requirement, char *argv[8]) {
+  argv[0] = (char *)"/usr/bin/codesign";
+  argv[1] = (char *)"--verify";
+  argv[2] = (char *)"--strict";
+  argv[3] = (char *)"--all-architectures";
+  argv[4] = (char *)"-R";
+  argv[5] = requirement;
+  argv[6] = path;
+  argv[7] = NULL;
+}
+
+static void yg__start_mac_open_argv(char *path, char *argv[8]) {
+  argv[0] = (char *)"/usr/bin/open";
+  argv[1] = (char *)"-g";
+  argv[2] = (char *)"-j";
+  argv[3] = (char *)"-a";
+  argv[4] = path;
+  argv[5] = (char *)"--args";
+  argv[6] = (char *)"--yougame-tray";
+  argv[7] = NULL;
+}
+
+/* Keep ordinary launcher variables, but never app/test switches or Electron/Node overrides.
+   LaunchServices does not pass open's caller environment to the app anyway; filter both helpers
+   as well so neither helper inherits these controls. The returned pointer array is caller-owned. */
+static char **yg__start_mac_environment(char *const source[]) {
+  size_t n = 0, kept = 0, i;
+  char **out;
+  while (source[n]) ++n;
+  if (n > (size_t)-1 / sizeof *out - 1) return NULL;
+  out = (char **)malloc((n + 1) * sizeof *out);
+  if (!out) return NULL;
+  for (i = 0; i < n; ++i) {
+    if (!strncmp(source[i], "YOUGAME_", 8) || !strncmp(source[i], "ELECTRON_", 9) ||
+        !strncmp(source[i], "NODE_OPTIONS=", 13) || !strcmp(source[i], "NODE_OPTIONS")) continue;
+    out[kept++] = source[i];
+  }
+  out[kept] = NULL;
+  return out;
+}
+
+static int yg__start_mac_owner_ok(unsigned long owner, unsigned long user) {
+  return owner == 0 || owner == user;
+}
+
+/* Audit every link, including links inside another link's target, reusing the same buffers.
+   link_target checks ownership and refuses any lstat/readlink failure. At most 40 links. */
+static int yg__start_mac_links_ok(const char *path,
+                                 int (*link_target)(const char *, char *, size_t)) {
+  char prefix[PATH_MAX], target[PATH_MAX], next[PATH_MAX];
+  unsigned links = 0;
+  size_t n = strlen(path);
+  if (path[0] != '/' || n >= sizeof next) return 0;
+  memcpy(next, path, n + 1);
+  for (;;) {
+    size_t i;
+    n = strlen(next);
+    memcpy(prefix, next, n + 1);
+    for (i = 1; i <= n; ++i) {
+      int link, written;
+      char saved;
+      size_t parent = i;
+      if (next[i] && next[i] != '/') continue;
+      saved = prefix[i];
+      prefix[i] = 0;
+      link = link_target(prefix, target, sizeof target);
+      prefix[i] = saved;
+      if (link < 0) return 0;
+      if (!link) continue;
+      if (++links > 40) return 0;
+      while (parent && prefix[parent - 1] != '/') --parent;
+      written = target[0] == '/' ? snprintf(next, sizeof next, "%s%s", target, prefix + i) :
+        snprintf(next, sizeof next, "%.*s%s%s", (int)parent, prefix, target, prefix + i);
+      if (written < 0 || (size_t)written >= sizeof next) return 0;
+      break;
+    }
+    if (i > n) return 1;
+  }
+}
+
+static int yg__start_mac_bundle_ok(unsigned long owner, unsigned long user,
+                                  unsigned mode, int directory) {
+  return directory && yg__start_mac_owner_ok(owner, user) && !(mode & 0022u);
+}
+
+/* Match desktop/src/os-handlers.ts's development exclusions. Resolved paths have no dot parts.
+   Additionally restrict quiet starts to Applications folders; mounted/build copies must not run. */
+static int yg__start_mac_candidate(const char *path, const char *home) {
+  const char *p;
+  char lower[4096];
+  size_t n, i, h;
+  int rank = 0;
+  if (!path || path[0] != '/') return 0;
+  n = strlen(path);
+  if (n < 5 || n >= sizeof lower) return 0;
+  for (i = 0; i <= n; ++i)
+    lower[i] = path[i] >= 'A' && path[i] <= 'Z' ? (char)(path[i] + ('a' - 'A')) : path[i];
+  if (strcmp(lower + n - 4, ".app")) return 0;
+  if (!strncmp(path, "/Applications/", 14)) rank = 2;
+  h = home ? strlen(home) : 0;
+  while (h > 1 && home[h - 1] == '/') --h;
+  if (!rank && h > 1 && home[0] == '/' && !strncmp(path, home, h) &&
+      !strncmp(path + h, "/Applications/", 14)) rank = 1;
+  if (!rank) return 0;
+  if (strstr(lower, "/apptranslocation/") || strstr(lower, "/volumes/") ||
+      strstr(lower, "worktree") || strstr(lower, "/.claude/") ||
+      strstr(lower, "/release-staging/") || strstr(path, "/desktop/release/")) return 0;
+  for (p = lower; (p = strstr(p, "/release/mac")) != NULL; ++p)
+    if (p[12] == '/' || p[12] == '-') return 0;
+  for (p = lower; *p; ++p) {
+    const char *end;
+    if (*p == '/' && (p[1] == '/' || (p[1] == '.' &&
+        (p[2] == '/' || (p[2] == '.' && p[3] == '/'))))) return 0;
+    /* os-handlers also excludes win[-arch]-unpacked and linux[-arch]-unpacked folders. */
+    end = *p == '/' ? strchr(p + 1, '/') : NULL;
+    if (end && end - p >= 13 && !strncmp(end - 9, "-unpacked", 9) &&
+        (!strncmp(p + 1, "win-", 4) || !strncmp(p + 1, "linux-", 6))) return 0;
+    /* The executable must be inside this bundle, not an outer .app's nested helper. */
+    if (!strncmp(p, ".app/", 5)) return 0;
+  }
+  return rank;
+}
+
+static int yg__start_mac_prefer(const char *path, const char *home, int best) {
+  int rank = yg__start_mac_candidate(path, home);
+  return rank > best ? rank : 0;
+}
+#endif
+
 #ifdef YOUGAME_START_TESTING
 /* The test translation unit defines these; no OS calls, apps or windows in seam builds. */
 typedef struct yg__start_app { int id; } yg__start_app;
-static int yg__start_test_windows; /* 1 = take Windows' tray path, 0 = macOS/Linux */
-#define YG__START_TRAY_SYSTEM yg__start_test_windows
+static int yg__start_test_windows; /* Windows tray and update-marker path */
+static int yg__start_test_macos; /* macOS tray path, without update markers; both 0 = Linux */
+#define YG__START_TRAY_SYSTEM (yg__start_test_windows || yg__start_test_macos)
+#define YG__START_UPDATE_SYSTEM yg__start_test_windows
 static int yg__start_running(int staging);
 static int yg__start_installed(int staging);
 static int yg__start_app_find(int staging, yg__start_app *app);
@@ -698,6 +896,7 @@ static int yg__start_marker(int staging, yg__start_mark *mark, char to[YG__START
 #endif
 
 #define YG__START_TRAY_SYSTEM 1
+#define YG__START_UPDATE_SYSTEM 1
 #ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
 #define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
 #endif
@@ -1502,6 +1701,9 @@ static int yg__start_offer(int which) {
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreServices/CoreServices.h>
 #include <crt_externs.h>
+#include <pwd.h>
+#include <sys/mount.h>
+#include <time.h>
 #define YG__START_ENVIRON (*_NSGetEnviron())
 #else
 #include <dirent.h>
@@ -1509,8 +1711,12 @@ extern char **environ;
 #define YG__START_ENVIRON environ
 #endif
 
-/* The app has no tray start on macOS or Linux yet: an installed YouGame is never started here. */
+/* A Mac has a menu bar; a Linux desktop need not have a tray. */
+#ifdef __APPLE__
+#define YG__START_TRAY_SYSTEM 1
+#else
 #define YG__START_TRAY_SYSTEM 0
+#endif
 
 static void yg__start_sleep(unsigned ms) { poll(NULL, 0, (int)ms); }
 
@@ -1624,6 +1830,8 @@ static int yg__start_spawn(const char *prog, char *const argv[], pid_t *pid) {
   int rc, attr_ok = 0;
   short flags = POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF;
 #ifdef __APPLE__
+  char **filtered = yg__start_mac_environment(YG__START_ENVIRON);
+  if (!filtered) return 0;
   flags |= POSIX_SPAWN_CLOEXEC_DEFAULT; /* only the descriptors the actions name reach the child */
 #endif
   sigemptyset(&none);
@@ -1649,19 +1857,49 @@ static int yg__start_spawn(const char *prog, char *const argv[], pid_t *pid) {
 #ifdef __linux__
     if (!rc && !yg__start_close_others(&fa)) rc = EMFILE;
 #endif
-    if (!rc) rc = posix_spawn(pid, prog, &fa, &attr, argv, YG__START_ENVIRON);
+    if (!rc) rc = posix_spawn(pid, prog, &fa, &attr, argv,
+#ifdef __APPLE__
+                             filtered
+#else
+                             YG__START_ENVIRON
+#endif
+                             );
     posix_spawn_file_actions_destroy(&fa);
   }
   if (attr_ok) posix_spawnattr_destroy(&attr);
+#ifdef __APPLE__
+  free(filtered);
+#endif
   return rc == 0;
 }
 
+#ifdef __APPLE__
+static int yg__start_mac_poll_child(void *child) {
+  pid_t pid = *(pid_t *)child, rc;
+  int status;
+  rc = waitpid(pid, &status, WNOHANG);
+  if (!rc || (rc < 0 && errno == EINTR)) return 0;
+  return rc == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 1 : -1;
+}
+
+static void yg__start_mac_stop_child(void *child) {
+  pid_t pid = *(pid_t *)child;
+  int status;
+  (void)kill(pid, SIGKILL);
+  while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+}
+
+static int yg__start_wait(pid_t pid, unsigned deadline) {
+  return yg__start_mac_wait(deadline, yg__start_mac_poll_child, yg__start_mac_stop_child, &pid);
+}
+#else
 static int yg__start_wait(pid_t pid) {
   int status;
   pid_t rc;
   do { rc = waitpid(pid, &status, 0); } while (rc < 0 && errno == EINTR);
   return rc == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
+#endif
 
 #ifdef __linux__
 /* xdg-open may live until a browser closes; reap it without holding up the game. */
@@ -1687,7 +1925,7 @@ static int yg__start_shell_open(const char *url) {
   argv[2] = NULL;
   if (!yg__start_spawn(prog, argv, &pid)) return 0;
 #ifdef __APPLE__
-  return yg__start_wait(pid);
+  return yg__start_wait(pid, YG__START_OPEN_MS) == 1;
 #else
   {
     pthread_t thread;
@@ -1746,19 +1984,150 @@ static void yg__start_xdg(const char *var, const char *fallback, char *out, size
 }
 #endif
 
-/* Installed = an app is registered for YouGame's link type. Only looked up: nothing is opened or
+#ifdef __APPLE__
+/* LaunchServices finds a bundle by flavour, never by a game-supplied path or URL. */
+typedef struct yg__start_app {
+  CFURLRef url;
+  CFBundleRef bundle;
+  char path[PATH_MAX];
+  int staging;
+} yg__start_app;
+
+static CFStringRef yg__start_bundle_id(int staging) {
+  return staging ? CFSTR("co.yougame.desktop.staging") : CFSTR("co.yougame.desktop");
+}
+
+/* 0 for a non-link, 1 for an allowed link's target, -1 for any refusal or read failure. */
+static int yg__start_mac_link_target(const char *path, char *target, size_t cap) {
+  struct stat st;
+  ssize_t len;
+  if (lstat(path, &st)) return -1;
+  if (!S_ISLNK(st.st_mode)) return 0;
+  if (!yg__start_mac_owner_ok((unsigned long)st.st_uid, (unsigned long)getuid())) return -1;
+  len = readlink(path, target, cap - 1);
+  if (len < 0 || (size_t)len >= cap - 1) return -1;
+  target[len] = 0;
+  return 1;
+}
+
+static int yg__start_mac_resolve(const char *path, const char *home, char resolved[PATH_MAX]) {
+  struct stat st;
+  struct statfs volume;
+  char parent[PATH_MAX], *slash;
+  /* Resolve once. All metadata reads, codesign and open then use this exact resolved string.
+     Full running-image binding cannot happen before execution with open/LaunchServices. An
+     attacker who can write the bundle can already replace the app the user starts by hand;
+     Windows has the same model (its hook additionally checks a suspended image). */
+  if (!yg__start_mac_candidate(path, home) || !yg__start_mac_links_ok(path, yg__start_mac_link_target) ||
+      !realpath(path, resolved) || !yg__start_mac_candidate(resolved, home) ||
+      lstat(resolved, &st) ||
+      !yg__start_mac_bundle_ok((unsigned long)st.st_uid, (unsigned long)getuid(),
+                               (unsigned)st.st_mode, S_ISDIR(st.st_mode))) return 0;
+  /* desktop's installation.installed rejects read-only volumes and unwritable parents too. */
+  if (statfs(resolved, &volume) || (volume.f_flags & MNT_RDONLY)) return 0;
+  strcpy(parent, resolved);
+  slash = strrchr(parent, '/');
+  if (!slash) return 0;
+  *slash = 0;
+  return access(parent, W_OK) == 0;
+}
+
+static int yg__start_app_find(int staging, yg__start_app *app) {
+  CFArrayRef urls = LSCopyApplicationURLsForBundleIdentifier(yg__start_bundle_id(staging), NULL);
+  struct passwd *user = getpwuid(getuid());
+  const char *home = user ? user->pw_dir : NULL;
+  int best = 0;
+  memset(app, 0, sizeof *app);
+  app->staging = staging;
+  if (urls) {
+    CFIndex i;
+    for (i = 0; i < CFArrayGetCount(urls); ++i) {
+      char path[PATH_MAX], resolved[PATH_MAX];
+      CFURLRef url = (CFURLRef)CFArrayGetValueAtIndex(urls, i), resolved_url;
+      CFBundleRef bundle;
+      int rank;
+      if (!CFURLGetFileSystemRepresentation(url, true, (UInt8 *)path, sizeof path) ||
+          !yg__start_mac_resolve(path, home, resolved)) continue;
+      rank = yg__start_mac_prefer(resolved, home, best);
+      if (!rank) continue;
+      resolved_url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)resolved,
+                                                            (CFIndex)strlen(resolved), true);
+      if (!resolved_url) continue;
+      bundle = CFBundleCreate(NULL, resolved_url);
+      if (!bundle) { CFRelease(resolved_url); continue; }
+      if (app->bundle) CFRelease(app->bundle);
+      if (app->url) CFRelease(app->url);
+      app->url = resolved_url;
+      app->bundle = bundle;
+      strcpy(app->path, resolved);
+      best = rank;
+    }
+    CFRelease(urls);
+  }
+  if (app->bundle) return 1;
+  if (app->url) CFRelease(app->url);
+  app->url = NULL;
+  return 0;
+}
+
+static void yg__start_app_close(yg__start_app *app) {
+  CFRelease(app->bundle);
+  CFRelease(app->url);
+}
+
+static int yg__start_app_named(yg__start_app *app, int staging) {
+  CFStringRef ident = CFBundleGetIdentifier(app->bundle);
+  CFTypeRef kind = CFBundleGetValueForInfoDictionaryKey(app->bundle, CFSTR("CFBundlePackageType"));
+  return ident && CFEqual(ident, yg__start_bundle_id(staging)) && kind && CFEqual(kind, CFSTR("APPL"));
+}
+
+static int yg__start_app_version(yg__start_app *app, unsigned have[3]) {
+  char text[32];
+  CFTypeRef v = CFBundleGetValueForInfoDictionaryKey(app->bundle, CFSTR("CFBundleShortVersionString"));
+  return v && CFGetTypeID(v) == CFStringGetTypeID() &&
+    CFStringGetCString((CFStringRef)v, text, sizeof text, kCFStringEncodingASCII) &&
+    yg__start_version_parse(text, have);
+}
+
+/* Offline code-signature verification, including sealed resources (nested code is sealed by them; no
+   --deep, which re-verifies every helper and doubles the time a game waits). Pin the same
+   Developer ID team as desktop/src/orca-policy.ts, and this flavour's signed bundle identifier.
+   No Gatekeeper assessment, shell, output, or certificate download. */
+static int yg__start_app_signed(yg__start_app *app) {
+  char requirement[512];
+  char *argv[8];
+  pid_t pid;
+  if (!yg__start_mac_requirement(app->staging, requirement, sizeof requirement)) return 0;
+  yg__start_mac_verify_argv(app->path, requirement, argv);
+  if (!yg__start_spawn(argv[0], argv, &pid)) return 0;
+  return yg__start_wait(pid, YG__START_CODESIGN_MS);
+}
+
+/* -g leaves the game in front, -j hides the app, --args reaches Electron's argv. Use the
+   verified bundle path (-a), rather than resolving its identifier again after verification. */
+static int yg__start_app_launch(yg__start_app *app, int staging) {
+  char *argv[8];
+  pid_t pid;
+  yg__start_mac_open_argv(app->path, argv);
+  if (!yg__start_spawn(argv[0], argv, &pid)) return 0;
+  return yg__start_mac_opened(yg__start_wait(pid, YG__START_OPEN_MS), staging);
+}
+
+static unsigned long yg__start_ms(void) {
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now)) return 0;
+  return ((unsigned long)now.tv_sec * 1000UL + (unsigned long)now.tv_nsec / 1000000UL) & 0xFFFFFFFFUL;
+}
+#endif
+
+/* Installed = a Mac bundle of this flavour, or an app registered for YouGame's link type. Only looked up: nothing is opened or
    started (Linux reads the association files itself rather than running xdg-mime). */
 static int yg__start_installed(int staging) {
 #ifdef __APPLE__
-  CFURLRef url = CFURLCreateWithString(NULL, staging ? CFSTR("yougame-staging://g/x") : CFSTR("yougame://g/x"), NULL);
-  CFURLRef app = NULL;
-  int found;
-  if (!url) return 0;
-  app = LSCopyDefaultApplicationURLForURL(url, kLSRolesAll, NULL);
-  CFRelease(url);
-  found = app != NULL;
-  if (app) CFRelease(app);
-  return found;
+  yg__start_app app;
+  if (!yg__start_app_find(staging, &app)) return 0;
+  yg__start_app_close(&app);
+  return 1;
 #else
   /* The files xdg-mime and the desktops read for a user's handler (the app's own xdg-settings call
      writes the first), then the caches a packaged install's desktop entry lands in. */
@@ -1828,26 +2197,28 @@ static int yg__start_offer(int which) {
 }
 #endif /* platform implementation */
 
-#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
-/* Windows' tray start, in the order that keeps one file from check to start: find and hold the
-   program, check it is the YouGame app (name and version texts), its version, its signature, then
-   start it (bound to the held file). */
+#if defined(_WIN32) || defined(__APPLE__) || defined(YOUGAME_START_TESTING)
+/* Windows and macOS: find the app, check its identity, version and signature, then launch it
+   quietly. Windows additionally holds and binds the executable throughout these checks. */
 static int yg__start_tray(int staging, const unsigned want[3], unsigned have[3]) {
   yg__start_app app;
-  int r;
+  int r, signature;
   if (!yg__start_app_find(staging, &app)) return YG__START_TRAY_REFUSED;
   if (!yg__start_app_named(&app, staging))
     r = YG__START_TRAY_REFUSED;
   else if (!yg__start_app_version(&app, have) || !yg__start_version_at_least(have, want))
     r = YG__START_TRAY_OLD;
-  else if (!yg__start_app_signed(&app))
-    r = YG__START_TRAY_REFUSED;
+  else if ((signature = yg__start_app_signed(&app)) <= 0)
+    r = signature < 0 ? YG__START_TRAY_FAILED : YG__START_TRAY_REFUSED;
   else
     r = yg__start_app_launch(&app, staging) ? YG__START_TRAY_STARTED : YG__START_TRAY_FAILED;
   yg__start_app_close(&app);
   return r;
 }
 
+#endif
+
+#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
 /* The marker's `to` is already installed: the registered program's file version
    (yg__start_installed_version, which never blocks an installer) reaches `to`
    (yg__start_version_reached). A program that cannot be read (an installer may be replacing it
@@ -1888,16 +2259,16 @@ yg_start_result yg_start(const yg_start_options *o) {
   /* YouGame quit to install an update: a fact, so quiet runs report it too, and nothing is started
      or shown. Taken whether or not the link type is registered right now, since an installer may
      drop and rewrite it while it runs, unless the installed YouGame already has the marker's version
-     and the marker file is at least 20 s old (a finished update, including installer post-steps). Windows only (YG__START_TRAY_SYSTEM): macOS and
+     and the marker file is at least 20 s old (a finished update, including installer post-steps). Windows only (YG__START_UPDATE_SYSTEM): macOS and
      Linux have no marker, so it is not even looked for there. */
   mark.looked = 0;
-  if (YG__START_TRAY_SYSTEM && yg__start_marker(staging, &mark, to) &&
+  if (YG__START_UPDATE_SYSTEM && yg__start_marker(staging, &mark, to) &&
       (mark.age_ms < 20000 || !yg__start_update_done(staging, to)))
     return yg__start_updating(o, to);
 #endif
   if (quiet) return installed ? YG_START_INSTALLED : YG_START_MISSING;
   text = installed ? YG__START_TEXT_NOT_RUNNING : YG__START_TEXT_MISSING;
-#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
+#if defined(_WIN32) || defined(__APPLE__) || defined(YOUGAME_START_TESTING)
   if (installed && YG__START_TRAY_SYSTEM && !o->no_open) {
     unsigned want[3], have[3] = {0, 0, 0};
     if (yg__start_version_parse(o->tray_from, want)) {
@@ -1905,7 +2276,7 @@ yg_start_result yg_start(const yg_start_options *o) {
       if (tray == YG__START_TRAY_OLD) text = YG__START_TEXT_UPDATE;
       else if (tray == YG__START_TRAY_FAILED) text = YG__START_TEXT_DIDNT_OPEN;
       else if (tray == YG__START_TRAY_STARTED) {
-        /* Polled every 500 ms: the channel first, then the update marker. The wait is bounded by
+        /* Polled every 500 ms: the channel first, then (Windows only) the update marker. The wait is bounded by
            the clock as well as by the sleeps it adds up, so slow checks never stretch it. */
         unsigned wait = o->open_wait_ms > 60000 ? 60000 : o->open_wait_ms, waited = 0;
         unsigned long start, elapsed;
@@ -1918,18 +2289,20 @@ yg_start_result yg_start(const yg_start_options *o) {
           elapsed = (yg__start_ms() - start) & 0xFFFFFFFFUL;
           if (elapsed > waited) waited = elapsed < wait ? (unsigned)elapsed : wait;
           if (yg__start_running(staging)) return YG_START_OPENED;
+#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
           /* An older YouGame that finds an update quits to install it: say so, not "didn't open".
              The version it was started at (have) tells a leftover marker from a new one. */
-          if (yg__start_marker(staging, &mark, to) &&
+          if (YG__START_UPDATE_SYSTEM && yg__start_marker(staging, &mark, to) &&
               (mark.age_ms < 20000 || !yg__start_version_reached(have, to)))
             return yg__start_updating(o, to);
+#endif
         }
         text = YG__START_TEXT_DIDNT_OPEN;
       }
     }
   }
 #else
-  /* macOS and Linux: no tray start, so these go unused there. */
+  /* Linux: no tray start, so these go unused there. */
   (void)yg__start_version_parse;
   (void)yg__start_version_at_least;
   (void)yg__start_sleep;

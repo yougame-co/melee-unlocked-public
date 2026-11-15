@@ -47,6 +47,8 @@ namespace mode_policy { enum class ModRefusal; }
 // environment (so nothing the game starts inherits them) and, in stdio mode, starts reading the
 // app's lines, so the player box's commands are heard from the first frame.
 void start();
+// Host-only, lock-free handoff to the best-effort match hint worker. Never affects gameplay.
+void online_match_state(bool open);
 
 // Launched by the YouGame desktop app (including Slippi-routed Unranked).
 bool active();

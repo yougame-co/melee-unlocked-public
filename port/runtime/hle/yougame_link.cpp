@@ -37,6 +37,7 @@
 #include "yougame_squad.h"
 #endif
 #include "yougame_search.h"
+#include "yougame_match_state.h"
 #include "gameplay_policy.h"
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include "yougame_agent_static.h"
@@ -82,13 +83,14 @@ extern char** environ;
 
 using json = nlohmann::json;
 
-// YouGame's start hook (MIT, YouGame's engines/native, claude/v2 8dfb30680). Built on Windows only for now:
-// elsewhere yg_start answers UNAVAILABLE, as in build 98, until the macOS and Linux paths are checked.
-#ifdef _WIN32
+// YouGame's native headers (MIT, engines/native, claude/v2 0b5798f46). The start hook is enabled on
+// Windows and macOS; Linux keeps its existing UNAVAILABLE behaviour.
+#if defined(_WIN32) || defined(__APPLE__)
 #define YOUGAME_START_IMPLEMENTATION
 #endif
 #include "../../third_party/yougame_start/yougame_start.h"
-#ifndef _WIN32
+#include "../../third_party/yougame_start/yougame.h"
+#if !defined(_WIN32) && !defined(__APPLE__)
 extern "C" yg_start_result yg_start(const yg_start_options*) { return YG_START_UNAVAILABLE; }
 #endif
 
@@ -273,7 +275,7 @@ void write_line(const std::string& line) {
   if (out && out != INVALID_HANDLE_VALUE) WriteFile(out, data.data(), (DWORD)data.size(), &wrote, nullptr);
 }
 
-// Only tournament writes use this cancellable path; ordinary SDK requests keep write_line.
+// Deadline-limited writes use this cancellable path; ordinary SDK requests keep write_line.
 bool tournament_write_line(const std::string& line, tourney::Deadline deadline) {
   std::packaged_task<bool()> task([data = line + "\n", deadline] {
     std::unique_lock<std::mutex> lock(g_io.write_mutex, std::defer_lock);
@@ -822,6 +824,22 @@ json bridge(const json& body, int timeout_ms = 15000, const std::function<bool()
   // Linking accepts the documented direct answer as well as the bridge result envelope.
   if (body.value("type", "") == "slippiLink") return j;
   return j.count("result") ? j["result"] : json::object();
+}
+
+// MU already owns stdio and the local channel. This narrow yg_match_state adapter uses that
+// transport instead of starting yougame.h's second reader. Only the host worker calls it, with
+// no callback: even update_required and every other refusal are ignored, without bridge()'s
+// UI/account/update policy. No answer or SDK result is ever used by the simulation.
+void yg_match_state(int open, yg_callback, void*) {
+  const json body = {{"type", "matchState"}, {"open", open != 0}};
+  if (g_stdio) bridge_stdio(body, 1000, {}, tourney::DeliveryClock::now() + std::chrono::seconds(1));
+  else if (g_channel_allowed) {
+    if (g_channel_up) bridge_channel(body, 1000);
+  } else if (!g_bridge_url.empty()) bridge_http(body, 1000);
+}
+match_state::Worker& match_hint_worker() {
+  static match_state::Worker worker;
+  return worker;
 }
 
 // Every attempt and reconnect shares one deadline, including locks and stdout.
@@ -2638,6 +2656,12 @@ void start() {
   }
   // Nothing is logged here: this runs before the log file is open, and an early line would send the
   // whole log to stdout, which in stdio mode is the bridge. fetch_identity says which mode this is.
+  try { match_hint_worker().start([](int open) { yg_match_state(open, nullptr, nullptr); }); }
+  catch (...) {} // A host without resources for hints still starts the game.
+}
+
+void online_match_state(bool open) {
+  match_hint_worker().set(open);
 }
 
 bool active() { return g_stdio || (!g_launcher && !g_bridge_url.empty() && !g_bridge_token.empty()); }
@@ -2770,8 +2794,8 @@ const char* start_result_name(int r) {
   }
 }
 // YouGame's start hook (yougame_start.h): YouGame running, nothing; not on this computer, YouGame's own
-// small window (Get YouGame / Not now). Installed but not running: YouGame 0.13.1407 or newer is started
-// hidden in the tray (signed program at its install folder, never when the game runs as administrator);
+// small window (Get YouGame / Not now). Installed but not running: a verified, recent YouGame starts
+// hidden in the tray/menu bar (the header checks identity, signature and the minimum OS version);
 // an older one gets the small window saying it needs an update (a standalone game never
 // brings up YouGame's client window). Blocks while YouGame's window is up, so it never runs on the
 // game's frame.
@@ -2780,7 +2804,14 @@ int run_start_hook(const char* why, bool automated) {
   o.game = "melee-unlocked";
   o.staging = 1;
   o.quiet = 1;   // first only look
-  o.tray_from = "0.13.1407"; // the first YouGame that starts hidden in the tray
+#ifdef __APPLE__
+  // The Windows floor does not imply Mac argv support. Supply the first shipped Mac build.
+#ifdef MELEE_YOUGAME_MAC_TRAY_FROM
+  o.tray_from = MELEE_YOUGAME_MAC_TRAY_FROM;
+#endif
+#else
+  o.tray_from = "0.13.1407"; // the first Windows YouGame that starts hidden in the tray
+#endif
   int r = yg_start(&o);
   const bool quiet = start_hook_quiet(automated);
   if ((r == YG_START_MISSING || r == YG_START_INSTALLED) && !quiet) {
@@ -2802,7 +2833,7 @@ void online_menu_opened() {
   // Never waits: this runs on the game's frame. A host found now opens the rows on the next visit.
   start_channel_probe(false);
   if (!coming_soon()) return;
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
   return;   // the start hook ran at game start; the client window is never opened from here
 #endif
   // YouGame installed but not running: open it once per run by itself (the first row offers it again).
@@ -2826,7 +2857,7 @@ void open_get_page() {
   host::log(ok ? "yougame: Get YouGame picked: download page opened" : "yougame: Get YouGame picked: download page could not be opened");
 }
 void first_row_picked() {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
   // Ranked, Unranked or Friends before YouGame was connected: YouGame's start hook, off the game's
   // frame, then look for YouGame's channel every second for a minute (the Online menu keeps looking
   // after that and continues into the row once the rows open).
@@ -4659,6 +4690,7 @@ void game_started(int64_t rng, int stage) {
 }
 
 void game_ended(const GameEnd& end) {
+  online_match_state(false); // End presence now, even when a ranked result waits for its report.
   std::lock_guard<std::mutex> lock(g_mutex);
   if (!g_room || !g_room->in_game) return;   // one report per game, however many places say it ended
   if (ranked::no_contest_waits_for_report(end.end_method, end.has_placements, g_room->ranked)) {
@@ -4838,6 +4870,7 @@ uint8_t local_rank() {
 }
 
 void end_session(Leave why) {
+  online_match_state(false);
   close_room(why);
   { std::lock_guard<std::mutex> lock(g_mutex); select_match_transport(false); }
   set_status("offline");
