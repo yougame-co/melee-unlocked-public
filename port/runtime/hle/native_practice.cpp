@@ -785,11 +785,22 @@ void tick() {
     if (g_bridge) { int32_t a[1] = {}; g_bridge(OP_FRIENDS_RETURN,a,1); }
     else request_major(1);
   }
-  // The Doubles row's press (menu value 16) is taken every tick, before any early return, and used this
-  // tick or dropped: one made while signing in, or anywhere the home can't open yet, never opens one later.
-  bool doubles_press = slippi::online::take_doubles_lobby_request();
-  if (yougame::console::console_active()) return;
-  if (friends_lobby.held()) return; // local CSS remains interactive; the room worker owns preparation
+  // The Doubles row's press (menu value 16) is taken every tick, before any early return. One made while
+  // signing in, or anywhere the home can't open, is dropped and never opens one later. The one wait: the
+  // menu counts as safe only 120 ticks after it was entered, and a press in that window was dropped, so a
+  // quick player had to press again (report a405af23, 11-17). That press is kept for up to 3 s while the
+  // Online menu stays up, and used when the menu is safe.
+  static bool doubles_pending = false;
+  static std::chrono::steady_clock::time_point doubles_pressed_at;
+  if (slippi::online::take_doubles_lobby_request()) {
+    doubles_pending = true;
+    doubles_pressed_at = std::chrono::steady_clock::now();
+  }
+  if (doubles_pending && (current_major() != 1 || std::chrono::steady_clock::now() - doubles_pressed_at > std::chrono::seconds(3)))
+    doubles_pending = false;
+  bool& doubles_press = doubles_pending;
+  if (yougame::console::console_active()) { doubles_pending = false; return; }
+  if (friends_lobby.held()) { doubles_pending = false; return; } // local CSS remains interactive; the room worker owns preparation
   // This tick runs at retrace even while the scene is frozen. No game state is
   // accessed by the stdin reader; online sessions never touch these pause flags.
   if (yougame::stdio_bridge()) {

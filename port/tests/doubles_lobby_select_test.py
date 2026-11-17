@@ -68,11 +68,14 @@ class DoublesRowOpensTheHome(unittest.TestCase):
         # Review G2 #5: the request is taken once per tick, before any early return, so a press that could
         # not open the home (signing in, not on the menu) never opens one later.
         tick = body(self.practice, 'void tick()')
-        take = 'bool doubles_press = slippi::online::take_doubles_lobby_request();'
+        # A press made before the menu is safe (its first 120 ticks) is kept up to 3 s on the Online menu
+        # (report a405af23): the early returns and leaving the menu still drop it.
+        take = 'if (slippi::online::take_doubles_lobby_request()) {'
         self.assertEqual(self.practice.count('take_doubles_lobby_request()'), 1)
         self.assertIn(take, tick)
-        self.assertLess(tick.index(take), tick.index('if (yougame::console::console_active()) return;'))
-        self.assertLess(tick.index(take), tick.index('if (friends_lobby.held()) return;'))
+        self.assertIn('current_major() != 1 || std::chrono::steady_clock::now() - doubles_pressed_at > std::chrono::seconds(3)', tick)
+        self.assertLess(tick.index(take), tick.index('if (yougame::console::console_active()) { doubles_pending = false; return; }'))
+        self.assertLess(tick.index(take), tick.index('if (friends_lobby.held()) { doubles_pending = false; return; }'))
         # Without identity, the Doubles row says what the Friends row says.
         refused = tick[tick.index('if (doubles_press && picker_scene) {'):]
         refused = refused[:refused.index('doubles_press = false;')]

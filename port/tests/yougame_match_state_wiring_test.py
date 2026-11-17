@@ -16,7 +16,8 @@ class MatchStateWiring(unittest.TestCase):
             # 114: YouGame v2 6db35802e raised rule (UAC off / Windows Sandbox: an elevated game whose shell is the same elevated user starts YouGame).
             # 120: yougame_start.h verbatim from YouGame v2 4b69a7a28 (o.ask: LATER at launch, ON_USE at the press; Play offline).
             # 120: then YouGame claude/c3-window-d258 063f1abcf (the drawn C3 window, o.name).
-            'yougame_start.h': '45d1ee496491320256160cf4449eca9123731c4fda1f05d046c7799f8861ea76',
+            # 121: then YouGame claude/v2 efdafa604 (PR 2413: /desktop?from=game&game=<slug>, long names wrap).
+            'yougame_start.h': '4fc1fa941a9875b4d9b76cf0de86bbbed441e7d4c38a59b8d25f1af497a86a9e',
             'yougame.h': 'f0796dd3ab37c6cc6ae96c554458f6638cadeff7268962d99da54baf9b9839de',
         }.items():
             self.assertEqual(hashlib.sha256((ROOT / 'port/third_party/yougame_start' / name).read_bytes()).hexdigest(), digest)

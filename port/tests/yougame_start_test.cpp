@@ -19,7 +19,7 @@ static int yg__start_app_version(yg__start_app*, unsigned have[3]) { std::memcpy
 static int yg__start_app_signed(yg__start_app*) { return signed_ok; }
 static int yg__start_app_launch(yg__start_app*, int) { ++launches; return 1; }
 static void yg__start_app_close(yg__start_app*) {}
-static int yg__start_shell_open(const char* url) { CHECK(!std::strcmp(url, "https://yougame.co/desktop")); ++opened_page; return 1; }
+static int yg__start_shell_open(const char* url) { CHECK(!std::strcmp(url, "https://yougame.co/desktop?from=game&game=melee-unlocked")); ++opened_page; return 1; }
 static int yg__start_offer(const yg__start_win* w) { ++offers; last_offer = w->which; last_on_use = w->on_use; return answer; }
 static int yg__start_offline(int, const char*, int) { return 0; }   // MU asks on use: never an at-start mark
 static int yg__start_quiet_env() { return 0; }

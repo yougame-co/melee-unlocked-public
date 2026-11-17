@@ -507,7 +507,10 @@ int mu_slippi_css_inputs(unsigned int trigger)
     case MU_SLP_MM_MATCHMAKING:
     case MU_SLP_MM_OPPONENT_CONNECTING:
     case MU_SLP_MM_ERROR:
-        if (trigger & HSD_PAD_Z) {
+        /* An error also clears on A or B: the keyboard's Z key is the pad's A (E is Z), so a keyboard
+         * player pressing the "Z" the screen names was stuck there until the game was killed (11-17). */
+        if ((trigger & HSD_PAD_Z) ||
+            (m->connection_state == MU_SLP_MM_ERROR && (trigger & (HSD_PAD_A | HSD_PAD_B)))) {
             mu_slippi_cleanup_connections();
         }
         /* A YouGame row while YouGame is on an older release: Start restarts in that release (the

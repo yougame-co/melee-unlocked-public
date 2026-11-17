@@ -2056,7 +2056,9 @@ static HFONT yg__start_font(float px, int weight) {
                      CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 }
 
-/* The height of text in font f wrapped to width (or one line when width is 0), and its width. */
+/* The height of text in font f wrapped to width (or one line when width is 0), and its width.
+   DT_EDITCONTROL also breaks a word wider than the line (a long name with no spaces), here and
+   where the text is drawn, so the window grows to fit instead of cutting it off. */
 static int yg__start_measure(HDC dc, HFONT f, const char *s, int width, int *out_w) {
   wchar_t t[YG__START_BODY_CAP];
   RECT r;
@@ -2065,7 +2067,7 @@ static int yg__start_measure(HDC dc, HFONT f, const char *s, int width, int *out
   r.right = width ? width : 4000;
   r.bottom = 0;
   if (yg__start_wide(s, t, YG__START_BODY_CAP))
-    DrawTextW(dc, t, -1, &r, DT_CALCRECT | DT_NOPREFIX | (width ? DT_WORDBREAK : DT_SINGLELINE));
+    DrawTextW(dc, t, -1, &r, DT_CALCRECT | DT_NOPREFIX | (width ? DT_WORDBREAK | DT_EDITCONTROL : DT_SINGLELINE));
   SelectObject(dc, old);
   if (out_w) *out_w = r.right - r.left;
   return r.bottom - r.top;
@@ -2213,8 +2215,8 @@ static int yg__start_ui_build(yg__start_ui *u) {
     }
   }
   GdiFlush();
-  yg__start_text(u->dc, u->f_title, w->title, &u->title, YG__START_C_TITLE, DT_WORDBREAK | DT_LEFT | DT_TOP);
-  yg__start_text(u->dc, u->f_body, w->body, &u->body, YG__START_C_BODY, DT_WORDBREAK | DT_LEFT | DT_TOP);
+  yg__start_text(u->dc, u->f_title, w->title, &u->title, YG__START_C_TITLE, DT_WORDBREAK | DT_EDITCONTROL | DT_LEFT | DT_TOP);
+  yg__start_text(u->dc, u->f_body, w->body, &u->body, YG__START_C_BODY, DT_WORDBREAK | DT_EDITCONTROL | DT_LEFT | DT_TOP);
   {
     RECT r;
     SetRect(&r, 0, u->brand_y, u->side, u->ch);
@@ -3409,8 +3411,13 @@ yg_start_result yg_start(const yg_start_options *o) {
   }
 #endif
   if (answer != YG__START_ANSWER_GET) return YG_START_DECLINED;
-  if (!yg__start_shell_open(staging ? "https://staging.yougame.co/desktop" : "https://yougame.co/desktop"))
-    return YG_START_UNAVAILABLE;
+  /* Which game sent the player (o->game is a checked plain slug), so the download page can name it. */
+  {
+    char url[160];
+    int n = snprintf(url, sizeof url, "%s/desktop?from=game&game=%s",
+                     staging ? "https://staging.yougame.co" : "https://yougame.co", o->game);
+    if (n <= 0 || (size_t)n >= sizeof url || !yg__start_shell_open(url)) return YG_START_UNAVAILABLE;
+  }
   return YG_START_OFFERED;
 }
 #else

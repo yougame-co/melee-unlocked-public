@@ -222,7 +222,13 @@ class Model {
         }
       }
       // The browser sign-in ran: asked for, or an app older than v2 that ignores the mode (no code).
+      // Since YouGame efdafa604 the browser answer carries the /link page's code too: shown under the
+      // line in case the browser opened behind the game.
       code_.clear();
+      if (asked == Ask::Browser && result.count("code") && result["code"].is_object()) {
+        const nlohmann::json& c = result["code"];
+        if (c.count("user_code") && c["user_code"].is_string()) code_ = c["user_code"].get<std::string>();
+      }
       screen_ = text_of(result, "where") == "overlay" ? Screen::Window : Screen::Browser;
       return Ask::None;
     }
@@ -312,7 +318,7 @@ class Model {
       case Screen::Expired: v.buttons[0] = Button::NewCode; v.buttons[1] = Button::Browser; v.buttons[2] = Button::Back; break;
       case Screen::Failed: v.buttons[0] = Button::TryAgain; v.buttons[1] = Button::Browser; v.buttons[2] = Button::Back; break;
       case Screen::NotYet: v.buttons[0] = Button::Browser; v.buttons[1] = Button::Back; break;
-      case Screen::Browser:
+      case Screen::Browser: v.user_code = code_; v.buttons[0] = Button::Back; break;
       case Screen::Window: v.buttons[0] = Button::Back; break;
       case Screen::SignedIn:
         v.message = name_.empty() ? std::string(kSignedIn) : std::string(kSignedInAs) + " " + name_;

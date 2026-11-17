@@ -1216,7 +1216,8 @@ void D3D12Backend::init() {
   // and a plain factory and device are made instead (the game starts without DLSS).
   for (int attempt = 0; attempt < 2 && !device_; ++attempt) {
   if (attempt == 1 && !streamline::device_faulted()) break;
-  factory.Reset();
+  try { adapter.Reset(); } catch (const std::system_error&) {}
+  try { factory.Reset(); } catch (const std::system_error&) {}
   check(create_factory(true, factory.GetAddressOf()), "factory");
   if (attempt == 0) {
     // Every GPU in the order they are tried, so a report shows when a machine has more than one.
@@ -1244,7 +1245,16 @@ void D3D12Backend::init() {
       texture_budget_bytes_ = replacement_budget_;
       g_vram_total = (float)((double)desc.DedicatedVideoMemory / 1073741824.0);   // the card's own size, for the VRAM meter
       adapter.As(&adapter3_);   // for the VRAM meter (Windows 10 and later)
+      const bool faulted_before = streamline::device_faulted();
       streamline::set_device(device_.Get());
+      if (!faulted_before && streamline::device_faulted()) {
+        // Streamline faulted taking the device: drop its proxy device (a throw from its broken locks
+        // only leaks it) and make a plain one on the next attempt.
+        try { device_.Reset(); } catch (const std::system_error&) {}
+        try { adapter3_.Reset(); } catch (const std::system_error&) {}
+        g_vram_total = 0;
+        break;
+      }
       streamline::dlss_supported(adapter.Get());
       if (!exe_dir_.empty()) xess::init(exe_dir_, device_.Get());
       if (!exe_dir_.empty()) fsr::init(exe_dir_, device_.Get());

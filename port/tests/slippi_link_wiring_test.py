@@ -83,14 +83,14 @@ MuSlippiMenuState* mu_slippi_state() { return &state; }
 enum { MU_SLP_MM_IDLE, MU_SLP_MM_INITIALIZING, MU_SLP_MM_MATCHMAKING, MU_SLP_MM_OPPONENT_CONNECTING,
 MU_SLP_MM_CONNECTION_SUCCESS, MU_SLP_MM_ERROR, MU_SLP_MODE_RANKED=0, MU_SLP_MODE_UNRANKED=1,
 MU_SLP_MODE_DIRECT=2,MU_SLP_MODE_TEAMS=3,MU_SLP_MODE_PARTY=4,MU_SLP_WINNER_NULL=-1,
-HSD_PAD_Z=0x10,HSD_PAD_X=0x400,HSD_PAD_Y=0x800,HSD_PAD_START=0x1000,SB_RAND=-2,
+HSD_PAD_Z=0x10,HSD_PAD_A=0x100,HSD_PAD_B=0x200,HSD_PAD_X=0x400,HSD_PAD_Y=0x800,HSD_PAD_START=0x1000,SB_RAND=-2,
 MU_YG_PRACTICE_START=1,MU_YG_PRACTICE_STOP=2 };
 struct MuMatchState { u8 connection_state,local_ready; };
 struct { MuMatchState msrb; u8 prev_lock_in,prev_connected; int chat_window_opened; u8 doubles_searched; } dt;
 int doubles_teams() { return 0; } void mu_slippi_sss_find_match() { std::abort(); }   // the 4-peer Doubles CSS: off here
 int starts,searches,setups,requests,cleanups; unsigned char chosen=1;unsigned char* char_chosen=&chosen;
 void lbAudioAx_80024030(int) {} int mu_online_p2p_menus() { return 0; }
-int mu_slippi_practice_available() { return 0; }
+int mu_slippi_practice_available() { return 0; } void mu_slippi_sss_report_pick(int) {}
 int mu_ranked_practice_control(int) { ++starts; return 1; }
 int gm_801A4BB8() { return 1; }
 void lock_in_and_search(int) { ++searches; } void load_code_entry() { ++setups; }
@@ -106,13 +106,13 @@ int main() {
  int checks=0;
  for(int mode=1;mode<=4;++mode)for(int conn : {MU_SLP_MM_MATCHMAKING,MU_SLP_MM_ERROR}) {
   state.mode=mode;dt.msrb.connection_state=conn;
-  for(unsigned button : {unsigned(HSD_PAD_Z),unsigned(HSD_PAD_X),unsigned(HSD_PAD_Y),unsigned(HSD_PAD_Y|HSD_PAD_Z)}) {
+  for(unsigned button : {unsigned(HSD_PAD_Z),unsigned(HSD_PAD_X),unsigned(HSD_PAD_Y),unsigned(HSD_PAD_Y|HSD_PAD_Z),unsigned(HSD_PAD_A),unsigned(HSD_PAD_B)}) {
    starts=searches=setups=requests=cleanups=0;
    if(mu_slippi_css_inputs(button)!=0 || starts || searches || setups)std::abort();
-   if(requests!=(button==HSD_PAD_Y) || cleanups!=bool(button&HSD_PAD_Z))std::abort();++checks;
+   if(requests!=(button==HSD_PAD_Y) || cleanups!=bool(button&(conn==MU_SLP_MM_ERROR ? HSD_PAD_Z|HSD_PAD_A|HSD_PAD_B : HSD_PAD_Z)))std::abort();++checks;
   }
  }
- std::printf("search/refusal Z/X/Y: %d combinations, no search/setup/practice\n",checks);
+ std::printf("search/refusal Z/X/Y/A/B (an error clears on A, B or Z): %d combinations, no search/setup/practice\n",checks);
 }
 '''
         menu.OnlineMenuTest().compile_fixture('slippi-link-input', '#include <initializer_list>\n' + stubs + inputs + cases, '-DYOUGAME_RANKED_BRANCH=1')

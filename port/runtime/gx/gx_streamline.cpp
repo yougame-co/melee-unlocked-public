@@ -339,7 +339,19 @@ long d3d12_create_device(void* adapter, int fl, const void* riid, void** out) {
 bool device_faulted() { return g_device_faulted; }
 void set_device(ID3D12Device* device) {
   if (!g_ready) return;
-  sl::Result res = driver_call([&] { return slSetD3DDevice(device); });
+  // MELEE_TEST_SL_SET_DEVICE_FAULT=1 (tests only): Streamline answers as its own exception handler does.
+  sl::Result res = host::test_env::getenv("MELEE_TEST_SL_SET_DEVICE_FAULT") ? sl::Result::eErrorExceptionHandler
+                 : driver_call([&] { return slSetD3DDevice(device); });
+  if (res == sl::Result::eErrorExceptionHandler || g_driver_failed) {
+    // Streamline caught a fault of its own while taking the device (seen on an RTX 4060). Its state,
+    // locks included, is no longer sound, and the next call through its proxy device stopped the game
+    // with "device or resource busy". The renderer starts over on a plain device without it.
+    host::log("dlss: Streamline faulted while taking the device (%d); starting without DLSS, Reflex and frame generation", (int)res);
+    g_device_faulted = true;
+    g_ready = false;
+    g_dlss_ok = g_fg_ok = g_rr_ok = g_reflex_ok = false;
+    return;
+  }
   if (res != sl::Result::eOk) { host::log("dlss: slSetD3DDevice failed (%d)", (int)res); g_dlss_ok = false; return; }
   sl::FeatureRequirements req{};
   g_dlss_ok = driver_call([&] { return slGetFeatureRequirements(sl::kFeatureDLSS, req); }) == sl::Result::eOk;

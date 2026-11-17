@@ -3191,6 +3191,11 @@ void sign_in_send(signin::Ask ask) {
     for (signin::Ask next = ask; next != signin::Ask::None;) {
       const signin::Ask asked = next;
       json answer;
+#ifdef _WIN32
+      // The game is the foreground process: let the browser the app opens come to the front instead of
+      // only flashing in the taskbar behind the game (YouGame efdafa604).
+      AllowSetForegroundWindow(ASFW_ANY);
+#endif
       try { answer = bridge_channel(asked == signin::Ask::Code ? signin::code_request() : signin::browser_request(), 15000); }
       catch (const std::exception&) { answer = json(); }
       if (!answer.is_object()) host::log("yougame sign-in: %s asked: no answer", ask_name(asked));
