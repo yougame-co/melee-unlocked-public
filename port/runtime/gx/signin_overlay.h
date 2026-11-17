@@ -6,6 +6,8 @@
 // press, B or Esc for Back), and the game gets no input while the panel is up.
 // The same panel says "Play online with YouGame" (yougame_signin.h Reach) when a YouGame row is picked
 // with no YouGame connected: why it can't start, with Open YouGame or Get YouGame, and Back.
+// And "Update to play online" (yougame_signin.h Update) when a search over the local channel was refused
+// as out of date: Update, its progress with Cancel, then Restart now.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 

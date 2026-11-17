@@ -196,6 +196,9 @@ void lobby_invite(const std::string& room, const std::function<bool()>& cancelle
 void doubles_invite(const std::string& room, const std::function<bool()>& cancelled);
 std::string slippi_link_status(const std::string& status);
 void blend_slippi_stopped(uint64_t epoch, const std::string& reason);
+// Blended Unranked ended with no match on either side (not left by the player): an out-of-date refusal its
+// YouGame side kept (yougame_signin.h Update) is offered now, never while Slippi's side may still match.
+void blend_over(uint64_t epoch);
 
 // Retire any previous YouGame room before selecting plain UDP for a Slippi search.
 bool prepare_slippi_match(const std::function<bool()>& cancelled, uint64_t epoch = 0);

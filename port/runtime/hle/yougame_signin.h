@@ -53,8 +53,25 @@ constexpr const char* kAdmin = "Melee Unlocked was started as administrator, so 
 constexpr const char* kOpening = "Opening YouGame...";
 constexpr const char* kOpenApp = "Open YouGame";
 constexpr const char* kGetApp = "Get YouGame";
+constexpr const char* kPlayOffline = "Play offline";   // the panel's dismiss, as YouGame's own window says it
 constexpr const char* kDidntOpen = "YouGame didn't open.";
 constexpr const char* kPageOpen = "The download page is open in your browser. Install YouGame, open it, then pick this again.";
+// "Update to play online" (Update below): a search refused because this copy is out of date.
+constexpr const char* kUpdateTitle = "Update to play online";
+constexpr const char* kOutOfDate = "This copy of Melee is out of date";   // + " (the latest is 1.2.3)" + "."
+constexpr const char* kUpdateIt = "Update it to play online.";
+constexpr const char* kGetLatest = "Get the latest from YouGame, then play online.";   // a copy YouGame didn't install
+constexpr const char* kOpenToUpdate = "Open YouGame to update it, then play online.";  // an app with no updateGame yet
+constexpr const char* kUpdating = "Updating...";                                       // "Updating... 42%"
+constexpr const char* kUpdateReady = "The update is ready.";                           // no version named
+constexpr const char* kRestarting = "Restarting...";
+constexpr const char* kRestartFailed = "Couldn't restart. Close the game and start it again.";
+constexpr const char* kUpdateFailed = "The update didn't finish.";
+constexpr const char* kLatest = "You have the latest. Try again.";
+constexpr const char* kNoCheck = "YouGame couldn't check for updates. Try again.";
+constexpr const char* kUpdate = "Update";
+constexpr const char* kCancel = "Cancel";
+constexpr const char* kRestartNow = "Restart now";
 
 inline nlohmann::json code_request() { return {{"type", "signIn"}, {"mode", "code"}}; }
 inline nlohmann::json browser_request() { return {{"type", "signIn"}, {"mode", "browser"}}; }
@@ -111,10 +128,22 @@ enum class Screen {
   NoApp,      // Online play needs the YouGame app: Get YouGame, Back
   Admin,      // run as administrator: Back
   Opening,    // Opening YouGame...: Back
+  // Update: this copy is out of date
+  UpdateOffered,      // out of date: Update, Play offline
+  UpdateChecking,     // Updating... (updateGame asked, or asked again after not_checked): Cancel
+  UpdateDownloading,  // Updating... 42%: Cancel, Play offline (the download carries on)
+  UpdateReady,        // Version X is ready.: Restart now, Play offline
+  UpdateRestarting,   // Restarting... (restartGame asked)
+  UpdateRestartFailed,// Couldn't restart...: Play offline
+  UpdateFailed,       // The update didn't finish. (or YouGame didn't answer.): Try again, Play offline
+  UpdateNotAppCopy,   // a copy YouGame didn't install: get the latest from YouGame; Play offline
+  UpdateOldApp,       // an app that answers updateGame with notYet: today's "Open YouGame to update it"
+  UpdateLatest,       // You have the latest. Try again.: Back
+  UpdateNoCheck,      // YouGame couldn't check for updates. Try again.: Try again, Play offline
 };
 enum class Ask { None, Code, Browser };
 // What the panel offers, in order. The first is where the cursor starts.
-enum class Button { None, NewCode, TryAgain, Browser, Back, OpenApp, GetApp };
+enum class Button { None, NewCode, TryAgain, Browser, Back, OpenApp, GetApp, Offline, Update, Cancel, Restart };
 
 struct View {
   Screen screen = Screen::Closed;
@@ -161,6 +190,10 @@ class Model {
       case Button::Back: close(); return Ask::None;
       case Button::OpenApp:
       case Button::GetApp:
+      case Button::Offline:   // the Play online and Update panels', never this panel's
+      case Button::Update:
+      case Button::Cancel:
+      case Button::Restart:
       case Button::None: break;
     }
     return Ask::None;
@@ -290,6 +323,17 @@ class Model {
       case Screen::NoApp:
       case Screen::Admin:
       case Screen::Opening:
+      case Screen::UpdateOffered:
+      case Screen::UpdateChecking:
+      case Screen::UpdateDownloading:
+      case Screen::UpdateReady:
+      case Screen::UpdateRestarting:
+      case Screen::UpdateRestartFailed:
+      case Screen::UpdateFailed:
+      case Screen::UpdateNotAppCopy:
+      case Screen::UpdateOldApp:
+      case Screen::UpdateLatest:
+      case Screen::UpdateNoCheck:
       case Screen::Closed: break;
     }
     return v;
@@ -354,18 +398,18 @@ class Reach {
     v.screen = screen_;
     v.title = kReachTitle;
     switch (screen_) {
-      case Screen::Looking: v.message = kLooking; v.buttons[0] = Button::Back; break;
-      case Screen::Opening: v.message = kOpening; v.buttons[0] = Button::Back; break;
-      case Screen::Admin: v.message = kAdmin; v.buttons[0] = Button::Back; break;
+      case Screen::Looking: v.message = kLooking; v.buttons[0] = Button::Offline; break;
+      case Screen::Opening: v.message = kOpening; v.buttons[0] = Button::Offline; break;
+      case Screen::Admin: v.message = kAdmin; v.buttons[0] = Button::Offline; break;
       case Screen::AppClosed:
         v.message = failed_ ? note_ + " Open YouGame to try again, or get the latest YouGame." : std::string(kAppClosed);
         v.buttons[0] = Button::OpenApp;
-        if (failed_) { v.buttons[1] = Button::GetApp; v.buttons[2] = Button::Back; }
-        else v.buttons[1] = Button::Back;
+        if (failed_) { v.buttons[1] = Button::GetApp; v.buttons[2] = Button::Offline; }
+        else v.buttons[1] = Button::Offline;
         break;
       case Screen::NoApp:
         v.message = kNoApp;
-        v.buttons[0] = Button::GetApp; v.buttons[1] = Button::Back;
+        v.buttons[0] = Button::GetApp; v.buttons[1] = Button::Offline;
         break;
       default: v.screen = Screen::Closed; break;
     }
@@ -377,6 +421,217 @@ class Reach {
   Screen screen_ = Screen::Closed;
   std::string note_;
   bool page_ = false, failed_ = false;
+};
+
+// "Update to play online": a copy of Melee started on its own, connected to YouGame over the local channel,
+// whose search was refused as out of date (old_build or build_replaced; never unknown_build, which follows an
+// upload for a moment). The same panel offers Update; the app downloads the latest build for a copy it
+// installed and relaunches it in its own window after Restart now (no website, no app window).
+//
+//   ask      updateGame   -> ok {state:"ready",version} | ok {state:"downloading"}
+//                            | not_app_copy | up_to_date | not_checked (+retryAfter: ask again, twice at most)
+//   ask      cancelUpdate -> ok {}
+//   ask      restartGame  -> ok {version} (then this game quits cleanly) | not_ready | unavailable (stay)
+//   push     gameUpdate {state:"downloading",percent} | {state:"ready",version} | {state:"failed",error}
+//
+// Pure, like Model: the caller sends the steps this returns from its own thread, passes back answers and
+// pushes, and quits on Step::Exit. Not thread-safe: the caller holds one lock around it.
+class Update {
+ public:
+  enum class Step { None, Update, Cancel, Restart, Exit };
+  static constexpr int kNotCheckedRetries = 2;
+
+  static nlohmann::json update_request() { return {{"type", "updateGame"}}; }
+  static nlohmann::json cancel_request() { return {{"type", "cancelUpdate"}}; }
+  static nlohmann::json restart_request() { return {{"type", "restartGame"}}; }
+  static nlohmann::json request(Step s) {
+    return s == Step::Cancel ? cancel_request() : s == Step::Restart ? restart_request() : update_request();
+  }
+  // A refusal this panel answers: the copy is known and out of date. unknown_build is not one.
+  static bool out_of_date(const nlohmann::json& answer) {
+    const std::string code = text_of(answer, "code");
+    return answer.is_object() && !true_of(answer, "ok") && (code == "old_build" || code == "build_replaced");
+  }
+  // A version as the app or the site names it, for one line: printable, no spaces, under 40 bytes.
+  static std::string version_text(const nlohmann::json& o, const char* key) {
+    std::string out;
+    for (const char c : text_of(o, key))
+      if (c > 0x20 && c < 0x7F && out.size() < 40) out += c;
+    return out;
+  }
+
+  bool is_open() const { return open_; }
+  Screen screen() const { return screen_; }
+
+  // The refused search's answer. An update already on its way is shown again as it stands.
+  void offer(const nlohmann::json& refusal) {
+    open_ = true;
+    const std::string latest = version_text(refusal, "current");
+    if (!latest.empty()) latest_ = latest;
+    if (in_progress()) return;
+    // The app already said it didn't install this copy: it won't this run either, so no Update to press.
+    screen_ = not_app_copy_ ? Screen::UpdateNotAppCopy : Screen::UpdateOffered;
+  }
+  void close() { open_ = false; }
+
+  Step press(Button b, uint64_t now) {
+    switch (b) {
+      case Button::Update:
+      case Button::TryAgain:
+        if (screen_ != Screen::UpdateOffered && screen_ != Screen::UpdateFailed && screen_ != Screen::UpdateNoCheck) break;
+        retries_ = 0;
+        return ask(now);
+      case Button::Cancel:
+        if (screen_ != Screen::UpdateChecking && screen_ != Screen::UpdateDownloading) break;
+        started_ = false;
+        retry_at_ = 0;
+        screen_ = Screen::UpdateOffered;
+        return Step::Cancel;
+      case Button::Restart:
+        if (screen_ != Screen::UpdateReady) break;
+        screen_ = Screen::UpdateRestarting;
+        return Step::Restart;
+      case Button::Back:
+      case Button::Offline: close(); break;
+      default: break;
+    }
+    return Step::None;
+  }
+
+  // The answer to `asked`: the whole answer object, or anything else for no answer.
+  Step answered(Step asked, const nlohmann::json& answer, uint64_t now) {
+    const bool ok = answer.is_object() && true_of(answer, "ok");
+    const std::string code = text_of(answer, "code");
+    const nlohmann::json result = ok && answer.count("result") && answer["result"].is_object() ? answer["result"] : nlohmann::json::object();
+    if (asked == Step::Cancel) return Step::None;   // the panel went back to Update already
+    if (asked == Step::Restart) {
+      if (screen_ != Screen::UpdateRestarting) return Step::None;
+      if (ok) return Step::Exit;                    // the app starts the new build once this game is gone
+      screen_ = Screen::UpdateRestartFailed;        // not_ready, unavailable, no answer: stay
+      return Step::None;
+    }
+    if (asked != Step::Update || screen_ != Screen::UpdateChecking) return Step::None;   // cancelled meanwhile
+    if (!answer.is_object()) return fail(kNoAnswer);
+    if (ok) {
+      const std::string state = text_of(result, "state");
+      if (state == "ready") { ready(version_text(result, "version")); return Step::None; }
+      if (state == "downloading") { screen_ = Screen::UpdateDownloading; return Step::None; }
+      return fail(kUpdateFailed);
+    }
+    if (code == "not_checked") {
+      if (retries_ >= kNotCheckedRetries) { started_ = false; screen_ = Screen::UpdateNoCheck; return Step::None; }
+      ++retries_;
+      retry_at_ = now + wait_ms(answer);
+      return Step::None;                            // tick() asks again when the wait ends
+    }
+    started_ = false;
+    if (code == "not_app_copy") { not_app_copy_ = true; screen_ = Screen::UpdateNotAppCopy; return Step::None; }
+    if (code == "up_to_date") { screen_ = Screen::UpdateLatest; return Step::None; }
+    if (code == "notYet") { screen_ = Screen::UpdateOldApp; return Step::None; }   // an app with no updateGame
+    return fail(kUpdateFailed);
+  }
+
+  // A push on the channel. True when it was ours (gameUpdate).
+  bool push(const nlohmann::json& p) {
+    if (text_of(p, "type") != "gameUpdate") return false;
+    if (!started_) return true;                     // none asked for, or cancelled: nothing to show
+    const std::string state = text_of(p, "state");
+    if (state == "downloading") {
+      if (screen_ == Screen::UpdateChecking || screen_ == Screen::UpdateDownloading) {
+        screen_ = Screen::UpdateDownloading;
+        retry_at_ = 0;
+        if (p.count("percent") && p["percent"].is_number()) {
+          const double v = p["percent"].get<double>();
+          percent_ = v >= 0 && v <= 100 ? (int)v : v > 100 ? 100 : 0;   // NaN reads as 0
+        }
+      }
+    } else if (state == "ready") {
+      if (screen_ != Screen::UpdateRestarting) ready(version_text(p, "version"));
+    } else if (state == "failed") {
+      if (screen_ != Screen::UpdateRestarting && screen_ != Screen::UpdateReady) fail(kUpdateFailed);
+    }
+    return true;
+  }
+
+  // Once per frame while open: a not_checked wait that ended asks again.
+  Step tick(uint64_t now) {
+    if (screen_ == Screen::UpdateChecking && retry_at_ && now >= retry_at_) { retry_at_ = 0; return Step::Update; }
+    return Step::None;
+  }
+
+  View view() const {
+    View v;
+    v.title = kUpdateTitle;
+    v.screen = open_ ? screen_ : Screen::Closed;
+    const std::string out_of_date = std::string(kOutOfDate) + (latest_.empty() ? "" : " (the latest is " + latest_ + ")") + ".";
+    switch (v.screen) {
+      case Screen::UpdateOffered:
+        v.message = out_of_date + " " + kUpdateIt;
+        v.buttons[0] = Button::Update; v.buttons[1] = Button::Offline;
+        break;
+      case Screen::UpdateChecking: v.message = kUpdating; v.buttons[0] = Button::Cancel; break;
+      case Screen::UpdateDownloading:
+        v.message = percent_ >= 0 ? std::string(kUpdating) + " " + std::to_string(percent_) + "%" : std::string(kUpdating);
+        v.buttons[0] = Button::Cancel; v.buttons[1] = Button::Offline;
+        break;
+      case Screen::UpdateReady:
+        v.message = version_.empty() ? std::string(kUpdateReady) : "Version " + version_ + " is ready.";
+        v.buttons[0] = Button::Restart; v.buttons[1] = Button::Offline;
+        break;
+      case Screen::UpdateRestarting: v.message = kRestarting; break;
+      case Screen::UpdateRestartFailed: v.message = kRestartFailed; v.buttons[0] = Button::Offline; break;
+      case Screen::UpdateFailed:
+        v.message = message_;
+        v.buttons[0] = Button::TryAgain; v.buttons[1] = Button::Offline;
+        break;
+      case Screen::UpdateNotAppCopy: v.message = out_of_date + " " + kGetLatest; v.buttons[0] = Button::Offline; break;
+      case Screen::UpdateOldApp: v.message = out_of_date + " " + kOpenToUpdate; v.buttons[0] = Button::Offline; break;
+      case Screen::UpdateLatest: v.message = kLatest; v.buttons[0] = Button::Back; break;
+      case Screen::UpdateNoCheck:
+        v.message = kNoCheck;
+        v.buttons[0] = Button::TryAgain; v.buttons[1] = Button::Offline;
+        break;
+      default: v.screen = Screen::Closed; break;
+    }
+    return v;
+  }
+
+ private:
+  bool in_progress() const {
+    return screen_ == Screen::UpdateChecking || screen_ == Screen::UpdateDownloading ||
+           screen_ == Screen::UpdateReady || screen_ == Screen::UpdateRestarting;
+  }
+  Step ask(uint64_t) {
+    started_ = true;
+    percent_ = -1;
+    retry_at_ = 0;
+    screen_ = Screen::UpdateChecking;
+    return Step::Update;
+  }
+  void ready(const std::string& version) {
+    if (!version.empty()) version_ = version;
+    retry_at_ = 0;
+    screen_ = Screen::UpdateReady;
+  }
+  Step fail(const char* words) {
+    started_ = false;
+    retry_at_ = 0;
+    message_ = words;
+    screen_ = Screen::UpdateFailed;
+    return Step::None;
+  }
+  static uint64_t wait_ms(const nlohmann::json& answer) {
+    double s = answer.count("retryAfter") && answer["retryAfter"].is_number() ? answer["retryAfter"].get<double>() : 2;
+    if (!(s >= 1)) s = 1;
+    if (s > 10) s = 10;
+    return (uint64_t)(s * 1000);
+  }
+
+  bool open_ = false, started_ = false, not_app_copy_ = false;
+  Screen screen_ = Screen::Closed;
+  std::string latest_, version_, message_;
+  int percent_ = -1, retries_ = 0;
+  uint64_t retry_at_ = 0;
 };
 
 }  // namespace yougame::signin

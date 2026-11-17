@@ -30,6 +30,10 @@ const char* label(Button b) {
     case Button::Back: return words::kBack;
     case Button::OpenApp: return words::kOpenApp;
     case Button::GetApp: return words::kGetApp;
+    case Button::Offline: return words::kPlayOffline;
+    case Button::Update: return words::kUpdate;
+    case Button::Cancel: return words::kCancel;
+    case Button::Restart: return words::kRestartNow;
     case Button::None: break;
   }
   return "";
@@ -163,6 +167,18 @@ void draw(float x0, float y0, float x1, float y1) {
       case Screen::AppClosed:
       case Screen::NoApp:
       case Screen::Admin: wrapped_text(v.message, 13.0f * u, kText); break;
+      // Update to play online (yougame_signin.h Update): the model writes each line whole.
+      case Screen::UpdateChecking:
+      case Screen::UpdateDownloading:
+      case Screen::UpdateRestarting: wrapped_text(v.message, 13.0f * u, kSoft); break;
+      case Screen::UpdateOffered:
+      case Screen::UpdateReady:
+      case Screen::UpdateRestartFailed:
+      case Screen::UpdateFailed:
+      case Screen::UpdateNotAppCopy:
+      case Screen::UpdateOldApp:
+      case Screen::UpdateLatest:
+      case Screen::UpdateNoCheck: wrapped_text(v.message, 13.0f * u, kText); break;
       case Screen::Closed: break;
     }
 

@@ -1128,7 +1128,7 @@ int main() {
 
     def test_status_window_requires_message_and_preserves_update_notice(self):
         ui = (ROOT / 'port/runtime/gx/pc_settings.cpp').read_text()
-        start = ui.index('  if (yougame::active() || slippi::online::online_status_visible()) {')
+        start = ui.index('  if (yougame::active() || yougame::channel_connected() || slippi::online::online_status_visible()) {')
         area = ui[start:ui.index('  ImGuiStyle launcher_saved_style;', start)]
         self.assertNotIn('version_line()', area)
         self.assertNotIn('MELEE_PORT_VERSION', area)

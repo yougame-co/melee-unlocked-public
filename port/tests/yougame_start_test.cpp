@@ -8,7 +8,7 @@
 #include <cstring>
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
 
-static int running, installed, launches, offers, signed_ok = 1, answer, last_offer = -1, opened_page, marker_ok;
+static int running, installed, launches, offers, signed_ok = 1, answer, last_offer = -1, last_on_use = -1, opened_page, marker_ok;
 static unsigned version[3] = {0, 13, 65535};
 static unsigned clock_ms;
 static int yg__start_running(int) { return running; }
@@ -20,7 +20,8 @@ static int yg__start_app_signed(yg__start_app*) { return signed_ok; }
 static int yg__start_app_launch(yg__start_app*, int) { ++launches; return 1; }
 static void yg__start_app_close(yg__start_app*) {}
 static int yg__start_shell_open(const char* url) { CHECK(!std::strcmp(url, "https://yougame.co/desktop")); ++opened_page; return 1; }
-static int yg__start_offer(int text) { ++offers; last_offer = text; return answer; }
+static int yg__start_offer(const yg__start_win* w) { ++offers; last_offer = w->which; last_on_use = w->on_use; return answer; }
+static int yg__start_offline(int, const char*, int) { return 0; }   // MU asks on use: never an at-start mark
 static int yg__start_quiet_env() { return 0; }
 static void yg__start_sleep(unsigned ms) { clock_ms += ms; }
 static unsigned long yg__start_ms() { return clock_ms; }
@@ -61,11 +62,26 @@ int main() {
   installed = 0;
   CHECK(yg_start(&options) == YG_START_DECLINED && launches == 2 && last_offer == YG__START_TEXT_MISSING);
   // The install offer promises nothing the player can't get today (no "smaller helper", YouGame 823c0f3ce).
-  CHECK(std::strstr(yg__start_texts[YG__START_TEXT_MISSING][1],
-                    "Get YouGame opens YouGame's download page. Not now starts the game."));
-  CHECK(!std::strstr(yg__start_texts[YG__START_TEXT_MISSING][1], "helper"));
+  {   // The C3 window (YouGame 063f1abcf): MU's name in the title, Get YouGame and Play offline, no "Not now".
+    yg__start_win w;
+    CHECK(yg__start_compose(YG__START_TEXT_MISSING, 1, "Melee Unlocked", 0, 0, &w));
+    CHECK(std::strstr(w.title, "Melee Unlocked") || std::strstr(w.body, "Melee Unlocked"));
+    CHECK(w.main_label && std::strcmp(w.main_label, "Get YouGame") == 0);
+    CHECK(w.later_label && std::strcmp(w.later_label, "Play offline") == 0);
+    CHECK(!std::strstr(w.body, "Not now") && !std::strstr(w.body, "helper"));
+  }
   answer = YG__START_ANSWER_GET;
   CHECK(yg_start(&options) == YG_START_OFFERED && opened_page == 2);
+  // Asked on first use: at launch ASK_LATER never shows the window; the row press
+  // (ASK_ON_USE) shows it, and Play offline is a plain DECLINED, never remembered.
+  const int offers_before = offers;
+  options.ask = YG_START_ASK_LATER;
+  CHECK(yg_start(&options) == YG_START_MISSING && offers == offers_before);
+  options.ask = YG_START_ASK_ON_USE;
+  answer = YG__START_ANSWER_LATER;
+  CHECK(yg_start(&options) == YG_START_DECLINED && offers == offers_before + 1 && last_on_use == 1);
+  CHECK(yg_start(&options) == YG_START_DECLINED && offers == offers_before + 2);
+  options.ask = YG_START_ASK_AT_START;
   CHECK(YG__START_OFFERS_OPEN(YG__START_TEXT_DIDNT_OPEN) && !YG__START_OFFERS_OPEN(YG__START_TEXT_UPDATE) &&
         !YG__START_OFFERS_OPEN(YG__START_TEXT_RAISED));
   char path[] = "/Applications/YouGame.app", *argv[8];

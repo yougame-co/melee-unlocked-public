@@ -241,6 +241,13 @@ std::atomic<bool> g_player_wait_running{false};
 // Sign in by code (yougame_signin.h) instead of staying locked.
 std::atomic<bool> g_channel_signed_out{false};
 void sign_in_push(const json& push);   // the sign-in panel's pushes (signedIn, signInExpired, signInFailed)
+// "Update to play online" (signin::Update): a search over the local channel refused as out of date, and
+// the app's gameUpdate pushes. Defined with the sign-in panel's code below. find_match offers it from the
+// player's first ticket of a search only (never a renewal); Blended Unranked keeps it until the blend is over.
+void update_offer(const json& refusal, uint64_t epoch, bool blend);
+void update_push(const json& push);
+// A match started (online_match_state): the panel closes on the next frame. Lock-free.
+std::atomic<bool> g_update_match_started{false};
 std::atomic<uint64_t> g_probe_started{0};           // now_ms() when the last probe began (timing lines)
 uint64_t since_probe() { const uint64_t at = g_probe_started.load(); return at ? now_ms() - at : 0; }
 relay_pads::State g_relay_pads([](const std::string& line) { host::log("%s", line.c_str()); }, false);
@@ -426,7 +433,7 @@ void handle_app_line(const std::string& line) {
         doubles::ui.back_if_active();
 #endif
         friends::lobby.leave(); console::entry.stop(); } // no-op outside a held room
-      if (!g_stdio && g_channel_allowed) sign_in_push(push);   // signedIn, signInExpired, signInFailed
+      if (!g_stdio && g_channel_allowed) { sign_in_push(push); update_push(push); }   // sign-in's pushes, gameUpdate
       const bool taken = friends::events.push(push, now_ms());
       if (taken && friends::version_reason(push)) log_friend_version();
       // Receipt only (no names or text): proves the app's notice reached the game, shown or not.
@@ -774,6 +781,9 @@ json bridge_http(const json& body, int timeout_ms, const std::function<bool()>& 
 thread_local std::string g_bridge_refusal;
 // The words of this thread's last update_required answer (update::error_text), empty when it carried none.
 thread_local std::string g_bridge_update_text;
+// This thread's last bridge() answer when it was an mpTicket refused over the local channel as out of date
+// (signin::Update::out_of_date), else null. Only find_match's first ticket reads it (update_offer).
+thread_local json g_ticket_out_of_date;
 // The local channel: the raw code of this thread's last refusal (letters only, <= 24, for the timing
 // lines), and accountSwitching's wait before asking again (0 for any other answer).
 thread_local std::string g_channel_code;
@@ -781,6 +791,7 @@ thread_local uint64_t g_channel_retry_after = 0;
 json bridge(const json& body, int timeout_ms = 15000, const std::function<bool()>& cancelled = {}) {
   g_bridge_refusal.clear();
   g_bridge_update_text.clear();
+  g_ticket_out_of_date = json();
   g_channel_code.clear();
   g_channel_retry_after = 0;
   search_policy::BusyRetry local_retry;
@@ -825,6 +836,9 @@ json bridge(const json& body, int timeout_ms = 15000, const std::function<bool()
       // The hidden page was mid-switch (today only mpCode): the connection stays; ask again later.
       if (g_bridge_refusal == "accountSwitching") g_channel_retry_after = channel::retry_after_ms(j);
       if (g_bridge_refusal == "notYet") g_bridge_refusal = "not_yet";
+      // A ticket refused as out of date (old_build, build_replaced): kept for find_match, which offers the
+      // app's update for the player's first ticket only. Its words still end the search below.
+      if (body.value("type", "") == "mpTicket" && signin::Update::out_of_date(j)) g_ticket_out_of_date = j;
       const std::string ours = channel::refusal_text(j);
       if (!ours.empty()) throw std::runtime_error(ours);
     }
@@ -934,7 +948,11 @@ class Socket {
       return false;
     }
     HINTERNET conn = WinHttpConnect(http_session(), u.host.c_str(), u.port, 0);
-    if (!conn) { *error = "Could not reach YouGame"; return false; }
+    if (!conn) {
+      host::log("yougame: socket open failed: at=%s step=connect error=%lu", address.substr(0, address.find('?')).c_str(), (unsigned long)GetLastError());
+      *error = "Could not reach YouGame";
+      return false;
+    }
     HINTERNET req = WinHttpOpenRequest(conn, L"GET", u.path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                                        u.secure ? WINHTTP_FLAG_SECURE : 0);
     DWORD status = 0, size = sizeof status;
@@ -942,12 +960,24 @@ class Socket {
     {
       PendingHttp pending(req, cancelled);
       if (req) WinHttpSetTimeouts(req, timeout, timeout, timeout, timeout);
-      bool ok = req && WinHttpSetOption(req, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0) &&
-                WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0) && WinHttpReceiveResponse(req, nullptr) &&
-                WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
-                                    WINHTTP_NO_HEADER_INDEX) &&
+      // Which WinHTTP step failed, and its error, for the log (a status-0 failure says nothing on screen).
+      const char* step = !req ? "open request" : nullptr;
+      DWORD step_error = !req ? GetLastError() : 0;
+      const auto at = [&](bool done, const char* name) {
+        if (!done && !step) { step = name; step_error = GetLastError(); }
+        return done;
+      };
+      bool ok = req && at(WinHttpSetOption(req, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, nullptr, 0), "upgrade option") &&
+                at(WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0), "send") &&
+                at(WinHttpReceiveResponse(req, nullptr), "receive") &&
+                at(WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &size,
+                                       WINHTTP_NO_HEADER_INDEX), "status") &&
                 status == 101;
       if (ok) ws_ = WinHttpWebSocketCompleteUpgrade(req, 0);
+      if (ok && !ws_ && !step) { step = "complete upgrade"; step_error = GetLastError(); }
+      if (!ws_ && !(cancelled && cancelled()))
+        host::log("yougame: socket open failed: at=%s step=%s error=%lu status=%lu", address.substr(0, address.find('?')).c_str(),
+                  step ? step : "status", (unsigned long)step_error, (unsigned long)status);
       if (ws_) WinHttpSetOption(ws_, WINHTTP_OPTION_RECEIVE_TIMEOUT, &forever, sizeof forever);
     }
     WinHttpCloseHandle(conn);
@@ -2725,6 +2755,7 @@ void start() {
 
 void online_match_state(bool open) {
   match_hint_worker().set(open);
+  if (open) g_update_match_started.store(true);   // the Update panel never sits over a match
 }
 
 void report_game_state(int state) {
@@ -2871,7 +2902,7 @@ const char* start_result_name(int r) {
     case YG_START_RUNNING: return "running";
     case YG_START_OPENED: return "opened";
     case YG_START_OFFERED: return "offered, Get YouGame pressed";
-    case YG_START_DECLINED: return "offered, Not now";
+    case YG_START_DECLINED: return "offered, Play offline";
     case YG_START_UNAVAILABLE: return "unavailable";
     case YG_START_INSTALLED: return "installed, not running";
     case YG_START_MISSING: return "not on this computer";
@@ -2880,7 +2911,9 @@ const char* start_result_name(int r) {
   }
 }
 // YouGame's start hook (yougame_start.h): YouGame running, nothing; not on this computer, YouGame's own
-// small window (Get YouGame / Not now). Installed but not running: a verified, recent YouGame starts
+// small window (Get YouGame / Play offline). Asked on first use: at game start only
+// YG_START_ASK_LATER (an installed YouGame starts quietly in the tray, no window ever), and the window
+// with YG_START_ASK_ON_USE when the player presses a YouGame row with no YouGame connected. Installed but not running: a verified, recent YouGame starts
 // hidden in the tray/menu bar (the header checks identity, signature and the minimum OS version);
 // an older one gets the small window saying it needs an update (a standalone game never
 // brings up YouGame's client window). Blocks while YouGame's window is up, so it never runs on the
@@ -2911,11 +2944,13 @@ const char* tray_from(bool staging) {
 #endif
 #endif
 }
-int start_once(bool staging, bool quiet) {
+int start_once(bool staging, bool quiet, int ask = YG_START_ASK_AT_START) {
   yg_start_options o{};
   o.game = "melee-unlocked";
   o.staging = staging ? 1 : 0;
   o.quiet = quiet ? 1 : 0;
+  o.ask = ask;
+  o.name = "Melee Unlocked";   // YouGame's window says "Play Melee Unlocked online"; needs stays 0 (offline play works)
   o.tray_from = tray_from(staging);
   return yg_start(&o);
 }
@@ -2934,24 +2969,25 @@ int look_for_app(bool& staging) {
   }
   return r;
 }
-int run_start_hook(const char* why, bool automated) {
+int run_start_hook(const char* why, bool automated, int ask) {
   bool staging = kStartStaging;
   int r = look_for_app(staging);   // first only look
   g_app_staging = staging;
   const bool quiet = start_hook_quiet(automated);
-  if ((r == YG_START_MISSING || r == YG_START_INSTALLED) && !quiet) r = start_once(staging, false);
+  if ((r == YG_START_MISSING || r == YG_START_INSTALLED) && !quiet) r = start_once(staging, false, ask);
   host::log("yougame: start hook (%s, %s): %s%s", why, staging ? "staging" : "production", start_result_name(r),
             quiet ? " (quiet run)" : "");
   return r;
 }
 }  // namespace
 
-namespace { void reach_open(); }
+namespace { void reach_open(); void reach_ask_on_use(); }
 
 void start_hook_at_boot(bool automated) {
   // The app started this game (its rows are open from the start), or a build without the hook.
   if (active() || g_launcher || !coming_soon_build()) return;
-  run_start_hook("game start", automated);
+  // Never a window at launch: an installed YouGame starts quietly in the tray; the ask waits for a press.
+  run_start_hook("game start", automated, YG_START_ASK_LATER);
 }
 
 void online_menu_opened() {
@@ -2982,11 +3018,16 @@ void open_get_page() {
   host::log(ok ? "yougame: Get YouGame picked: download page opened" : "yougame: Get YouGame picked: download page could not be opened");
 }
 void first_row_picked() {
-  // Ranked, Unranked or Friends before YouGame was connected: the "Play online with YouGame" panel
-  // says why and offers Open or Get YouGame (reach_open, with the sign-in panel's code below). The
-  // menu still continues into the row once YouGame answers.
+  // Ranked, Unranked or Friends before YouGame was connected. Windows and Mac: YouGame's own small window
+  // asks (reach_ask_on_use: Get YouGame / Open YouGame / Play offline), once per press, never remembered.
+  // Linux, where the hook has no window: the "Play online with YouGame" panel (reach_open). The menu
+  // still continues into the row once YouGame answers.
   if (g_channel_up.load()) return;
+#if defined(_WIN32) || defined(__APPLE__)
+  reach_ask_on_use();
+#else
   reach_open();
+#endif
 }
 const char* first_row_text() {
   if (g_app_opening.load()) return "Opening YouGame...";
@@ -3229,6 +3270,40 @@ void reach_open() {
     g_reach_busy = false;
   }).detach();
 }
+// Windows and Mac, a YouGame row pressed with no YouGame connected: the start hook with ASK_ON_USE, on its
+// own thread (it blocks while YouGame's window is up; presses meanwhile are ignored). Running or opened:
+// our panel's "Opening YouGame..." until the channel answers. Play offline, or Get YouGame (the page is
+// open): nothing more, the player is back in the game, and the next press asks again. The hook unable to
+// run (UNAVAILABLE), or a quiet run that showed no window: the panel as before (reach_open), with its own
+// administrator screen; otherwise the hook's administrator window says it.
+void reach_ask_on_use() {
+  bool idle = false;
+  if (!g_reach_busy.compare_exchange_strong(idle, true)) return;
+  { std::lock_guard<std::mutex> lock(g_reach_mutex); if (g_reach.is_open()) { g_reach_busy = false; return; } }
+  host::log("yougame: online row picked, no YouGame connected: asking (on use)");
+  std::thread([] {
+    const int r = run_start_hook("YouGame row pressed", false, YG_START_ASK_ON_USE);
+    if (r == YG_START_RUNNING || r == YG_START_OPENED || r == YG_START_UPDATING) {
+      {
+        std::lock_guard<std::mutex> lock(g_reach_mutex);
+        g_reach.open(false);
+        g_reach.opening();
+      }
+      g_app_opening = true;
+      const bool up = reach_wait_for_channel(25);
+      g_app_opening = false;
+      host::log(up ? "yougame: YouGame row: YouGame answered" : "yougame: YouGame row: YouGame did not answer");
+      std::lock_guard<std::mutex> lock(g_reach_mutex);
+      if (up) g_reach.close();
+      else g_reach.open_failed(signin::kNoAnswer);
+      g_reach_busy = false;
+      return;
+    }
+    g_reach_busy = false;
+    if (r == YG_START_DECLINED || r == YG_START_OFFERED) return;   // the player chose; never remembered
+    reach_open();   // UNAVAILABLE, or a quiet run that showed nothing: today's panel
+  }).detach();
+}
 // Open YouGame: the start hook's own open (the verified app, hidden in the tray, or its small window),
 // the app's link on Linux; then 25 s for its channel.
 void reach_open_app() {
@@ -3238,8 +3313,14 @@ void reach_open_app() {
   std::thread([] {
 #if defined(_WIN32) || defined(__APPLE__)
     g_app_opening = true;
-    const int r = run_start_hook("Open YouGame pressed", false);
+    const int r = run_start_hook("Open YouGame pressed", false, YG_START_ASK_ON_USE);
     const bool asked = r == YG_START_OPENED || r == YG_START_RUNNING;
+    if (r == YG_START_DECLINED || r == YG_START_OFFERED) {   // its window asked; Play offline or Get YouGame
+      g_app_opening = false;
+      { std::lock_guard<std::mutex> lock(g_reach_mutex); g_reach.close(); }
+      g_reach_busy = false;
+      return;
+    }
 #else
     const bool asked = open_app("Open YouGame pressed") || g_app_opening.load();
 #endif
@@ -3265,10 +3346,11 @@ void reach_press(signin::Button button) {
       g_reach.page_opened();
       break;
     }
-    case signin::Button::Back: {
+    case signin::Button::Back:      // B on a pad
+    case signin::Button::Offline: {
       std::lock_guard<std::mutex> lock(g_reach_mutex);
       g_reach.close();
-      host::log("yougame: Play online with YouGame: Back");
+      host::log("yougame: Play online with YouGame: Play offline");
       break;
     }
     default: break;
@@ -3293,6 +3375,128 @@ bool reach_view(signin::View& out) {
 }
 }  // namespace
 
+// ------------------------------------------------------------------ "Update to play online" (signin::Update)
+// A copy started on its own, connected over the local channel, whose search was refused as out of date. The
+// app (not this game) decides whether it can update this copy (not_app_copy: one it didn't install, a GitHub
+// download). Asks run on their own threads; the sign-in panel draws it (sign_in_showing/view/press).
+namespace {
+std::mutex g_update_mutex;
+signin::Update g_update;                      // g_update_mutex
+uint64_t g_update_epoch = 0;                  // g_update_mutex: the search whose refusal opened the panel
+uint64_t g_update_closed_epoch = 0;           // g_update_mutex: the player closed the panel for this search
+json g_update_deferred;                       // g_update_mutex: a blend's refusal, offered when the blend is over
+uint64_t g_update_deferred_epoch = 0;         // g_update_mutex
+// Opens the panel for this search's refusal, unless the player already closed it for this search.
+void update_open(const json& refusal, uint64_t epoch) {
+  if (g_stdio || !g_channel_allowed || !g_channel_up.load()) return;
+  {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    if (epoch == g_update_closed_epoch) return;
+    g_update_match_started.store(false);        // only a match from now on closes this panel
+    try { g_update.offer(refusal); } catch (const std::exception&) { return; }
+    g_update_epoch = epoch;
+  }
+  host::log("yougame update: out of date (%.24s), Update offered", channel::log_text(ranked::str(refusal, "code")).c_str());
+}
+const char* update_step_name(signin::Update::Step s) {
+  return s == signin::Update::Step::Cancel ? "cancelUpdate" : s == signin::Update::Step::Restart ? "restartGame" : "updateGame";
+}
+void update_send(signin::Update::Step step) {
+  using Step = signin::Update::Step;
+  if (step == Step::None) return;
+  std::thread([step] {
+    for (Step next = step; next != Step::None;) {
+      if (next == Step::Exit) {
+        host::log("yougame update: restarting into the new build");
+        host::request_exit(0);
+        return;
+      }
+      const Step asked = next;
+      json answer;
+      try { answer = bridge_channel(signin::Update::request(asked), 15000); }
+      catch (const std::exception&) { answer = json(); }
+      const std::string code = ranked::str(answer, "code");
+      host::log("yougame update: %s: %s", update_step_name(asked),
+                !answer.is_object() ? "no answer" : signin::true_of(answer, "ok") ? "ok" : channel::log_text(code.empty() ? "refused" : code).c_str());
+      std::lock_guard<std::mutex> lock(g_update_mutex);
+      try { next = g_update.answered(asked, answer, now_ms()); }
+      catch (const std::exception&) { next = g_update.answered(asked, json(), now_ms()); }   // read as no answer
+    }
+  }).detach();
+}
+bool update_showing() {
+  std::lock_guard<std::mutex> lock(g_update_mutex);
+  if (g_update_match_started.exchange(false) && g_update.is_open()) {
+    g_update.close();
+    g_update_closed_epoch = g_update_epoch;
+    host::log("yougame update: panel closed, a match started");
+  }
+  return g_update.is_open();
+}
+bool update_view(signin::View& out) {
+  signin::Update::Step step;
+  {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    if (!g_update.is_open()) return false;
+    step = g_update.tick(now_ms());
+    out = g_update.view();
+  }
+  update_send(step);
+  return true;
+}
+void update_press(signin::Button button) {
+  signin::Update::Step step;
+  bool closed = false;
+  {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    step = g_update.press(button, now_ms());
+    // Closed by the player: not again for this search (its renewals never offer; a new search may).
+    if (!g_update.is_open()) { closed = true; g_update_closed_epoch = g_update_epoch; }
+  }
+  if (closed) host::log("yougame update: panel closed");
+  update_send(step);
+}
+
+// Only a copy nothing started, while its local channel is up: the app updates a copy it launched itself.
+// A blend's YouGame side failing leaves Slippi's searching (a match may still start): kept for blend_over.
+void update_offer(const json& refusal, uint64_t epoch, bool blend) {
+  if (g_stdio || !g_channel_allowed || !g_channel_up.load() || !g_search_generation.current(epoch)) return;
+  if (blend) {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    g_update_deferred = refusal;
+    g_update_deferred_epoch = epoch;
+    return;
+  }
+  update_open(refusal, epoch);
+}
+void update_push(const json& push) {
+  bool took = false;
+  signin::Screen screen = signin::Screen::Closed;
+  {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    try { took = g_update.push(push); } catch (const std::exception&) { took = false; }
+    screen = g_update.screen();
+  }
+  // Every state but each percent step: one line per change of screen.
+  static signin::Screen logged = signin::Screen::Closed;
+  if (took && screen != logged) {
+    logged = screen;
+    host::log("yougame update: push gameUpdate %.16s", channel::log_text(signin::text_of(push, "state")).c_str());
+  }
+}
+}  // namespace
+
+void blend_over(uint64_t epoch) {
+  json refusal;
+  {
+    std::lock_guard<std::mutex> lock(g_update_mutex);
+    if (g_update_deferred_epoch != epoch || g_update_deferred.is_null()) return;
+    refusal.swap(g_update_deferred);
+    g_update_deferred_epoch = 0;
+  }
+  if (g_search_generation.current(epoch)) update_open(refusal, epoch);
+}
+
 bool sign_in_needed() {
   if (g_stdio || !g_channel_allowed || !g_channel_up.load() || !g_channel_signed_out.load()) return false;
   std::lock_guard<std::mutex> lock(g_mutex);
@@ -3305,12 +3509,12 @@ void sign_in_open() {
   sign_in_send(ask);
 }
 bool sign_in_showing() {
-  if (reach_showing()) return true;
+  if (reach_showing() || update_showing()) return true;
   std::lock_guard<std::mutex> lock(g_signin_mutex);
   return g_signin.is_open();
 }
 void sign_in_view(signin::View& out) {
-  if (reach_view(out)) return;
+  if (reach_view(out) || update_view(out)) return;
   Identity id;
   { std::lock_guard<std::mutex> lock(g_mutex); id = g_identity; }
   signin::Ask ask;
@@ -3325,6 +3529,7 @@ void sign_in_view(signin::View& out) {
 }
 void sign_in_press(signin::Button button) {
   if (reach_showing()) { reach_press(button); return; }
+  if (update_showing()) { update_press(button); return; }
   signin::Ask ask;
   { std::lock_guard<std::mutex> lock(g_signin_mutex); ask = g_signin.press(button, now_ms()); }
   if (button == signin::Button::Back) host::log("yougame sign-in: Back");
@@ -4022,6 +4227,8 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     // room as another kind (1v1, Friends lobby, Doubles home, Teams): only the room's own kind refusal over the
     // socket may, below, within the room's tries.
     if (!cancelled()) host::log("yougame: ticket refused (%s)", g_bridge_refusal.empty() ? "no code" : g_bridge_refusal.c_str());
+    // The player's own search was refused as out of date: offer the app's update (a blend: once it is over).
+    if (!cancelled() && !g_ticket_out_of_date.is_null()) update_offer(g_ticket_out_of_date, epoch, blend);
     return fail(e.what());
   }
   if (search.mode == 0 && !ranked::set_contract_matches(ticket))

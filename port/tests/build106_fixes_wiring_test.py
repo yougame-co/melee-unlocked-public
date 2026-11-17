@@ -45,26 +45,26 @@ int main() {
   if (r.is_open() || r.view().screen != Screen::Closed) return 10;
   r.open(false);
   View v = r.view();
-  if (v.screen != Screen::Looking || v.title != kReachTitle || !has(v, Button::Back)) return 11;
+  if (v.screen != Screen::Looking || v.title != kReachTitle || !has(v, Button::Offline)) return 11;
   r.looked(false, true);
   v = r.view();
-  if (v.screen != Screen::AppClosed || v.message != kAppClosed || !has(v, Button::OpenApp, Button::Back)) return 12;
+  if (v.screen != Screen::AppClosed || v.message != kAppClosed || !has(v, Button::OpenApp, Button::Offline)) return 12;
   r.opening();
   if (r.view().screen != Screen::Opening) return 13;
   r.open_failed(kDidntOpen);
   v = r.view();
-  if (v.screen != Screen::AppClosed || v.message.find(kDidntOpen) != 0 || !has(v, Button::OpenApp, Button::GetApp, Button::Back)) return 14;
+  if (v.screen != Screen::AppClosed || v.message.find(kDidntOpen) != 0 || !has(v, Button::OpenApp, Button::GetApp, Button::Offline)) return 14;
   r.close();
   r.open(false);
   r.looked(false, false);
   v = r.view();
-  if (v.screen != Screen::NoApp || v.message != kNoApp || !has(v, Button::GetApp, Button::Back)) return 15;
+  if (v.screen != Screen::NoApp || v.message != kNoApp || !has(v, Button::GetApp, Button::Offline)) return 15;
   r.page_opened();
   if (r.view().message.find(kPageOpen) == std::string::npos) return 16;
   r.close();
   r.open(true);
   v = r.view();
-  if (v.screen != Screen::Admin || v.message != kAdmin || !has(v, Button::Back)) return 17;
+  if (v.screen != Screen::Admin || v.message != kAdmin || !has(v, Button::Offline)) return 17;
   r.looked(false, true);                 // a late look never replaces the administrator screen
   if (r.view().screen != Screen::Admin) return 18;
   r.close();
@@ -83,13 +83,30 @@ class Build106Fixes(unittest.TestCase):
     def test_online_rows_open_the_reach_panel(self):
         link = source("port/runtime/hle/yougame_link.cpp")
         picked = body(link, "void first_row_picked() {")
-        self.assertIn("reach_open();", picked)
+        # Asked on first use: Windows and Mac ask through YouGame's own window at the press;
+        # Linux (no window in the hook) keeps the Reach panel.
+        win_mac = picked.split("#if defined(_WIN32) || defined(__APPLE__)", 1)[1].split("#else", 1)
+        self.assertIn("reach_ask_on_use();", win_mac[0])
+        self.assertIn("reach_open();", win_mac[1].split("#endif", 1)[0])
         self.assertNotIn("run_start_hook", picked)
+        ask = body(link, "void reach_ask_on_use() {")
+        self.assertIn('run_start_hook("YouGame row pressed", false, YG_START_ASK_ON_USE)', ask)
+        self.assertIn("g_reach_busy.compare_exchange_strong(idle, true)", ask)
+        self.assertIn("std::thread(", ask)
+        self.assertIn("reach_wait_for_channel(25)", ask)
+        self.assertIn("g_reach.opening();", ask)
+        self.assertIn("if (r == YG_START_DECLINED || r == YG_START_OFFERED) return;", ask)
+        self.assertIn("reach_open();", ask)
+        self.assertNotIn("yg__start_raised", ask)   # the hook's own administrator window says it
+        boot = body(link, "void start_hook_at_boot(")
+        self.assertIn('run_start_hook("game start", automated, YG_START_ASK_LATER)', boot)
+        once = body(link, "int start_once(")
+        self.assertIn("o.ask = ask;", once)
         reach = body(link, "void reach_open() {")
         self.assertIn("admin = yg__start_raised() != 0;", reach)
         self.assertIn("look_for_app(staging)", reach)
         opened = body(link, "void reach_open_app() {")
-        self.assertIn('run_start_hook("Open YouGame pressed", false)', opened)
+        self.assertIn('run_start_hook("Open YouGame pressed", false, YG_START_ASK_ON_USE)', opened)
         self.assertIn('open_app("Open YouGame pressed")', opened)
         self.assertIn("reach_wait_for_channel(25)", opened)
         press = body(link, "void reach_press(signin::Button button) {")
@@ -97,8 +114,8 @@ class Build106Fixes(unittest.TestCase):
         # Get YouGame goes to production's page unless the build is the staging-only start build.
         get = body(link, "void open_get_page() {")
         self.assertIn('kStartStaging ? "https://staging.yougame.co/desktop" : "https://yougame.co/desktop"', get)
-        self.assertIn("if (reach_showing()) return true;", body(link, "bool sign_in_showing() {"))
-        self.assertIn("if (reach_view(out)) return;", body(link, "void sign_in_view(signin::View& out) {"))
+        self.assertIn("if (reach_showing() || update_showing()) return true;", body(link, "bool sign_in_showing() {"))
+        self.assertIn("if (reach_view(out) || update_view(out)) return;", body(link, "void sign_in_view(signin::View& out) {"))
         self.assertIn("if (reach_showing()) { reach_press(button); return; }", body(link, "void sign_in_press(signin::Button button) {"))
         overlay = source("port/runtime/gx/signin_overlay.cpp")
         self.assertIn("case Button::OpenApp: return words::kOpenApp;", overlay)
@@ -114,7 +131,7 @@ class Build106Fixes(unittest.TestCase):
     def test_start_window_offers_open(self):
         start = source("port/third_party/yougame_start/yougame_start.h")
         self.assertIn('#define YG__START_OPEN "Open YouGame"', start)
-        self.assertIn("(offers_open ? 0 : BS_DEFPUSHBUTTON)", start)   # Open is the default when offered
+        self.assertIn('#define YG__START_LATER "Play offline"', start)   # the C3 window (YouGame 55e1965c6)
         # v2 a678bb7b: a tray start waits for YouGame to come up; a slow one is DECLINED, never the download page.
         self.assertIn("if (yg__start_tray(staging, any, have) == YG__START_TRAY_STARTED) {", start)
         self.assertIn("return up >= 0 ? (yg_start_result)up : YG_START_DECLINED;", start)

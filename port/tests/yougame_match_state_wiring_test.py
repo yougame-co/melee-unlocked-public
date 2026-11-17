@@ -14,7 +14,9 @@ class MatchStateWiring(unittest.TestCase):
             # 113: the administrator window offers only OK (YouGame is installed there, Get YouGame can't help).
             # 115: both headers verbatim from YouGame v2 a678bb7b (MU's Open YouGame and one-OK window upstreamed).
             # 114: YouGame v2 6db35802e raised rule (UAC off / Windows Sandbox: an elevated game whose shell is the same elevated user starts YouGame).
-            'yougame_start.h': 'd2692569763facbb3535dd57777a81f52b9fd259c9aaecc900f676ce9e012e91',
+            # 120: yougame_start.h verbatim from YouGame v2 4b69a7a28 (o.ask: LATER at launch, ON_USE at the press; Play offline).
+            # 120: then YouGame claude/c3-window-d258 063f1abcf (the drawn C3 window, o.name).
+            'yougame_start.h': '45d1ee496491320256160cf4449eca9123731c4fda1f05d046c7799f8861ea76',
             'yougame.h': 'f0796dd3ab37c6cc6ae96c554458f6638cadeff7268962d99da54baf9b9839de',
         }.items():
             self.assertEqual(hashlib.sha256((ROOT / 'port/third_party/yougame_start' / name).read_bytes()).hexdigest(), digest)

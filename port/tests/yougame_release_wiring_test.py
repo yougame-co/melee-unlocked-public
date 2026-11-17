@@ -349,7 +349,7 @@ class ReleaseWiringTest(unittest.TestCase):
     def test_version_and_update_reuse_the_existing_status_area(self):
         ui = source("port/runtime/gx/pc_settings.cpp")
         area = ui[ui.index('const bool show_status ='):ui.index('ImGuiStyle launcher_saved_style;')]
-        self.assertIn('if (yougame::active() || slippi::online::online_status_visible())', ui)
+        self.assertIn('if (yougame::active() || yougame::channel_connected() || slippi::online::online_status_visible())', ui)
         self.assertIn('!slippi::online::is_online_match()', area)
         self.assertIn('ImGui::Begin("##yougame_friend_waiting"', area)
         self.assertIn('status == yougame::update::kMessage', area)

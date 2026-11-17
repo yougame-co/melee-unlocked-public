@@ -2901,6 +2901,7 @@ void Matchmaking::blendMatchmaking() {
     }
     if (over) {
       dropSlippi();
+      yougame::blend_over(search.epoch);   // the YouGame side's out-of-date refusal offers Update now
       fail(last_error.empty() ? "Matchmaking failed" : last_error);
       return;
     }

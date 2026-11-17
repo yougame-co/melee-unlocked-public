@@ -9,6 +9,16 @@
  *   o.tray_from = "0.13.1407";               first shipped quiet-start version for the target OS
  *   yg_start(&o);                            then carry on starting the game, whatever it returns
  *
+ * When to ask is the game's choice (o.ask). At start (the default, YG_START_ASK_AT_START): the
+ * call above, at launch; the small window shows then if YouGame isn't ready. On first use: at
+ * launch call with o.ask = YG_START_ASK_LATER (an installed YouGame starts quietly in the tray, and
+ * no window ever shows), then, when the player presses one of the game's YouGame features (Online,
+ * Friends, Ranked) and YouGame isn't connected, call with o.ask = YG_START_ASK_ON_USE: the same
+ * checks and small window, whose Play offline goes back to the game. It is never remembered: the
+ * next press asks again. Pick at start for a game that needs YouGame to run at all (controller
+ * support, sign-in to play); on first use when online is an extra, so nothing covers the game until
+ * the player reaches for it.
+ *
  * It never brings up YouGame's client window or a game page, and never brings a running YouGame
  * forward. What it does, in this order:
  *   1. YouGame is running for this user: nothing is shown. YG_START_RUNNING.
@@ -39,7 +49,7 @@
  *      path: a Linux desktop may have no tray.
  *   3. YouGame is not on this computer: the small window says "Play online with YouGame".
  * The small window is YouGame's own, with two buttons: "Get YouGame" opens YouGame's download page
- * in the browser (YG_START_OFFERED); "Not now" or closing it returns YG_START_DECLINED. It waits for
+ * in the browser (YG_START_OFFERED); "Play offline" or closing it returns YG_START_DECLINED. It waits for
  * an answer. Every answer and every failure returns, so the game starts as usual.
  *
  * It only looks and starts; it does not talk to YouGame. Online calls are yougame.h's job (or the
@@ -102,7 +112,7 @@ typedef enum yg_start_result {
   YG_START_OPENED = 1,      /* Windows/macOS: installed YouGame was started quietly */
   YG_START_OFFERED = 2,     /* the small window was shown and the player pressed Get YouGame;
                                the download page is open */
-  YG_START_DECLINED = 3,    /* the small window was shown and the player pressed Not now (or closed
+  YG_START_DECLINED = 3,    /* the small window was shown and the player pressed Play offline (or closed
                                it), or no window could be shown */
   YG_START_UNAVAILABLE = 4, /* nothing was done: unsupported system, bad options, or an error */
   YG_START_INSTALLED = 5,   /* quiet runs only: installed but not running; nothing was started */
@@ -112,6 +122,16 @@ typedef enum yg_start_result {
                                updating" line and call yg_start again in about 10 s, for at most
                                5 minutes. The version it installs is in update_to, when given. */
 } yg_start_result;
+
+/* yg_start_options.ask: when the game asks for YouGame. The game decides; the hook never does. */
+#define YG_START_ASK_AT_START 0 /* at game start; the small window shows if YouGame isn't ready.
+                                   The default: a game that never sets ask gets this */
+#define YG_START_ASK_LATER 1    /* at game start, for a game that asks on first use: an installed
+                                   YouGame is started quietly (the same checks as at start) and no
+                                   window ever shows. YG_START_RUNNING, OPENED or UPDATING, else
+                                   YG_START_INSTALLED (installed, not running) or YG_START_MISSING */
+#define YG_START_ASK_ON_USE 2   /* the player just pressed one of the game's YouGame features: the
+                                   same checks and window as at start */
 
 /* "YGU1": with it, update_to is also cleared at entry (empty on every result but YG_START_UPDATING). */
 #define YG_START_UPDATE_TO_MAGIC 0x59475531u
@@ -137,9 +157,18 @@ typedef struct yg_start_options {
                                is installing (at most 32 characters), cut to fit, always NUL-terminated */
   size_t update_to_cap;     /* buffer size including terminator (0 = not written) */
   unsigned update_to_magic; /* YG_START_UPDATE_TO_MAGIC: also clear update_to at entry */
+  int ask;                  /* when the game asks: YG_START_ASK_AT_START (0, the default),
+                               YG_START_ASK_LATER or YG_START_ASK_ON_USE; any other value: at start */
+  const char *name;         /* optional: the game's name as players know it ("Melee Unlocked"), shown
+                               in the window ("Play Melee Unlocked online"). 1 to 40 characters:
+                               letters, digits, spaces and . , ' - : ! & + ( ). Else "this game". */
+  int needs;                /* 1 = the game needs YouGame to run at all (no offline play): the window's
+                               other button says Quit, it asks at every start, and on
+                               YG_START_DECLINED the game quits. 0 = online is an extra (the usual) */
 } yg_start_options;
 
-/* Call once, on the thread that starts the game, before or after the game's own window exists. */
+/* Call on the thread that starts the game, before or after the game's own window exists; again
+   with YG_START_ASK_ON_USE when the player presses something that needs YouGame. */
 yg_start_result yg_start(const yg_start_options *options);
 
 #ifdef __cplusplus
@@ -168,48 +197,121 @@ static int yg__start_raised_rule(int full, int elevated, int shell_peer) {
 }
 #endif
 
-/* Every text the small window shows, on every system: {title, body}. Paragraphs split by "\n\n";
-   Windows turns "\n" into "\r\n". Plain ASCII only. */
+/* Every text the small window shows, on every system. Plain ASCII only. The game's name (`name`)
+   goes where the mock says "Melee Unlocked"; without one (or one that isn't plain text) the window
+   says "this game". Never "the free app": YouGame is "a free app" at most. */
 #define YG__START_TEXT_MISSING 0     /* not installed */
 #define YG__START_TEXT_DIDNT_OPEN 1  /* started in the tray, but not running within open_wait_ms */
 #define YG__START_TEXT_UPDATE 2      /* installed, older than tray_from (or its version unreadable) */
 #define YG__START_TEXT_NOT_RUNNING 3 /* installed, not started by the hook */
 #define YG__START_TEXT_RAISED 4      /* Windows: the game runs as administrator, so nothing is started */
-static const char *const yg__start_texts[5][2] = {
-  {"Play online with YouGame",
-   "This game uses YouGame for online matches, friends and feedback. "
-   "YouGame isn't on this computer yet.\n\n"
-   "Get YouGame opens YouGame's download page. Not now starts the game."},
-  {"YouGame didn't open",
-   "This game uses YouGame for online matches, friends and feedback. "
-   "YouGame is on this computer, but it didn't open just now.\n\n"
-   "Open YouGame yourself, or Get YouGame opens its download page to install it again. "
-   "Not now starts the game."},
-  {"YouGame needs an update",
-   "This game uses YouGame for online matches, friends and feedback. "
-   "The YouGame on this computer is an older version.\n\n"
-   "Get YouGame opens its download page to get the latest version. Not now starts the game."},
-  {"YouGame isn't running",
-   "This game uses YouGame for online matches, friends and feedback. "
-   "YouGame is on this computer but isn't running.\n\n"
-   "Open YouGame to play online, or Get YouGame opens its download page to get the latest version. "
-   "Not now starts the game."},
-  {"YouGame can't open from here",
-   "This game was started as administrator, so it can't open YouGame. "
-   "To play online, close it and start it normally (not as administrator).\n\n"
-   "OK starts the game now, for offline play."}};
+#define YG__START_TEXTS 5
 #define YG__START_GET "Get YouGame"
-#define YG__START_LATER "Not now"
+#define YG__START_UPDATE "Update YouGame"
+#define YG__START_LATER "Play offline"
 #define YG__START_OPEN "Open YouGame"
-#define YG__START_OK "OK"
-/* The administrator window (YouGame is installed, so Get YouGame would not help): one button, OK. */
-#define YG__START_ONLY_OK(text) ((text) == YG__START_TEXT_RAISED)
+#define YG__START_QUIT "Quit"
 /* yg__start_offer's answers. Open is offered (Windows) when YouGame is installed and the game can
    start it: "isn't running" and "didn't open". */
 #define YG__START_ANSWER_LATER 0
 #define YG__START_ANSWER_GET 1
 #define YG__START_ANSWER_OPEN 2
+#define YG__START_ANSWER_NONE (-1) /* nothing was shown, or the game closed meanwhile: no choice made */
 #define YG__START_OFFERS_OPEN(text) ((text) == YG__START_TEXT_NOT_RUNNING || (text) == YG__START_TEXT_DIDNT_OPEN)
+#define YG__START_NAME_MAX 40
+#define YG__START_TITLE_CAP 96
+#define YG__START_BODY_CAP 240
+
+/* One window, every word of it: what yg__start_offer draws (Windows) or hands to the system's box. */
+typedef struct yg__start_win {
+  int which;   /* YG__START_TEXT_* */
+  int on_use;  /* asked on use (the player pressed a YouGame feature) */
+  int facts;   /* show the Matchmaking / Friends / Ranked row */
+  int answer;  /* what the main button answers: YG__START_ANSWER_GET or _OPEN; _LATER = one button */
+  char title[YG__START_TITLE_CAP];
+  char body[YG__START_BODY_CAP];
+  const char *main_label;  /* the main (white) button */
+  const char *later_label; /* the other button: Play offline, or Quit for a game that needs YouGame */
+} yg__start_win;
+
+/* The game's name as the window may print it: 1 to 40 characters of letters, digits, spaces and
+   . , ' - : ! & + ( ), not starting or ending with a space. Anything else: NULL ("this game"). */
+static const char *yg__start_name_ok(const char *name) {
+  size_t n = 0;
+  if (!name || !name[0] || name[0] == ' ') return NULL;
+  for (; name[n]; ++n) {
+    unsigned char c = (unsigned char)name[n];
+    if (n >= YG__START_NAME_MAX) return NULL;
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ' ||
+          c == '.' || c == ',' || c == '\'' || c == '-' || c == ':' || c == '!' || c == '&' || c == '+' ||
+          c == '(' || c == ')'))
+      return NULL;
+  }
+  return name[n - 1] == ' ' ? NULL : name;
+}
+
+/* Fills the window for a state. `needs`: the game needs YouGame to run (no offline play), so the
+   other button is Quit and the words drop "online". `open_ok`: this system can start an installed
+   YouGame from the window (Windows). 0 when a text does not fit (never, with a name of at most 40). */
+static int yg__start_compose(int which, int on_use, const char *name, int needs, int open_ok,
+                             yg__start_win *w) {
+  const char *g = yg__start_name_ok(name), *lower = g ? g : "this game", *upper = g ? g : "This game";
+  int t, b;
+  if (which < 0 || which >= YG__START_TEXTS) return 0;
+  memset(w, 0, sizeof *w);
+  w->which = which;
+  w->on_use = on_use ? 1 : 0;
+  w->facts = !needs && which != YG__START_TEXT_RAISED;
+  w->answer = YG__START_ANSWER_GET;
+  w->main_label = YG__START_GET;
+  w->later_label = needs ? YG__START_QUIT : YG__START_LATER;
+  switch (which) {
+    case YG__START_TEXT_MISSING:
+      if (needs) {
+        t = snprintf(w->title, sizeof w->title, "%s needs YouGame", upper);
+        b = snprintf(w->body, sizeof w->body, "YouGame is a free app. Get it, then start %s again.", lower);
+      } else {
+        t = g ? snprintf(w->title, sizeof w->title, "Play %s online", g)
+              : snprintf(w->title, sizeof w->title, "Play online with YouGame");
+        b = snprintf(w->body, sizeof w->body,
+                     "YouGame is a free app that runs online matches, friends and ranked play for %s.", lower);
+      }
+      break;
+    case YG__START_TEXT_UPDATE:
+      w->main_label = YG__START_UPDATE;
+      t = snprintf(w->title, sizeof w->title, needs ? "Update YouGame to play" : "Update YouGame to play online");
+      b = snprintf(w->body, sizeof w->body, needs ? "%s needs a newer YouGame." :
+                   "%s needs a newer YouGame for online play.", upper);
+      break;
+    case YG__START_TEXT_NOT_RUNNING:
+      t = snprintf(w->title, sizeof w->title, needs ? "Open YouGame to play" : "Open YouGame to play online");
+      b = snprintf(w->body, sizeof w->body, open_ok ? "YouGame is on this computer but isn't running." :
+                   "YouGame is on this computer but isn't running. Open it yourself, or get the latest version.");
+      break;
+    case YG__START_TEXT_DIDNT_OPEN:
+      t = snprintf(w->title, sizeof w->title, "YouGame didn't open");
+      if (on_use) b = snprintf(w->body, sizeof w->body, "Open YouGame yourself, then try again.");
+      else if (needs) b = snprintf(w->body, sizeof w->body, "Open YouGame yourself, then start %s again.", lower);
+      else b = snprintf(w->body, sizeof w->body, "Open YouGame yourself to play online.");
+      break;
+    default: /* YG__START_TEXT_RAISED: YouGame is installed, so Get YouGame would not help. One button. */
+      w->answer = YG__START_ANSWER_LATER;
+      w->main_label = w->later_label;
+      w->later_label = NULL;
+      t = snprintf(w->title, sizeof w->title, needs ? "YouGame can't start from here" : "Online can't start from here");
+      b = snprintf(w->body, sizeof w->body, needs ?
+                   "%s was started as administrator. Close it and start it normally." :
+                   "%s was started as administrator. Close it and start it normally to play online.", upper);
+      break;
+  }
+  /* Installed but not running, or didn't open: Open YouGame where this system can start it. If
+     it then won't start, yg_start sends the player to the download page instead. */
+  if (open_ok && YG__START_OFFERS_OPEN(which)) {
+    w->answer = YG__START_ANSWER_OPEN;
+    w->main_label = YG__START_OPEN;
+  }
+  return t > 0 && (size_t)t < sizeof w->title && b > 0 && (size_t)b < sizeof w->body;
+}
 #define YG__START_WIDE_(s) L##s
 #define YG__START_WIDE(s) YG__START_WIDE_(s)
 
@@ -902,7 +1004,8 @@ static int yg__start_app_signed(yg__start_app *app);
 static int yg__start_app_launch(yg__start_app *app, int staging);
 static void yg__start_app_close(yg__start_app *app);
 static int yg__start_shell_open(const char *url);
-static int yg__start_offer(int text);
+static int yg__start_offer(const yg__start_win *w);
+static int yg__start_offline(int staging, const char *game, int note);
 static int yg__start_raised(void);
 static int yg__start_quiet_env(void);
 static void yg__start_sleep(unsigned ms);
@@ -916,6 +1019,7 @@ static int yg__start_marker(int staging, yg__start_mark *mark, char to[YG__START
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <math.h>
 #include <sddl.h>
 #include <shellapi.h>
 #include <wchar.h>
@@ -1656,48 +1760,53 @@ static int yg__start_shell_open(const char *url) {
 
 /* The small window: YouGame's own, two buttons, or three with Open YouGame (the default then).
    Returns YG__START_ANSWER_*. */
-#define YG__START_ID_GET 101
-#define YG__START_ID_NOT_NOW 102
-#define YG__START_ID_OPEN 103
-static int yg__start_choice;
-static int yg__start_done; /* the small window has been destroyed */
-
-static LRESULT CALLBACK yg__start_wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
-  switch (m) {
-    case WM_COMMAND:
-      if (LOWORD(wp) == YG__START_ID_GET) { yg__start_choice = YG__START_ANSWER_GET; DestroyWindow(w); return 0; }
-      if (LOWORD(wp) == YG__START_ID_OPEN) { yg__start_choice = YG__START_ANSWER_OPEN; DestroyWindow(w); return 0; }
-      if (LOWORD(wp) == YG__START_ID_NOT_NOW || LOWORD(wp) == IDCANCEL) { DestroyWindow(w); return 0; }
-      break;
-    case WM_ACTIVATE: /* clicked in later (after a flash): focus the default button (Open YouGame when
-                         offered, else Get YouGame), so Enter works */
-      if (LOWORD(wp) != WA_INACTIVE) {
-        HWND open = GetDlgItem(w, YG__START_ID_OPEN), get = GetDlgItem(w, YG__START_ID_GET);
-        if (open) SetFocus(open);
-        else if (get) SetFocus(get);
-        else SetFocus(GetDlgItem(w, YG__START_ID_NOT_NOW));
-        return 0;
+/* The at-start game's player pressed Play offline once (see yg_start): an empty file named for the
+   game in %LOCALAPPDATA%\\YouGame Start (FOLDERID_LocalAppData from SHGetKnownFolderPath, loaded from
+   the system directory). note = 0 asks whether it is there; note = 1 makes it. Any failure: not
+   there (the window shows at start, as before). */
+static int yg__start_offline(int staging, const char *game, int note) {
+  typedef HRESULT (WINAPI *known_fn)(const GUID *, DWORD, HANDLE, PWSTR *);
+  typedef void (WINAPI *free_fn)(LPVOID);
+  static const GUID local = /* FOLDERID_LocalAppData */
+    {0xf1b32785, 0x6fba, 0x4fcf, {0x9d, 0x55, 0x7b, 0x8e, 0x7f, 0x15, 0x70, 0x91}};
+  HMODULE shell = yg__start_system_dll(L"shell32.dll");
+  HMODULE ole = yg__start_system_dll(L"ole32.dll");
+  known_fn known = NULL;
+  free_fn release = NULL;
+  PWSTR root = NULL;
+  wchar_t path[YG__START_PATH_CAP];
+  int ok = 0;
+  if (shell && ole) {
+    YG__START_PROC(known, shell, "SHGetKnownFolderPath");
+    YG__START_PROC(release, ole, "CoTaskMemFree");
+  }
+  if (known && release && known(&local, 0, NULL, &root) == S_OK && root) {
+    size_t at = wcslen(root), i;
+    const char *tail = staging ? ".staging.offline" : ".offline";
+    static const wchar_t folder[] = L"\\YouGame Start";
+    if (at + wcslen(folder) + 1 + strlen(game) + strlen(tail) + 1 <= YG__START_PATH_CAP) {
+      memcpy(path, root, at * sizeof(wchar_t));
+      memcpy(path + at, folder, sizeof folder);
+      at += wcslen(folder);
+      if (note) CreateDirectoryW(path, NULL);
+      path[at++] = L'\\';
+      for (i = 0; game[i]; ++i) path[at++] = (wchar_t)(unsigned char)game[i];
+      for (i = 0; tail[i]; ++i) path[at++] = (wchar_t)(unsigned char)tail[i];
+      path[at] = 0;
+      if (!note) {
+        DWORD a = GetFileAttributesW(path);
+        ok = a != INVALID_FILE_ATTRIBUTES && !(a & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
+      } else {
+        HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        ok = f != INVALID_HANDLE_VALUE;
+        if (ok) CloseHandle(f);
       }
-      break;
-    case WM_CLOSE: DestroyWindow(w); return 0;
-    case WM_DESTROY: yg__start_done = 1; return 0; /* never a WM_QUIT: that would end the game */
-    default: break;
-  }
-  return DefWindowProcW(w, m, wp, lp);
-}
-
-/* ASCII to wide, "\n" to "\r\n". Returns the length written, or 0 if it does not fit. */
-static size_t yg__start_widen(const char *s, wchar_t *out, size_t at, size_t cap) {
-  for (; *s; ++s) {
-    if (*s == '\n') {
-      if (at + 1 >= cap) return 0;
-      out[at++] = L'\r';
     }
-    if (at + 1 >= cap) return 0;
-    out[at++] = (wchar_t)(unsigned char)*s;
   }
-  out[at] = 0;
-  return at;
+  if (root) release(root);
+  if (ole) FreeLibrary(ole);
+  if (shell) FreeLibrary(shell);
+  return ok;
 }
 
 /* Puts the small window in front. A game that just started often isn't the foreground process yet,
@@ -1738,77 +1847,819 @@ static void yg__start_front(HWND w) {
   }
 }
 
-static int yg__start_offer(int which) {
-  static const wchar_t *cls = L"YouGameStartOffer";
+/* YouGame's own window (the approved C3 look): a red logo panel on the left, the words
+   and buttons on the right, on YouGame's dark surface. Everything is drawn here, with no image file
+   and no new library: shapes are anti-aliased by distance (yg__start_cover), text is the system's
+   Segoe UI. Mouse, keyboard (Tab, arrows, Enter, Space, Escape) and an Xbox-style controller (D-pad
+   or left stick, A, B) all work; the window can be dragged by any empty spot. */
+#define YG__START_ID_MAIN 101
+#define YG__START_ID_LATER 102
+#define YG__START_ID_CLOSE 103
+#define YG__START_TIMER 1
+
+/* Colours as 0xRRGGBB, from the mock. */
+#define YG__START_C_SURFACE 0x212121u
+#define YG__START_C_BORDER 0x3a3a3au
+#define YG__START_C_TITLE 0xffffffu
+#define YG__START_C_BODY 0xd0d0d0u
+#define YG__START_C_FACT 0xeeeeeeu
+#define YG__START_C_RED 0xff0000u
+#define YG__START_C_WHITE 0xffffffu
+#define YG__START_C_MAIN 0xf1f1f1u
+#define YG__START_C_MAIN_HOT 0xffffffu
+#define YG__START_C_MAIN_DOWN 0xd9d9d9u
+#define YG__START_C_MAIN_TEXT 0x0f0f0fu
+#define YG__START_C_LATER 0x383838u
+#define YG__START_C_LATER_HOT 0x474747u
+#define YG__START_C_LATER_DOWN 0x2e2e2eu
+#define YG__START_C_LATER_TEXT 0xf1f1f1u
+#define YG__START_C_X 0x8a8a8au
+#define YG__START_C_X_HOT 0xe6e6e6u
+#define YG__START_C_FOCUS 0x4da3ffu
+
+typedef struct yg__start_xi {
+  DWORD packet;
+  WORD buttons;
+  BYTE left_trigger, right_trigger;
+  SHORT lx, ly, rx, ry;
+} yg__start_xi;
+typedef DWORD (WINAPI *yg__start_xi_fn)(DWORD, yg__start_xi *);
+
+typedef struct yg__start_ui {
+  const yg__start_win *w;
+  float s;                       /* pixels per mock pixel (the monitor's DPI / 96) */
+  int cw, ch;                    /* client size */
+  int side;                      /* the logo panel's width */
+  RECT title, body, close, main, later;
+  int facts_y, logo_y, logo, brand_y, ring;
+  int rounded;                   /* Windows 11 rounds the corners and draws the border itself */
+  HFONT f_title, f_body, f_fact, f_button, f_brand;
+  HDC dc;                        /* the back buffer: the window without its buttons */
+  HBITMAP bmp, old_bmp;
+  DWORD *bits;
+  HWND hwnd;
+  int hot, down;                 /* the button under the mouse, and the one held */
+  int choice, done;
+  HMODULE xinput;
+  yg__start_xi_fn xi_get;
+  WORD xi_last;
+  int xi_armed;                  /* every controller button was seen released since the window opened */
+  WNDPROC button_proc;
+  HICON icon_big, icon_small;
+} yg__start_ui;
+static yg__start_ui yg__start_u;
+
+static float yg__start_clamp01(float v) { return v < 0.f ? 0.f : v > 1.f ? 1.f : v; }
+
+/* Coverage of a pixel by a shape whose signed distance at the pixel's centre is d (negative inside). */
+static float yg__start_cover(float d) { return yg__start_clamp01(0.5f - d); }
+
+/* Blends colour c over one 0x00RRGGBB pixel by a (0..1). */
+static void yg__start_blend(DWORD *px, unsigned c, float a) {
+  unsigned d = (unsigned)*px, r, g, b;
+  if (a <= 0.f) return;
+  if (a >= 1.f) { *px = c & 0xffffffu; return; }
+  r = (unsigned)(((c >> 16) & 255) * a + ((d >> 16) & 255) * (1.f - a) + .5f);
+  g = (unsigned)(((c >> 8) & 255) * a + ((d >> 8) & 255) * (1.f - a) + .5f);
+  b = (unsigned)((c & 255) * a + (d & 255) * (1.f - a) + .5f);
+  *px = (r << 16) | (g << 8) | b;
+}
+
+/* Signed distance to a rounded rectangle (x, y, w, h, corner r). */
+static float yg__start_sd_rrect(float px, float py, float x, float y, float w, float h, float r) {
+  float hx = w * .5f, hy = h * .5f, qx = (float)fabs(px - (x + hx)) - hx + r, qy = (float)fabs(py - (y + hy)) - hy + r;
+  float ox = qx > 0.f ? qx : 0.f, oy = qy > 0.f ? qy : 0.f, in = qx > qy ? qx : qy;
+  return (float)sqrt(ox * ox + oy * oy) + (in < 0.f ? in : 0.f) - r;
+}
+
+/* Fills a rounded rectangle into a w-wide pixel buffer, clipped to [0,bw) x [0,bh). */
+static void yg__start_fill_rrect(DWORD *bits, int bw, int bh, float x, float y, float w, float h, float r,
+                                 unsigned c) {
+  int x0 = (int)x - 1, y0 = (int)y - 1, x1 = (int)(x + w) + 2, y1 = (int)(y + h) + 2, i, j;
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 > bw) x1 = bw;
+  if (y1 > bh) y1 = bh;
+  for (j = y0; j < y1; ++j)
+    for (i = x0; i < x1; ++i)
+      yg__start_blend(&bits[j * bw + i], c, yg__start_cover(yg__start_sd_rrect(i + .5f, j + .5f, x, y, w, h, r)));
+}
+
+static void yg__start_fill_circle(DWORD *bits, int bw, int bh, float cx, float cy, float r, unsigned c) {
+  yg__start_fill_rrect(bits, bw, bh, cx - r, cy - r, 2 * r, 2 * r, r, c);
+}
+
+/* A stroked line drawing (round ends and joins): segments in a 24-unit box, drawn at (x, y), size px. */
+#define YG__START_SEGS 64
+typedef struct yg__start_path { int n; float p[YG__START_SEGS][4]; } yg__start_path;
+
+static void yg__start_seg(yg__start_path *p, float ax, float ay, float bx, float by) {
+  if (p->n >= YG__START_SEGS) return;
+  p->p[p->n][0] = ax; p->p[p->n][1] = ay; p->p[p->n][2] = bx; p->p[p->n][3] = by;
+  ++p->n;
+}
+
+/* An arc of a circle from angle a0 to a1 (radians, y down), as 10 segments. */
+static void yg__start_arc(yg__start_path *p, float cx, float cy, float r, float a0, float a1) {
+  int i;
+  for (i = 0; i < 10; ++i) {
+    float t0 = a0 + (a1 - a0) * i / 10.f, t1 = a0 + (a1 - a0) * (i + 1) / 10.f;
+    yg__start_seg(p, cx + r * (float)cos(t0), cy + r * (float)sin(t0), cx + r * (float)cos(t1), cy + r * (float)sin(t1));
+  }
+}
+
+static void yg__start_bezier(yg__start_path *p, float x0, float y0, float x1, float y1, float x2, float y2,
+                             float x3, float y3) {
+  float lx = x0, ly = y0;
+  int i;
+  for (i = 1; i <= 8; ++i) {
+    float t = i / 8.f, u = 1.f - t;
+    float x = u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x3;
+    float y = u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y3;
+    yg__start_seg(p, lx, ly, x, y);
+    lx = x;
+    ly = y;
+  }
+}
+
+static void yg__start_stroke(DWORD *bits, int bw, int bh, const yg__start_path *p, float x, float y,
+                             float size, float width, unsigned c) {
+  float k = size / 24.f, half = width * k * .5f;
+  int x0 = (int)x - 1, y0 = (int)y - 1, x1 = (int)(x + size) + 2, y1 = (int)(y + size) + 2, i, j, s;
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 > bw) x1 = bw;
+  if (y1 > bh) y1 = bh;
+  for (j = y0; j < y1; ++j)
+    for (i = x0; i < x1; ++i) {
+      float px = (i + .5f - x) / k, py = (j + .5f - y) / k, best = 1e9f;
+      for (s = 0; s < p->n; ++s) {
+        float ax = p->p[s][0], ay = p->p[s][1], dx = p->p[s][2] - ax, dy = p->p[s][3] - ay;
+        float len2 = dx * dx + dy * dy, t = len2 > 0.f ? ((px - ax) * dx + (py - ay) * dy) / len2 : 0.f, ex, ey, d;
+        t = yg__start_clamp01(t);
+        ex = px - (ax + t * dx);
+        ey = py - (ay + t * dy);
+        d = ex * ex + ey * ey;
+        if (d < best) best = d;
+      }
+      yg__start_blend(&bits[j * bw + i], c, yg__start_cover((float)sqrt(best) * k - half));
+    }
+}
+
+/* The three icons of the facts row (the mock's match2, friends and rank drawings). */
+static void yg__start_icon(int which, yg__start_path *p) {
+  const float pi = 3.14159265f;
+  p->n = 0;
+  if (which == 0) { /* Matchmaking: crossed swords */
+    yg__start_seg(p, 4.5f, 4.5f, 15, 15); yg__start_seg(p, 12.5f, 17.5f, 17.5f, 12.5f);
+    yg__start_seg(p, 16, 16, 19.5f, 19.5f); yg__start_seg(p, 19.5f, 4.5f, 9, 15);
+    yg__start_seg(p, 6.5f, 12.5f, 11.5f, 17.5f); yg__start_seg(p, 8, 16, 4.5f, 19.5f);
+  } else if (which == 1) { /* Friends: two people */
+    yg__start_arc(p, 9, 8, 3.5f, 0, 2 * pi);
+    yg__start_bezier(p, 2.5f, 20, 3.3f, 16.5f, 5.9f, 14.5f, 9, 14.5f);
+    yg__start_bezier(p, 9, 14.5f, 12.1f, 14.5f, 14.7f, 16.5f, 15.5f, 20);
+    yg__start_arc(p, 17, 9, 2.5f, 0, 2 * pi);
+    yg__start_bezier(p, 16, 14.6f, 18.6f, 14.8f, 20.6f, 16.6f, 21.2f, 19.5f);
+  } else { /* Ranked: a cup */
+    yg__start_seg(p, 7, 4, 17, 4); yg__start_seg(p, 17, 4, 17, 9);
+    yg__start_arc(p, 12, 9, 5, 0, pi);
+    yg__start_seg(p, 7, 9, 7, 4); yg__start_seg(p, 12, 14, 12, 18); yg__start_seg(p, 8, 20, 16, 20);
+    yg__start_seg(p, 7, 6, 4, 6); yg__start_seg(p, 4, 6, 4, 7); yg__start_arc(p, 7, 7, 3, pi, pi / 2);
+    yg__start_seg(p, 17, 6, 20, 6); yg__start_seg(p, 20, 6, 20, 7); yg__start_arc(p, 17, 7, 3, 0, pi / 2);
+  }
+}
+
+/* YouGame's logo (the site's 192-unit drawing) at (x, y), size px. */
+static void yg__start_logo(DWORD *bits, int bw, int bh, float x, float y, float size) {
+  float k = size / 192.f;
+  yg__start_fill_rrect(bits, bw, bh, x, y, 192 * k, 192 * k, 44 * k, YG__START_C_RED);
+  yg__start_fill_rrect(bits, bw, bh, x + 34 * k, y + 66 * k, 124 * k, 60 * k, 30 * k, YG__START_C_WHITE);
+  yg__start_fill_rrect(bits, bw, bh, x + 56 * k, y + 90 * k, 24 * k, 8 * k, 2 * k, YG__START_C_RED);
+  yg__start_fill_rrect(bits, bw, bh, x + 64 * k, y + 82 * k, 8 * k, 24 * k, 2 * k, YG__START_C_RED);
+  yg__start_fill_circle(bits, bw, bh, x + 118 * k, y + 88 * k, 6 * k, YG__START_C_RED);
+  yg__start_fill_circle(bits, bw, bh, x + 130 * k, y + 102 * k, 6 * k, YG__START_C_RED);
+}
+
+/* ASCII to wide. Returns the length, or 0 if it does not fit. */
+static int yg__start_wide(const char *s, wchar_t *out, int cap) {
+  int n = 0;
+  for (; *s; ++s) {
+    if (n + 1 >= cap) return 0;
+    out[n++] = (wchar_t)(unsigned char)*s;
+  }
+  out[n] = 0;
+  return n;
+}
+
+static HFONT yg__start_font(float px, int weight) {
+  return CreateFontW(-(int)(px + .5f), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+}
+
+/* The height of text in font f wrapped to width (or one line when width is 0), and its width. */
+static int yg__start_measure(HDC dc, HFONT f, const char *s, int width, int *out_w) {
+  wchar_t t[YG__START_BODY_CAP];
+  RECT r;
+  HGDIOBJ old = SelectObject(dc, f);
+  r.left = r.top = 0;
+  r.right = width ? width : 4000;
+  r.bottom = 0;
+  if (yg__start_wide(s, t, YG__START_BODY_CAP))
+    DrawTextW(dc, t, -1, &r, DT_CALCRECT | DT_NOPREFIX | (width ? DT_WORDBREAK : DT_SINGLELINE));
+  SelectObject(dc, old);
+  if (out_w) *out_w = r.right - r.left;
+  return r.bottom - r.top;
+}
+
+static void yg__start_text(HDC dc, HFONT f, const char *s, RECT *r, unsigned c, UINT how) {
+  wchar_t t[YG__START_BODY_CAP];
+  HGDIOBJ old = SelectObject(dc, f);
+  SetBkMode(dc, TRANSPARENT);
+  SetTextColor(dc, RGB((c >> 16) & 255, (c >> 8) & 255, c & 255));
+  if (yg__start_wide(s, t, YG__START_BODY_CAP)) DrawTextW(dc, t, -1, r, how | DT_NOPREFIX);
+  SelectObject(dc, old);
+}
+
+static void yg__start_ui_fonts(yg__start_ui *u) {
+  float s = u->s;
+  u->f_title = yg__start_font(19 * s, FW_SEMIBOLD);
+  u->f_body = yg__start_font(13.5f * s, FW_NORMAL);
+  u->f_fact = yg__start_font(12.5f * s, FW_SEMIBOLD);
+  u->f_button = yg__start_font(14 * s, FW_SEMIBOLD);
+  u->f_brand = yg__start_font(14 * s, FW_BOLD);
+}
+
+static void yg__start_ui_free(yg__start_ui *u) {
+  if (u->dc) {
+    if (u->old_bmp) SelectObject(u->dc, u->old_bmp);
+    DeleteDC(u->dc);
+  }
+  if (u->bmp) DeleteObject(u->bmp);
+  if (u->f_title) DeleteObject(u->f_title);
+  if (u->f_body) DeleteObject(u->f_body);
+  if (u->f_fact) DeleteObject(u->f_fact);
+  if (u->f_button) DeleteObject(u->f_button);
+  if (u->f_brand) DeleteObject(u->f_brand);
+  u->dc = NULL;
+  u->bmp = u->old_bmp = NULL;
+  u->bits = NULL;
+  u->f_title = u->f_body = u->f_fact = u->f_button = u->f_brand = NULL;
+}
+
+/* A 32-bit top-down DIB section selected into a new memory DC. */
+static int yg__start_dib(int w, int h, HDC *dc, HBITMAP *bmp, HBITMAP *old, DWORD **bits) {
+  BITMAPINFO bi;
+  void *p = NULL;
+  memset(&bi, 0, sizeof bi);
+  bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+  bi.bmiHeader.biWidth = w;
+  bi.bmiHeader.biHeight = -h;
+  bi.bmiHeader.biPlanes = 1;
+  bi.bmiHeader.biBitCount = 32;
+  bi.bmiHeader.biCompression = BI_RGB;
+  *dc = CreateCompatibleDC(NULL);
+  if (!*dc) return 0;
+  *bmp = CreateDIBSection(*dc, &bi, DIB_RGB_COLORS, &p, NULL, 0);
+  if (!*bmp || !p) {
+    if (*bmp) DeleteObject(*bmp);
+    *bmp = NULL;
+    DeleteDC(*dc);
+    *dc = NULL;
+    return 0;
+  }
+  *old = (HBITMAP)SelectObject(*dc, *bmp);
+  *bits = (DWORD *)p;
+  return 1;
+}
+
+/* Lays the window out at scale u->s (fonts made first) and draws everything but the buttons into
+   the back buffer. 0 on failure. */
+static int yg__start_ui_build(yg__start_ui *u) {
+  const yg__start_win *w = u->w;
+  float s = u->s;
+  HDC probe = CreateCompatibleDC(NULL);
+  int x0, x1, y, th, bh, tw, mw = 0, lw = 0, btn_h, gap = (int)(10 * s + .5f), i, j;
+  if (!probe) return 0;
+  u->cw = (int)(480 * s + .5f);
+  u->side = (int)(128 * s + .5f);
+  x0 = u->side + (int)(20 * s + .5f);
+  x1 = u->cw - (int)(20 * s + .5f);
+  y = (int)(20 * s + .5f);
+  th = yg__start_measure(probe, u->f_title, w->title, x1 - x0 - (int)(22 * s + .5f), NULL);
+  SetRect(&u->title, x0, y, x1 - (int)(22 * s + .5f), y + th);
+  y += th + (int)(6 * s + .5f);
+  bh = yg__start_measure(probe, u->f_body, w->body, x1 - x0, NULL);
+  SetRect(&u->body, x0, y, x1, y + bh);
+  y += bh;
+  if (w->facts) {
+    y += (int)(14 * s + .5f);
+    u->facts_y = y;
+    y += (int)(18 * s + .5f);
+  }
+  y += (int)(16 * s + .5f);
+  btn_h = yg__start_measure(probe, u->f_button, "Ag", 0, NULL) + (int)(16 * s + .5f);
+  yg__start_measure(probe, u->f_button, w->main_label, 0, &mw);
+  if (w->later_label) yg__start_measure(probe, u->f_button, w->later_label, 0, &lw);
+  SetRect(&u->main, x1 - mw - (int)(36 * s + .5f), y, x1, y + btn_h);
+  if (w->later_label) SetRect(&u->later, u->main.left - gap - lw - (int)(32 * s + .5f), y, u->main.left - gap, y + btn_h);
+  else SetRectEmpty(&u->later);
+  /* The child windows are the pills plus room for the focus ring around them. */
+  u->ring = (int)(3 * s + .5f);
+  InflateRect(&u->main, u->ring, u->ring);
+  if (w->later_label) InflateRect(&u->later, u->ring, u->ring);
+  y += btn_h + (int)(18 * s + .5f);
+  u->logo = (int)(56 * s + .5f);
+  tw = yg__start_measure(probe, u->f_brand, "YouGame", 0, NULL);
+  if (y < u->logo + tw + (int)(60 * s + .5f)) y = u->logo + tw + (int)(60 * s + .5f);
+  u->ch = y;
+  u->logo_y = (u->ch - (u->logo + (int)(10 * s + .5f) + tw)) / 2;
+  u->brand_y = u->logo_y + u->logo + (int)(10 * s + .5f);
+  {
+    int c = (int)(28 * s + .5f), r = u->cw - (int)(8 * s + .5f), t = (int)(8 * s + .5f);
+    SetRect(&u->close, r - c, t, r, t + c);
+  }
+  DeleteDC(probe);
+  if (!yg__start_dib(u->cw, u->ch, &u->dc, &u->bmp, &u->old_bmp, &u->bits)) return 0;
+
+  /* Surface, then the panel's gradient (the mock's 165deg: #5e1118, #35151a at 55%, #251a1b). */
+  for (i = 0; i < u->cw * u->ch; ++i) u->bits[i] = YG__START_C_SURFACE;
+  {
+    const float dx = .2588f, dy = .9659f, len = u->side * dx + u->ch * dy;
+    for (j = 0; j < u->ch; ++j)
+      for (i = 0; i < u->side; ++i) {
+        float t = ((i + .5f - u->side * .5f) * dx + (j + .5f - u->ch * .5f) * dy) / len + .5f;
+        unsigned a, b;
+        float k;
+        if (t < .55f) { a = 0x5e1118u; b = 0x35151au; k = yg__start_clamp01(t / .55f); }
+        else { a = 0x35151au; b = 0x251a1bu; k = yg__start_clamp01((t - .55f) / .45f); }
+        u->bits[j * u->cw + i] = a;
+        yg__start_blend(&u->bits[j * u->cw + i], b, k);
+      }
+  }
+  yg__start_logo(u->bits, u->cw, u->ch, (u->side - u->logo) * .5f, (float)u->logo_y, (float)u->logo);
+  if (w->facts) {
+    static const char *const names[3] = {"Matchmaking", "Friends", "Ranked"};
+    int x = x0, k;
+    for (k = 0; k < 3; ++k) {
+      yg__start_path p;
+      int lwid = 0, lh = yg__start_measure(u->dc, u->f_fact, names[k], 0, &lwid);
+      RECT r;
+      yg__start_icon(k, &p);
+      yg__start_stroke(u->bits, u->cw, u->ch, &p, (float)x, (float)u->facts_y, 18 * s, 2, YG__START_C_FACT);
+      x += (int)(23 * s + .5f);
+      SetRect(&r, x, u->facts_y + ((int)(18 * s + .5f) - lh) / 2, x + lwid + 2, u->facts_y + (int)(18 * s + .5f));
+      yg__start_text(u->dc, u->f_fact, names[k], &r, YG__START_C_FACT, DT_SINGLELINE | DT_LEFT | DT_TOP);
+      x += lwid + (int)(14 * s + .5f);
+    }
+  }
+  GdiFlush();
+  yg__start_text(u->dc, u->f_title, w->title, &u->title, YG__START_C_TITLE, DT_WORDBREAK | DT_LEFT | DT_TOP);
+  yg__start_text(u->dc, u->f_body, w->body, &u->body, YG__START_C_BODY, DT_WORDBREAK | DT_LEFT | DT_TOP);
+  {
+    RECT r;
+    SetRect(&r, 0, u->brand_y, u->side, u->ch);
+    yg__start_text(u->dc, u->f_brand, "YouGame", &r, YG__START_C_WHITE, DT_SINGLELINE | DT_CENTER | DT_TOP);
+  }
+  GdiFlush();
+  if (!u->rounded) { /* Windows 10: square corners, a hairline border drawn here */
+    for (i = 0; i < u->cw; ++i) u->bits[i] = u->bits[(u->ch - 1) * u->cw + i] = YG__START_C_BORDER;
+    for (j = 0; j < u->ch; ++j) u->bits[j * u->cw] = u->bits[j * u->cw + u->cw - 1] = YG__START_C_BORDER;
+  }
+  return 1;
+}
+
+/* Draws one button: the back buffer behind its place src (window coordinates), then the pill or the
+   close mark, into target at (dx, dy). hot: mouse over; down: pressed; focus: keyboard focus shown. */
+static void yg__start_ui_button(yg__start_ui *u, int id, HDC target, const RECT *src, int dx, int dy,
+                                int hot, int down, int focus) {
+  HDC dc;
+  HBITMAP bmp, old;
+  DWORD *bits;
+  int bw = src->right - src->left, bh = src->bottom - src->top;
+  float s = u->s;
+  if (bw <= 0 || bh <= 0 || !yg__start_dib(bw, bh, &dc, &bmp, &old, &bits)) return;
+  BitBlt(dc, 0, 0, bw, bh, u->dc, src->left, src->top, SRCCOPY);
+  GdiFlush();
+  if (id == YG__START_ID_CLOSE) {
+    yg__start_path p;
+    float m = bw * .5f;
+    if (hot || focus) yg__start_fill_circle(bits, bw, bh, m, bh * .5f, m - 1, 0x303030u);
+    p.n = 0;
+    yg__start_seg(&p, 7.5f, 7.5f, 16.5f, 16.5f);
+    yg__start_seg(&p, 16.5f, 7.5f, 7.5f, 16.5f);
+    yg__start_stroke(bits, bw, bh, &p, 0, 0, (float)bw, 1.6f * s * 24.f / (float)bw,
+                     hot ? YG__START_C_X_HOT : YG__START_C_X);
+  } else {
+    int is_main = id == YG__START_ID_MAIN;
+    unsigned fill = is_main ? (down ? YG__START_C_MAIN_DOWN : hot ? YG__START_C_MAIN_HOT : YG__START_C_MAIN)
+                            : (down ? YG__START_C_LATER_DOWN : hot ? YG__START_C_LATER_HOT : YG__START_C_LATER);
+    float g = (float)u->ring, pw = bw - 2 * g, ph = bh - 2 * g;
+    if (focus) {
+      float t = 2 * s; /* the ring: 2 px, 1 px clear of the pill */
+      yg__start_fill_rrect(bits, bw, bh, g - t - s, g - t - s, pw + 2 * (t + s), ph + 2 * (t + s), ph * .5f + t + s, YG__START_C_FOCUS);
+      yg__start_fill_rrect(bits, bw, bh, g - s, g - s, pw + 2 * s, ph + 2 * s, ph * .5f + s, YG__START_C_SURFACE);
+    }
+    yg__start_fill_rrect(bits, bw, bh, g, g, pw, ph, ph * .5f, fill);
+    GdiFlush();
+    {
+      RECT t;
+      SetRect(&t, 0, 0, bw, bh);
+      yg__start_text(dc, u->f_button, is_main ? u->w->main_label : u->w->later_label, &t,
+                     is_main ? YG__START_C_MAIN_TEXT : YG__START_C_LATER_TEXT, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    }
+  }
+  GdiFlush();
+  BitBlt(target, dx, dy, bw, bh, dc, 0, 0, SRCCOPY);
+  SelectObject(dc, old);
+  DeleteObject(bmp);
+  DeleteDC(dc);
+}
+
+/* The logo as an icon (taskbar, Alt+Tab), size px, with real alpha. */
+static HICON yg__start_logo_icon(int size) {
+  HDC dc;
+  HBITMAP bmp, old, mask;
+  DWORD *bits;
+  ICONINFO ii;
+  HICON icon = NULL;
+  int i;
+  if (!yg__start_dib(size, size, &dc, &bmp, &old, &bits)) return NULL;
+  /* Drawn twice: once over black and once over white; alpha from the difference. */
+  {
+    DWORD *white = (DWORD *)malloc((size_t)size * size * sizeof(DWORD));
+    if (!white) { SelectObject(dc, old); DeleteObject(bmp); DeleteDC(dc); return NULL; }
+    for (i = 0; i < size * size; ++i) { bits[i] = 0; white[i] = 0xffffffu; }
+    yg__start_logo(bits, size, size, 0, 0, (float)size);
+    yg__start_logo(white, size, size, 0, 0, (float)size);
+    for (i = 0; i < size * size; ++i) {
+      unsigned a = 255 - (((white[i] >> 8) & 255) - ((bits[i] >> 8) & 255));
+      unsigned r = (bits[i] >> 16) & 255, g = (bits[i] >> 8) & 255, b = bits[i] & 255;
+      if (a) { r = r * 255 / a; g = g * 255 / a; b = b * 255 / a; }
+      bits[i] = (a << 24) | ((r > 255 ? 255 : r) << 16) | ((g > 255 ? 255 : g) << 8) | (b > 255 ? 255 : b);
+    }
+    free(white);
+  }
+  GdiFlush();
+  SelectObject(dc, old);
+  {
+    void *zero = calloc((size_t)((size + 15) / 16) * 2, (size_t)size); /* rows are WORD-aligned */
+    mask = zero ? CreateBitmap(size, size, 1, 1, zero) : NULL;
+    free(zero);
+  }
+  if (mask) {
+    memset(&ii, 0, sizeof ii);
+    ii.fIcon = TRUE;
+    ii.hbmColor = bmp;
+    ii.hbmMask = mask;
+    icon = CreateIconIndirect(&ii);
+    DeleteObject(mask);
+  }
+  DeleteObject(bmp);
+  DeleteDC(dc);
+  return icon;
+}
+
+/* The player's choice. Closing the window (Esc, the X, Alt+F4) is Play offline: the player saw it and
+   chose not to go online. */
+static void yg__start_pick(HWND w, int id) {
+  if (id == YG__START_ID_MAIN) yg__start_u.choice = yg__start_u.w->answer;
+  else yg__start_u.choice = YG__START_ANSWER_LATER;
+  DestroyWindow(w);
+}
+
+/* Moves focus between the two buttons and shows the focus ring (keyboard or controller). */
+static void yg__start_focus(HWND w, int id) {
+  HWND b = GetDlgItem(w, id);
+  if (!b) return;
+  SendMessageW(w, WM_CHANGEUISTATE, MAKEWPARAM(UIS_CLEAR, UISF_HIDEFOCUS), 0);
+  SetFocus(b);
+  InvalidateRect(GetDlgItem(w, YG__START_ID_MAIN), NULL, FALSE);
+  if (GetDlgItem(w, YG__START_ID_LATER)) InvalidateRect(GetDlgItem(w, YG__START_ID_LATER), NULL, FALSE);
+}
+
+static int yg__start_focused_id(HWND w) {
+  HWND f = GetFocus();
+  if (f && GetParent(f) == w) return GetDlgCtrlID(f);
+  return 0;
+}
+
+/* The controller: D-pad or left stick left/right moves between the buttons, A presses, B is the
+   other button (Play offline, or Quit). Nothing counts until every button was seen released, so the
+   press that opened the window (A on the game's Online) never answers it. Only while it is in front. */
+static void yg__start_pad(HWND w) {
+  yg__start_ui *u = &yg__start_u;
+  yg__start_xi st;
+  WORD now = 0, fresh;
+  DWORD i;
+  if (!u->xi_get) return;
+  for (i = 0; i < 4; ++i) {
+    memset(&st, 0, sizeof st);
+    if (u->xi_get(i, &st) == ERROR_SUCCESS) {
+      now |= st.buttons;
+      if (st.lx < -16000) now |= 0x0004;
+      if (st.lx > 16000) now |= 0x0008;
+    }
+  }
+  if (!u->xi_armed) {
+    if ((now & 0x300c) == 0) u->xi_armed = 1;
+    u->xi_last = now;
+    return;
+  }
+  fresh = (WORD)(now & ~u->xi_last);
+  u->xi_last = now;
+  if (GetForegroundWindow() != w || !fresh) return;
+  if (fresh & 0x2000) { yg__start_pick(w, YG__START_ID_LATER); return; }               /* B */
+  if (fresh & 0x1000) { yg__start_pick(w, yg__start_focused_id(w) == YG__START_ID_LATER ? YG__START_ID_LATER : YG__START_ID_MAIN); return; } /* A */
+  if ((fresh & 0x0004) && GetDlgItem(w, YG__START_ID_LATER)) yg__start_focus(w, YG__START_ID_LATER); /* left */
+  if (fresh & 0x0008) yg__start_focus(w, YG__START_ID_MAIN);                           /* right */
+}
+
+static LRESULT CALLBACK yg__start_button_proc(HWND b, UINT m, WPARAM wp, LPARAM lp) {
+  yg__start_ui *u = &yg__start_u;
+  int id = GetDlgCtrlID(b);
+  switch (m) {
+    case WM_MOUSEMOVE:
+      if (u->hot != id) {
+        TRACKMOUSEEVENT t;
+        HWND prev = u->hot ? GetDlgItem(GetParent(b), u->hot) : NULL;
+        u->hot = id;
+        memset(&t, 0, sizeof t);
+        t.cbSize = sizeof t;
+        t.dwFlags = TME_LEAVE;
+        t.hwndTrack = b;
+        TrackMouseEvent(&t);
+        if (prev) InvalidateRect(prev, NULL, FALSE);
+        InvalidateRect(b, NULL, FALSE);
+      }
+      break;
+    case WM_MOUSELEAVE:
+      if (u->hot == id) { u->hot = 0; InvalidateRect(b, NULL, FALSE); }
+      break;
+    case WM_SETCURSOR:
+      SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_HAND));
+      return TRUE;
+    default: break;
+  }
+  return CallWindowProcW(u->button_proc, b, m, wp, lp);
+}
+
+/* Puts the child buttons at their laid-out places. */
+static void yg__start_ui_place(yg__start_ui *u) {
+  HWND b;
+  if ((b = GetDlgItem(u->hwnd, YG__START_ID_MAIN)) != NULL)
+    MoveWindow(b, u->main.left, u->main.top, u->main.right - u->main.left, u->main.bottom - u->main.top, FALSE);
+  if ((b = GetDlgItem(u->hwnd, YG__START_ID_LATER)) != NULL)
+    MoveWindow(b, u->later.left, u->later.top, u->later.right - u->later.left, u->later.bottom - u->later.top, FALSE);
+  if ((b = GetDlgItem(u->hwnd, YG__START_ID_CLOSE)) != NULL)
+    MoveWindow(b, u->close.left, u->close.top, u->close.right - u->close.left, u->close.bottom - u->close.top, FALSE);
+}
+
+static LRESULT CALLBACK yg__start_wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
+  yg__start_ui *u = &yg__start_u;
+  switch (m) {
+    case WM_COMMAND:
+      if (LOWORD(wp) == YG__START_ID_MAIN) { yg__start_pick(w, YG__START_ID_MAIN); return 0; }
+      if (LOWORD(wp) == YG__START_ID_LATER || LOWORD(wp) == YG__START_ID_CLOSE || LOWORD(wp) == IDCANCEL) {
+        /* The administrator window's one button is its main button: same answer either way. */
+        yg__start_pick(w, YG__START_ID_LATER);
+        return 0;
+      }
+      break;
+    case WM_DRAWITEM: {
+      const DRAWITEMSTRUCT *d = (const DRAWITEMSTRUCT *)lp;
+      int id = (int)d->CtlID;
+      const RECT *src = id == YG__START_ID_MAIN ? &u->main : id == YG__START_ID_LATER ? &u->later : &u->close;
+      yg__start_ui_button(u, id, d->hDC, src, 0, 0, u->hot == id, (d->itemState & ODS_SELECTED) != 0,
+                          (d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT));
+      return TRUE;
+    }
+    case WM_PAINT: {
+      PAINTSTRUCT ps;
+      HDC dc = BeginPaint(w, &ps);
+      if (u->dc) BitBlt(dc, 0, 0, u->cw, u->ch, u->dc, 0, 0, SRCCOPY);
+      EndPaint(w, &ps);
+      return 0;
+    }
+    case WM_ERASEBKGND: return 1;
+    case WM_NCHITTEST: { /* drag the window by any empty spot */
+      LRESULT h = DefWindowProcW(w, m, wp, lp);
+      return h == HTCLIENT ? HTCAPTION : h;
+    }
+    case WM_DPICHANGED: { /* moved to a monitor with another scale: everything again at the new size */
+      const RECT *to = (const RECT *)lp; /* where Windows suggests, so it stays on the new monitor */
+      yg__start_ui_free(u);
+      u->s = LOWORD(wp) / 96.f;
+      yg__start_ui_fonts(u);
+      if (!yg__start_ui_build(u)) { /* nothing left to show: no choice was made */
+        u->choice = YG__START_ANSWER_NONE;
+        DestroyWindow(w);
+        return 0;
+      }
+      yg__start_ui_place(u);
+      SetWindowPos(w, NULL, to->left, to->top, u->cw, u->ch, SWP_NOZORDER | SWP_NOACTIVATE);
+      RedrawWindow(w, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+      return 0;
+    }
+    case WM_TIMER:
+      if (wp == YG__START_TIMER) yg__start_pad(w);
+      return 0;
+    case WM_UPDATEUISTATE: {
+      LRESULT r = DefWindowProcW(w, m, wp, lp);
+      InvalidateRect(w, NULL, FALSE);
+      return r;
+    }
+    case WM_ACTIVATE: /* clicked in later (after a flash): focus the main button, so Enter works */
+      if (LOWORD(wp) != WA_INACTIVE) {
+        int f = yg__start_focused_id(w);
+        if (!f) SetFocus(GetDlgItem(w, YG__START_ID_MAIN));
+        return 0;
+      }
+      break;
+    case WM_CLOSE: yg__start_pick(w, YG__START_ID_LATER); return 0;
+    case WM_DESTROY:
+      KillTimer(w, YG__START_TIMER);
+      u->done = 1;
+      return 0; /* never a WM_QUIT: that would end the game */
+    default: break;
+  }
+  return DefWindowProcW(w, m, wp, lp);
+}
+
+typedef HRESULT (WINAPI *yg__start_dwm_fn)(HWND, DWORD, LPCVOID, DWORD);
+typedef HANDLE (WINAPI *yg__start_dpictx_fn)(HANDLE);
+typedef HRESULT (WINAPI *yg__start_mondpi_fn)(HMONITOR, int, UINT *, UINT *);
+
+static HWND yg__start_child(HWND parent, int id, const char *label, DWORD style, HINSTANCE inst) {
+  wchar_t t[64];
+  HWND b;
+  if (!yg__start_wide(label, t, 64)) return NULL;
+  b = CreateWindowExW(0, L"BUTTON", t, WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | style, 0, 0, 1, 1, parent,
+                      (HMENU)(INT_PTR)id, inst, NULL);
+  if (b) {
+    WNDPROC was = (WNDPROC)SetWindowLongPtrW(b, GWLP_WNDPROC, (LONG_PTR)yg__start_button_proc);
+    if (!yg__start_u.button_proc) yg__start_u.button_proc = was;
+  }
+  return b;
+}
+
+static int yg__start_offer_window(const yg__start_win *win) {
+  static const wchar_t *cls = L"YouGameStartWindow";
+  yg__start_ui *u = &yg__start_u;
   HINSTANCE inst = GetModuleHandleW(NULL);
+  HMODULE user = GetModuleHandleW(L"user32.dll"), dll;
+  yg__start_dpictx_fn set_ctx = NULL;
+  HANDLE old_ctx = NULL;
   WNDCLASSW wc;
-  HWND w, text, get = NULL, later, open = NULL;
-  const int offers_open = YG__START_OFFERS_OPEN(which), only_ok = YG__START_ONLY_OK(which);
-  HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+  HWND w, mainb;
   MSG msg;
-  wchar_t wide[1024];
-  size_t at;
-  int width = 460, height = 236;
-  int x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2, y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
-  at = yg__start_widen(yg__start_texts[which][0], wide, 0, 1024);
-  if (at) at = yg__start_widen("\n\n", wide, at, 1024);
-  if (at) at = yg__start_widen(yg__start_texts[which][1], wide, at, 1024);
-  if (!at) return 0;
+  UINT dpi = 96;
+  HMONITOR mon;
+  MONITORINFO mi;
+  wchar_t title[YG__START_TITLE_CAP];
+  int x, y;
+  memset(u, 0, sizeof *u);
+  u->w = win;
+  u->choice = YG__START_ANSWER_NONE;
+  if (!yg__start_wide(win->title, title, YG__START_TITLE_CAP)) return YG__START_ANSWER_NONE;
+  /* Drawn at the monitor's real scale (per-monitor DPI for this window only, the game's own
+     setting untouched), on the monitor the player is looking at. */
+  if (user) YG__START_PROC(set_ctx, user, "SetThreadDpiAwarenessContext");
+  if (set_ctx) old_ctx = set_ctx((HANDLE)(INT_PTR)-4); /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */
+  mon = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
+  if (old_ctx && (dll = yg__start_system_dll(L"shcore.dll")) != NULL) {
+    yg__start_mondpi_fn get = NULL;
+    UINT dx = 0, dy = 0;
+    YG__START_PROC(get, dll, "GetDpiForMonitor");
+    if (get && get(mon, 0, &dx, &dy) == S_OK && dx) dpi = dx;
+    FreeLibrary(dll);
+  } else {
+    HDC screen = GetDC(NULL);
+    if (screen) {
+      dpi = (UINT)GetDeviceCaps(screen, LOGPIXELSX);
+      ReleaseDC(NULL, screen);
+    }
+  }
+  u->s = (dpi ? dpi : 96) / 96.f;
   memset(&wc, 0, sizeof wc);
+  wc.style = CS_DROPSHADOW;
   wc.lpfnWndProc = yg__start_wndproc;
   wc.hInstance = inst;
   wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
-  wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
   wc.lpszClassName = cls;
-  if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return 0;
-  yg__start_choice = 0;
-  yg__start_done = 0;
-  w = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, cls, L"YouGame",
-                      WS_POPUP | WS_CAPTION | WS_SYSMENU, x < 0 ? 0 : x, y < 0 ? 0 : y, width, height,
-                      NULL, NULL, inst, NULL);
-  if (!w) return 0;
-  text = CreateWindowExW(0, L"STATIC", wide, WS_CHILD | WS_VISIBLE, 20, 16, width - 46, 130, w,
-                         NULL, inst, NULL);
-  if (offers_open)
-    open = CreateWindowExW(0, L"BUTTON", YG__START_WIDE(YG__START_OPEN),
-                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                           width - 430, 154, 130, 32, w, (HMENU)(INT_PTR)YG__START_ID_OPEN, inst, NULL);
-  if (!only_ok)
-    get = CreateWindowExW(0, L"BUTTON", YG__START_WIDE(YG__START_GET),
-                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | (offers_open ? 0 : BS_DEFPUSHBUTTON),
-                          width - 290, 154, 130, 32, w, (HMENU)(INT_PTR)YG__START_ID_GET, inst, NULL);
-  later = CreateWindowExW(0, L"BUTTON", only_ok ? YG__START_WIDE(YG__START_OK) : YG__START_WIDE(YG__START_LATER),
-                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | (only_ok ? BS_DEFPUSHBUTTON : 0),
-                          width - 150, 154, 110, 32, w, (HMENU)(INT_PTR)YG__START_ID_NOT_NOW, inst, NULL);
-  if (font) {
-    if (text) SendMessageW(text, WM_SETFONT, (WPARAM)font, TRUE);
-    if (get) SendMessageW(get, WM_SETFONT, (WPARAM)font, TRUE);
-    if (later) SendMessageW(later, WM_SETFONT, (WPARAM)font, TRUE);
-    if (open) SendMessageW(open, WM_SETFONT, (WPARAM)font, TRUE);
+  if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+    if (old_ctx) set_ctx(old_ctx);
+    return YG__START_ANSWER_NONE;
   }
+  w = CreateWindowExW(WS_EX_TOPMOST | WS_EX_APPWINDOW, cls, title, WS_POPUP | WS_CLIPCHILDREN, 0, 0, 1, 1,
+                      NULL, NULL, inst, NULL);
+  if (!w) {
+    if (old_ctx) set_ctx(old_ctx);
+    UnregisterClassW(cls, inst);
+    return YG__START_ANSWER_NONE;
+  }
+  u->hwnd = w;
+  /* Windows 11 rounds the corners and draws a hairline in the window's own colour; Windows 10
+     keeps square corners and the border drawn in the back buffer. */
+  if ((dll = yg__start_system_dll(L"dwmapi.dll")) != NULL) {
+    yg__start_dwm_fn set = NULL;
+    YG__START_PROC(set, dll, "DwmSetWindowAttribute");
+    if (set) {
+      DWORD round = 2;                       /* DWMWCP_ROUND */
+      COLORREF border = RGB(0x3a, 0x3a, 0x3a);
+      u->rounded = set(w, 33, &round, sizeof round) == S_OK; /* DWMWA_WINDOW_CORNER_PREFERENCE */
+      if (u->rounded) set(w, 34, &border, sizeof border);    /* DWMWA_BORDER_COLOR */
+    }
+    FreeLibrary(dll);
+  }
+  yg__start_ui_fonts(u);
+  if (!u->f_title || !u->f_body || !u->f_fact || !u->f_button || !u->f_brand || !yg__start_ui_build(u)) {
+    DestroyWindow(w);
+    yg__start_ui_free(u);
+    if (old_ctx) set_ctx(old_ctx);
+    UnregisterClassW(cls, inst);
+    return YG__START_ANSWER_NONE;
+  }
+  memset(&mi, 0, sizeof mi);
+  mi.cbSize = sizeof mi;
+  if (GetMonitorInfoW(mon, &mi)) {
+    x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - u->cw) / 2;
+    y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - u->ch) / 2;
+  } else {
+    x = (GetSystemMetrics(SM_CXSCREEN) - u->cw) / 2;
+    y = (GetSystemMetrics(SM_CYSCREEN) - u->ch) / 2;
+  }
+  SetWindowPos(w, NULL, x, y, u->cw, u->ch, SWP_NOZORDER | SWP_NOACTIVATE);
+  if (win->later_label) yg__start_child(w, YG__START_ID_LATER, win->later_label, WS_TABSTOP, inst);
+  mainb = yg__start_child(w, YG__START_ID_MAIN, win->main_label, WS_TABSTOP, inst);
+  yg__start_child(w, YG__START_ID_CLOSE, "Close", 0, inst);
+  if (old_ctx) set_ctx(old_ctx);
+  if (!mainb) {
+    DestroyWindow(w);
+    yg__start_ui_free(u);
+    UnregisterClassW(cls, inst);
+    return YG__START_ANSWER_NONE;
+  }
+  yg__start_ui_place(u);
+  u->icon_big = yg__start_logo_icon(GetSystemMetrics(SM_CXICON));
+  u->icon_small = yg__start_logo_icon(GetSystemMetrics(SM_CXSMICON));
+  if (u->icon_big) SendMessageW(w, WM_SETICON, ICON_BIG, (LPARAM)u->icon_big);
+  if (u->icon_small) SendMessageW(w, WM_SETICON, ICON_SMALL, (LPARAM)u->icon_small);
+  /* The controller (Xbox-style, through the system's XInput), polled 20 times a second. */
+  u->xinput = yg__start_system_dll(L"xinput1_4.dll");
+  if (!u->xinput) u->xinput = yg__start_system_dll(L"xinput9_1_0.dll");
+  if (u->xinput) YG__START_PROC(u->xi_get, u->xinput, "XInputGetState");
+  if (u->xi_get) SetTimer(w, YG__START_TIMER, 50, NULL);
+  SendMessageW(w, WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0); /* ring after a key only */
   ShowWindow(w, SW_SHOWNORMAL);
   yg__start_front(w);
-  if (open) SetFocus(open);
-  else if (get) SetFocus(get);
-  else if (later) SetFocus(later);
-  /* Its own short message loop, until the window is gone: Tab, Enter and Escape work like in a dialog.
-     It also pumps the game's windows on this thread. A WM_QUIT it receives is the game's (the player
-     closed the game meanwhile): the small window goes, the quit is posted again for the game's own
-     loop, and the answer is Not now. */
-  while (!yg__start_done) {
+  SetFocus(mainb);
+  /* Its own short message loop, until the window is gone. It also pumps the game's windows on this
+     thread. A WM_QUIT it receives is the game's (the player closed the game meanwhile): the small
+     window goes, the quit is posted again for the game's own loop, and no choice was made.
+     Enter and Escape count only when pressed here: a key still held from the game (its repeat) never
+     answers the window. */
+  while (!u->done) {
     BOOL got = GetMessageW(&msg, NULL, 0, 0);
     if (got == 0 || got == -1) {
-      yg__start_choice = YG__START_ANSWER_LATER;
+      u->choice = YG__START_ANSWER_NONE;
       if (IsWindow(w)) DestroyWindow(w);
       if (got == 0) PostQuitMessage((int)msg.wParam);
       break;
+    }
+    if (IsWindow(w) && (msg.hwnd == w || IsChild(w, msg.hwnd)) && msg.message == WM_KEYDOWN) {
+      int f = yg__start_focused_id(w);
+      if ((msg.wParam == VK_RETURN || msg.wParam == VK_ESCAPE || msg.wParam == VK_SPACE) && (msg.lParam & (1L << 30)))
+        continue;
+      if (msg.wParam == VK_RETURN) {
+        yg__start_pick(w, f == YG__START_ID_LATER || f == YG__START_ID_CLOSE ? YG__START_ID_LATER : YG__START_ID_MAIN);
+        continue;
+      }
+      if (msg.wParam == VK_LEFT && win->later_label) { yg__start_focus(w, YG__START_ID_LATER); continue; }
+      if (msg.wParam == VK_RIGHT) { yg__start_focus(w, YG__START_ID_MAIN); continue; }
     }
     if (IsWindow(w) && IsDialogMessageW(w, &msg)) continue;
     TranslateMessage(&msg);
     DispatchMessageW(&msg);
   }
+  if (u->xinput) FreeLibrary(u->xinput);
+  if (u->icon_big) DestroyIcon(u->icon_big);
+  if (u->icon_small) DestroyIcon(u->icon_small);
+  yg__start_ui_free(u);
   UnregisterClassW(cls, inst);
-  return yg__start_choice;
+  return u->choice;
+}
+
+/* One window at a time: the window's loop also runs the game's own window messages, so a game that
+   calls yg_start again from one of them (the player clicked its Online button meanwhile) gets no
+   second window over the first; it hears that nothing was shown. */
+static int yg__start_offer(const yg__start_win *win) {
+  static int busy;
+  int answer;
+  if (busy) return YG__START_ANSWER_NONE;
+  busy = 1;
+  answer = yg__start_offer_window(win);
+  busy = 0;
+  return answer;
 }
 
 #elif defined(__APPLE__) || defined(__linux__)
@@ -2021,12 +2872,15 @@ static int yg__start_wait(pid_t pid, unsigned deadline) {
   return yg__start_mac_wait(deadline, yg__start_mac_poll_child, yg__start_mac_stop_child, &pid);
 }
 #else
-static int yg__start_wait(pid_t pid) {
+/* The child's exit code, or -1 when it did not exit normally. */
+static int yg__start_wait_code(pid_t pid) {
   int status;
   pid_t rc;
   do { rc = waitpid(pid, &status, 0); } while (rc < 0 && errno == EINTR);
-  return rc == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+  return rc == pid && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
+
+static int yg__start_wait(pid_t pid) { return yg__start_wait_code(pid) == 0; }
 #endif
 
 #ifdef __linux__
@@ -2278,50 +3132,103 @@ static int yg__start_installed(int staging) {
 #endif
 }
 
-static int yg__start_offer(int which) {
+/* The at-start game's player pressed Play offline once (see yg_start): a file named for the game in
+   the user's own folder (macOS ~/Library/Application Support/YouGame Start, Linux
+   $XDG_STATE_HOME/yougame-start or ~/.local/state/yougame-start). note = 0 asks whether it is there;
+   note = 1 makes it. Any failure: not there (the window shows at start, as before). */
+static int yg__start_offline(int staging, const char *game, int note) {
+  char dir[PATH_MAX], path[PATH_MAX];
+  struct stat st;
+  int fd;
 #ifdef __APPLE__
-  CFStringRef title = CFStringCreateWithCString(NULL, yg__start_texts[which][0], kCFStringEncodingASCII);
-  CFStringRef body = CFStringCreateWithCString(NULL, yg__start_texts[which][1], kCFStringEncodingASCII);
+  const char *home = getenv("HOME");
+  if (!home || home[0] != '/' ||
+      (size_t)snprintf(dir, sizeof dir, "%s/Library/Application Support/YouGame Start", home) >= sizeof dir)
+    return 0;
+#else
+  char state[PATH_MAX];
+  yg__start_xdg("XDG_STATE_HOME", ".local/state", state, sizeof state);
+  if (!state[0] || (size_t)snprintf(dir, sizeof dir, "%s/yougame-start", state) >= sizeof dir) return 0;
+#endif
+  if ((size_t)snprintf(path, sizeof path, "%s/%s%s.offline", dir, game, staging ? ".staging" : "") >= sizeof path)
+    return 0;
+  if (!note) return lstat(path, &st) == 0 && S_ISREG(st.st_mode);
+#ifndef __APPLE__
+  mkdir(state, 0700); /* ~/.local/state may not exist yet; its parent ~/.local almost always does */
+#endif
+  if (mkdir(dir, 0700) != 0 && errno != EEXIST) return 0;
+  fd = open(path, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+  if (fd < 0) return 0;
+  close(fd);
+  return 1;
+}
+
+/* The system's own box (macOS alert; Linux zenity or kdialog) with the window's words. YouGame's
+   own drawn window is Windows only for now (Windows first). 1: the main button, 0: the
+   other, -1: nothing was shown or no answer came. */
+static int yg__start_show(const yg__start_win *w) {
+#ifdef __APPLE__
+  CFStringRef title = CFStringCreateWithCString(NULL, w->title, kCFStringEncodingASCII);
+  CFStringRef body = CFStringCreateWithCString(NULL, w->body, kCFStringEncodingASCII);
+  CFStringRef main_label = CFStringCreateWithCString(NULL, w->main_label, kCFStringEncodingASCII);
+  CFStringRef later_label = w->later_label ? CFStringCreateWithCString(NULL, w->later_label, kCFStringEncodingASCII) : NULL;
   CFOptionFlags answer = kCFUserNotificationCancelResponse;
   SInt32 rc = -1;
-  if (title && body)
+  if (title && body && main_label && (later_label || !w->later_label))
     rc = CFUserNotificationDisplayAlert(0, kCFUserNotificationNoteAlertLevel, NULL, NULL, NULL,
-      title, body, CFSTR(YG__START_GET), CFSTR(YG__START_LATER), NULL, &answer);
+      title, body, main_label, later_label, NULL, &answer);
   if (title) CFRelease(title);
   if (body) CFRelease(body);
-  return rc == 0 && (answer & 3) == kCFUserNotificationDefaultResponse;
+  if (main_label) CFRelease(main_label);
+  if (later_label) CFRelease(later_label);
+  if (rc != 0) return -1;
+  if ((answer & 3) == kCFUserNotificationDefaultResponse) return 1;
+  return (answer & 3) == kCFUserNotificationAlternateResponse ? 0 : -1;
 #else
   char *argv[10];
-  char message[1024];
+  char message[YG__START_TITLE_CAP + YG__START_BODY_CAP + 4];
+  char ok[64], cancel[64];
   pid_t pid;
   const char *prog;
-  if ((size_t)snprintf(message, sizeof message, "%s\n\n%s", yg__start_texts[which][0],
-                       yg__start_texts[which][1]) >= sizeof message) return 0;
+  int code;
+  if ((size_t)snprintf(message, sizeof message, "%s\n\n%s", w->title, w->body) >= sizeof message) return -1;
   if (access("/usr/bin/zenity", X_OK) == 0) {
     prog = "/usr/bin/zenity";
+    snprintf(ok, sizeof ok, "--ok-label=%s", w->main_label);
+    snprintf(cancel, sizeof cancel, "--cancel-label=%s", w->later_label ? w->later_label : w->main_label);
     argv[0] = (char *)prog;
     argv[1] = (char *)"--question";
     argv[2] = (char *)"--title=YouGame";
-    argv[3] = (char *)"--ok-label=" YG__START_GET;
-    argv[4] = (char *)"--cancel-label=" YG__START_LATER;
-    argv[5] = (char *)"--text";
-    argv[6] = message;
-    argv[7] = NULL;
+    argv[3] = ok;
+    argv[4] = cancel;
+    argv[5] = (char *)"--no-markup"; /* a name may hold & */
+    argv[6] = (char *)"--text";
+    argv[7] = message;
+    argv[8] = NULL;
   } else if (access("/usr/bin/kdialog", X_OK) == 0) {
     prog = "/usr/bin/kdialog";
     argv[0] = (char *)prog;
     argv[1] = (char *)"--title";
     argv[2] = (char *)"YouGame";
     argv[3] = (char *)"--yes-label";
-    argv[4] = (char *)YG__START_GET;
+    argv[4] = (char *)w->main_label;
     argv[5] = (char *)"--no-label";
-    argv[6] = (char *)YG__START_LATER;
+    argv[6] = (char *)(w->later_label ? w->later_label : w->main_label);
     argv[7] = (char *)"--yesno";
     argv[8] = message;
     argv[9] = NULL;
-  } else return 0;
-  return yg__start_spawn(prog, argv, &pid) && yg__start_wait(pid);
+  } else return -1;
+  if (!yg__start_spawn(prog, argv, &pid)) return -1;
+  code = yg__start_wait_code(pid);
+  /* 0 the main button, 1 the other (or Esc); anything else is an error (no display, a crash). */
+  return code == 0 ? 1 : code == 1 ? 0 : -1;
 #endif
+}
+
+static int yg__start_offer(const yg__start_win *w) {
+  /* One button (nothing to choose): whatever the player presses is that button's answer. */
+  int pressed = yg__start_show(w);
+  return pressed > 0 ? w->answer : pressed == 0 ? YG__START_ANSWER_LATER : YG__START_ANSWER_NONE;
 }
 #endif /* platform implementation */
 
@@ -2412,7 +3319,8 @@ static int yg__start_wait_up(const yg_start_options *o, int staging, const unsig
 
 #if defined(_WIN32) || defined(__APPLE__) || defined(__linux__) || defined(YOUGAME_START_TESTING)
 yg_start_result yg_start(const yg_start_options *o) {
-  int staging, quiet, installed, text, answer;
+  int staging, quiet, installed, text, answer, ask, at_start, open_ok;
+  yg__start_win win;
 #if defined(_WIN32) || defined(YOUGAME_START_TESTING)
   char to[YG__START_TO_CAP];
   yg__start_mark mark;
@@ -2423,6 +3331,7 @@ yg_start_result yg_start(const yg_start_options *o) {
   if (!o || !yg__start_slug_ok(o->game)) return YG_START_UNAVAILABLE;
   staging = o->staging ? 1 : 0;
   quiet = o->quiet || yg__start_quiet_env();
+  ask = o->ask; /* any value but LATER and ON_USE acts as at start */
   if (yg__start_running(staging)) return YG_START_RUNNING;
   installed = yg__start_installed(staging);
 #if defined(_WIN32) || defined(YOUGAME_START_TESTING)
@@ -2462,7 +3371,25 @@ yg_start_result yg_start(const yg_start_options *o) {
   /* Run as administrator: no tray start was tried, and Open could not work either. */
   if (installed && YG__START_UPDATE_SYSTEM && yg__start_raised()) text = YG__START_TEXT_RAISED;
 #endif
-  answer = yg__start_offer(text);
+  /* An at-start game whose player already pressed Play offline once: from then on it starts like a
+     game that asks on first use ("once, then at the button"). Not for a game that needs
+     YouGame to run: that one asks at every start. */
+  at_start = ask != YG_START_ASK_LATER && ask != YG_START_ASK_ON_USE;
+  if (at_start && !o->needs && yg__start_offline(staging, o->game, 0)) ask = YG_START_ASK_LATER;
+  /* Asked later (the game asks on first use): whatever the window would have said waits for the
+     player's press; tell the game what was found. */
+  if (ask == YG_START_ASK_LATER) return installed ? YG_START_INSTALLED : YG_START_MISSING;
+#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
+  open_ok = YG__START_UPDATE_SYSTEM; /* Open YouGame: Windows starts it from the window */
+#else
+  open_ok = 0;
+#endif
+  if (!yg__start_compose(text, ask == YG_START_ASK_ON_USE, o->name, o->needs, open_ok, &win))
+    return YG_START_UNAVAILABLE;
+  answer = yg__start_offer(&win);
+  /* Remembered only from a real choice: not from the administrator window, which has no other button. */
+  if (at_start && !o->needs && answer == YG__START_ANSWER_LATER && text != YG__START_TEXT_RAISED)
+    yg__start_offline(staging, o->game, 1);
 #if defined(_WIN32) || defined(YOUGAME_START_TESTING)
   /* Open YouGame: the same checked tray start as above, at any version, now the player asked (also
      with no_open or no tray_from: pressing Open is the player's own choice). The window may have been
@@ -2494,7 +3421,7 @@ yg_start_result yg_start(const yg_start_options *options) {
   (void)yg__start_slug_ok;
   (void)yg__start_version_parse;
   (void)yg__start_version_at_least;
-  (void)yg__start_texts;
+  (void)yg__start_compose;
   return YG_START_UNAVAILABLE;
 }
 #endif
