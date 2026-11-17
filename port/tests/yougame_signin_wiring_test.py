@@ -72,6 +72,12 @@ need("sign_in_rehello" in link and "player_arrived()" in link, "signedIn says he
 need("signin::hello_signed_out(result)" in link, "hello records a signed-out app")
 need("bool sign_in_needed()" in link and "bool sign_in_needed();" in header, "sign_in_needed")
 need("yougame::sign_in_needed()) yougame::sign_in_open();" in online, "a picked row opens the panel")
+# A row pressed before the app could say "signed out" (cold start): the shim's once-a-second poll opens
+# the card when it knows, and the mpCode signedOut answer marks it at once (11-17).
+need("if (!yougame::sign_in_needed()) s_yg_pick = now_pick_ms();" in online, "an early press is remembered")
+need("else if (yougame::sign_in_needed()) { s_yg_pick = 0; yougame::sign_in_open(); }" in online,
+     "the menu's poll opens the card for a remembered press")
+need('g_channel_code == "signedOut") g_channel_signed_out = true;' in link, "mpCode signedOut marks the app signed out")
 need("yougame::sign_in_needed()) && !yougame::active() && (q[0] & 2)) q[0] |= 64;" in online,
      "the guest's wait-and-confirm bit while signed out")
 need("user_code" not in re.sub(r"//.*", "", link.split("void sign_in_send")[1].split("\n}\n")[0]).split("log(")[-1],

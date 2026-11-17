@@ -3317,6 +3317,18 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
       // feeds the stickers over the menu.
       // The plain query is the Online menu opening: a game started on its own looks for YouGame again.
       if (payload_len == 0) yougame::online_menu_opened();
+      // A YouGame row pressed before the app could say it is signed out (still starting, its page still
+      // loading): the shim's wait polls this query once a second, so the card opens on the first poll
+      // that knows, not on a second press (11-17: the first press after a cold start sat
+      // ~50 s and then showed nothing). Dropped after the shim's own 180 s wait or any other pick.
+      static std::atomic<int64_t> s_yg_pick{0};
+      const auto now_pick_ms = [] {
+        return (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+      };
+      if (payload_len == 0 && s_yg_pick) {
+        if (now_pick_ms() - s_yg_pick > 180000) s_yg_pick = 0;
+        else if (yougame::sign_in_needed()) { s_yg_pick = 0; yougame::sign_in_open(); }
+      }
       // 0x20: the first row picked while YouGame is Coming soon: open the installed app, else the download page.
       // 0x10: older menus' Coming soon stickers; none are drawn since build 98.2 (the rows look the same
       // connected or not).
@@ -3325,6 +3337,7 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
         if (yougame::coming_soon()) yougame::first_row_picked();
         // YouGame is open but signed out (local channel): the sign-in panel, then the menu carries on.
         else if (yougame::sign_in_needed()) yougame::sign_in_open();
+        if (!yougame::sign_in_needed()) s_yg_pick = now_pick_ms();   // not known yet: the poll opens it
       } else if (payload_len == 1 && payload[0] == 3) {
         if (g_older_offer_mode >= 0) {
           std::string why;
@@ -3332,6 +3345,7 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
           else g_forced_error = why;
         }
       } else if (payload_len == 1) {
+        s_yg_pick = 0;
         yougame::set_launcher_session(payload[0] == 1);
       }
       q.assign(1, 0);

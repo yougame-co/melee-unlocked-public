@@ -1712,6 +1712,8 @@ Identity fetch_identity(const std::function<bool()>& cancelled = nullptr) {
         if (via_channel)
           host::log("yougame channel: mpCode answered %llu ms %s", (unsigned long long)since_probe(),
                     g_channel_code.empty() ? "no answer" : g_channel_code.c_str());
+        // The app said signed out: the card can open now, not on the next hello 5 s later.
+        if (via_channel && g_channel_code == "signedOut") g_channel_signed_out = true;
         const uint64_t wait = via_channel && attempt < 2 ? g_channel_retry_after : 0;
         if (wait && search_policy::wait(wait, now_ms, [](int ms) { Sleep(ms); },
                                         [&] { return (cancelled && cancelled()) || !g_channel_up; })) continue;
@@ -4303,7 +4305,19 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       json m;
       if (!queue.next(m, 250)) {
         if (queue.closed()) {
-          if (!queue.recoverable()) return fail("Lost the connection to YouGame matchmaking");
+          // Only a close that says the search itself is over ends it (another search took over, a
+          // build or version refusal, a flood close). Any other close (a drop, a restarted or reset
+          // matchmaker, a silent-socket close) reopens the queue: the player only pressed search once.
+          const int qcode = queue.close_code();
+          host::log("yougame: matchmaking connection closed (code %d)", qcode);
+          // 4000 "replaced": Rooms keeps one search per player and a newer one took this slot. A newer
+          // search of this game drops this one quietly; otherwise it came from somewhere else.
+          if (qcode == 4000) {
+            if (!g_search_generation.current(epoch)) return fail("Cancelled");
+            return fail("This account started a search somewhere else, so this one stopped");
+          }
+          if (qcode == 4003 || qcode == 4403 || qcode == 1008)
+            return fail("Lost the connection to YouGame matchmaking");
           const uint64_t until = now_ms() + 15000;
           bool reopened = false;
           transport::TicketRetry retry;

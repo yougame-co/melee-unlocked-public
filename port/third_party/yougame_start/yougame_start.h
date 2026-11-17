@@ -2462,6 +2462,12 @@ static LRESULT CALLBACK yg__start_wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) 
       RedrawWindow(w, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
       return 0;
     }
+    case WM_SHOWWINDOW: /* runs in the window's own (per-monitor) context: the buttons at their rects again */
+      if (wp) {
+        yg__start_ui_place(u);
+        RedrawWindow(w, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN);
+      }
+      break;
     case WM_TIMER:
       if (wp == YG__START_TIMER) yg__start_pad(w);
       return 0;
@@ -2594,6 +2600,10 @@ static int yg__start_offer_window(const yg__start_win *win) {
   if (win->later_label) yg__start_child(w, YG__START_ID_LATER, win->later_label, WS_TABSTOP, inst);
   mainb = yg__start_child(w, YG__START_ID_MAIN, win->main_label, WS_TABSTOP, inst);
   yg__start_child(w, YG__START_ID_CLOSE, "Close", 0, inst);
+  /* Placed while this thread is still per-monitor aware: the laid-out rects are physical pixels.
+     After the game's own (unaware) context is back, Windows reads MoveWindow's numbers as 96-DPI
+     and scales them, which put all three buttons outside the window at 150% (11-17). */
+  if (mainb) yg__start_ui_place(u);
   if (old_ctx) set_ctx(old_ctx);
   if (!mainb) {
     DestroyWindow(w);
@@ -2601,7 +2611,6 @@ static int yg__start_offer_window(const yg__start_win *win) {
     UnregisterClassW(cls, inst);
     return YG__START_ANSWER_NONE;
   }
-  yg__start_ui_place(u);
   u->icon_big = yg__start_logo_icon(GetSystemMetrics(SM_CXICON));
   u->icon_small = yg__start_logo_icon(GetSystemMetrics(SM_CXSMICON));
   if (u->icon_big) SendMessageW(w, WM_SETICON, ICON_BIG, (LPARAM)u->icon_big);
