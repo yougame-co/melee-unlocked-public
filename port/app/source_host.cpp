@@ -22,6 +22,9 @@
 #include "friends_handoff_capture.h"
 #include "handoff_state.h"
 #include <windows.h>
+#ifdef _WIN32
+#include <shellapi.h>   // CommandLineToArgvW: an arena viewer's options
+#endif
 #ifndef _WIN32
 #include <dlfcn.h>
 #ifdef __APPLE__
@@ -87,6 +90,8 @@
 #include "yougame_css_origin.h"
 #include "yougame_css_join.h"
 #include "lab_view.h"
+#include "walter_egg.h"
+#include "gecko_session.h"
 #include "../runtime/abi/mu_look_snapshot.h"
 // Both builds: the neutral netplay state. In the build without the Slippi layer it also answers the
 // Slippi names; in the normal build a peer-to-peer session (--p2p-*) is found through it.
@@ -121,6 +126,7 @@
 #endif
 #include "native_replay_stream.h"
 #include "slippi_spectate.h"
+#include "slippi_arena.h"
 #include "slippi_net.h"
 #include "native_recording_codes.h"
 #include "slippilib/SlippiGame.h"
@@ -435,6 +441,32 @@ std::unordered_set<int32_t> g_pack_skin_served;
 // the player's own Mods-tab skin: that skin was checked against the standard costume, which this file
 // matches. A pack that changes the skeleton keeps its costume, as before.
 bool pack_costume_takes_skins(uint32_t entry) { return g_pack_skin_served.count((int32_t)entry) != 0; }
+// A pack stage rebuilt around the same stage (Animelee CE's legal stages): online it is served as the
+// original stage file with the pack's meshes drawn over it (stage_online_form, stage_graft.h), which
+// the gameplay comparison proves plays the same. Pack entry -> the entry serving that grafted copy,
+// kept in memory in the top of the system-file range.
+std::unordered_map<int32_t, int32_t> g_pack_online_entry;
+struct PackOnlineFile { uint32_t start; std::vector<uint8_t> data; };
+std::vector<PackOnlineFile> g_pack_online_files;
+constexpr uint32_t kPackOnlineBase = 0x6C000000u;   // up to the overlay at 0x70000000; system files stay below
+uint32_t g_pack_online_next = kPackOnlineBase;
+bool read_pack_online(uint32_t offset, void* dst, uint32_t size, bool* ok) {
+  if (offset < kPackOnlineBase || offset >= 0x70000000u || g_pack_online_files.empty()) return false;
+  for (const auto& f : g_pack_online_files) {
+    if (offset < f.start || offset >= f.start + (uint32_t)f.data.size()) continue;
+    // Reads come in 32-byte rounded chunks: the tail past the file reads as zeros, within its slot.
+    const uint32_t at = offset - f.start;
+    const uint32_t slot = ((uint32_t)f.data.size() + 0xFFFFu) & ~0xFFFFu;
+    *ok = size <= slot - at;
+    if (*ok) {
+      const uint32_t have = std::min<uint32_t>(size, (uint32_t)f.data.size() - at);
+      std::memcpy(dst, f.data.data() + at, have);
+      std::memset((uint8_t*)dst + have, 0, size - have);
+    }
+    return true;
+  }
+  return false;
+}
 // Buttons held on any controller at the last pad read, for the stage pick of a disc with alternate
 // stages (host::cosmetics::set_stage_button_probe).
 std::atomic<uint32_t> g_held_buttons{0};
@@ -599,6 +631,9 @@ void compute_pack_skin_verdicts(const std::unordered_map<std::string, int32_t>& 
                                 const std::vector<FstFile>& base_fst) {
   g_pack_skins.clear();
   g_pack_skin_served.clear();
+  g_pack_online_entry.clear();
+  g_pack_online_files.clear();
+  g_pack_online_next = kPackOnlineBase;
   auto& notes = mods::status().pack_skins;
   notes.clear();
   for (const auto& file : g_mod_overlay.files()) {
@@ -640,8 +675,26 @@ void compute_pack_skin_verdicts(const std::unordered_map<std::string, int32_t>& 
                      : stage ? host::cosmetics::stage_safety::matches(clean, pack, &detail)
                              : skins::music_is_valid(pack, &detail);
       verdict.reason = host::cosmetics::online_reason_short(detail);
+      // A stage that is not the same file may still be the same stage: the pack's look drawn over
+      // the original's gameplay, as an installed stage skin gets. Served from memory in that view.
+      std::vector<uint8_t> online;
+      std::string graft_detail;
+      if (stage && !verdict.served &&
+          host::cosmetics::stage_online_form(clean, pack, &online, &graft_detail, file.path) && !online.empty()) {
+        const uint32_t span = ((uint32_t)online.size() + 0xFFFFu) & ~0xFFFFu;
+        if (online.size() < 64u * 1024 * 1024 && (uint64_t)g_pack_online_next + span <= 0x70000000ull) {
+          const int32_t grafted = (int32_t)g_fst.size();
+          g_fst.push_back({g_pack_online_next, (uint32_t)online.size(), false});
+          g_pack_online_files.push_back({g_pack_online_next, std::move(online)});
+          g_pack_online_next += span;
+          g_pack_online_entry[verdict.entry] = grafted;
+          verdict.served = true;
+          verdict.reason = "its look drawn over the standard stage's gameplay";
+          host::log("mods: cosmetic %s online as %s", verdict.path.c_str(), graft_detail.c_str());
+        }
+      }
     }
-    if (verdict.served) g_pack_skin_served.insert(verdict.entry);
+    if (verdict.served && !g_pack_online_entry.count(verdict.entry)) g_pack_skin_served.insert(verdict.entry);
     host::log("mods: cosmetic %s %s online (%s)", verdict.path.c_str(), verdict.served ? "stays on" : "swapped",
               verdict.reason.c_str());
     notes.push_back({verdict.path, verdict.layer, verdict.reason, verdict.served, verdict.identical});
@@ -879,6 +932,10 @@ void load_mod_overlay() {
   std::filesystem::path stub_disc;
   for (const auto& file : g_mod_overlay.files()) {
     if (!skins::is_stage_file(file.path) || !file.length || file.length > 1024u * 1024u) continue;
+    // Only a file in place of one of the game's own stages is a stub: a stage file the disc adds has
+    // no game stage to keep, and leaving it out lost it (ACE's Smashville sunset map GrAcSs.dat: every
+    // evening match there stopped the game, 0.9.201 report).
+    if (g_paths.find(file.path) == g_paths.end()) continue;
     std::vector<uint8_t> bytes(file.length);
     if (g_mod_overlay.read(file.start, bytes.data(), file.length) != ModOverlay::Read::Success ||
         !stage_file_is_stub(bytes)) continue;
@@ -1159,7 +1216,7 @@ void load_system_files(const char* forced_off_by) {
       }
     }
     const uint32_t size = (uint32_t)data.size();
-    if (uint64_t(next) + size > ModOverlay::base) { host::log("slippi menus: off (system files exceed their range)"); return; }
+    if (uint64_t(next) + size > kPackOnlineBase) { host::log("slippi menus: off (system files exceed their range)"); return; }
     files.push_back({path, next, std::move(data), std::move(open), nullptr});
     next += (size + 0xFFFFu) & ~0xFFFFu;
   }
@@ -1302,6 +1359,7 @@ template <class F> void guarded(F&& f) {
     write_replay_recording();
 #ifndef MELEE_NO_SLIPPI
     slippi::spectate::stop();
+    slippi::arena::shutdown();
 #endif
     rollback_log(true);
     log_native_pose_bridge_stats();
@@ -1513,6 +1571,7 @@ void h_poll() {
 static int (*g_update_ranked_busy)() = nullptr;
 static void (*g_look_snapshot)(MuLookSnapshot*) = nullptr;
 static void (*g_look_items)(MuLookItems*) = nullptr;
+static void (*g_look_extras)(MuLookExtras*) = nullptr;
 void native_retrace() {
   ConsoleServiceScope service;
   struct ConsoleRetraceScope {
@@ -1530,12 +1589,15 @@ void native_retrace() {
     g_game.fire_alarms(engine.alarm_ticks());
   } else g_game.fire_alarms(host::cpu->tb);
   g_game.retrace();
-  if (g_look_snapshot && lab::styles_on()) {
+  if (g_look_snapshot && lab::active()) {
     MuLookSnapshot snapshot{};
     g_look_snapshot(&snapshot);
     MuLookItems items{};
     if (g_look_items) g_look_items(&items);
-    lab::native_frame(snapshot, g_look_items ? &items : nullptr);
+    MuLookExtras extras{};
+    if (g_look_extras) g_look_extras(&extras);
+    const std::array<std::string, 4> names = slippi::online::player_names_for_overlay();
+    lab::native_frame(snapshot, g_look_items ? &items : nullptr, g_look_extras ? &extras : nullptr, names.data());
   }
 }
 
@@ -1647,13 +1709,19 @@ float h_picture_widen() {
   return gx::true_widescreen_active() ? 1.0f / gx::true_widescreen_factor() : 1.0f;
 }
 uint32_t h_audio_options() {
-  if (yougame::console::console_active()) return 0;
-  if (g_replaying || slippi::online::session_mode() >= 0 || source_p2p::requested()) return 0;
+  // Mute character voices: everywhere (online and replays too); it changes no timing.
+  static const int mute_env = [] { const char* v = host::test_env::getenv("MELEE_TEST_MUTE_VOICES"); return v && *v ? (*v == '1' ? 1 : 0) : -1; }();
+  const bool mute = mute_env >= 0 ? mute_env == 1 : gx::RenderOptions::live_mute_voices();
+  static int mute_logged = -1;
+  if ((int)mute != mute_logged) { host::log("audio: character voices %s", mute ? "muted" : "on"); mute_logged = mute; }
+  const uint32_t voices = mute ? MU_AUDIO_OPTION_MUTE_VOICES : 0u;
+  if (yougame::console::console_active()) return voices;
+  if (g_replaying || slippi::online::session_mode() >= 0 || source_p2p::requested()) return voices;
   static const int env = [] { const char* v = std::getenv("MELEE_AUDIO_EARLY_KEYON"); return v && *v ? (*v == '1' ? 1 : 0) : -1; }();
   const bool on = env >= 0 ? env == 1 : gx::RenderOptions::live_audio_early_keyon();
   static int logged = -1;
   if ((int)on != logged) { host::log("audio: faster sound effects %s", on ? "on" : "off"); logged = on; }
-  return on ? MU_AUDIO_OPTION_EARLY_KEYON : 0u;
+  return (on ? MU_AUDIO_OPTION_EARLY_KEYON : 0u) | voices;
 }
 
 uint32_t h_game_options3() {
@@ -2177,6 +2245,11 @@ constexpr uint8_t CMD_LAB_SAVE = 0xF2, CMD_LAB_LOAD = 0xF3, CMD_LAB_ADVANTAGE = 
 constexpr uint8_t CMD_PRACTICE_CPU = 0xF6;   // the practice CPU's settings (port/runtime/hle/practice_cpu.h)
 constexpr uint8_t CMD_FRAME_EVENT = 0xE8;   // replay frame data for the coach (shim/mu_framedata.c, host/replay_coach.h)
 constexpr uint8_t CMD_REPLAY_DEFENSE = 0xE9;   // a takeover's opponents once the game leaves the replay (shim/mu_replay_defend.c)
+constexpr uint8_t CMD_ZELDA_AS_SHEIK = 0xDE;  // a human's Zelda starts as Sheik (shim/mu_slippi_css.c): offline only; upstream 0xE6, CMD_YOUGAME_FRIENDS_MENU in this build
+constexpr uint8_t CMD_CSS_FRAME = 0xDA;  // every character select frame (shim/mu_slippi_css.c): the easter egg; upstream 0xEC, MU_SQUAD_COMMAND in this build
+constexpr uint8_t CMD_ARENA_HAND = 0xDB;  // the online CSS hand (shim/mu_slippi_css.c): an arena room's side panels; upstream 0xEF, CMD_YOUGAME_MENU in this build
+constexpr uint8_t CMD_ARENA_PICK = 0xDC;  // the online CSS pick (shim/mu_slippi_sss.c): an arena room's portraits; upstream 0xEE, MU_MAKER_COMMAND in this build
+constexpr uint8_t CMD_ARENA_PAIRING = 0xDD;  // an arena room's pairing count (shim/mu_slippi_css.c, hle/slippi_arena.h); upstream 0xED, MU_PICK_PREVIEW_COMMAND in this build
 constexpr uint8_t CMD_GHOST_AI = 0xEA;         // a pro AI's controller for this frame (hle/ghost_ai.h)
 constexpr uint8_t CMD_STAGE_SONGS = 0xEB;      // a stage's main and alternate songs (gr/ground.c, hle/jukebox.h)
 void apply_content_mode(int mode);
@@ -2654,7 +2727,8 @@ int32_t h_slippi_command(uint8_t command, const uint8_t* payload, uint32_t paylo
   }
   if (yougame::console::console_active() &&
       (command == CMD_LAB_SAVE || command == CMD_LAB_LOAD || command == CMD_GHOST_AI ||
-       command == CMD_PRACTICE_CPU || command == CMD_SKIN_CYCLE || command == CMD_STAGE_SKIN_CYCLE)) {
+       command == CMD_PRACTICE_CPU || command == CMD_SKIN_CYCLE || command == CMD_STAGE_SKIN_CYCLE ||
+       command == CMD_ZELDA_AS_SHEIK || command == CMD_CSS_FRAME)) {   // the same on every console machine
     if (response_size) *response_size = 0;
     return 0;
   }
@@ -2678,7 +2752,8 @@ int32_t h_slippi_command(uint8_t command, const uint8_t* payload, uint32_t paylo
         // CPU prep uses the ordinary B3/B5/BF/C0/C1 bridge, entirely locally.
         if (yougame::ranked_cpu::intercept(c, p, n, reply, yougame::active())) return true;
 #endif
-        if (c == MU_TOURNEY_COMMAND) return yougame::tournament_command(p, n, reply);
+        // CMD_STAGE_SONGS shares 0xEB with MU_TOURNEY_COMMAND; the tournament never sends 16 bytes.
+        if (c == MU_TOURNEY_COMMAND && !(c == CMD_STAGE_SONGS && n == 16)) return yougame::tournament_command(p, n, reply);
         // Music: the game hands its songs to the jukebox as the static recomp's Slippi codes do
         // (StartSong D6, Stop D7, VolumeChange D8; shim/mu_audio.c).
         if (c == 0xD6 && n == 8) {
@@ -2759,6 +2834,41 @@ int32_t h_slippi_command(uint8_t command, const uint8_t* payload, uint32_t paylo
             const auto* bytes = reinterpret_cast<const uint8_t*>(&act);
             reply.assign(bytes, bytes + sizeof act);
           }
+          return true;
+        }
+        if (c == CMD_CSS_FRAME) slippi::online::gecko_pump();   // Gecko codes for the match (gecko_session.h)
+        if (c == CMD_CSS_FRAME && n == 0) { walter_egg::set_camera(nullptr); reply.push_back(walter_egg::css_frame()); return true; }
+        if (c == CMD_CSS_FRAME && n == 13 * sizeof(float)) {   // with the menu camera (shim mu_menu_camera): the C-stick's turn
+          float camera[13];
+          std::memcpy(camera, p, sizeof camera);
+          walter_egg::set_camera(camera);
+          reply.push_back(walter_egg::css_frame());
+          return true;
+        }
+        if (c == CMD_CSS_FRAME && n == 5) {   // with five bytes: a hand moved (the port, then x and y in tenths)
+          walter_egg::set_hand(p[0], (int16_t)(p[1] << 8 | p[2]), (int16_t)(p[3] << 8 | p[4]));
+          return true;
+        }
+        if (c == CMD_ZELDA_AS_SHEIK && n == 0) {
+          static const int test = [] { const char* v = host::test_env::getenv("MELEE_TEST_ZELDA_SHEIK"); return v && *v ? (*v == '1' ? 1 : 0) : -1; }();
+          const bool want = test >= 0 ? test == 1 : gx::RenderOptions::live_zelda_as_sheik();
+          const bool on = want && !g_replaying && slippi::online::session_mode() < 0 && !source_p2p::requested() &&
+                          !host::gameplay::vanilla_only();
+          if (on) host::log("game: Zelda starts as Sheik (setting)");
+          reply.push_back(on ? 1 : 0);
+          return true;
+        }
+        if (c == CMD_ARENA_HAND && n == 4) {   // shim/mu_slippi_css.c: the CSS hand, in tenths
+          slippi::arena::set_css_hand((int16_t)(p[0] << 8 | p[1]), (int16_t)(p[2] << 8 | p[3]));
+          return true;
+        }
+        if (c == CMD_ARENA_PICK && n == 3) {   // shim/mu_slippi_sss.c: the character select's pick
+          slippi::arena::set_css_pick(p[2] ? p[0] : 0xFF, p[1]);
+          return true;
+        }
+        if (c == CMD_ARENA_PAIRING && n == 0) {   // shim/mu_slippi_css.c: an arena room's new pairing
+          append_be32(reply, slippi::online::arena_pairing());
+          reply.push_back(slippi::arena::locks_in_itself() ? 1 : 0);   // the room locks in a random stage itself (tests)
           return true;
         }
         if (c == CMD_PRACTICE_CPU) {   // shim/mu_practice_cpu.c: the settings, or what it is doing
@@ -3254,6 +3364,9 @@ void h_pad_read(MuPadStatus out[4]) {
     return;
   }
   if (g_online_test_mode == 0) ranked_harness_tick();
+#ifndef MELEE_NO_SLIPPI
+  if (!g_resim && !g_replaying) slippi::arena::tick();   // an arena room, once a frame (nothing without one)
+#endif
   host::PadState pads[4];
 #ifdef YOUGAME_AGENT_TEST_HOOK
   using namespace yougame::agent_test;
@@ -3292,7 +3405,11 @@ void h_pad_read(MuPadStatus out[4]) {
   // The player's data-only Gecko codes, once per frame. Offline only: the writer in the game
   // library also refuses during an online match, whichever kind.
   if (slippi::online::session_mode() < 0 && !g_replaying && !yougame::tournament_active()) user_gecko::apply();
-  else user_gecko::suspend_function_patches();   // a code's rewritten functions go back online, in replays and in YouGame tournaments
+  else {
+    user_gecko::suspend_function_patches();   // a code's rewritten functions go back online, in replays and in YouGame tournaments
+    // Online: only the codes both players agreed to run (gecko_session.h), on both games alike.
+    if (!g_replaying && !yougame::tournament_active() && slippi::online::is_online_match()) user_gecko::run_agreed(gecko_session::match_codes());
+  }
   // A pasted always-display hitbox code turns on the Arcade look switches its lines stand for.
   gx::set_arcade_display(gx::ArcadeSource::Codes, user_gecko::arcade_bits_of_codes());
   // Hidden test hook: MELEE_TEST_INSTALL_LOOK=<0 Diet, 1 Animelee, 2 Animelee x DBZ> starts that one-click install once.
@@ -3438,6 +3555,8 @@ int32_t resolve_disc_entrynum(const std::string& p) {
   if (it != g_paths.end() && g_retail_view) {
     // The retail copy, or -1 for a file the retail game does not have. A pack costume that only
     // changes looks keeps its own entry, so it is the same file (and the same cached copy) in both views.
+    const auto grafted = g_pack_online_entry.find(it->second);
+    if (grafted != g_pack_online_entry.end()) return grafted->second;
     const int32_t opened = skins::resolve_open(true, it->second, g_view_alias, g_pack_skin_served);
     if (opened != it->second) return opened;
   }
@@ -3512,7 +3631,8 @@ bool jukebox_music_pack_read(uint32_t offset, std::filesystem::path* out) {
 // The jukebox reads songs from where the game would: Slippi system files, the mod overlay, the disc.
 bool jukebox_disc_read(uint32_t offset, void* dst, uint32_t size) {
   bool ok = false;
-  if (!read_cosmetic(offset, dst, size, &ok) && !read_system_file(offset, dst, size, &ok) &&
+  if (!read_cosmetic(offset, dst, size, &ok) && !read_pack_online(offset, dst, size, &ok) &&
+      !read_system_file(offset, dst, size, &ok) &&
       !read_overlay(offset, dst, size, &ok))
     ok = host::disc_read(offset, dst, size);
   return ok;
@@ -3546,7 +3666,8 @@ void h_disc_read(uint32_t offset, void* dst, uint32_t size, MuDiscDone done, voi
   bool ok = false;
   note_stage_file_read(offset);
   const auto began = std::chrono::steady_clock::now();
-  if (!read_cosmetic(offset, dst, size, &ok) && !read_system_file(offset, dst, size, &ok) &&
+  if (!read_cosmetic(offset, dst, size, &ok) && !read_pack_online(offset, dst, size, &ok) &&
+      !read_system_file(offset, dst, size, &ok) &&
       !read_overlay(offset, dst, size, &ok))
     ok = host::disc_read(offset, dst, size);
   if (!ok) host::log("disc: read %08X+%X failed", offset, size);
@@ -4552,6 +4673,56 @@ void h_mark_match_start() {
 #endif
 }
 
+#if !defined(MELEE_NO_SLIPPI) && defined(_WIN32)
+// An arena room's viewer window (hle/slippi_arena.h): this same program playing the live recording,
+// with the options that set how the game looks and runs taken from this run's own command line.
+void* launch_arena_viewer(const std::string& path) {
+  wchar_t exe[MAX_PATH];
+  if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return nullptr;
+  int argc = 0;
+  LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  auto quote = [](const std::wstring& a) {
+    std::wstring q = L"\"";
+    for (wchar_t c : a) { if (c == L'"') q += L'\\'; q += c; }
+    return q + L"\"";
+  };
+  std::wstring cmd = quote(exe);
+  bool hidden = false;
+  // Kept: the disc, the system files, the settings, how it draws and sounds. Dropped: anything that
+  // would make the viewer play online, run a script or join the room.
+  static const wchar_t* const with_value[] = {L"--iso", L"--sys-dir", L"--settings-path", L"--shader-cache", L"--backend",
+                                              L"--volume", L"--mod-base-iso", L"--look-iso", L"--user-dir"};
+  static const wchar_t* const flags[] = {L"--load-settings", L"--hidden", L"--headless", L"--no-music"};
+  for (int i = 1; argv && i < argc; ++i) {
+    const std::wstring a = argv[i];
+    bool kept = false;
+    for (const wchar_t* f : flags) if (a == f) { cmd += L" " + a; kept = true; if (a != L"--load-settings" && a != L"--no-music") hidden = true; }
+    for (const wchar_t* w : with_value)
+      if (!kept && a == w && i + 1 < argc) { cmd += L" " + a + L" " + quote(argv[++i]); kept = true; }
+  }
+  if (argv) LocalFree(argv);
+  const std::filesystem::path live = std::filesystem::u8path(path);
+  cmd += L" --replay " + quote(live.wstring());
+  // Its own recording of what it showed goes beside the live one (tests compare the two).
+  cmd += L" --replay-dir " + quote((live.parent_path() / L"viewer").wstring());
+  if (hidden) cmd += L" --log-file " + quote((live.parent_path() / (live.stem().wstring() + L".log")).wstring());
+  STARTUPINFOW si{};
+  si.cb = sizeof si;
+  PROCESS_INFORMATION pi{};
+  std::vector<wchar_t> line(cmd.begin(), cmd.end());
+  line.push_back(0);
+  if (!CreateProcessW(exe, line.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+    host::log("arena: viewer did not start (error %lu)", GetLastError());
+    return nullptr;
+  }
+  CloseHandle(pi.hThread);
+  host::log("arena: viewer pid %lu", pi.dwProcessId);
+  return pi.hProcess;
+}
+#elif !defined(MELEE_NO_SLIPPI)
+void* launch_arena_viewer(const std::string&) { return nullptr; }
+#endif
+
 #ifdef MELEE_NO_SLIPPI
 // No replay playback and no recording in this build. The game is told there is no replay; the
 // callbacks stay in the host table so the same game interface version is served.
@@ -4614,9 +4785,38 @@ int32_t replay_restore(int32_t target) {
 
 // CMD_REPLAY_GATE. Phase 0, every frame: 1 when the viewer wants to go back (the game then calls
 // again with phase 1, with its timers held), else 0. Phase 1: the state is restored.
+static void replay_hold_for_live_frame(int32_t frame);
+
 uint8_t replay_gate(int32_t frame, uint8_t phase) {
   if (!g_replay) return 0;
-  if (phase == 0) return replay_control::gate(frame) == replay_control::Gate::GoBack ? 1 : 0;
+  if (phase == 0) {
+    replay_hold_for_live_frame(frame);
+    // A recording still being written plays as close to live as it can: a viewer that opened late
+    // (an arena watcher's window starts after the game does) runs unpaced and unheard until it is
+    // within a frame of the newest one, then plays at normal speed again.
+    static bool catching_up = false;
+    if (!g_replay->IsProcessingComplete() && !replay_control::status().seeking) {
+      const int32_t behind = g_replay->GetLatestIndex() - frame;
+      // On the clock the players' games log their frames with ("online frame N wall T"): a test
+      // compares the two to see how far behind the match a watcher's window shows it.
+      if (frame % 30 == 0 && !catching_up) host::log("replay: live frame %d wall %.3f s", frame, host::now_seconds());
+      const bool was = catching_up;
+      if (behind > 3) catching_up = true;
+      else if (behind <= 1) catching_up = false;
+      if (catching_up != was) {
+        host::options.fast = catching_up;
+        host::audio_set_muted(catching_up);
+        replay_control::set_catching_up(catching_up);   // the way there is not drawn: the window joins live
+        if (!catching_up) host::log("replay: caught up with the live game at frame %d", frame);
+      }
+    } else if (catching_up) {
+      catching_up = false;
+      host::options.fast = false;
+      host::audio_set_muted(false);
+      replay_control::set_catching_up(false);
+    }
+    return replay_control::gate(frame) == replay_control::Gate::GoBack ? 1 : 0;
+  }
   return replay_control::go_back() == replay_control::Gate::Restored ? 2 : 0;
 }
 
@@ -4890,6 +5090,39 @@ static int32_t replay_wait_or_end(int32_t frame) {
   return MU_REPLAY_TERMINATE;
 }
 
+// A frame of a recording still being written that can be played: there, all of its inputs in, and
+// final. A finished recording answers yes for every frame (the fetch then finds it or ends).
+static bool replay_frame_ready(int32_t frame) {
+  const bool exists = g_replay->DoesFrameExist(frame);
+  if (g_replay->IsProcessingComplete()) return true;
+  if (!exists || !g_replay->GetFrame(frame)->inputsFullyFetched) return false;
+  const auto v = g_replay->GetVersion();
+  const bool has_finalized = v[0] > 3 || (v[0] == 3 && v[1] >= 7);
+  return !has_finalized || g_replay->GetLastFinalizedFrame() >= frame;
+}
+
+// Top of a frame, where a pause holds (replay_gate): a live recording's next frame is waited for
+// here, the way Dolphin's mirror mode stops the game until the frame arrives. The fetch would
+// otherwise answer WAIT and the match would run that frame with no one's inputs, and every frame
+// after it would be one behind (an arena watcher's viewer that caught up with the live game).
+static void replay_hold_for_live_frame(int32_t frame) {
+  if (replay_frame_ready(frame)) return;
+  const double started = host::now_seconds();
+  bool told = false;
+  while (!host::exit_requested() && !replay_frame_ready(frame) && !replay_recording_abandoned()) {
+    if (!told && host::now_seconds() - started > 1.0) {
+      std::error_code ec;
+      const auto size = std::filesystem::file_size(std::filesystem::u8path(g_replay_path), ec);
+      host::log("replay: waiting for frame %d of %s (read to frame %d, %llu bytes on disk)", frame,
+                g_replay_path.c_str(), g_replay->GetLatestIndex(), ec ? 0ull : (unsigned long long)size);
+      told = true;
+    }
+    if (host::g_has_window) host::window_pump();   // the simulation thread owns the window only without the render thread
+    { host::perf::Scope wait_cost(host::perf::Stage::Wait); Sleep(4); }
+  }
+  if (told) host::log("replay: frame %d came after %.1f s", frame, host::now_seconds() - started);
+}
+
 void h_replay_frame(int32_t frame, MuReplayFrame* out) {
   *out = MuReplayFrame{};
   if (!g_replay) { out->result = MU_REPLAY_TERMINATE; return; }
@@ -5010,7 +5243,10 @@ void h_replay_event(uint8_t command, const uint8_t* payload, uint32_t size) {
     } else {
 #endif
     slippi::spectate::start_game();
-    g_replay_stream.set_event_sink([](const uint8_t* data, uint32_t size) { slippi::spectate::write(data, size); });
+    g_replay_stream.set_event_sink([](const uint8_t* data, uint32_t size) {
+      slippi::spectate::write(data, size);
+      slippi::arena::recording_event(data, size);   // an arena room's live feed and game reports
+    });
 #if MU_SQUAD
     // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
     }
@@ -5600,6 +5836,15 @@ bool set_replay(const char* path) {
       names[i] = "P" + std::to_string(i + 1) + " " + (c < 26 ? kNames[c] : "Fighter");
     }
     replay_control::set_players(ports, names);
+    // The Lab view's HUD names the players as Slippi Lab does: the display name, else the connect code.
+    std::string lab_names[4];
+    for (int i = 0; i < 4; ++i) {
+      if (!(ports & (1u << i))) continue;
+      const auto& p = s->players[(uint8_t)i];
+      lab_names[i] = lab::name_from_sjis(p.displayName.data(), p.displayName.size());
+      if (lab_names[i].empty()) lab_names[i] = lab::name_from_sjis(p.connectCode.data(), p.connectCode.size());
+    }
+    lab::set_replay_names(lab_names);
   }
   replay_control::set_replay_path(path);
   replay_control::begin(Slippi::GAME_FIRST_FRAME, g_replay->GetLatestIndex(), engine);
@@ -5943,8 +6188,11 @@ int run(void (*shutdown)(int)) {
   g_update_ranked_busy = (int (*)())game_proc("mu_update_ranked_busy_v1");
   g_look_snapshot = (void (*)(MuLookSnapshot*))game_proc("mu_look_snapshot_v1");
   g_look_items = (void (*)(MuLookItems*))game_proc("mu_look_items_v1");
+  g_look_extras = (void (*)(MuLookExtras*))game_proc("mu_look_extras_v1");
   user_gecko::set_native_writer((user_gecko::NativeWrite)game_proc("mu_user_gecko_write"));
   user_gecko::set_native_reader((user_gecko::NativeRead)game_proc("mu_user_gecko_read"));
+  user_gecko::set_agreed_writer((user_gecko::NativeWrite)game_proc("mu_user_gecko_write_agreed"),
+                                (user_gecko::NativeRead)game_proc("mu_user_gecko_read_agreed"));
   {
     // Functions a code may make return at once (shim/mu_gecko_functions.c); an older library has none.
     using Functions = uint32_t (*)(const user_gecko::NativeFunction**);
@@ -6034,6 +6282,8 @@ int run(void (*shutdown)(int)) {
   int code = 0;
 #ifndef MELEE_NO_SLIPPI
   slippi::spectate::start();   // Slippi Dolphin's spectator server (settings: Spectator server)
+  slippi::arena::set_recording_codes(std::vector<uint8_t>(std::begin(native_online_recording_codes), std::end(native_online_recording_codes)));
+  slippi::arena::set_viewer_launcher(launch_arena_viewer);
 #endif
 #ifdef __APPLE__
   g_mac_running = true;

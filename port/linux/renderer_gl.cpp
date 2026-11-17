@@ -196,6 +196,7 @@ struct Texture {
   GLuint id = 0, fbo = 0;
   uint32_t width = 0, height = 0, levels = 1;
   uint64_t used = 0, bytes = 0;
+  uint64_t replacement_bytes = 0;   // charged to the texture pack budget; given back when the cache drops it
 };
 
 #ifdef __APPLE__
@@ -1186,6 +1187,7 @@ void main() {
           }
           glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, entry.levels - 1);
           replacement_bytes_ += entry.bytes;
+          entry.replacement_bytes = entry.bytes;
           const GLuint id = entry.id; textures_.emplace(key, entry); return id;
         }
       }
@@ -1806,11 +1808,16 @@ void main() {
   bool video_layer_logged_[2] = {false, false};
 #endif
   int draw_video_slot_ = -1;   // the video slot the last draw sampled (the stage select's layer follows it)
+  // A cached texture dropped: its texture pack bytes go back to the replacement budget (as on Windows).
+  void release(Texture& t) {
+    replacement_bytes_ -= std::min(replacement_bytes_, t.replacement_bytes);
+    destroy(t);
+  }
   void trim() {
     if (sequence_ % 120) return;
     invalidate_state(); // Deleting a bound texture also changes the binding.
     for (auto i = textures_.begin(); i != textures_.end();) {
-      if (i->second.used + 180 < sequence_) { destroy(i->second); i = textures_.erase(i); } else ++i;
+      if (i->second.used + 180 < sequence_) { release(i->second); i = textures_.erase(i); } else ++i;
     }
     for (auto i = copies_.begin(); i != copies_.end();) {
       if (i->second.used + 3600 < sequence_) { destroy(i->second); i = copies_.erase(i); } else ++i;
@@ -1826,7 +1833,7 @@ void main() {
       for (const auto& item : oldest) {
         if (bytes <= budget * 9 / 10) break;
         auto i = textures_.find(item.second);
-        bytes -= i->second.bytes; destroy(i->second); textures_.erase(i);
+        bytes -= i->second.bytes; release(i->second); textures_.erase(i);
       }
     }
   }

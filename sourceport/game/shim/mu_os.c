@@ -459,6 +459,14 @@ BOOL OSGetResetSwitchState(void) { return mu_host->reset_switch(); }
  * different path). The arena below is the host's whole reservation, larger because native pointers
  * are twice the size. */
 u32 OSGetPhysicalMemSize(void) { return 24u << 20; }
+
+/* True when a 32-bit address is in the game's memory: MEM1 (the arena), or Melee Maker's loading
+ * cache 64 MB above its start. Data files load there; anything else is not a loaded file's. */
+unsigned int mu_game_memory_has(unsigned int addr)
+{
+    const u32 mem1_end = 0x80000000u + mu_host->mem1_size();
+    return (addr >= 0x80000000u && addr < mem1_end) || (addr >= 0x84000000u && addr < 0x86000000u);
+}
 u32 OSGetConsoleSimulatedMemSize(void) { return 24u << 20; }
 u32 OSGetSoundMode(void) { return (u32) mu_host->sound_mode(); }
 void OSSetSoundMode(u32 mode) { mu_host->set_sound_mode((int32_t) mode); }

@@ -869,6 +869,10 @@ void* mu_slippi_sss_slpcss(void);            /* NULL until the CSS registered it
 int mu_slippi_sss_frozen(void);              /* frozen Stadium cave byte */
 void mu_slippi_sss_frozen_flip(void);        /* CursorOnHoverStadium Z */
 int mu_slippi_sss_lock_in(int stage_behavior);           /* FN_TX_LOCK_IN: -2 random, -1 unset, 0+ pick; 1 sent, 0 refused, -1 held */
+void mu_slippi_sss_report_pick(int chosen);              /* the CSS pick to the host when it changes (arena rooms) */
+void mu_css_frame(void);                                 /* every character select frame, any mode: the host's CSS features */
+int mu_human_zelda_as_sheik(void);                       /* Settings > Game > Zelda starts as Sheik; 0 online and in replays */
+void mu_slippi_css_hand(int port, float x, float y);     /* the CSS hand, each frame (arena rooms' side panels) */
 void mu_slippi_sss_find_match(void);                     /* FN_TX_FIND_MATCH (B4, typed code) */
 void mu_slippi_sss_run_callback(int stage_behavior);     /* r13-0x5018 lock-in callback */
 #endif
@@ -947,5 +951,8 @@ void mu_tmce_on_start_melee(void);
 int mu_tmce_active(void);                    /* enabled and loaded: the hooks run */
 int mu_test_classic_stage(void);             /* MELEE_TEST_CLASSIC_STAGE, -1 when unset (tests only) */
 int mu_test_vs_stage(void);                  /* MELEE_TEST_VS_STAGE, -1 when unset (tests only) */
+int mu_test_mex_icon(void);                  /* MELEE_TEST_MEX_ICON, -1 when unset (tests only) */
+int mu_test_css_char(int port);              /* MELEE_TEST_CSS_CHAR, once per CSS visit, -1 otherwise (tests only) */
+void mu_test_css_enter(void);                /* a new CSS visit for mu_test_css_char */
 int mu_test_adventure_scene(void);           /* MELEE_TEST_ADVENTURE_SCENE, -1 when unset (tests only) */
 #endif

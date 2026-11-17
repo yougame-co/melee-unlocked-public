@@ -8,7 +8,7 @@
 // The start used to wait for both the plain and the motion-vector variant of every recipe whenever
 // an upscaler was available on the PC (XeSS runs on any Direct3D 12 card), whatever the player had
 // chosen. A session only ever draws with one of them, so only that one was in the saved library: the
-// next start compiled the other half behind "Preparing graphics for this PC (first start only)" (a test PC,
+// next start compiled the other half behind "Preparing graphics for this PC (first start only)" (pc3,
 // AMD Radeon iGPU, XeSS available, upscaler off, 11-15: "prewarmed 80 pipelines from 40 recipes",
 // cache_hits=40 compiled=40, the panel at 61/80 on the second launch). The start now waits only for
 // the variant this session draws with; the other one compiles behind it, after the boot, so

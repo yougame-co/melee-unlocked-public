@@ -29,6 +29,8 @@
 #include <sysdolphin/baselib/mobj.h>
 #include <sysdolphin/baselib/random.h>
 #include <sysdolphin/baselib/tobj.h>
+#include <dolphin/dvd.h>
+#include <melee/lb/lbfile.h>
 #include <string.h>
 
 AcParam* ac_param;
@@ -57,12 +59,30 @@ static HSD_Archive* ac_load_map(const char* file)
     return archive;
 }
 
+/* Whether a file is on the disc. A disc without one of the time-of-day or event maps (a 0.9.201
+ * report: no GrAcSs.dat, so every evening match stopped the game in lbFileGetSize) plays with the
+ * maps it has: the console stops on the missing file, natively the stage goes on without it. */
+static int ac_on_disc(const char* file)
+{
+    return DVDConvertPathToEntrynum(lbFileGetFullName(file)) != -1;
+}
+
 /* +1A74: named native fields replace raw stage globals. Colors are GXColor bytes on both hosts. */
 MU_NO_CONTRACT static void ac_load_environment(void)
 {
     static const char* files[4] = { "GrAcDy.dat", "GrAcSs.dat", "GrAcNt.dat", "GrAcDn.dat" };
-    HSD_Archive* archive = ac_load_map(files[ac_time]);
-    GroundParam* param = HSD_ArchiveGetPublicAddress(archive, "grGroundParam");
+    HSD_Archive* archive;
+    GroundParam* param;
+    if (!ac_on_disc(files[ac_time])) {
+        int i;
+        for (i = 0; i < 4 && !ac_on_disc(files[i]); i++) {}
+        OSReport("[mex] village: %s is not on this disc; %s\n", files[ac_time], i < 4 ? files[i] : "no time of day");
+        if (i == 4) return;
+        ac_time = i;
+    }
+    archive = ac_load_map(files[ac_time]);
+    param = HSD_ArchiveGetPublicAddress(archive, "grGroundParam");
+    if (param == NULL) return;
     HSD_FogDesc* fogdesc;
     LightListSlot* lights;
     GXColor* colors;
@@ -161,9 +181,16 @@ static void ac_init(void)
     if (buttons & 2) { ac_time = 3; }
     if (buttons & 1) { ac_time = 0; }
     ac_constant_particles();
-    if (ac_event == 1 || ac_event == 2) { ac_load_map("GrAcKk.dat"); }
-    else if (ac_event == 3) { ac_load_map("GrAcNy.dat"); }
-    else if (ac_event == 4) { ac_load_map("GrAcHm.dat"); }
+    {
+        const char* event_map = ac_event == 1 || ac_event == 2 ? "GrAcKk.dat" : ac_event == 3 ? "GrAcNy.dat" :
+                                ac_event == 4 ? "GrAcHm.dat" : NULL;
+        if (event_map != NULL && !ac_on_disc(event_map)) {
+            OSReport("[mex] village: %s is not on this disc; no event\n", event_map);
+            ac_event = 0;
+        } else if (event_map != NULL) {
+            ac_load_map(event_map);
+        }
+    }
     ac_load_environment();
     ac_playlist();
     mu_grTSeak_80223908(0);

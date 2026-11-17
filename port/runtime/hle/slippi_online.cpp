@@ -6,6 +6,7 @@
 #include "slippi_agent_lock.h"
 #include "test_env.h"
 #include "slippi_online.h"
+#include "gecko_session.h"
 #include "yougame_net_test.h"
 #include "yougame_link.h"
 #include "yougame_lobby_setup.h"
@@ -580,6 +581,7 @@ void cleanup_connection(yougame::Leave why = yougame::Leave::Lost) {
   g_squad_costume_match = false;   // the connection is gone: no squad match is set up
   g_squad_match_standards.clear();
 #endif
+  gecko_session::disconnected();
 #ifdef YOUGAME_AGENT_TEST_HOOK
   yougame::agent_test::static_match.event(yougame::agent_test::StaticEvent::Cancel, true, [] {});
 #endif
@@ -951,6 +953,7 @@ void handle_online_inputs(const uint8_t* payload, uint32_t size, std::vector<uin
     g_latched_delay = (int)delay;   // the delay the game took: every later answer this match agrees with it
     g_in_online_match = true;
     g_friends_lobby.note.clear();
+    gecko_session::match_started();   // the agreed Gecko codes, decided from both locks
     if (g_user) g_user->ResetOnlineCompatibility();  // the next game needs its own fresh check
     host::input_mark_match_start();
     // Early inputs: watch the controller for the match. Sent only to peers whose build takes them.
@@ -1356,13 +1359,21 @@ int build_verdict(uint8_t remote_count, std::string* why) {
     }
     if (g_local_build.mod_view) {
       if (!native_direct_builds_match(true, g_local_build.fingerprint, rb.mod_view, rb.fingerprint)) {
-          const int port = i < g_netplay->LocalPlayerPort() ? i + 1 : i + 2;
+        const int port = i < g_netplay->LocalPlayerPort() ? i + 1 : i + 2;
+        // An opponent on the standard game: say it is this player's own mod disc that differs, and
+        // where it is switched off. A copy of Melee with one changed file left in Mods\Discs read as
+        // "a different mod build" to a player whose ISOs were the same (0.9.203 report).
+        if (!rb.mod_view)
+          *why = "Your mod disc " + (g_local_build.name.empty() ? std::string("") : g_local_build.name + " ") +
+                 "is on and Player " + std::to_string(port) +
+                 " plays the standard game. Turn it off in the launcher's Mods, or both use the same disc";
+        else
           *why = "Player " + std::to_string(port) + " has a different mod build. Everyone needs the same ISO and game version";
         return -1;
       }
     } else if (rb.mod_view) {
-      *why = "Your opponent is using " + (rb.name.empty() ? std::string("a mod build") : rb.name) +
-             ". Use the same build, or ask them to play Direct without it";
+      *why = "Your opponent has the mod disc " + (rb.name.empty() ? std::string("a mod build") : rb.name) +
+             " on. They can turn it off in the launcher's Mods, or you both use the same disc";
       return -1;
     }
   }
@@ -2310,6 +2321,31 @@ void squad_costume_refuse(const std::string& path, bool mod) {
 }
 void set_squad_standard_copy(squad_costume::Standard (*copy)(const std::string& path)) { g_squad_standard = copy; }
 #endif
+// Gecko codes for the match (gecko_session.h), every character select frame: the exchange starts when
+// a connection to one opponent is up and its build message came (or did not, within the wait), and
+// its messages move both ways; when the codes are agreed, this side's selection goes again with the
+// new lock.
+void gecko_pump() {
+  static const NetplayClient* started = nullptr;
+  const bool up = g_netplay && g_netplay->GetSlippiConnectStatus() == NetplayClient::ConnectStatus::CONNECTED;
+  if (!up) {
+    if (started) { gecko_session::disconnected(); started = nullptr; }
+    return;
+  }
+  if (started != g_netplay.get()) {
+    const auto rb = g_netplay->GetRemoteBuild(0);
+    const uint64_t since = g_netplay->ConnectedAtMs();
+    const uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (!rb.received && (since == 0 || now - since < kBuildWaitMs)) return;   // its build message may still come
+    const bool direct = g_last_search.mode == Matchmaking::DIRECT;
+    gecko_session::connected(direct && rb.received && rb.gecko && g_netplay->RemoteCount() == 1);
+    started = g_netplay.get();
+  }
+  std::vector<uint8_t> message;
+  while (g_netplay->PopGecko(message)) gecko_session::receive(message.data(), message.size());
+  for (const auto& out : gecko_session::take_outgoing()) g_netplay->SendGecko(out);
+  if (gecko_session::take_resend()) g_netplay->ResendSelections();
+}
 bool is_online_match() { return g_in_online_match || (p2p_session_up() && host::netplay::is_online_match()); }
 int local_player_slot() { return p2p_session_up() ? host::netplay::local_player_slot() : (int)g_local_player_index; }
 std::array<std::string, 4> player_names_for_overlay() {
@@ -2333,6 +2369,14 @@ int ping_ms() { return p2p_session_up() ? host::netplay::ping_ms() : (g_netplay 
 // g_last_search keeps the mode of the last search for the whole session, so it only means anything
 // while an online session is actually up: searching, set up (the online character select screen),
 // or in the match. Everywhere else this is offline and the answer is -1.
+bool opponent_auto_lcancel() {
+  if (!g_netplay || g_last_search.mode != Matchmaking::DIRECT) return false;
+  if (g_netplay->GetSlippiConnectStatus() != NetplayClient::ConnectStatus::CONNECTED) return false;
+  const int n = std::min<int>(bounded_remote_machine_count(), REMOTE_PLAYER_MAX);
+  for (int i = 0; i < n; ++i) if (g_netplay->GetRemoteBuild(i).auto_lcancel) return true;
+  return false;
+}
+
 int session_mode() {
   const bool session = g_in_online_match || g_play_session_active || (g_matchmaking && g_matchmaking->IsSearching());
   if (!session) return host::netplay::session_mode();   // a peer-to-peer session, or -1
@@ -2482,6 +2526,85 @@ bool native_ranked_next_game(uint8_t character, uint8_t color) {
   set_match_selections(selections);
   return true;
 }
+
+ArenaMatchStatus arena_match_status() {
+  ArenaMatchStatus out;
+  out.active = slippi_session_up();
+  // A search that failed is no longer "up", but its client still has to be cleaned up before the
+  // next one (FindMatch on it again would end the program).
+  out.state = g_matchmaking ? (int)g_matchmaking->GetMatchmakeState() : 0;
+  out.direct = g_last_search.mode == Matchmaking::DIRECT;
+  out.mode = (int)g_last_search.mode;
+  out.code = shiftjis_to_utf8(g_last_search.connect_code);
+  out.state = g_matchmaking ? (int)g_matchmaking->GetMatchmakeState() : 0;
+  // The flag stays set on the character select after a game until the pair is cleaned up: a match is
+  // running only while the game is not polling the online menus.
+  out.in_match = g_in_online_match && !in_online_menus();
+  out.local_ready = g_local_selections.is_character_selected;
+  return out;
+}
+
+bool arena_start_search(int mode, const std::string& code, bool locked, uint8_t character, uint8_t color,
+                        uint8_t team, std::string* error) {
+  if (mode != Matchmaking::DIRECT && mode != Matchmaking::TEAMS) return false;
+  if (!g_user) init();
+  if (session_mode() >= 0) {
+    if (error) *error = "An online session is already active";
+    return false;
+  }
+  if (const char* reason = local_matchmaking_error(mode)) {
+    if (error) *error = reason;
+    return false;
+  }
+  // A client that has searched before (and failed or ended) is replaced first, as the online
+  // character select does before every search.
+  if (!g_matchmaking || g_matchmaking->GetMatchmakeState() != Matchmaking::IDLE) cleanup_connection(yougame::Leave::Quit);
+  g_forced_error.clear();
+  uint8_t selections[9] = {team, character, color, (uint8_t)(locked ? 1 : 0), 0, 0, 3, (uint8_t)mode, 0};
+  set_match_selections(selections);
+  uint8_t find[19] = {};
+  find[0] = (uint8_t)mode;
+  const std::string sjis = utf8_to_shiftjis(code);
+  std::memcpy(find + 1, sjis.data(), std::min<size_t>(18, sjis.size()));
+  start_find_match(find);
+  if (!g_forced_error.empty()) {
+    if (error) *error = g_forced_error;
+    return false;
+  }
+  return g_matchmaking && g_matchmaking->IsSearching();
+}
+
+bool local_identity(std::string* code, std::string* name) {
+  if (!g_user) init();
+  if (!g_user || !g_user->IsLoggedIn()) return false;
+  const UserInfo info = g_user->GetUserInfo();
+  if (code) *code = info.connect_code;
+  if (name) *name = info.display_name.empty() ? info.connect_code : info.display_name;
+  return !info.connect_code.empty();
+}
+
+std::unique_ptr<Matchmaking> arena_matchmaking() {
+  if (!g_user) init();
+  // Room links search on their own (not through start_find_match): they need this game's own hold on
+  // Windows networking (the spectator server lets go of its own when it cannot open its port).
+  if (!enet_ready()) return nullptr;
+  return g_user ? std::make_unique<Matchmaking>(g_user.get()) : nullptr;
+}
+
+bool arena_pop_from_match(std::vector<uint8_t>& out) { return g_netplay && g_netplay->PopArena(out); }
+
+bool arena_lock_in(uint8_t character, uint8_t color) {
+  if (!g_user || !g_matchmaking || !g_netplay) return false;
+  if (g_last_search.mode != Matchmaking::DIRECT && g_last_search.mode != Matchmaking::TEAMS) return false;
+  if (g_matchmaking->GetMatchmakeState() != Matchmaking::CONNECTION_SUCCESS || g_local_selections.is_character_selected) return false;
+  uint8_t selections[9] = {g_local_selections.team_id, character, color, 1, 0, 0, 3, (uint8_t)g_last_search.mode, 0};   // a random legal stage
+  set_match_selections(selections);
+  return true;
+}
+
+static std::atomic<uint32_t> g_arena_pairing{0};
+void arena_note_new_pairing() { g_arena_pairing.fetch_add(1, std::memory_order_relaxed); }
+uint32_t arena_pairing() { return g_arena_pairing.load(std::memory_order_relaxed); }
 
 bool local_css_selection(uint8_t* character, uint8_t* color) {
   if (!g_local_selections.is_character_selected || g_local_selections.character_id >= 26) return false;
@@ -3200,6 +3323,8 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
       if (payload_len == 1 && (payload[0] & 0xF0) == 0x10) {
       } else if (payload_len == 1 && payload[0] == 0x20) {
         if (yougame::coming_soon()) yougame::first_row_picked();
+        // YouGame is open but signed out (local channel): the sign-in panel, then the menu carries on.
+        else if (yougame::sign_in_needed()) yougame::sign_in_open();
       } else if (payload_len == 1 && payload[0] == 3) {
         if (g_older_offer_mode >= 0) {
           std::string why;
@@ -3215,8 +3340,9 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
       // The local channel never holds a frame: its identity is asked on the probe's thread, and the
       // rows open on the first visit after it is in.
       if (yougame::launcher() && (yougame::channel_connected() ? yougame::identity().ok : yougame::wait_identity(500).ok)) q[0] |= 4;
-      // Bit 6: YouGame is not open yet; its rows show (labelled Coming soon!) but cannot be picked.
-      if (yougame::coming_soon() && !yougame::active() && (q[0] & 2)) q[0] |= 64;
+      // Bit 6: YouGame is not ready for the rows yet: not open (picking a row starts it), or open and signed
+      // out (picking a row opens Sign in by code). Either way the menu then carries on into that row.
+      if ((yougame::coming_soon() || yougame::sign_in_needed()) && !yougame::active() && (q[0] & 2)) q[0] |= 64;
       // Bit 4/5: started for a YouGame mode (--online-mode): the menu opens Ranked (16) or Direct (32).
       if (payload_len == 0 && (q[0] & 4)) {
         if (const int arg = yougame::take_online_mode_arg()) q[0] |= arg == 2 ? 32 : 16;

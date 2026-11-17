@@ -84,13 +84,14 @@ static Detected find(const ScanResult& r, Kind kind) {
 }
 
 int main(int argc, char** argv) {
-  // Optional field validation against private discs, never required in CI.
+  // Optional field validation against private discs, never required in CI. The game disc "-": none.
   if (argc == 3) {
     ScanOptions options;
-    options.base_iso = fs::u8path(argv[1]);
+    if (std::string(argv[1]) != "-") options.base_iso = fs::u8path(argv[1]);
     const auto d = identify(fs::u8path(argv[2]), options);
     std::cout << kind_id(d.kind) << " | " << d.name << " | " << engine_id(d.needs)
-              << " | " << support_id(d.status) << " | " << d.hash << "\n";
+              << " | " << support_id(d.status) << " | " << d.hash << (d.copy ? " | copy" : "") << "\n"
+              << d.message << "\n";
     return d.kind == Kind::AssetMod && d.needs == Engine::Either &&
            d.status == Support::Supported && d.can_enable ? 0 : 1;
   }
@@ -233,6 +234,51 @@ int main(int argc, char** argv) {
         "current and legacy official Hack Pack fingerprints are recognized");
   check(hack_pack_version("d926ba5b39551f5245fd655bc1dfeb30").empty(),
         "a near-match fingerprint is not identified as a known Hack Pack");
+
+  // ---- a copy of Melee (its own title, a few changed files) never turns on by itself ----
+  {
+    const fs::path mods = root / "CopyMods";
+    fs::create_directories(mods / "Discs");
+    const std::vector<std::pair<std::string, std::string>> game = {{"a.dat", "original"}, {"b.dat", "bee"}, {"c.dat", "sea"}, {"d.dat", "dee"}};
+    write_disc(root / "base4.iso", "GALE01", 2, "Super Smash Bros Melee", game);
+    auto changed = game;
+    changed[0].second = "one changed file";
+    write_disc(mods / "Discs" / "SSBM GALE01 1.02.iso", "GALE01", 2, "Super Smash Bros Melee", changed);
+    write_disc(mods / "Discs" / "named.iso", "GALE01", 2, "Visual pack", changed);
+    write_disc(mods / "Discs" / "many.iso", "GALE01", 2, "Super Smash Bros Melee", {{"a.dat", "1"}, {"b.dat", "2"}, {"c.dat", "3"}, {"d.dat", "4"}});
+    ScanOptions copies;
+    copies.mods_dir = mods;
+    copies.base_iso = root / "base4.iso";
+    copies.use_cache = true;
+    const Detected copy = identify(mods / "Discs" / "SSBM GALE01 1.02.iso", copies);
+    check(copy.kind == Kind::AssetMod && copy.copy && copy.can_enable && copy.message.rfind("A copy of Melee with 1 changed file,", 0) == 0,
+          "Melee's own title and one changed file: a copy of Melee, listed and switchable (" + copy.message + ")");
+    check(!identify(mods / "Discs" / "many.iso", copies).copy, "four changed files are a mod, not a copy");
+    check(!identify(mods / "Discs" / "named.iso", copies).copy, "a disc with its own title is a mod, not a copy");
+    const auto item = [](const ScanResult& r, const char* name) {
+      for (const auto& d : r.items) if (d.path.filename() == name) return d;
+      return Detected{};
+    };
+    std::map<std::string, int> picks;
+    const ScanResult found = scan(copies, &picks);
+    check(!item(found, "SSBM GALE01 1.02.iso").enabled && picks.count(copy.key) && picks[copy.key] == 0,
+          "a copy found for the first time stays off, and that choice is recorded");
+    check(item(found, "many.iso").enabled && item(found, "named.iso").enabled, "mods found for the first time still turn on");
+    // An earlier version turned the copy on when it found it: the first scan after the update (an
+    // older version's scan cache) switches it off once.
+    picks[copy.key] = 1;
+    std::ofstream(mods / ".cache" / "scan.txt", std::ios::trunc) << "mu-scan 17\n";
+    const ScanResult updated = scan(copies, &picks);
+    check(!item(updated, "SSBM GALE01 1.02.iso").enabled && picks[copy.key] == 0 && !updated.notes.empty(),
+          "the first scan after the update switches a copy an earlier version turned on off, with a note");
+    check(item(updated, "many.iso").enabled && item(updated, "named.iso").enabled, "and leaves the mods on");
+    picks[copy.key] = 1;   // the player switches it on: from then on it stays on
+    const ScanResult chosen = scan(copies, &picks);
+    check(item(chosen, "SSBM GALE01 1.02.iso").enabled && picks[copy.key] == 1, "a copy the player switched on stays on");
+    // Without a game disc to compare with, the retail game code is known by its hash, which these
+    // made-up discs do not have: that case is checked on real discs (the two-argument run above,
+    // "-" for no game disc).
+  }
 
   write_disc(root / "external asset.iso", "GALE01", 2, "Linked visual pack", {{"a.dat", "external replacement"}});
   {

@@ -372,10 +372,16 @@ static void enter_css(GameModeState* state)
     gmVsMelee_EnterCss(state, &selection, REG_CLASSIC);
 }
 
+int mu_human_zelda_as_sheik(void);   /* shim/mu_slippi_css.c: Settings > Game > Zelda starts as Sheik */
+
 static void exit_css(GameModeState* state)
 {
     gmVsMelee_ExitCss(state, &selection);
     if (css.pending_scene_change == CSSPendingSceneChange_2) return;
+    /* Holding A at the start does not exist here: Settings > Game > Zelda starts as Sheik does. */
+    if (selection.start.players[run_port].ckind == CKind_Zelda && mu_human_zelda_as_sheik()) {
+        selection.start.players[run_port].ckind = CKind_Seak;
+    }
     RogueDirector_Start((RogueSeed) OSGetTime(), selection.start.players[run_port].ckind);
     if (!RogueRun_Configure(RogueDirector_Run(),
             selection.start.players[run_port].stocks,

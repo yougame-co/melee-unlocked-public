@@ -225,6 +225,9 @@ int unit_test() {
     g.w32(lines + 8, maplines + 0x10); g.w32(lines + 12, (1u << 16) | (1u << 18) | (1u << 8) | 1);   // hidden
     host::ram = g.bytes.data();
 
+    // The outline stage style draws the live collision; Slippi Lab's own look keeps its fixed shapes
+    // on its six stages, as Slippi Lab does.
+    lab::set_style(0, 1);
     feed(game_start());   // Final Destination, which has no platforms of its own in Slippi Lab
     feed(post_frame(-123, 10, 0, 0));
     feed(bookend(-123));
@@ -253,6 +256,7 @@ int unit_test() {
     CHECK(draw_vertex_count(W, H) > 0);
     feed(end);
     host::ram = nullptr;
+    lab::set_style(0, 0);
   }
 
   // Both native low-detail styles retain shield/reflector signals without silhouette packs,
@@ -267,7 +271,7 @@ int unit_test() {
     fighter.capsule_count = 1; fighter.capsules[0] = {0, 2, 0, 10, 2};
     MuLookItems items{};
     lab::native_frame(snapshot, &items);
-    const ImU32 shield_color = IM_COL32(0xB9, 0x1C, 0x1C, (int)(0.35f * 255));
+    const ImU32 shield_color = IM_COL32(0xB9, 0x1C, 0x1C, (int)(0.6f * 255));   // the port colour at 60%, as Slippi Lab
     CHECK(frame_box(shield_color, W, H).n == 0);
     ++snapshot.frame; fighter.action = 179;
     lab::native_frame(snapshot, &items);
@@ -287,7 +291,7 @@ int unit_test() {
     items.items[2] = {999, 0, -1, 0, 0, 1, 0, 0, 10, 12};
     lab::native_frame(snapshot, &items);
     CHECK(frame_box(IM_COL32(255, 0, 0, 255), W, H).n > 8);          // laser
-    CHECK(frame_box(IM_COL32(0x38, 0xBD, 0xF8, 255), W, H).n > 8); // PK Thunder
+    CHECK(frame_box(IM_COL32(0x38, 0xBD, 0xF8, 255), W, H).n == 0); // PK Thunder: Slippi Lab draws no such item
     CHECK(frame_box(shield_color, W, H).n == 0);
     ++snapshot.frame; items.count = 0;
     lab::native_frame(snapshot, &items);

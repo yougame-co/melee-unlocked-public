@@ -13,6 +13,9 @@ constexpr uint32_t kSdlEventMessage = 0x7FFF0001u;
 void window_set_message_callback(MessageCallback cb);
 void window_input_capture(bool capture);
 bool window_input_captured(); // shared by Windows, macOS and Linux; local console samples only
+// GameCube buttons held back from the game while the overlay uses them (0: none). The overlay still
+// reads them through window_ui_pads.
+void window_withhold_buttons(uint16_t mask);
 struct PadState;
 bool window_ui_gamecube_pad(PadState& pad);
 // Last routed state for every in-game port, captured before UI input suppression. This lets an
@@ -78,6 +81,9 @@ void window_set_title(const wchar_t* title);
 // "Static Recomp"), so the title bar and any screenshot of it say which build is playing. main()
 // sets it once before the window opens; every title the runtime writes begins with it.
 inline std::wstring& window_title_base() { static std::wstring base = L"Melee Unlocked"; return base; }
+// The version and engine ("Melee Unlocked 0.9.120  |  Source Port"): only in the title while the
+// Performance overlay is on, with the display rates after it (threaded_backend.cpp).
+inline std::wstring& window_title_debug() { static std::wstring debug = L"Melee Unlocked"; return debug; }
 // A small progress panel over the game window for startup work that holds the first frame back
 // (compiling the pipeline cache on the first launch of a new version). Call from the thread that
 // owns the game window; nothing is shown for a hidden window.

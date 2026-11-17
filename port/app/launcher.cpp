@@ -26,6 +26,7 @@
 #include <nlohmann/json.hpp>
 #include "launcher_mod_catalog.h"
 #include "mod_scan.h"
+#include <array>
 #include <set>
 #include <sstream>
 #include <algorithm>
@@ -2140,7 +2141,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         std::thread([ms = std::atoi(ms)] { Sleep(ms); PostMessageW(g_main, WM_APP + 41, 0, 0); }).detach();
 #ifndef MELEE_NO_SLIPPI   // the public releases are the other build: this one must never install them over itself
 #ifndef MELEE_YOUGAME_NO_UPSTREAM_UPDATES   // upstream's releases have no YouGame plugin: never offer them over this build
-      if (!g_launcher_test) { host::updater::check(MELEE_PORT_VERSION); refresh_updater(); }
+      // Test runs skip the update check, unless MELEE_LAUNCHER_TEST_UPDATER=1 asks for the real release
+      // list (the version picker test reads it; nothing installs without a click).
+      if (!g_launcher_test || std::getenv("MELEE_LAUNCHER_TEST_UPDATER")) { host::updater::check(MELEE_PORT_VERSION); refresh_updater(); }
 #endif
       if (!g_launcher_test) PostMessageW(hwnd, WM_APP + 77, 0, 0);   // offer DLSS 5 once the window is up
 #endif
@@ -2150,6 +2153,10 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (g_launcher_test) mod_manager::test_get();
       if (g_launcher_test && std::getenv("MELEE_LAUNCHER_TEST_CHANGELOG")) host::updater::check(MELEE_PORT_VERSION);
       if (g_launcher_test && std::getenv("MELEE_LAUNCHER_TEST_REPLAY_LIST")) refresh_replays();   // writes the list there
+#ifndef MELEE_NO_SLIPPI
+      // Test runs only: the Replay Viewer with Watch live pressed, for a capture of what it says.
+      if (g_launcher_test && std::getenv("MELEE_LAUNCHER_TEST_WATCH_LIVE")) { select_tab(3); watch_live_toggle(); }
+#endif
       return 0;
     }
     case WM_ERASEBKGND: return 1;        // WM_PAINT paints every pixel from a memory DC

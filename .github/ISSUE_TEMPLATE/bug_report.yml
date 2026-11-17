@@ -34,6 +34,11 @@ body:
   - type: textarea
     id: log
     attributes:
-      label: Console log and port-settings.ini
-      description: Attach melee_port.log from the game folder (or paste its last 50 lines). Attach a .slp replay if the bug is in a match.
+      label: Logs
+      description: >-
+        Easiest: press Send logs in the launcher, describe the bug there, and write "sent from the
+        launcher" here. Or attach two files from the folder that holds MeleeUnlockedLauncher.exe
+        (on Linux, the folder with MeleeUnlocked): melee_port.log and port-settings.ini. With file
+        extensions hidden, Windows shows them as "melee_port" (a text document) and "port-settings"
+        (configuration settings). Attach a .slp replay if the bug is in a match.
       render: text

@@ -162,4 +162,19 @@ bool save();
 // host's pad_read on the Source Port), to apply the enabled codes' writes.
 void apply();
 
+// ---- Codes in a network match (gecko_online.h, gecko_session.h). Source Port only.
+// The codes this player may offer: switched on, supported, made only of reads and writes of game
+// variables (no function rewrites). Name and lines.
+struct Offerable { std::string name; std::vector<std::pair<uint32_t, uint32_t>> lines; };
+std::vector<Offerable> offerable();
+// The game library's writer and reader for agreed codes (mu_user_gecko_write_agreed, ..._read_agreed):
+// the same as the others, but they also store during a network match. Only run_agreed uses them.
+void set_agreed_writer(NativeWrite write, NativeRead read);
+// Whether this game can run a code online (by its lines); why not in *why.
+bool can_run(const std::vector<std::pair<uint32_t, uint32_t>>& lines, std::string* why);
+// One frame of the codes both players agreed to run, by their lines (the opponent's codes are not
+// in this player's list). Each is checked and planned once; one this build cannot run is skipped and
+// logged. The other game runs the same list, so both stay in step.
+void run_agreed(const std::vector<std::vector<std::pair<uint32_t, uint32_t>>>& codes);
+
 }  // namespace user_gecko

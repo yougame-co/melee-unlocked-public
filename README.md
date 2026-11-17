@@ -231,8 +231,9 @@ send for replays and draws them over the game image, so it never touches the sim
 safe online: your opponent's game is unaffected, and the rollback state it shows is exactly what
 the game is running.
 
-The silhouettes are Slippi Lab's own animation frames and are not shipped with this build.
-Generate them once from a Slippi Lab checkout (Python 3, no extra packages):
+The silhouettes are Slippi Lab's own animation frames, converted by `tools/build_lab_assets.py`.
+The game downloads them (about 85 MB) the first time the Lab view is used and keeps them in `Lab\`
+through updates. To build them yourself from a Slippi Lab checkout (Python 3, no extra packages):
 
 ```powershell
 git clone https://github.com/frankborden/slippilab.git

@@ -113,13 +113,14 @@ class YouGame0962MergeTest(unittest.TestCase):
                 active = conditional_source(loader, defines)
                 self.assertEqual(active.count("auto game_proc ="), 1)
                 self.assertIn(resolver, active)
-                for symbol in ("mu_game_entry", "mu_look_snapshot_v1", "mu_look_items_v1",
+                for symbol in ("mu_game_entry", "mu_look_snapshot_v1", "mu_look_items_v1", "mu_look_extras_v1",
                                "mu_user_gecko_write", "mu_user_gecko_read"):
                     self.assertIn('game_proc("' + symbol + '")', active)
         retrace = host.split("void native_retrace() {", 1)[1].split("void h_gx_fifo", 1)[0]
         self.assertLess(retrace.index("g_game.retrace();"), retrace.index("g_look_snapshot(&snapshot);"))
-        self.assertIn("g_look_snapshot && lab::styles_on()", retrace)
-        self.assertIn("lab::native_frame(snapshot, g_look_items ? &items : nullptr);", retrace)
+        self.assertIn("g_look_snapshot && lab::active()", retrace)
+        self.assertIn("lab::native_frame(snapshot, g_look_items ? &items : nullptr, g_look_extras ? &extras : nullptr, names.data());",
+                      retrace)
 
     def test_shader_workers_and_gl_headers_stay_platform_specific(self):
         renderer = source("port/linux/renderer_gl.cpp")

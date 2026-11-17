@@ -264,6 +264,20 @@ inline HidBindings haybox_dinput_bindings() {
   b.mask[(size_t)BindAction::DLeft] = HID_HAT_LEFT; b.mask[(size_t)BindAction::DRight] = HID_HAT_RIGHT;
   return b;
 }
+// A Frame1 on its own firmware in DInput mode ("Frame1 Dinput", hid_pad.h): the button order of its
+// maker's pico-rectangle HID report, A B X Y Start, three unused, D-pad left right down up, Z R L.
+// The analog sliders carry the trigger travel; these bits are the full presses.
+inline HidBindings frame1_dinput_bindings() {
+  HidBindings b{};
+  b.mask[(size_t)BindAction::A] = 1u << 0;  b.mask[(size_t)BindAction::B] = 1u << 1;
+  b.mask[(size_t)BindAction::X] = 1u << 2;  b.mask[(size_t)BindAction::Y] = 1u << 3;
+  b.mask[(size_t)BindAction::Start] = 1u << 4;
+  b.mask[(size_t)BindAction::DLeft] = 1u << 8;  b.mask[(size_t)BindAction::DRight] = 1u << 9;
+  b.mask[(size_t)BindAction::DDown] = 1u << 10; b.mask[(size_t)BindAction::DUp] = 1u << 11;
+  b.mask[(size_t)BindAction::Z] = 1u << 12; b.mask[(size_t)BindAction::R] = 1u << 13;
+  b.mask[(size_t)BindAction::L] = 1u << 14;
+  return b;
+}
 // vJoy fed as a B0XX (the b0xx-ahk keyboard setup and others that use its profile), from
 // b0xx-keyboard.ini.
 inline HidBindings vjoy_b0xx_bindings() {
@@ -531,6 +545,60 @@ inline int8_t xinput_axis(int16_t v) {
   const double s = v < 0 ? v / 32768.0 : v / 32767.0;
   const int a = (int)std::floor(s * 127.0);
   return (int8_t)(a > 127 ? 127 : a < -128 ? -128 : a);
+}
+
+// A Frame1 in XInput mode (its own firmware, the pico-rectangle line) scales each GameCube stick so
+// that 70 units already reach the edge: (g - 128) * (32768 / 70), truncated, and 70 or more sends the
+// edge itself. Its triggers send (analog - 40) * 255 / 100, a click 255. Read as an Xbox stick (127 at
+// the edge), every coordinate came out 1.8 times too far: shield + down-diagonal, (0.7, -0.6875),
+// left the stick's rim as a spot dodge instead of a shield drop, and the light shield (49) arrived as
+// 22, under the game's trigger deadzone.
+//
+// Such a pad is known by its values alone: every stick reading lands on that grid of whole GameCube
+// units. An Xbox stick, or a box that scales the way Dolphin reads (x * 257), leaves the grid on its
+// first reading off centre or off the edge, and is then read as before for as long as it stays
+// connected. Two different grid values are needed before the pad counts as a Frame1 (about one Xbox
+// reading in 460 lands on the grid by chance, and two of HayBox's 256 values do); until then a value
+// on the grid is still read in GameCube units, so a Frame1's first modifier press is right.
+inline constexpr double kBoxXInputStep = 32768.0 / 70.0;
+struct BoxXInputDetect {
+  int8_t state = 0;   // 0 not known yet, 1 a Frame1 grid, -1 not one
+  int8_t first = 0;   // the first grid value seen (0: none yet)
+};
+// The GameCube offset `v` stands for when it lies on the grid (the edge and centre say nothing).
+inline bool box_xinput_grid(int16_t v, int* units) {
+  if (v == 0 || v == 32767 || v == -32768) return false;
+  const int o = (int)std::lround(v / kBoxXInputStep);
+  if (o == 0 || o <= -70 || o >= 70 || (int)(o * kBoxXInputStep) != v) return false;
+  if (units) *units = o;
+  return true;
+}
+inline void box_xinput_observe(BoxXInputDetect& d, const int16_t (&axes)[4]) {
+  if (d.state < 0) return;
+  for (int16_t v : axes) {
+    if (v == 0 || v == 32767 || v == -32768) continue;
+    int o = 0;
+    if (!box_xinput_grid(v, &o)) { d.state = -1; return; }
+    if (d.first == 0) d.first = (int8_t)o;
+    else if (o != d.first) d.state = 1;
+  }
+}
+// One stick axis of an XInput pad, in GameCube units: on the grid while the pad may be a Frame1
+// (the edge then a full press, 80 units, once it is known to be one), otherwise as an Xbox stick.
+inline int8_t box_xinput_axis(const BoxXInputDetect& d, int16_t v) {
+  if (d.state < 0) return xinput_axis(v);
+  if (d.state > 0 && v == 32767) return 80;
+  if (d.state > 0 && v == -32768) return -80;
+  int o = 0;
+  if (box_xinput_grid(v, &o)) return (int8_t)o;
+  return xinput_axis(v);
+}
+// Its trigger, back to the GameCube value: the smallest analog value the firmware sends as `t`.
+inline uint8_t box_xinput_trigger(uint8_t t) {
+  if (t == 0 || t == 255) return t;
+  for (int g = 41; g < 140; ++g)
+    if ((g - 40) * 255 / 100 == t) return (uint8_t)g;
+  return t;
 }
 
 inline void apply_deadzone(const Deadzone& dz, int8_t& x, int8_t& y, bool c) {

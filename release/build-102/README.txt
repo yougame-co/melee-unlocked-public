@@ -12,7 +12,7 @@ linux-build-labels.patch applies to yg-ci-linux-101 at
 b7805297157afc6933e8be95285c92346893863c. It changes the two build 101 workflow labels to build 102;
 the upstream version remains 0.9.120 and its existing Linux GECKO-CHECK remains intact.
 
-mk-mac102-src.sh is the build 102 copy of the build 101 Mac source recipe. It uses
+mk-mac102-src.sh is the build 102 copy of ball101-work/mk-mac101-src.sh. It uses
 0.9.120-online-test.102 and yg-build-102, requires the new artifact id and both full source commits,
 and refuses to reuse a build 101 source pin. It has not been run against a build 102 artifact.
 No packaging, publishing or network operation was performed while preparing these files.

@@ -373,9 +373,10 @@ typedef struct MuHostApi {
      * in a replay and never sent to an opponent: nothing the simulation reads follows them. */
     uint32_t (*display_options)(void);
 
-    /* Version 19. Audio options (MU_AUDIO_OPTION_*), read live once per sound frame. Never recorded
-     * in a replay; the host returns 0 during online matches and replay playback, because early
-     * key-on lets the game see a sound finish one tick sooner (crowd loops, a stage text box). */
+    /* Version 19. Audio options (MU_AUDIO_OPTION_*), read live once per sound frame (and per fighter
+     * voice). Never recorded in a replay; the host leaves EARLY_KEYON out during online matches and
+     * replay playback, because early key-on lets the game see a sound finish one tick sooner (crowd
+     * loops, a stage text box). MUTE_VOICES changes no timing and stays on everywhere. */
     uint32_t (*audio_options)(void);
 
     /* Version 20. How much wider the presented picture is than the game's own camera sees: True
@@ -440,6 +441,10 @@ typedef struct MuHostApi {
  * the game's sound callback owed at the end of a frame runs at the top of the next one, before
  * the voices are synced (axnative/AXOut.c). Offline only. */
 #define MU_AUDIO_OPTION_EARLY_KEYON 0x00000001u
+/* Audio > Mute character voices: the fighters' voices play at volume 0 (Game & Watch and Samus,
+ * whose "voices" are sound effects, excepted). Allowed online and in replays: the sound still runs
+ * its length, so nothing the game reads changes. */
+#define MU_AUDIO_OPTION_MUTE_VOICES 0x00000002u
 
 /* "Low poly fighters": the fighter draw shows the game's own far model (the one it draws in the
  * Fountain of Dreams reflection, the shadow pass and the magnifier bubble) in place of the full
@@ -733,7 +738,8 @@ enum {
     MU_PRACTICE_CSS_PICK = 16,     /* out [0] live CSS fighter, [1] costume, [2] physical pad */
     MU_PRACTICE_FRIENDS_RETURN = 17, /* leave to Online, Friends row highlighted */
     MU_PRACTICE_PAGE_PAUSE = 15,    /* in [0] -1 query, 0 resume, 1 pause; out [0] flag,
-                                      [1] live match, [2] scene frame counter */
+                                      [1] live match, [2] scene frame counter; with n >= 5 also
+                                      [3] Start's pause, [4] a match scene (game state) */
     MU_PRACTICE_BOOT_MATCH = 35,    /* agent test: the --match VS game from the main menu, no
                                       character or stage screens; returns its stage, -1 refused
                                       (shim/mu_boot_match.c). 32-34 are the CPU bracket's ops. */

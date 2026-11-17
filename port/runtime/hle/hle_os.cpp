@@ -55,6 +55,15 @@ HLE(OSPanic) {
     host::die("OSPanic at ftdata.c:%u: a fighter's animation on this mod's disc could not be read (after %s). "
               "The disc is probably damaged or only partly patched: patch it again from a clean Melee 1.02 ISO",
               ARG1, host::recent_files(2).c_str());
+  // ftdata.c 0x9AF: an animation of the fighter just loaded is larger than the 0x8000 bytes the game
+  // keeps for a fighter's animation (the game's line above has the size, the line after it the
+  // animation). On a mod disc the mod's own code makes this test and stops: that fighter does not fit
+  // (Chaos Eternal, PlBFAJ.dat, 0x8072 bytes, in a player's report). The player is told which files
+  // were being loaded, and the start of the line is unchanged for grouping.
+  if (ARG1 == 0x9AF && file == "ftdata.c" && host::mod_disc_active())
+    host::die("OSPanic at ftdata.c:%u: a fighter on this mod's disc has an animation larger than the game can hold "
+              "(after %s). That fighter cannot be played on this build of the mod: pick another fighter",
+              ARG1, host::recent_files(2).c_str());
   host::die("OSPanic at %s:%u: %s", file.c_str(), ARG1, msg.c_str());
 }
 // HSD_MemAlloc (sysdolphin memory.c), as the game has it: nothing for a size of 0 or less, else

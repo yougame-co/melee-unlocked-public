@@ -45,6 +45,7 @@ struct Detected {
   bool enabled = false;            // switched on (the player's choice, or turned on when first found)
   bool card = false;               // a memory card save: one at a time, a card holds one Melee save
   bool restart = false;            // switching it takes effect after a restart
+  bool copy = false;               // a copy of Melee (its own title, a few changed files): never turned on by itself
 };
 // Card saves: 20XX TE and memory card mods share the card's single Melee save.
 inline bool is_card_mod(const Detected& d) { return d.kind == Kind::Te || d.kind == Kind::CardMod; }

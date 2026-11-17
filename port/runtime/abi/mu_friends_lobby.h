@@ -17,6 +17,9 @@
 #define MU_BUILD_CAPS2_LOCAL_PARTNER 0x02 /* versioned machine pad packets and two owned human ports */
 #define MU_BUILD_CAPS2_FRIENDS_LOBBY 0x01   /* plays the Friends lobby's frozen setup (yougame_lobby_setup.h) */
 #define MU_BUILD_CAPS2_GONE_OWN_FRAMES 0x04 /* reads a player who left by their own frames (slippi_gone_port.h) */
+#define MU_BUILD_CAPS2_ARENA 0x08          /* takes arena room messages (NP_MSG_MU_ARENA); upstream sends caps 0x10 */
+#define MU_BUILD_CAPS2_AUTO_LCANCEL 0x10    /* presses for L-cancels this session; upstream sends caps 0x20 */
+#define MU_BUILD_CAPS2_GECKO 0x20          /* takes Gecko code messages (NP_MSG_MU_GECKO); upstream sends caps 0x40 */
 #define MU_FRIENDS_LOBBY_OLD_BUILD_TEXT "A player's game can't play the Friends lobby yet. Everyone needs the latest Melee Unlocked."
 
 static inline int mu_local_partner_capable(unsigned caps2) { return (caps2 & MU_BUILD_CAPS2_LOCAL_PARTNER) != 0; }

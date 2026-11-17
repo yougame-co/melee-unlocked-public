@@ -502,8 +502,175 @@ void check_frame1_dinput_axes() {
   }
 }
 
+// A Frame1 on its own firmware in DInput mode (pico-rectangle's "HID with triggers" report): every
+// stick byte comes back exactly, a resting stick reads centred (it read full left and full up, the
+// top-left corner a player reported), and the trigger sliders read as their bytes.
+void check_frame1_own_dinput() {
+  CHECK(host::frame1_dinput_name("Frame1 Dinput"));
+  CHECK(host::frame1_dinput_name("pico-rectangle - HID with triggers mode"));
+  CHECK(!host::frame1_dinput_name("Arduino Leonardo"));
+  auto word = [](long v) { return (unsigned long)(v & 0xFFFF); };
+  const unsigned long rest = word(127);                       // ((128 - 128) << 8) + 127
+  const int8_t enc = host::frame1_stick_encoding(rest, 16);
+  CHECK(enc == host::kFrame1Twos);
+  CHECK(host::frame1_stick(rest, 16, enc) == 0);
+  CHECK(host::frame1_stick(rest, 16, enc, true) == 0);
+  for (int g = 1; g <= 255; ++g) {
+    CHECK(host::frame1_stick(word(((long)(g - 128) << 8) + 127), 16, enc) == g - 128);
+    CHECK(host::frame1_stick(word(((long)(-(g - 128)) << 8) + 127), 16, enc, true) == (g - 128 > 127 ? 127 : g - 128));
+  }
+  // Offset binary (centre 0x8000) is still read right if a build sends it that way.
+  const int8_t off = host::frame1_stick_encoding(128ul * 257, 16);
+  CHECK(off == host::kFrame1Offset);
+  for (int g = 0; g <= 255; ++g) CHECK(host::frame1_stick((unsigned long)g * 257, 16, off) == g - 128);
+  // Triggers: pico-rectangle's ((l - 128) << 8) + 128, or plain l << 8, told apart by the rest.
+  for (int rest_l : {0, 31}) {
+    const unsigned long pico_rest = word(((long)(rest_l - 128) << 8) + 128);
+    const int8_t te = host::frame1_trigger_encoding(pico_rest, 16);
+    CHECK(host::frame1_trigger(pico_rest, 16, te) == rest_l);
+    for (int l = 0; l <= 255; ++l) CHECK(host::frame1_trigger(word(((long)(l - 128) << 8) + 128), 16, te) == l);
+    const int8_t pe = host::frame1_trigger_encoding((unsigned long)rest_l << 8, 16);
+    for (int l = 0; l <= 255; ++l) CHECK(host::frame1_trigger((unsigned long)l << 8, 16, pe) == l);
+  }
+  const host::HidBindings b = host::frame1_dinput_bindings();
+  CHECK(b.mask[(size_t)host::BindAction::A] == 1u << 0 && b.mask[(size_t)host::BindAction::Z] == 1u << 12);
+  CHECK(b.mask[(size_t)host::BindAction::L] == 1u << 14 && b.mask[(size_t)host::BindAction::R] == 1u << 13);
+}
+
+// A Frame1 in XInput mode, as its firmware sends it: a GameCube stick byte g as (g - 128) * 32768 / 70
+// truncated, 70 units or more as the edge; a trigger as (analog - 40) * 255 / 100, a click as 255;
+// Z on RB. Its Melee coordinates are (uint8_t)(128 + 80 * c + 0.5), mirrored as 256 - that.
+int16_t f1x_stick(int g) {
+  if (g <= 128 - 70) return (int16_t)-32768;
+  if (g >= 128 + 70) return 32767;
+  return (int16_t)((g - 128) * ((128 << 8) / 70.));
+}
+uint8_t f1x_trigger(bool click, int analog) {
+  return click ? 255 : analog >= 140 ? 255 : (uint8_t)((analog >= 40 ? analog - 40 : 0) * 255 / 100);
+}
+int f1_coord(double c, bool negative) {
+  const int v = (uint8_t)(128. + 80. * c + 0.5);
+  return negative ? (uint8_t)(256 - v) : v;
+}
+// One read of the pad, the way the game's XInput read does it (window.cpp).
+host::PadState f1x_read(host::BoxXInputDetect& d, uint16_t buttons, uint8_t lt, uint8_t rt, int16_t lx, int16_t ly,
+                        int16_t rx = 0, int16_t ry = 0) {
+  const int16_t axes[4] = {lx, ly, rx, ry};
+  host::box_xinput_observe(d, axes);
+  if (d.state > 0) { lt = host::box_xinput_trigger(lt); rt = host::box_xinput_trigger(rt); }
+  host::PadState p{};
+  p.stick_x = host::box_xinput_axis(d, lx); p.stick_y = host::box_xinput_axis(d, ly);
+  p.sub_x = host::box_xinput_axis(d, rx); p.sub_y = host::box_xinput_axis(d, ry);
+  const host::Deadzone dz{};
+  host::xinput_apply_bindings(host::default_pad_bindings()[0], buttons, lt, rt, dz.click_l, dz.click_r, p);
+  return p;
+}
+void check_frame1_xinput() {
+  using host::BindAction; using host::kActionPadBit;
+  const uint16_t Z = kActionPadBit[(size_t)BindAction::Z], L = kActionPadBit[(size_t)BindAction::L],
+                 R = kActionPadBit[(size_t)BindAction::R], A = kActionPadBit[(size_t)BindAction::A];
+  // Every coordinate of the Frame1's Melee logic, both ways, comes back as its exact GameCube offset
+  // (the edge, 70 units and more, as a full press).
+  const double coords[] = {0.0, 0.3125, 0.3375, 0.3625, 0.375, 0.3875, 0.45, 0.475, 0.4875, 0.5, 0.5125, 0.525,
+                           0.5375, 0.5875, 0.6125, 0.6375, 0.6625, 0.6875, 0.7, 0.7125, 0.7375, 0.7625, 0.7875,
+                           0.8, 0.8375, 0.85, 0.875, 0.9125, 1.0};
+  host::BoxXInputDetect known{}; known.state = 1;
+  for (double c : coords)
+    for (bool neg : {false, true}) {
+      const int g = f1_coord(c, neg), o = g - 128;
+      const int want = o >= 70 ? 80 : o <= -70 ? -80 : o;
+      CHECK(host::box_xinput_axis(known, f1x_stick(g)) == want);
+    }
+  // Every stick byte, not only the logic's.
+  for (int g = 0; g <= 255; ++g) {
+    const int o = g - 128, want = o >= 70 ? 80 : o <= -70 ? -80 : o;
+    CHECK(host::box_xinput_axis(known, f1x_stick(g)) == want);
+  }
+
+  // Shield drop: R held, down and a side. The firmware sends (0.7, -0.6875): 56, -55.
+  {
+    host::BoxXInputDetect d{};
+    host::PadState p = f1x_read(d, 0, 0, 0, 0, 0);                      // plugged in, nothing held
+    CHECK(d.state == 0 && p.stick_x == 0 && p.stick_y == 0 && p.button == 0 && p.trig_l == 0 && p.trig_r == 0);
+    const int16_t sx = f1x_stick(f1_coord(0.7, false)), sy = f1x_stick(f1_coord(0.6875, true));
+    p = f1x_read(d, 0, 0, f1x_trigger(true, 140), sx, sy);
+    CHECK(d.state == 1);                                                // two grid values: a Frame1
+    CHECK(p.stick_x == 56 && p.stick_y == -55);
+    CHECK((p.button & R) && p.trig_r == 255 && !(p.button & (L | Z)));
+    // As an Xbox stick the same report read (101, -100): past the rim, pulled back to it at
+    // y -0.70, a spot dodge instead of the shield drop.
+    CHECK(host::xinput_axis(sx) == 101 && host::xinput_axis(sy) == -100);
+  }
+  // The very first modifier press, before the pad is known: MX + right (0.6625, 0) reads 53.
+  {
+    host::BoxXInputDetect d{};
+    host::PadState p = f1x_read(d, 0, 0, 0, f1x_stick(f1_coord(0.6625, false)), 0);
+    CHECK(d.state == 0 && p.stick_x == 53 && p.stick_y == 0);
+  }
+  // Light shield and mid shield: 49 and 94 sent as 22 and 137, read back as 49 and 94. Every
+  // analog value the firmware can send comes back exactly.
+  {
+    CHECK(f1x_trigger(false, 49) == 22 && f1x_trigger(false, 94) == 137);
+    for (int g = 41; g < 140; ++g) CHECK(host::box_xinput_trigger(f1x_trigger(false, g)) == g);
+    CHECK(host::box_xinput_trigger(0) == 0 && host::box_xinput_trigger(255) == 255);
+    host::BoxXInputDetect d{}; d.state = 1;
+    host::PadState p = f1x_read(d, 0, f1x_trigger(false, 49), 0, 0, 0);
+    CHECK(p.trig_l == 49 && !(p.button & L));                           // a light shield, no click
+    p = f1x_read(d, 0, f1x_trigger(false, 94), 0, 0, 0);
+    CHECK(p.trig_l == 94 && !(p.button & L));
+    p = f1x_read(d, 0, f1x_trigger(true, 140), 0, 0, 0);
+    CHECK(p.trig_l == 255 && (p.button & L));                           // L itself: full and clicked
+  }
+  // Z is RB: Z alone, nothing else held (the code entry screen's Z takes the suggestion).
+  {
+    host::BoxXInputDetect d{};
+    host::PadState p = f1x_read(d, XINPUT_GAMEPAD_RIGHT_SHOULDER, 0, 0, 0, 0);
+    CHECK(p.button == Z && p.trig_l == 0 && p.trig_r == 0 && p.stick_x == 0 && p.stick_y == 0);
+    p = f1x_read(d, XINPUT_GAMEPAD_A, 0, 0, 0, 0);
+    CHECK(p.button == A);
+  }
+  // An Xbox stick leaves the grid on its first reading off centre and is read as before from then on,
+  // grid values included.
+  {
+    host::BoxXInputDetect d{};
+    f1x_read(d, 0, 0, 0, 1234, -877);
+    CHECK(d.state == -1);
+    const int16_t on_grid = f1x_stick(128 + 30);
+    CHECK(host::box_xinput_axis(d, on_grid) == host::xinput_axis(on_grid));
+    CHECK(host::box_xinput_axis(d, 32767) == host::xinput_axis(32767) && host::box_xinput_axis(d, -32768) == host::xinput_axis(-32768));
+  }
+  // A box that scales the way Dolphin reads ((g - 128) * 65535 / 255 + 128): it never becomes a
+  // Frame1 grid, whatever it sends, and as it moves it is ruled out.
+  {
+    host::BoxXInputDetect walk{};
+    for (int g = 0; g <= 255; ++g) {
+      const int16_t v = (int16_t)((g - 128) * 65535 / 255 + 128);
+      host::BoxXInputDetect one{};
+      const int16_t axes[4] = {v, 0, 0, 0};
+      host::box_xinput_observe(one, axes);
+      CHECK(one.state != 1);
+      host::box_xinput_observe(walk, axes);
+    }
+    CHECK(walk.state == -1);
+  }
+  // Random Xbox readings: a pad is never taken for a Frame1.
+  {
+    uint32_t seed = 12345;
+    auto next = [&] { seed = seed * 1664525u + 1013904223u; return (int16_t)(seed >> 16); };
+    int latched = 0;
+    for (int run = 0; run < 20000; ++run) {
+      host::BoxXInputDetect d{};
+      for (int i = 0; i < 4; ++i) { const int16_t axes[4] = {next(), next(), 0, 0}; host::box_xinput_observe(d, axes); }
+      latched += d.state == 1;
+    }
+    CHECK(latched == 0);
+  }
+}
+
 int main() {
   check_frame1_dinput_axes();
+  check_frame1_own_dinput();
+  check_frame1_xinput();
   check_haybox_shape();
   check_trigger_cap();
   check_binding_levels();

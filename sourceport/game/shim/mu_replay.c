@@ -1035,6 +1035,11 @@ void mu_replay_game_info_block(unsigned char* out, const StartMeleeData* data)
 
 /* ResetLCancelStatus (8006C324, Fighter_procMap) and GetLCancelStatus (8008D698, an aerial's
  * landing): 1 when the landing was L-cancelled, 2 when it was not. */
+int mu_replay_lcancel_status_of(int port, int follower)   /* the Lab view (mu_snapshot.c) */
+{
+    return lcancel_status[port & 3][follower ? 1 : 0];
+}
+
 void mu_replay_lcancel_reset(Fighter* fp)
 {
     lcancel_status[fp->player_idx & 3][is_follower(fp)] = 0;

@@ -105,6 +105,25 @@ int main(int argc,char** argv) {
     check(matches(clean,out,&reason),"flag-tolerant pairing preserves gameplay");
   }
   {
+    // A rebuilt stage that moved a platform's art half a unit (Animelee CE's Battlefield: 34.0 -> 33.5):
+    // still the same joint, drawn at the original's transform.
+    using namespace host::cosmetics::stage_safety;
+    auto clean=fixture(0,1), skin=fixture(32,2);
+    pointer(clean,96+8,320); pointer(clean,320+16,192);
+    pointer(skin,128+8,352); pointer(skin,352+16,224);
+    put(clean,32+320+48,0x42080000u);   // translate y 34.0
+    put(skin,32+352+48,0x42060000u);    // 33.5
+    std::vector<uint8_t> out; std::string note;
+    check(graft_visuals(clean,skin,&out,&note),"a joint moved within tolerance still pairs");
+    check(word(out.data()+32+320+16)!=0,"the near joint shows the skin mesh");
+    check(word(out.data()+32+320+48)==0x42080000u,"the near joint keeps the original transform");
+    check(matches(clean,out,&reason),"near pairing preserves gameplay");
+    put(skin,32+352+48,0x42480000u);    // 50.0: another joint, not this one
+    // (The fixture's child shares its parent's mesh, so the graft itself may pass; the child must not
+    // be paired: it shows no skin mesh of its own.)
+    check(!graft_visuals(clean,skin,&out,&note) || word(out.data()+32+320+16)==0,"a joint moved far is not paired");
+  }
+  {
     using namespace host::cosmetics::stage_safety;
     auto clean=fixture(0,1), skin=fixture(32,2);
     pointer(clean,40,320);   // bound the unused tail without adding a gameplay joint

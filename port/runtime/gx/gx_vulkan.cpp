@@ -883,7 +883,18 @@ class VulkanBackend final : public Backend {
 #else
   void release_exclusive() {}
   bool exclusive_lost(VkResult) { return false; }
-  void timing_reset() { last_actual_present_ = 0; timing_intervals_ = timing_on_grid_ = 0; timing_window_start_ = 0; }
+  void timing_reset() { last_actual_present_ = 0; timing_intervals_ = timing_on_grid_ = 0; timing_window_start_ = 0; present_times_ = {}; }
+  // Latency probe: when a present reached the screen, from the times update_variable_refresh
+  // collects (VK_GOOGLE_display_timing reports each once). Nanoseconds on CLOCK_MONOTONIC, the
+  // clock now_seconds reads.
+  uint64_t probe_present_id() override { return display_timing_on_ ? present_id_ : 0; }
+  int probe_presented(uint64_t id, double* seconds) override {
+    if (!display_timing_on_ || !id) return -1;
+    update_variable_refresh();
+    for (const auto& t : present_times_)
+      if (t.second && t.first == (uint32_t)id) { *seconds = (double)t.second * 1e-9; return 1; }
+    return 0;
+  }
   // Linux: VK_GOOGLE_display_timing says when each frame really reached the screen. On a display
   // that refreshes at a fixed rate those times sit on its refresh grid (intervals are whole
   // refreshes); on one that follows the frames they follow the frame times. Verdict after two
@@ -904,6 +915,7 @@ class VulkanBackend final : public Backend {
         if (std::fabs(k - std::round(k)) < 0.05) { ++timing_on_grid_; ++timing_line_on_grid_; }
       }
       last_actual_present_ = std::max(last_actual_present_, t[i].actualPresentTime);
+      present_times_[present_times_next_++ % present_times_.size()] = {t[i].presentID, t[i].actualPresentTime};
     }
     const double now = host::now_seconds();
     if (timing_window_start_ <= 0) { timing_window_start_ = now; timing_window_presents_ = presented_; return; }
@@ -3519,6 +3531,8 @@ class VulkanBackend final : public Backend {
   vrr::Detector vrr_;
 #else
   uint64_t last_actual_present_ = 0;
+  std::array<std::pair<uint32_t, uint64_t>, 64> present_times_{};   // presentID, actualPresentTime
+  size_t present_times_next_ = 0;
   uint32_t timing_intervals_ = 0, timing_on_grid_ = 0, timing_line_intervals_ = 0, timing_line_on_grid_ = 0;
   double timing_window_start_ = 0;
   uint32_t timing_window_presents_ = 0;

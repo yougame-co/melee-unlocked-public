@@ -49,5 +49,8 @@ const char* auto_suppressed_mode();
 // True while an online session exists and its match has not started: matchmaking and the online
 // character select screen. The notice about the suppressed setting belongs here.
 bool online_session_pending();
+// True when this side presses for L-cancels in the current online session (set on, and the mode
+// allows it). Sent to Direct opponents in the build message so their screen can say so.
+bool automatic_active_online();
 
 }  // namespace lcancel

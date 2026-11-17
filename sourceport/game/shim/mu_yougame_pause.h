@@ -1,5 +1,5 @@
 /* YouGame page pause, simulation-thread only. Shared by the Slippi and no-Slippi game shims.
- * The host gates this operation to stdio, offline, live matches. */
+ * The host gates pause/resume to stdio, offline, live matches; a query (-1) runs anywhere. */
 #ifndef MU_YOUGAME_PAUSE_H
 #define MU_YOUGAME_PAUSE_H
 #include <melee/gm/gmscene.h>
@@ -25,6 +25,13 @@ static int mu_yougame_page_pause(int* a, int n)
     a[0] = gm_GetDbPauseFlag(0);
     a[1] = match;
     a[2] = mu_gm_engine_state()->unk_0;
+    /* Game state for the YouGame button (n >= 5, query only): [3] Start's pause (contexts 1 and 2,
+     * gm_DoPauseChecksAndRoutine), [4] a match scene even after GAME! ends play. */
+    if (n >= 5) {
+        a[3] = gm_GetDbPauseFlag(1) || gm_GetDbPauseFlag(2);
+        a[4] = kind == GS_VS || kind == GS_SUDDEN_DEATH || kind == GS_TRAINING ||
+               kind == GS_CAMERA_VS;
+    }
     return 0;
 }
 #endif

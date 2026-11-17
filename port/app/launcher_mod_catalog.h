@@ -20,6 +20,7 @@ struct CatalogMod {
 struct Installed {
   std::string id, key, kind, name, version, message, path, needs_engine, status, hash;
   bool enabled = false;
+  bool copy = false;   // a copy of Melee, not a mod: never turned on by itself
 };
 bool valid_sha256(const std::string& value);
 bool valid_id(const std::string& value);

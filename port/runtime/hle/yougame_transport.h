@@ -49,6 +49,19 @@ inline DatagramRoute posix_datagram_route(const json& hello) {
          integer_is(*direct, "version", 1) && integer_is(*direct, "maxDatagram", 1200)
       ? DatagramRoute::Ring : DatagramRoute::Refuse;
 }
+// A seat whose game has no YouGame direct links (a standalone copy the player started itself): Rooms marks
+// it links:false in participants (YouGame claude/relay-flag-7a31, the pool merge of 11-17). A seat without
+// the key, or with anything but false, has links. One such seat puts the whole match on own UDP + STUN.
+inline bool seat_without_links(const json& seat) {
+  if (!seat.is_object()) return false;
+  const auto l = seat.find("links");
+  return l != seat.end() && l->is_boolean() && !l->get<bool>();
+}
+inline bool any_seat_without_links(const json& participants) {
+  if (!participants.is_array()) return false;
+  for (const auto& p : participants) if (seat_without_links(p)) return true;
+  return false;
+}
 struct PosixAttachment { int section = -1, wake = -1, wait = -1; size_t size = 0; };
 inline bool posix_attachment(const json& answer, PosixAttachment& out) {
   const auto p = answer.find("posix");
@@ -535,6 +548,26 @@ inline void close_links(Links& links, Request request) {
   for (unsigned id : ids) { try { request({{"type", "directClose"}, {"link", id}}, 1000); } catch (...) {} }
 }
 inline bool retry_link_failure(int mode) { return mode != 0 && mode != 2; }
+// One message per connect attempt, for rooms to log (rooms adds the game, the mode and whether the seats
+// share a public IP itself): connected or not, how ("lan"/"ext"/"other" for own UDP, "links", "none"), how
+// long it took. Never an address. Rooms ignores a message type it doesn't know.
+inline json link_report(bool ok, const std::string& via, uint64_t ms, bool own, const std::string& path = {}) {
+  json out = {{"t", "linkReport"}, {"ok", ok}, {"via", via}, {"ms", ms}, {"transport", own ? "own" : "links"}};
+  if (!own && !path.empty()) out["path"] = path;
+  return out;
+}
+// A links match's path for linkReport: the slowest of its links' routes as the app reports them ("lan",
+// "direct", "relay"; relay reported as "turn"), "unknown" when none is known yet.
+template<class Route> std::string links_path(const std::vector<unsigned>& ids, Route route) {
+  int worst = -1;
+  static const char* names[] = {"lan", "direct", "turn"};
+  for (unsigned id : ids) {
+    const std::string r = route(id);
+    const int rank = r == "lan" ? 0 : r == "direct" ? 1 : r == "relay" ? 2 : -1;
+    worst = std::max(worst, rank);
+  }
+  return worst < 0 ? std::string("unknown") : std::string(names[worst]);
+}
 template<class State, class Clock, class Pause, class Cancel>
 bool open_links(Links& links, int conn, const std::vector<std::string>& peers, Request request,
                 State state, Clock clock, Pause pause, Cancel cancelled) {

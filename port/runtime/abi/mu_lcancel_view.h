@@ -30,6 +30,7 @@ typedef struct MuLcancelView {
     float trigger_deadzone;                                /* ftCommonData analog_shoulder_deadzone */
     MuLcancelS32 lcancel_window;                           /* ftCommonData xE4 */
     MuLcancelFighter port[4];
+    float z_analog;                                        /* ftCommonData z_press_analog_value */
 } MuLcancelView;
 
 #endif

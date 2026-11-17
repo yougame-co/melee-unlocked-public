@@ -292,6 +292,10 @@ void apply_to_fst(uint8_t* fst, uint32_t fst_size);
 // Ganondorf) and a costume index in the game's order; empty when the game has no such costume. The
 // Ice Climbers give Popo's slot.
 std::string costume_slot_file(int css_character, int costume);
+// The game's own character select portrait of that fighter number and costume, from the disc's
+// MnSlChr.usd, as RGBA rows from the top. Sheik shows Zelda's portrait (they share a cell). False
+// when the disc has no such picture. Any thread; the file is read once.
+bool standard_portrait(int css_character, int costume, std::vector<uint8_t>* rgba, int* width, int* height);
 // Like select_variant for a costume slot, without the restart: an empty asset_id is the standard
 // costume. Refused while an online match is queued or running. Inside the online flow only a skin
 // proven to change looks alone (verdict online_allowed) can be picked; the standard costume always can.

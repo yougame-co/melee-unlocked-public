@@ -391,6 +391,104 @@ int main() {
     Events other;   // a teams invite for another room than the hello's own: no hint
     other.hello({{"room", "abcdefghjkmn"}, {"nativeTeamsInvite", {{"v", 1}, {"room", "abcdefghjkmp"}, {"mode", "teams"}}}});
     CHECK(other.take_join(true) == "abcdefghjkmn" && !other.join_doubles());
+    // The page's inviteMode (PR 2280) names the kind an accepted invite opens, in the hello reply and the join
+    // push: "singles" 1v1, "default" the 4-player Friends lobby, "teams" the Doubles home. It outranks players
+    // and the Teams marks, and counts as a hint: a plain refusal stops (another build or remix), while the room's
+    // own kind refusal still reroutes in the mode's order. Unknown or absent changes nothing.
+    CHECK(invite_mode_kind({{"inviteMode", "singles"}}) == kRoom1v1 &&
+          invite_mode_kind({{"inviteMode", "default"}}) == kRoomFriends4 &&
+          invite_mode_kind({{"inviteMode", "teams"}}) == kRoomDoubles);
+    for (const json& bad : {json(), json::object(), json::array(), json("teams"), json{{"inviteMode", "ranked"}},
+                            json{{"inviteMode", ""}}, json{{"inviteMode", "Teams"}}, json{{"inviteMode", 2}},
+                            json{{"inviteMode", json()}}, json{{"invite_mode", "teams"}}})
+      CHECK(invite_mode_kind(bad) == -1);
+    {
+      // What a taken join does: its room, Doubles first, its size, whether a plain / kind refusal reroutes,
+      // and the kind after a refused Doubles try (1v1 first and Doubles first: 1v1; Friends lobby first: it).
+      struct Taken { std::string room; bool doubles; int players; bool plain, kind; int after_doubles; };
+      const auto taken = [](Events& ev, const std::string& code) {
+        Taken t{ev.take_join(true), ev.join_doubles(), ev.join_players(), ev.mismatch_reroutes(code),
+                ev.mismatch_reroutes(code, true), 0};
+        t.after_doubles = ev.mismatch_next(code, kRoomDoubles, "", true);
+        return t;
+      };
+      const auto same = [](const Taken& a, const Taken& b) {
+        return a.room == b.room && a.doubles == b.doubles && a.players == b.players && a.plain == b.plain &&
+               a.kind == b.kind && a.after_doubles == b.after_doubles;
+      };
+      const auto pushed = [&](json value) {
+        Events ev;
+        value["type"] = "join"; value["room"] = "modeinviteAB";
+        CHECK(ev.push(value, 1));
+        return taken(ev, "modeinviteAB");
+      };
+      const auto launched = [&](json value) {
+        Events ev;
+        value["room"] = "modeinviteAB";
+        ev.hello(value);
+        return taken(ev, "modeinviteAB");
+      };
+      const json teams_invite = {{"v", 1}, {"room", "modeinviteAB"}, {"mode", "teams"}};
+      for (int launch = 0; launch < 2; ++launch) {
+        const auto join = [&](const json& value) { return launch ? launched(value) : pushed(value); };
+        // singles: 1v1 first, size 2, hinted (a kind refusal tries the Friends lobby next).
+        auto t = join({{"inviteMode", "singles"}});
+        CHECK(t.room == "modeinviteAB" && !t.doubles && t.players == 2 && !t.plain && t.kind && t.after_doubles == kRoom1v1);
+        { Events ev; json v = {{"inviteMode", "singles"}, {"room", "modeinviteAB"}};
+          if (launch) ev.hello(v); else { v["type"] = "join"; CHECK(ev.push(v, 1)); }
+          CHECK(ev.take_join(true) == "modeinviteAB" && ev.mismatch_next("modeinviteAB", kRoom1v1, "", false) == -1 &&
+                ev.mismatch_next("modeinviteAB", kRoom1v1, "", true) == kRoomFriends4); }
+        // default: the Friends lobby first, size 4, hinted.
+        t = join({{"inviteMode", "default"}});
+        CHECK(!t.doubles && t.players == 4 && !t.plain && t.kind && t.after_doubles == kRoomFriends4);
+        // teams: the Doubles home first, hinted (a push marked teamsLobby:1 alone stays unhinted, as before).
+        t = join(launch ? json{{"inviteMode", "teams"}, {"nativeTeamsInvite", teams_invite}}
+                        : json{{"inviteMode", "teams"}, {"teamsLobby", 1}});
+        CHECK(t.doubles && t.players == 0 && !t.plain && t.kind && t.after_doubles == kRoom1v1);
+        t = join({{"inviteMode", "teams"}});   // the mode alone is enough
+        CHECK(t.doubles && t.players == 0 && !t.plain && t.kind);
+        // teams with players 4 (a 4-seat Doubles home): still the Doubles home first, the page's size kept.
+        t = join(launch ? json{{"inviteMode", "teams"}, {"players", 4}, {"nativeTeamsInvite", teams_invite}}
+                        : json{{"inviteMode", "teams"}, {"players", 4}, {"teamsLobby", 1}});
+        CHECK(t.doubles && t.players == 4 && !t.plain && t.kind && t.after_doubles == kRoom1v1);
+        // ... where the same invite without the mode goes Friends lobby first in a push (players outranks the
+        // mark there) and Doubles first in a hello (the Teams invite outranks players), as before.
+        t = join(launch ? json{{"players", 4}, {"nativeTeamsInvite", teams_invite}}
+                        : json{{"players", 4}, {"teamsLobby", 1}});
+        CHECK(t.doubles == bool(launch) && t.players == 4);
+        // The mode outranks a contradicting size or mark.
+        t = join({{"inviteMode", "singles"}, {"players", 4}});
+        CHECK(!t.doubles && t.players == 2 && t.after_doubles == kRoom1v1);
+        t = join(launch ? json{{"inviteMode", "default"}, {"nativeTeamsInvite", teams_invite}}
+                        : json{{"inviteMode", "default"}, {"teamsLobby", 1}});
+        CHECK(!t.doubles && t.players == 4 && t.after_doubles == kRoomFriends4);
+        // Unknown and absent: exactly the old behaviour, for every older shape.
+        const std::vector<json> shapes = {
+            json::object(), json{{"players", 2}}, json{{"players", 4}}, json{{"compatibility", "mu:friends-lobby-1"}},
+            json{{"compatibility", "mu-0.9.105"}}, json{{"teamsLobby", 1}}, json{{"teamsLobby", 1}, {"players", 4}},
+            json{{"md", 1}}, json{{"mu_doubles", 1}}, json{{"md", 0}}, json{{"nativeTeamsInvite", teams_invite}},
+            json{{"nativeTeamsInvite", teams_invite}, {"players", 4}}};
+        for (const auto& shape : shapes) {
+          const auto old = join(shape);
+          for (const json& unknown : {json("ranked"), json(""), json("Teams"), json(3), json()}) {
+            json v = shape; v["inviteMode"] = unknown;
+            CHECK(same(join(v), old));
+          }
+        }
+        // A legacy md:1 Teams invite keeps its own path whatever the mode says.
+        json legacy_invite = teams_invite; legacy_invite["md"] = 1;
+        const json legacy_shape = launch ? json{{"nativeTeamsInvite", legacy_invite}} : json{{"teamsLobby", 1}, {"md", 1}};
+        json legacy_mode = legacy_shape; legacy_mode["inviteMode"] = "teams";
+        CHECK(same(join(legacy_mode), join(legacy_shape)) && !join(legacy_mode).doubles);
+      }
+      // Absent in the old shapes the tests above already pin: unchanged.
+      auto t = pushed({{"teamsLobby", 1}});
+      CHECK(t.doubles && t.players == 0 && t.plain);
+      t = launched({{"nativeTeamsInvite", teams_invite}});
+      CHECK(t.doubles && t.players == 0 && t.plain);
+      t = pushed(json::object());
+      CHECK(!t.doubles && t.players == 0 && t.plain && t.after_doubles == kRoom1v1);
+    }
     // The room decides. A Doubles-first join refused (a socket lobby_mismatch, or the ticket route's
     // teams_lobby_off / bad_teams_lobby / teams_lobby_branch) tries 1v1, then the Friends lobby, each once, still
     // unknown and unhinted; when every kind was tried, the FIRST refusal's words stand. teams_home is never a kind

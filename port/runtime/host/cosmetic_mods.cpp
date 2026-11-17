@@ -7637,8 +7637,30 @@ bool install_official(int which, const fs::path& retail, const fs::path& xdelta,
 }  // namespace
 
 bool official_cosmetic_disc(const std::string& disc_path) {
-  for (const auto& pin : kAnimeleeDiscs)
-    if (file_matches(fs::u8path(disc_path), pin.size, pin.sha)) return true;
+  // Hashing the 1.4 GB disc took seconds at every start (long enough that an online test peer gave up
+  // waiting). Once it has matched, a note beside it records its size and write time, and the same file
+  // is trusted from then on; any change to it is hashed again.
+  const fs::path disc = fs::u8path(disc_path);
+  std::error_code ec;
+  const uint64_t size = fs::file_size(disc, ec);
+  if (ec) return false;
+  const auto written = fs::last_write_time(disc, ec);
+  if (ec) return false;
+  const std::string stamp = std::to_string(size) + " " +
+                            std::to_string((long long)written.time_since_epoch().count());
+  const fs::path note = disc.wstring() + L".verified";
+  for (const auto& pin : kAnimeleeDiscs) {
+    if (size != pin.size) continue;
+    {
+      std::ifstream in(note);
+      std::string line;
+      if (in && std::getline(in, line) && line == stamp + " " + pin.sha) return true;
+    }
+    if (file_matches(disc, pin.size, pin.sha)) {
+      std::ofstream(note, std::ios::trunc) << stamp << " " << pin.sha << "\n";
+      return true;
+    }
+  }
   return false;
 }
 
@@ -7738,5 +7760,37 @@ bool merge_fighter_sounds(const std::vector<uint8_t>& clean, const std::vector<u
   return fighter_sound_overlay(clean, mod, fighter_kind, merged, error);
 }
 }  // namespace testing
+
+bool standard_portrait(int css_character, int costume, std::vector<uint8_t>* rgba, int* width, int* height) {
+  static std::mutex lock;
+  static bool tried = false;
+  static std::vector<uint8_t> file;
+  static std::map<int, SelectPortrait> frames;
+  std::lock_guard<std::mutex> lk(lock);
+  if (!tried) {
+    tried = true;
+    uint32_t offset = 0, size = 0;
+    if (host::disc_find_file("MnSlChr.usd", &offset, &size) && size && size <= kMaxAssetBytes) {
+      file.resize(size);
+      if (!host::disc_read(offset, file.data(), size) || !select_portraits(file, &frames)) { file.clear(); frames.clear(); }
+    }
+  }
+  if (frames.empty() || costume < 0) return false;
+  if (css_character == 19) css_character = 18;   // Sheik is in Zelda's cell
+  int frame = -1;
+  if (css_character == 3) {
+    frame = 3 + 30 * std::min(costume, 3);       // Mr. Game & Watch: one costume file, a cell per colour
+  } else {
+    SlotName slot;
+    if (!find_slot(costume_slot_file(css_character, costume), &slot)) return false;
+    frame = portrait_frame(slot);
+  }
+  const auto it = frames.find(frame);
+  if (frame < 0 || it == frames.end()) return false;
+  *rgba = decode_portrait(file.data() + 0x20, it->second);
+  *width = (int)it->second.width;
+  *height = (int)it->second.height;
+  return !rgba->empty();
+}
 
 }  // namespace host::cosmetics

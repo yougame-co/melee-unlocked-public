@@ -2835,6 +2835,64 @@ void note_scene_memory() {
   }
   log("heap: object memory %u is %u bytes, %u in use in %u blocks", current, size, used, blocks);
 }
+// The game counts each fighter kind's live character items (Mario's fireball, Pikachu's jolt: the item
+// kinds from It_Kind_Mario_Fire up to It_Kind_Unk4) in ft_8045996C, 33 words, one per retail kind:
+// ftData_80085560(kind, +1) when such an item is made, (kind, -1) when it is removed, and a stop at
+// ftdata.c:1944 when a count is below zero. Nothing else reads the counts. m-ex numbers the fighters
+// it adds from 33 up and has no table of its own for this one, so an added fighter that throws a
+// retail projectile counts in whatever word lies that far past the table: a retail fighter's costume
+// list (33..62, 75..134), or the stage hazard entries of ftdevice.c (63..74), which keep a function
+// address from the last stage that set one. An address plus one reads as a count below zero, and the
+// game stopped on the fighter's first projectile (three reports on Chaos Eternal, 0.9.120). For a
+// kind past the table the call is turned into "add nothing to the first count": no word changes, and
+// the word that belongs to something else is left alone. Retail kinds reach the game's code as they
+// came, and a mod that brings its own version of this function (it then runs from RAM) is left alone.
+static void fighter_item_count_guard(ppc::Context& c) {   // ftData_80085560(kind, change)
+  constexpr uint32_t kCounts = 0x8045996Cu, kKinds = 33u;
+  if (ppc::runs_from_ram(0x80085560u)) return;
+  const uint32_t kind = c.r[3];
+  uint32_t held = 0;
+  const bool readable = heap_trace_read32(kCounts + 4u * kind, held);
+  if (kind < kKinds) {
+    // The game's own stop follows; the log gets what the count held, which the game's line does not say.
+    if (readable && (int32_t)(held + c.r[4]) < 0)
+      log("fighters: the item count of fighter kind %u goes below zero (it held %08X, change %d)", kind, held, (int32_t)c.r[4]);
+    return;
+  }
+  static bool told[256];
+  bool& once = told[kind < 256u ? kind : 255u];
+  if (!once) {
+    once = true;
+    log("fighters: kind %u is a fighter the mod adds; the game's item count has no place for it (the word that far past the table, at %08X, holds %08X), so its items are not counted",
+        kind, kCounts + 4u * kind, readable ? held : 0u);
+  }
+  c.r[3] = 0;
+  c.r[4] = 0;
+}
+// ftdata.c:2479: an animation of the fighter being loaded is larger than the 0x8000 bytes the game
+// keeps for a fighter's current animation (ftData_80085A14 tests every row of the fighter's animation
+// table when its animation file is first read; "fighter figatree over!" with the size is the game's
+// own line). At that call the loop's registers are still set: r26 the row's index, r27 the fighter's
+// data, r28 the kind's {file data, row count}, r30 the index times 0x18. The row goes in the log, so
+// a report tells an animation a little over the limit from a row count or a file that does not match
+// the fighter's data. Read only; anything that does not fit this exactly prints nothing.
+static void report_figatree_stop(ppc::Context& c) {
+  if (c.lr != 0x80085AD0u || c.r[4] != 2479u || !heap_trace_literal(c.r[3], "ftdata.c")) return;
+  uint32_t table = 0, count = 0, name = 0, offset = 0, size = 0;
+  if (c.r[27] > 0xFFFFFFF0u || !heap_trace_read32(c.r[27] + 12u, table)) return;
+  const uint32_t row = table + c.r[30];
+  if (!heap_trace_read32(row, name) || !heap_trace_read32(row + 4u, offset) || !heap_trace_read32(row + 8u, size)) return;
+  if (!heap_trace_read32(c.r[28] + 4u, count)) count = 0;
+  char text[64] = "no name";
+  if (const uint8_t* s = try_ptr(name, 63)) {
+    size_t n = 0;
+    while (n < 62 && s[n] >= 0x20 && s[n] < 0x7F) ++n;
+    if (n >= 3 && s[n] == 0) { std::memcpy(text, s, n); text[n] = 0; }
+  }
+  log("fighters: animation %u of %u (%s) is %u bytes at offset %u of the fighter's animation file; the game keeps 32768 bytes for one",
+      c.r[26], count, text, size, offset);
+  log_flush();
+}
 void install_mod_disc_guards() {
   if (!mod_disc_active()) return;
   if (!ppc::redirect_to_host(0x80337C60u, dvd_fast_open_checked)) log("mods: DVDFastOpen keeps the game's own code");
@@ -2843,6 +2901,8 @@ void install_mod_disc_guards() {
   // it, to show the stop and its report.
   if (!(host::test_env::getenv("MELEE_TEST_NO_DEMO_FIT") && options.no_gc_adapter)) ppc::add_entry_hook(0x801BF3F8u, title_demo_fit);
   ppc::add_entry_hook(0x80388220u, report_heap_stop);
+  ppc::add_entry_hook(0x80388220u, report_figatree_stop);
+  ppc::add_entry_hook(0x80085560u, fighter_item_count_guard);
 }
 // Every disc: the preloader's full heap (preload_make_room).
 void install_preload_room() { ppc::add_entry_hook(0x80014FC8u, preload_make_room); }
@@ -3577,7 +3637,9 @@ void retrace() {
   QueryThreadCycleTime(GetCurrentThread(), &g_slow_frame_cycles);
   static const bool sim_times_wanted = [] { const char* v = std::getenv("MELEE_SIM_TIMES"); return v && *v; }();
   if (sim_times_wanted) QueryThreadCycleTime(GetCurrentThread(), &g_sim_frame_start_cycles);
-  g_tick_timing = {g_frame_time, g_sim_frame_start, 0, -1};
+  // The latency probe's newest press is carried on (tick_timing.h); without the trace it stays 0.
+  g_tick_timing.target = g_frame_time; g_tick_timing.wake = g_sim_frame_start;
+  g_tick_timing.pad = 0; g_tick_timing.pad_age = -1;
   if (native_retrace) {
     native_retrace();
   } else {

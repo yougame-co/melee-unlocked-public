@@ -34,6 +34,9 @@
 #include "slippi_playback.h"
 #include "exi_slippi.h"
 #include "slippi_online.h"
+#ifndef MELEE_NO_SLIPPI
+#include "slippi_arena.h"
+#endif
 #include "slippi_net.h"
 #include "jukebox.h"
 #ifdef MELEE_SOURCE_PORT
@@ -2187,6 +2190,9 @@ static int melee_main(int argc, char** argv) {
       slippi::online::config().lobby_character = (int)character;
     }
     else if (a == "--lobby-status-file") slippi::online::config().lobby_status_file = next();
+    else if (a == "--arena-test") {   // a test arena room on loopback (hle/slippi_arena.h)
+      if (!slippi::arena::set_test(next())) { std::fprintf(stderr, "--arena-test <index>/<count>/<base port>[/<character>]\n"); return 2; }
+    }
     else if (a == "--online-delay") slippi::online::config().delay = std::atoi(next());
     else if (a == "--chat") { std::string v = next(); slippi::online::config().chat = v == "off" ? 2 : v == "direct" ? 1 : 0; }
     else if (a == "--netplay-port") slippi::Matchmaking::forced_port = (uint16_t)std::atoi(next());
@@ -2560,7 +2566,7 @@ static int melee_main(int argc, char** argv) {
   if (!host::disc_open(o.iso)) { std::fprintf(stderr, "cannot open ISO %s\n", o.iso.c_str()); return 1; }
   // The window, and with it the YouGame app's caps line (a toplevel window's caps carry its handle),
   // before the slow startup work: Sys generation, the retail-disc check, the card and the disc prefetch.
-  // On a PC with 0.6 GB free they took about 90 s (11-15, a test PC), past the 30 s the app gives a first run
+  // On a PC with 0.6 GB free they took about 90 s (11-15, pc4), past the 30 s the app gives a first run
   // to send caps, and the app then kept the game in child mode with a frozen picture. The window stays
   // black (its class brush) until the first frame. Only the render thread's window (every normal
   // launch) moves: that thread answers the window's messages while this one works. Without it this
@@ -2575,7 +2581,8 @@ static int melee_main(int argc, char** argv) {
 #else
     base += L"  |  Static Recomp";
 #endif
-    host::window_title_base() = base;
+    // Players see just the name; the version, engine and rates stay behind the Performance overlay.
+    host::window_title_debug() = base;
   }
 #ifdef _WIN32
   // Embedded in YouGame (child or toplevel): the app owns placement and size; never change display
@@ -2636,6 +2643,17 @@ static int melee_main(int argc, char** argv) {
         o.sys_dir = beside.u8string();
         host::log("sys: no --sys-dir given; using %s beside the exe", o.sys_dir.c_str());
       }
+    }
+  }
+#endif
+#if defined(_WIN32) && defined(MELEE_SOURCE_PORT)
+  // Started with some arguments but no --user-dir (say, --iso alone): generate the two managed Sys
+  // files into the same AppData folder a double-click uses, instead of failing the whole start.
+  if (sysgen_user_dir.empty() && sysgen_data_dir.empty()) {
+    const auto fallback = standalone_launch::data_dir();
+    if (!fallback.empty()) {
+      sysgen_data_dir = (fallback / L"User").u8string();
+      host::log("sys: no --user-dir given; generating into %s", sysgen_data_dir.c_str());
     }
   }
 #endif

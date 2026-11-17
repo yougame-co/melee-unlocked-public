@@ -202,7 +202,10 @@ void server_thread(uint16_t port) {
     return;
   }
   ENetAddress address{};
-  address.host = ENET_HOST_ANY;
+  // This computer only: the Slippi Launcher and overlays connect on 127.0.0.1. Listening on every interface
+  // made Windows Firewall ask about the game at its first start, over the game, before the player went
+  // anywhere near online play (A2 walk 11-17); a loopback listener never asks.
+  address.host = ENET_HOST_TO_NET_32(0x7F000001u);   // 127.0.0.1
   address.port = port;
   // Fails while something else holds the port, or for a while after it closed: retry as Dolphin does.
   ENetHost* server = enet_host_create(&address, kMaxClients, kChannels, 0, 0);
@@ -217,7 +220,7 @@ void server_thread(uint16_t port) {
     return;
   }
   g_port = port;
-  host::log("spectator: serving the game on port %u for the Slippi Launcher and overlays", (unsigned)port);
+  host::log("spectator: serving the game on 127.0.0.1 port %u for the Slippi Launcher and overlays", (unsigned)port);
   while (!g_stop) {
     pop_events();
     for (auto& entry : g_sockets)

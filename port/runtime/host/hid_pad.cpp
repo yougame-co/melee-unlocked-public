@@ -40,6 +40,7 @@ struct Axis {
   USAGE usage = 0;
   LONG logical_min = 0, logical_max = 0;
   bool present = false;
+  USHORT bits = 0;   // the field's size in the report
 };
 
 struct Slot {
@@ -49,6 +50,13 @@ struct Slot {
   int axis_count = 0;
   USAGE button_min = 0, button_max = 0;
   bool haybox = false;                 // HayBox DInput (haybox_dinput_shape): triggers on Z and Rz
+  bool frame1 = false;                 // Frame1 firmware in DInput mode (frame1_dinput_name in hid_pad.h)
+  // Every Slider field by its data index, in report order: a Frame1 has two (L, R), which one usage
+  // lookup cannot tell apart.
+  std::array<USHORT, 2> slider_index{};
+  int slider_count = 0;
+  int8_t f1_enc[8] = {-1, -1, -1, -1, -1, -1, -1, -1};   // per axis, from the first report
+  int8_t f1_trig_enc[2] = {-1, -1};
   std::string name;
   bool ready = false;
   // Latest decoded state.
@@ -143,10 +151,24 @@ bool describe(Slot& s, HANDLE device) {
       if (s.axes[i].logical_max <= s.axes[i].logical_min)
         s.axes[i] = {usage, 0, (LONG)((1u << std::min<USHORT>(c.BitSize, 31)) - 1), true};
       s.axes[i].present = true;
+      s.axes[i].bits = c.BitSize;
       ++s.axis_count;
       break;
     }
   }
+
+  s.slider_count = 0;
+  for (USHORT v = 0; v < value_count; ++v) {
+    const HIDP_VALUE_CAPS& c = values[v];
+    if (c.UsagePage != kUsagePageGeneric) continue;
+    if (c.IsRange) {
+      for (USAGE u = c.Range.UsageMin; u <= c.Range.UsageMax && s.slider_count < 2; ++u)
+        if (u == kUsageSlider) s.slider_index[s.slider_count++] = (USHORT)(c.Range.DataIndexMin + (u - c.Range.UsageMin));
+    } else if (c.NotRange.Usage == kUsageSlider && s.slider_count < 2) {
+      s.slider_index[s.slider_count++] = c.NotRange.DataIndex;
+    }
+  }
+  std::sort(s.slider_index.begin(), s.slider_index.begin() + s.slider_count);
 
   std::vector<HIDP_BUTTON_CAPS> buttons(caps.NumberInputButtonCaps);
   USHORT button_count = caps.NumberInputButtonCaps;
@@ -248,11 +270,22 @@ bool hidpad_raw_input(void* device_handle, const uint8_t* report, uint32_t size,
   Slot& s = g_slots[index];
   if (!s.device) {
     const std::string path = device_path(device);
-    if (claimed_elsewhere(info.hid, path)) return false;
+    if (claimed_elsewhere(info.hid, path)) {
+      // Named once in the log: which pad is being read through XInput (or another reader) says what a
+      // box in its XInput mode calls itself, which a report about its stick values needs.
+      static std::vector<HANDLE> named;
+      if (path.find("IG_") != std::string::npos && std::find(named.begin(), named.end(), device) == named.end() && named.size() < 16) {
+        named.push_back(device);
+        host::log("hid pad: %s (%04X:%04X) is read through XInput", friendly_name(path, info.hid).c_str(),
+                  (unsigned)info.hid.dwVendorId, (unsigned)info.hid.dwProductId);
+      }
+      return false;
+    }
     if (!describe(s, device)) return false;
     s.device = device;
     s.name = friendly_name(path, info.hid);
     s.ready = true;
+    s.frame1 = !s.haybox && frame1_dinput_name(s.name) && s.axes[0].present && s.axes[1].present;
     // Everything needed to tell, from a log alone, why a pad does not bind: how the device
     // described itself and what the first report actually contained. A box controller reports its
     // buttons in ways that differ from a normal pad, and without this the only symptom is a rebind
@@ -261,7 +294,13 @@ bool hidpad_raw_input(void* device_handle, const uint8_t* report, uint32_t size,
     const unsigned collections = HidP_GetCaps(preparsed_of(s), &caps) == HIDP_STATUS_SUCCESS ? caps.NumberLinkCollectionNodes : 0;
     host::log("hid pad %d: %s (%d axes, buttons %u..%u, %u collections, report %u bytes)%s", index + 1, s.name.c_str(),
               s.axis_count, (unsigned)s.button_min, (unsigned)s.button_max, collections, caps.InputReportByteLength,
-              s.haybox ? ", a HayBox box in DInput mode (triggers on Z and Rz)" : "");
+              s.haybox ? ", a HayBox box in DInput mode (triggers on Z and Rz)"
+              : s.frame1 ? ", a Frame1 in DInput mode (C-stick on Z and Rx, triggers on the sliders)" : "");
+    for (int i = 0; i < 8; ++i)
+      if (s.axes[i].present)
+        host::log("hid pad %d: axis %s range %ld..%ld, %u bits", index + 1, axis_name(s.axes[i].usage),
+                  (long)s.axes[i].logical_min, (long)s.axes[i].logical_max, (unsigned)s.axes[i].bits);
+    if (s.slider_count) host::log("hid pad %d: %d slider fields", index + 1, s.slider_count);
     s.log_reports = 3;
   }
   if (!s.ready) return false;
@@ -280,6 +319,37 @@ bool hidpad_raw_input(void* device_handle, const uint8_t* report, uint32_t size,
     return true;
   };
 
+  if (s.frame1) {
+    // Frame1 DInput (hid_pad.h): each stick field read as the GameCube byte it carries, exactly.
+    auto stick = [&](int i, bool flip, int8_t& out) {
+      if (!read_axis(i, value)) return;
+      const unsigned long raw = (unsigned long)value;
+      if (s.f1_enc[i] < 0) s.f1_enc[i] = frame1_stick_encoding(raw, s.axes[i].bits);
+      out = frame1_stick(raw, s.axes[i].bits, s.f1_enc[i], flip);
+    };
+    stick(0, false, pad.stick_x);
+    stick(1, true, pad.stick_y);
+    stick(2, false, pad.sub_x);
+    stick(3, true, pad.sub_y);
+    ULONG count = HidP_MaxDataListLength(HidP_Input, preparsed_of(s));
+    if (count && s.slider_count) {
+      std::vector<HIDP_DATA> data(count);
+      if (HidP_GetData(HidP_Input, data.data(), &count, preparsed_of(s), (PCHAR)report, size) == HIDP_STATUS_SUCCESS) {
+        for (ULONG d = 0; d < count; ++d)
+          for (int t = 0; t < s.slider_count; ++t) {
+            if (data[d].DataIndex != s.slider_index[t]) continue;
+            const unsigned long raw = data[d].RawValue;
+            const int bits = s.axes[6].bits ? s.axes[6].bits : 16;
+            if (s.f1_trig_enc[t] < 0) s.f1_trig_enc[t] = frame1_trigger_encoding(raw, bits);
+            (t == 0 ? pad.trig_l : pad.trig_r) = frame1_trigger(raw, bits, s.f1_trig_enc[t]);
+          }
+      }
+    }
+    if (s.log_reports == 3)
+      host::log("hid pad %d: Frame1 fields at rest: X %08lX Y %08lX Z %08lX Rx %08lX, read as %s", index + 1,
+                (unsigned long)s.raw[0], (unsigned long)s.raw[1], (unsigned long)s.raw[2], (unsigned long)s.raw[3],
+                s.f1_enc[0] == kFrame1Twos ? "centred on 0" : "centred mid-range");
+  } else {
   // X/Y are the control stick. Which pair carries the C-stick differs between devices, so both of
   // the common choices are accepted: Rx/Ry when present, otherwise Z/Rz, which is what most cheap
   // pads and most vJoy feeder configurations use.
@@ -311,6 +381,7 @@ bool hidpad_raw_input(void* device_handle, const uint8_t* report, uint32_t size,
     if (s.axes[6].present && read_axis(6, value)) pad.trig_l = trigger(6, value);
     if (s.axes[3].present && s.axes[4].present && s.axes[2].present && read_axis(2, value))
       pad.trig_r = trigger(2, value);
+  }
   }
 
   uint32_t mask = 0;
@@ -371,6 +442,12 @@ bool hidpad_haybox_dinput(int slot) {
   if (slot < 0 || slot >= kHidPadSlots) return false;
   std::lock_guard<std::mutex> lock(g_mutex);
   return g_slots[slot].ready && g_slots[slot].haybox;
+}
+
+bool hidpad_frame1_dinput(int slot) {
+  if (slot < 0 || slot >= kHidPadSlots) return false;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  return g_slots[slot].ready && g_slots[slot].frame1;
 }
 
 std::string hidpad_name(int slot) {

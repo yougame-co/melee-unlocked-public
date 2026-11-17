@@ -246,8 +246,22 @@ std::string refusal_text(const json& answer) {
   const bool has_words = answer.count("error") && answer["error"].is_string() && !answer["error"].get<std::string>().empty();
   if (code == "notYet") return "YouGame can't do this for a game started on its own yet. Start it from the YouGame app.";
   if (code == "notHere") return "YouGame is still getting ready. Try again in a moment.";
-  if (code == "unknown_build") return "YouGame doesn't list this copy of Melee yet. Start Melee from the YouGame app to play online.";
-  if (code == "old_build") return "This copy of Melee is out of date. Update it to play online.";
+  // A copy the player started itself that YouGame doesn't recognise is almost always an older download: the app's own
+  // words say so ("isn't the latest version on YouGame…"), so they win over ours.
+  if (code == "unknown_build")
+    return has_words ? answer["error"].get<std::string>()
+                     : "This copy of Melee isn't the latest version on YouGame. Get the latest from YouGame, then try again.";
+  // Recognised but replaced by a newer build (old_build today; build_replaced once YouGame remembers replaced files).
+  // build_replaced may carry `current`, the live build's version: named when present (printable, short).
+  if (code == "old_build" || code == "build_replaced") {
+    std::string current;
+    if (answer.count("current") && answer["current"].is_string())
+      for (const char c : answer["current"].get<std::string>())
+        if (c > 0x20 && c < 0x7F && current.size() < 40) current += c;
+    return current.empty() ? "This copy of Melee is out of date. Open YouGame to update it, then play online."
+                           : "This copy of Melee is out of date (the latest is " + current +
+                                 "). Open YouGame to update it, then play online.";
+  }
   if (code == "standalone_teams" && !has_words) return "Doubles needs the YouGame app. Start Melee from the YouGame app to play it.";
   return {};
 }

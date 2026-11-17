@@ -38,4 +38,6 @@ uint8_t observed_owner();
 // its shadow and its effects are not, which is what separates the model from everything else drawn
 // under the same player.
 bool observed_skinned();
+// The stage map gobj being rendered, as token 0xF7 tags it (abi/mu_stage_scenery.h); 0xFF otherwise.
+uint8_t observed_stage_map();
 }

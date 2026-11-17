@@ -725,8 +725,7 @@ void watch_live_toggle() {
     if(!folder.empty()&&std::filesystem::is_directory(folder,ec))
       for(const auto& entry:std::filesystem::directory_iterator(folder,ec))
         if(!ec&&entry.path().extension()==L".slp"&&now-entry.last_write_time(ec)>std::chrono::seconds(10)) g_live_seen.insert(entry.path().wstring());
-    replay_status(launcher::lang::fill(launcher::lang::tx("Waiting for a live game. Watch a broadcast in the Slippi Launcher's Spectate tab; it plays here. Folder: {folder}"),
-                                       launcher::lang::Args{{"folder",folder.u8string()}}));
+    replay_status("Waiting for a live game: in the Slippi Launcher, open Spectate and watch a broadcast. It plays here.");
   } else replay_status("Stopped watching live.");
   live_caption();
 }
@@ -1303,7 +1302,13 @@ void paint_replays(HDC dc) {
     return;
   }
   draw_text(dc,L"Replay Viewer",LR(214,24,420,32),g_font_big,C_TEXT,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-  draw_text(dc,L"Relive your matches and see the details that matter.",LR(214,58,560,22),g_font,C_DIM,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+  // The status shows under the title, where nothing covers it. It used to sit in the button row,
+  // under the "Save replays" box and the Watch live button, so "Waiting for a live game..." was hidden
+  // and pressing Watch live looked like it did nothing.
+  if(g_replay_status.empty())
+    draw_text(dc,L"Relive your matches and see the details that matter.",LR(214,58,740,22),g_font,C_DIM,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+  else
+    draw_text(dc,widen(g_replay_status),LR(214,58,740,22),g_font,g_live_watch?C_TEXT:C_DIM,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
   round_rect(dc,LR(212,90,320,30),7,C_FIELD,C_FIELD,C_FIELD_BORDER);   // the search box
   if(g_replay_visible.empty()) {
     // The list box is hidden while it has no rows (replay_view_build), so this shows in its place.
@@ -1315,5 +1320,4 @@ void paint_replays(HDC dc) {
     else if(!loading) draw_text(dc,L"Play a match or browse for a .slp file.",LR(212,354,748,28),g_font,C_DIM,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 #endif
   }
-  draw_text(dc,widen(g_replay_status),LR(460,622,330,34),g_font_small,C_DIM,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
 }

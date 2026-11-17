@@ -34,6 +34,8 @@ struct LookLive {
   std::atomic<bool> retro{false};                        // the original "Retro (64 style)" switch
   std::atomic<bool> exact{false};                        // an exact look's pack is served: the game's art is theirs, no treatment
   std::atomic<bool> exact_low_poly{true};                // that look's own fighters are the low poly ones (Diet Classic, Diet 64; not Crystal)
+  std::atomic<bool> full_models{false};                  // the look keeps the fighters' full models (Silhouettes)
+  std::atomic<uint8_t> lightweight{0};                   // the Lightweight level (gx_core set_lightweight_level), for owner tracking
 };
 inline LookLive& look_live() { static LookLive l; return l; }
 inline void set_retro_textures(bool on) { look_live().retro.store(on, std::memory_order_relaxed); }
@@ -45,6 +47,7 @@ template <class Options> inline void publish_look(const Options& o) {
   l.stage.store((uint8_t)o.look_stage, std::memory_order_relaxed);
   l.menus.store((uint8_t)o.look_menus, std::memory_order_relaxed);
   l.unfiltered.store(o.look_unfiltered, std::memory_order_relaxed);
+  l.full_models.store(o.look_full_models, std::memory_order_relaxed);
   l.colours.store((uint8_t)o.look_colours, std::memory_order_relaxed);
   l.effect_owners.store(o.effects_level > 0 || o.lightweight > 0 || o.look_stage != 0 || o.look_fighter != 0, std::memory_order_relaxed);
   l.background.store((uint8_t)o.look_background, std::memory_order_relaxed);

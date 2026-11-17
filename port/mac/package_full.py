@@ -1,7 +1,7 @@
 """Unsigned M3 app; package existing inputs only, never fetch/build game or dependencies."""
 from pathlib import Path
 from build_full import GAME_LIBRARY, build_dir
-import argparse, hashlib, json, os, plistlib, runpy, shutil, subprocess
+import argparse, hashlib, json, os, plistlib, runpy, shutil, subprocess, sys
 ROOT = Path(__file__).resolve().parents[2]
 BUILD = ROOT/'build-mac-full'
 APP = BUILD/'MeleeUnlocked.app'
@@ -77,6 +77,9 @@ def main():
     copy(ROOT/'port/sys_deltas/manifest.json',res/'deltas/manifest.json')
     for f in deltas['files']:
         copy(ROOT/'port/sys_deltas'/f['delta'],res/'deltas'/f['delta'])
+    # v0.9.204: package_linux_release.py imports build_content_release beside it; run_path does not add its folder.
+    if str(ROOT/'tools') not in sys.path:
+        sys.path.insert(0, str(ROOT/'tools'))
     packaging = runpy.run_path(str(ROOT/'tools/package_linux_release.py'),run_name='mac_pack')
     (res/'Shaders').mkdir()
     (res/'Shaders/crt-shaders.pak').write_bytes(packaging['shader_pak']())

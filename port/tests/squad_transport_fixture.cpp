@@ -231,7 +231,7 @@ int main() {
     b.Deliver(bytes);
     int seen=0;
     for (const auto& rb : b.remote_build_) if (rb.received) {
-      ++seen; assert(rb.caps2==(old?0:(MU_BUILD_CAPS2_FRIENDS_LOBBY|MU_BUILD_CAPS2_LOCAL_PARTNER|MU_BUILD_CAPS2_GONE_OWN_FRAMES))); assert(rb.setup_hash);
+      ++seen; assert(rb.caps2==(old?0:(MU_BUILD_CAPS2_FRIENDS_LOBBY|MU_BUILD_CAPS2_LOCAL_PARTNER|MU_BUILD_CAPS2_GONE_OWN_FRAMES))); assert(rb.setup_hash==!old);
       assert(mu_gone_own_frames_capable(rb.caps2)==!old);   // a peer that stops before the byte reads as absent
       assert(rb.shield_rgb==(has_shield?0x1001234u:0u));
     }

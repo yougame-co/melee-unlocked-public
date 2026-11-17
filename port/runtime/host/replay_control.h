@@ -60,6 +60,9 @@ Gate go_back();
 // Simulation thread (gx_core): the frame being simulated is on the way to a jump's target and is
 // not shown.
 bool skip_render();
+// A live recording opened late is catching up with the newest frame (simulated, not drawn).
+void set_catching_up(bool on);
+bool catching_up();
 // Render thread: the picture stands still (paused, or held as the session held it) but the bar,
 // the overlay and the settings panel still have to be drawn.
 bool repaint_wanted();

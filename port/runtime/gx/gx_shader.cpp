@@ -1090,9 +1090,11 @@ void fill_ps_constants(const DrawCall& dc, PSConstants& c, int efb_scale) {
   if (look_live().colours.load(std::memory_order_relaxed) == 1 && dc.skinned && dc.owner_player < 4 && dc.xf_regs[0x26] == 0) {
     static const float port[4][3] = {{1.0f, 0.22f, 0.22f}, {0.28f, 0.45f, 1.0f}, {1.0f, 0.85f, 0.15f}, {0.25f, 0.9f, 0.3f}};
     c.tint[0] = port[dc.owner_player][0]; c.tint[1] = port[dc.owner_player][1]; c.tint[2] = port[dc.owner_player][2];
-    // Over an exact look (Crystal Ports on the real Crystal files) the fighter takes its port colour solidly,
-    // light and shade kept, instead of a tint over its own colours, which read as dirty.
-    c.tint[3] = look_live().exact.load(std::memory_order_relaxed) ? -1.0f : 0.85f;
+    // The fighter takes its port colour solidly, light and shade kept: over an exact look (Crystal Ports on
+    // the real Crystal files), and over a treated surface (Silhouettes, Potato), where a tint over each
+    // texture's flat colour left every part of the costume its own patch: blocky, and not one colour.
+    const bool treated_fighter = treated((Surface)look_live().fighter.load(std::memory_order_relaxed)) != Surface::Textured;
+    c.tint[3] = look_live().exact.load(std::memory_order_relaxed) || treated_fighter ? -1.0f : 0.85f;
   }
   // The look's White stage (Potato, Silhouettes): every opaque piece of the stage in one plain colour, light and
   // shade kept. A white texture alone leaves a stage's own material colours (Final Destination's magenta edges

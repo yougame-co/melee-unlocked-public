@@ -406,6 +406,11 @@ void mu_slippi_log_online_rows(void)
 #endif
              tournament_offered ? "Tournament," : "", MU_ROWS_SQUAD, tournament_offered ? 1 : 0);
 #undef MU_ROWS_SQUAD
+    /* Agent copies never show Slippi (mu_online_agent_locked); say so, so a walk doesn't read it as missing. */
+    if (agent_copy) {
+        size_t n = strlen(line);
+        if (n > 0 && line[n - 1] == '\n') snprintf(line + n - 1, sizeof line - (n - 1), " (agent copy: Slippi row hidden)\n");
+    }
     mu_online_abi_log(line);
 }
 int mu_slippi_menu_count(void) { return mu_online_menu_count(ranked_supported, slippi_submenu); }
@@ -1871,6 +1876,7 @@ static void css_decide(GameModeState* state)
     case MU_SLP_MODE_TEAMS:
         /* The first match and the last winner go to the splash; the loser picks the stage unless
          * it already did. Any other value stalls on the console. */
+        OSReport("online css: is_winner %d, chose_stage %d\n", (int) slp.is_winner, (int) slp.chose_stage);
         if (slp.is_winner == MU_SLP_WINNER_LOST && slp.chose_stage == 0) {
             gm_SetNextGameModeStateId(MU_SLP_STATE_SSS);
             return;

@@ -11,6 +11,9 @@
 #include "stage_dat_safety.h"
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 
 namespace host::cosmetics::stage_safety {
@@ -24,6 +27,20 @@ constexpr uint32_t kBehaviourJoint = 0x20u | 0x4000u;
 // The transform part of a joint (+20..+56: rotation, scale, translation) and its non-drawing flags:
 // what pairs a skin joint with an original one when the skin removed some of their siblings.
 constexpr uint32_t kDrawFlags = 0x6u | 0x80u | 0x100u | 0x10000u | 0x1C0000u | 0x70000000u;
+inline float joint_float(const Archive& z, uint32_t at) {
+  const uint32_t w = z.get(at);
+  float f;
+  std::memcpy(&f, &w, 4);
+  return f;
+}
+// No rotation, unit scale, no translation (+20..+56), signed zeros included.
+inline bool identity_transform(const Archive& z, uint32_t joint) {
+  for (uint32_t k = 0; k < 9; ++k) {
+    const float f = joint_float(z, joint + 20 + k * 4);
+    if (std::fabs(f - ((k >= 3 && k < 6) ? 1.0f : 0.0f)) > 1e-6f) return false;
+  }
+  return true;
+}
 }  // namespace graft_detail
 
 // Stage models the game only draws: the stage's code starts each one's animation and does nothing
@@ -130,6 +147,18 @@ inline bool graft_visuals(const std::vector<uint8_t>& clean, const std::vector<u
       return (a.get(x + 4) & mask) == (b.get(y + 4) & mask) &&
              !std::memcmp(a.bytes.data() + 32ull + x + 20, b.bytes.data() + 32ull + y + 20, 36);
     };
+    // A transform within a hair of the original's (a rebuilt stage saves -0.0 for 0.0, or moves a
+    // platform's art half a unit to sit on its line): the same joint. The grafted file keeps the
+    // original's transform, so the skin's mesh is drawn exactly where the collision is.
+    auto near = [&](uint32_t x, uint32_t y) {
+      if ((a.get(x + 4) & kBehaviourJoint) != (b.get(y + 4) & kBehaviourJoint)) return false;
+      for (uint32_t k = 0; k < 9; ++k) {
+        const float fa = joint_float(a, x + 20 + k * 4), fb = joint_float(b, y + 20 + k * 4);
+        const float tolerance = k < 6 ? 0.02f : 1.0f;   // rotation and scale, then translation
+        if (!(std::fabs(fa - fb) <= tolerance)) return false;
+      }
+      return true;
+    };
     size_t next = 0;
     const bool child_tail = tail && !a.pointers.count(ja + 12);
     for (uint32_t x : ca) {
@@ -137,11 +166,11 @@ inline bool graft_visuals(const std::vector<uint8_t>& clean, const std::vector<u
       // Prefer an exact flag match. Exporters also change transform/visibility
       // flags while retaining the same local transform; grafting never copies
       // those flags, so they must not prevent the matching mesh from drawing.
-      for (bool flags : {true, false}) {
+      for (int pass = 0; pass < 3 && !match; ++pass)
         for (size_t k = next; k < cb.size(); ++k)
-          if (!used[k] && same(x, cb[k], flags)) { match = cb[k]; used[k] = true; next = k + 1; break; }
-        if (match) break;
-      }
+          if (!used[k] && (pass < 2 ? same(x, cb[k], pass == 0) : near(x, cb[k]))) {
+            match = cb[k]; used[k] = true; next = k + 1; break;
+          }
       walk(x, match, depth + 1, child_tail);
     }
   };
@@ -223,11 +252,34 @@ inline bool graft_visuals(const std::vector<uint8_t>& clean, const std::vector<u
   }
   for (uint32_t jb : ambiguous_joints) original_joint.erase(jb);
   std::map<uint32_t, uint32_t> mesh_of;   // original joint -> skin mesh offset, or UINT32_MAX for none
+  std::set<uint32_t> paired_skin;
+  for (const auto& [ja, jb] : pairs) if (jb) paired_skin.insert(jb);
+  // A skin joint that moved its parent's mesh onto a new child of its own: the child has no
+  // transform, no children and no behaviour, so its mesh drawn by the parent is the same picture
+  // (Animelee's Yoshi's Story). Only when the parent has no mesh of its own in the skin.
+  std::map<uint32_t, uint32_t> folded;   // original joint -> the skin child whose mesh it shows
+  for (const auto& [ja, jb] : pairs) {
+    if (!jb || (a.get(ja + 4) & kBehaviourJoint) || (b.get(jb + 4) & kBehaviourJoint) || b.pointers.count(jb + 16) ||
+        !b.pointers.count(jb + 8))
+      continue;
+    uint32_t found = 0;
+    int candidates = 0;
+    for (uint32_t c = b.get(jb + 8), guard = 0; guard < 4096; ++guard) {
+      if (!paired_skin.count(c) && !(b.get(c + 4) & kBehaviourJoint) && b.pointers.count(c + 16) &&
+          !b.pointers.count(c + 8) && identity_transform(b, c)) {
+        found = c; ++candidates;
+      }
+      if (!b.pointers.count(c + 12)) break;
+      c = b.get(c + 12);
+    }
+    if (candidates == 1) folded[ja] = found;
+  }
   for (const auto& [ja, jb] : pairs) {
     if (a.get(ja + 4) & kBehaviourJoint) continue;   // behaviour, not a mesh: untouched
-    if (!jb || (b.get(jb + 4) & kBehaviourJoint) || !b.pointers.count(jb + 16)) { mesh_of[ja] = UINT32_MAX; continue; }
+    const uint32_t from = folded.count(ja) ? folded.at(ja) : jb;
+    if (!from || (b.get(from + 4) & kBehaviourJoint) || !b.pointers.count(from + 16)) { mesh_of[ja] = UINT32_MAX; continue; }
     std::set<uint32_t> reach;
-    std::vector<uint32_t> pending{b.get(jb + 16)};
+    std::vector<uint32_t> pending{b.get(from + 16)};
     bool ok = true;
     while (!pending.empty() && ok) {
       const uint32_t at = pending.back(); pending.pop_back();
@@ -246,7 +298,7 @@ inline bool graft_visuals(const std::vector<uint8_t>& clean, const std::vector<u
       if (reach.size() > 200000) ok = false;
     }
     if (!ok) continue;   // keeps the original mesh
-    mesh_of[ja] = b.get(jb + 16);
+    mesh_of[ja] = b.get(from + 16);
     copy.insert(reach.begin(), reach.end());
   }
 
@@ -323,7 +375,8 @@ inline bool graft_visuals(const std::vector<uint8_t>& clean, const std::vector<u
       // branches HSD traverses. Keeping the original masks drew scenery the
       // skin deliberately excluded, producing a mixture of both stages online.
       // HIDDEN, transform flags and every behavior flag remain the original's.
-      put(data, ja + 4, (a.get(ja + 4) & ~kDrawFlags) | (b.get(jb + 4) & kDrawFlags));
+      const uint32_t draw = (b.get(jb + 4) | (folded.count(ja) ? b.get(folded.at(ja) + 4) : 0u)) & kDrawFlags;
+      put(data, ja + 4, (a.get(ja + 4) & ~kDrawFlags) | draw);
     }
     if (a.pointers.count(ja + 16)) unhooked.insert(a.get(ja + 16));
     if (m->second == UINT32_MAX) {
@@ -399,6 +452,24 @@ inline bool graft_visuals(const std::vector<uint8_t>& clean, const std::vector<u
   // Dropping unmatched geometry produced invisible floors/scenery online. Keep
   // the standard stage when this conversion cannot retain every skin mesh.
   // Offline the caller still serves the original, unconverted skin.
+  if (used.size() != all.size() && std::getenv("MELEE_GRAFT_DEBUG")) {
+    // Which skin meshes found no place, by the skin model that holds them (hidden test runs only).
+    std::map<uint32_t, uint32_t> model_of;
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t pb = b.get(hb + 8) + i * 52;
+      if (!b.pointers.count(pb)) continue;
+      std::set<uint32_t> joints;
+      tree(b, b.get(pb), joints, 0);
+      for (uint32_t j : joints) model_of.emplace(j, i);
+    }
+    for (uint32_t j : b.joint_offsets) {
+      if ((b.get(j + 4) & kBehaviourJoint) || !b.pointers.count(j + 16) || used.count(b.get(j + 16))) continue;
+      const auto m = model_of.find(j);
+      std::fprintf(stderr, "graft: skin mesh at joint %u (model %d, flags %08X) %s\n", j,
+                   m == model_of.end() ? -1 : (int)m->second, b.get(j + 4),
+                   paired_b.count(j) ? "paired, but its mesh reaches something not copied" : "has no original joint to sit on");
+    }
+  }
   if (used.size() != all.size()) {
     *note = "incomplete visual conversion (" + std::to_string(used.size()) + " of the skin's " +
             std::to_string(all.size()) + " meshes retained); using the standard stage online";

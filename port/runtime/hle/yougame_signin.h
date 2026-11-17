@@ -1,0 +1,382 @@
+// Sign in by code (local-channel-contract.md section 8): Melee started on its own while the YouGame app
+// runs signed out (maybe only in the tray). The game asks the app for a short code over the local
+// channel, draws it with a QR, and the player approves it at yougame.co/link on any device. The game
+// never holds a token. "Sign in on this PC" is v1's browser sign-in, unchanged.
+//
+//   ask      yg {"id":n,"type":"signIn","mode":"code"}       (or "mode":"browser")
+//   answer   {"ok":true,"result":{"where":"code","code":{"user_code","verify_url","qr_text","expires_in"}}}
+//            an app older than v2 answers {"ok":true,"result":{"opened":true,"where":"overlay"|"browser"}}
+//   refusal  notYet (show its words, offer the browser), busy + retryAfter (wait, then ask again),
+//            alreadySignedIn (hello again), signInFailed (Try again), badRequest (the browser instead)
+//   pushes   signedIn {name?}, signInExpired, signInFailed; any other push type is skipped
+//
+// One code per app: a code still pending is drawn again from here, never asked for again. Asks happen
+// only on the player's press (open with no live code, Get a new code, Try again, Sign in on this PC)
+// or once when a busy wait ends, so a redraw never asks. Pure: the caller sends the asks this returns
+// and passes back the answers and pushes (yougame_link.cpp), the overlay draws view()
+// (port/runtime/gx/signin_overlay.cpp). Not thread-safe: the caller holds one lock around it.
+// SPDX-License-Identifier: GPL-2.0-or-later
+#pragma once
+#include <nlohmann/json.hpp>
+#include <algorithm>
+#include <cstdint>
+#include <string>
+
+namespace yougame::signin {
+
+// ---- the words (plain and short; one clear next action per screen)
+constexpr const char* kTitle = "Sign in to YouGame";
+constexpr const char* kAsking = "Getting a code...";
+constexpr const char* kGoTo = "Go to";               // "Go to yougame.co/link and enter ABCD-EFGH"
+constexpr const char* kAndEnter = "and enter";
+constexpr const char* kScan = "Or scan this with your phone.";
+constexpr const char* kExpiresIn = "Code expires in";  // "Code expires in 9:41"
+constexpr const char* kBrowserButton = "Sign in on this PC";
+constexpr const char* kBack = "Back";
+constexpr const char* kNewCode = "Get a new code";
+constexpr const char* kTryAgain = "Try again";
+constexpr const char* kExpired = "This code ran out of time.";
+constexpr const char* kFailed = "That didn't work.";
+constexpr const char* kNoAnswer = "YouGame didn't answer.";
+constexpr const char* kBrowser = "Finish signing in in your browser";
+constexpr const char* kWindow = "Finish signing in in the YouGame window";
+constexpr const char* kSignedIn = "Signed in";       // "Signed in as Ada"
+constexpr const char* kSignedInAs = "Signed in as";
+constexpr const char* kWait = "YouGame is busy. Trying again in";   // "... in 12 s"
+constexpr const char* kNotYet = "Sign in with a code works only in a game YouGame checked. Sign in with your browser instead.";
+// "Play online with YouGame" (Reach below): a YouGame row picked with no YouGame to reach.
+constexpr const char* kReachTitle = "Play online with YouGame";
+constexpr const char* kLooking = "Looking for YouGame...";
+constexpr const char* kAppClosed = "YouGame isn't running. Open YouGame to play online.";
+constexpr const char* kNoApp = "Online play needs the YouGame app.";
+constexpr const char* kAdmin = "Melee Unlocked was started as administrator, so it can't reach YouGame. Start it normally to play online.";
+constexpr const char* kOpening = "Opening YouGame...";
+constexpr const char* kOpenApp = "Open YouGame";
+constexpr const char* kGetApp = "Get YouGame";
+constexpr const char* kDidntOpen = "YouGame didn't open.";
+constexpr const char* kPageOpen = "The download page is open in your browser. Install YouGame, open it, then pick this again.";
+
+inline nlohmann::json code_request() { return {{"type", "signIn"}, {"mode", "code"}}; }
+inline nlohmann::json browser_request() { return {{"type", "signIn"}, {"mode", "browser"}}; }
+
+// The address as the player types it: https:// (and http://) left off, no trailing slash.
+inline std::string display_url(std::string url) {
+  for (const char* scheme : {"https://", "http://"})
+    if (url.rfind(scheme, 0) == 0) { url = url.substr(std::string(scheme).size()); break; }
+  while (!url.empty() && url.back() == '/') url.pop_back();
+  return url;
+}
+
+// Off-contract types (a null, a number where a string goes) read as missing: nlohmann's value() would throw.
+inline std::string text_of(const nlohmann::json& o, const char* key) {
+  return o.is_object() && o.count(key) && o[key].is_string() ? o[key].get<std::string>() : std::string();
+}
+inline bool true_of(const nlohmann::json& o, const char* key) {
+  return o.is_object() && o.count(key) && o[key].is_boolean() && o[key].get<bool>();
+}
+
+// A hello answer that says nobody is signed in: no player, not pending, and signedIn false (or, from an
+// app that does not send signedIn, no word either way).
+inline bool hello_signed_out(const nlohmann::json& result) {
+  if (!result.is_object()) return false;
+  if (result.count("player") && result["player"].is_object() && text_of(result["player"], "id") != "") return false;
+  if (true_of(result, "playerPending")) return false;
+  if (!result.count("signedIn")) return true;
+  return result["signedIn"].is_boolean() && !result["signedIn"].get<bool>();
+}
+
+// "9:41"
+inline std::string clock(int seconds) {
+  if (seconds < 0) seconds = 0;
+  std::string s = std::to_string(seconds / 60) + ":";
+  const int r = seconds % 60;
+  if (r < 10) s += "0";
+  return s + std::to_string(r);
+}
+
+enum class Screen {
+  Closed,
+  Asking,     // Getting a code...
+  Code,       // Go to <url> and enter <code>, the code large, the QR, the countdown
+  Browser,    // Finish signing in in your browser (the browser was asked, or an app older than v2)
+  Window,     // Finish signing in in the YouGame window (signed in, a step still owed in the app)
+  Busy,       // YouGame is busy. Trying again in N s
+  Expired,    // Get a new code
+  Failed,     // Try again, Sign in on this PC
+  NotYet,     // the app's words; Sign in on this PC
+  SignedIn,   // Signed in as Ada, briefly, then the panel closes and the menu carries on
+  // Reach: no YouGame to reach yet
+  Looking,    // Looking for YouGame...
+  AppClosed,  // YouGame isn't running: Open YouGame, Back
+  NoApp,      // Online play needs the YouGame app: Get YouGame, Back
+  Admin,      // run as administrator: Back
+  Opening,    // Opening YouGame...: Back
+};
+enum class Ask { None, Code, Browser };
+// What the panel offers, in order. The first is where the cursor starts.
+enum class Button { None, NewCode, TryAgain, Browser, Back, OpenApp, GetApp };
+
+struct View {
+  Screen screen = Screen::Closed;
+  std::string title;     // empty: kTitle
+  std::string user_code, verify_display, qr_text;
+  std::string message;   // the line under the title (notYet's words, a failure's words, Signed in as Ada)
+  int seconds = 0;       // Code: the code's time left; Busy: the wait left
+  Button buttons[3] = {Button::None, Button::None, Button::None};
+};
+
+class Model {
+ public:
+  static constexpr uint64_t kSignedInShowMs = 2000;   // "Signed in as Ada" before the menu carries on
+  static constexpr int kBusyMaxSeconds = 60;           // one ask per game per minute (the app's limit)
+
+  bool is_open() const { return open_; }
+  Screen screen() const { return screen_; }
+
+  // The player needs to sign in (a YouGame row picked while signed out). A code still pending is drawn
+  // again; an ask still on its way is waited for; otherwise one ask for a code.
+  Ask open(uint64_t now) {
+    open_ = true;
+    if (screen_ == Screen::SignedIn || screen_ == Screen::Window || screen_ == Screen::Browser) return Ask::None;
+    if (in_flight_) { screen_ = Screen::Asking; return Ask::None; }
+    if (!code_.empty() && now < expires_at_) { screen_ = Screen::Code; return Ask::None; }
+    if (screen_ == Screen::Busy && now < retry_at_) return Ask::None;
+    return ask(Ask::Code);
+  }
+  // Back: the panel closes. A pending code stays the app's (and ours, to draw again on the next open).
+  void close() { open_ = false; if (screen_ != Screen::Code && screen_ != Screen::Busy) screen_ = Screen::Closed; }
+
+  Ask press(Button b, uint64_t now) {
+    if (b != Button::Back && b != Button::None && in_flight_) { code_.clear(); screen_ = Screen::Asking; return Ask::None; }
+    switch (b) {
+      case Button::NewCode:
+      case Button::TryAgain:
+        code_.clear();
+        if (now < retry_at_) { screen_ = Screen::Busy; retry_ask_ = Ask::Code; return Ask::None; }
+        return ask(Ask::Code);
+      case Button::Browser:
+        code_.clear();
+        if (now < retry_at_) { screen_ = Screen::Busy; retry_ask_ = Ask::Browser; return Ask::None; }
+        return ask(Ask::Browser);
+      case Button::Back: close(); return Ask::None;
+      case Button::OpenApp:
+      case Button::GetApp:
+      case Button::None: break;
+    }
+    return Ask::None;
+  }
+
+  // The answer to `asked`: the whole answer line's object ({ok, result | error, code, retryAfter}), or
+  // anything else for no answer. Returns the next ask to send at once (badRequest: the browser).
+  Ask answered(Ask asked, const nlohmann::json& answer, uint64_t now) {
+    in_flight_ = false;
+    if (!answer.is_object()) return fail(kNoAnswer);
+    if (true_of(answer, "ok")) {
+      const nlohmann::json result = answer.count("result") && answer["result"].is_object() ? answer["result"] : nlohmann::json::object();
+      if (asked == Ask::Code && text_of(result, "where") == "code" && result.count("code") && result["code"].is_object()) {
+        const nlohmann::json& c = result["code"];
+        const std::string user = c.count("user_code") && c["user_code"].is_string() ? c["user_code"].get<std::string>() : "";
+        if (!user.empty()) {
+          code_ = user;
+          verify_ = display_url(c.count("verify_url") && c["verify_url"].is_string() ? c["verify_url"].get<std::string>() : "");
+          qr_ = c.count("qr_text") && c["qr_text"].is_string() ? c["qr_text"].get<std::string>() : "";
+          double secs = c.count("expires_in") && c["expires_in"].is_number() ? c["expires_in"].get<double>() : 600;
+          if (!(secs >= 1)) secs = 1;
+          if (secs > 3600) secs = 3600;
+          expires_at_ = now + (uint64_t)(secs * 1000);
+          screen_ = Screen::Code;
+          return Ask::None;
+        }
+      }
+      // The browser sign-in ran: asked for, or an app older than v2 that ignores the mode (no code).
+      code_.clear();
+      screen_ = text_of(result, "where") == "overlay" ? Screen::Window : Screen::Browser;
+      return Ask::None;
+    }
+    const std::string code = answer.count("code") && answer["code"].is_string() ? answer["code"].get<std::string>() : "";
+    const std::string words = answer.count("error") && answer["error"].is_string() ? answer["error"].get<std::string>() : "";
+    if (code == "alreadySignedIn") { rehello_ = true; return signed_in("", now); }
+    if (code == "busy") {
+      retry_at_ = now + wait_ms(answer, kBusyMaxSeconds);
+      retry_ask_ = asked;
+      screen_ = Screen::Busy;
+      return Ask::None;
+    }
+    if (code == "notYet") { message_ = words.empty() ? kNotYet : words; screen_ = Screen::NotYet; return Ask::None; }
+    if (code == "badRequest" && asked == Ask::Code) return ask(Ask::Browser);   // an app that knows no code mode
+    if (code == "signInFailed" && answer.count("retryAfter")) retry_at_ = now + wait_ms(answer, kBusyMaxSeconds);
+    return fail(code == "signInFailed" || words.empty() ? kFailed : words);
+  }
+
+  // A push on the channel. True when it was one of ours (the caller then says hello again on signedIn).
+  bool push(const nlohmann::json& push, uint64_t now) {
+    if (!push.is_object()) return false;
+    const std::string type = push.count("type") && push["type"].is_string() ? push["type"].get<std::string>() : "";
+    if (type == "signedIn") {
+      rehello_ = true;
+      signed_in(push.count("name") && push["name"].is_string() ? push["name"].get<std::string>() : "", now);
+      return true;
+    }
+    if (type == "signInExpired") {
+      code_.clear();
+      if (screen_ == Screen::Code || screen_ == Screen::Asking || screen_ == Screen::Closed) screen_ = Screen::Expired;
+      return true;
+    }
+    if (type == "signInFailed") {
+      code_.clear();
+      if (screen_ != Screen::SignedIn) fail(kFailed);
+      return true;
+    }
+    return false;
+  }
+  // signedIn or alreadySignedIn: the caller says hello again once. True once per such answer.
+  bool take_rehello() { const bool r = rehello_; rehello_ = false; return r; }
+  // What the hello after signedIn found. No player: a step is still owed in the app's window.
+  void rehello_result(bool player, const std::string& name, uint64_t now) {
+    if (player) {
+      if (screen_ != Screen::SignedIn) signed_in(name, now);
+      else if (name_.empty() && !name.empty()) name_ = name;
+    } else if (screen_ == Screen::SignedIn || screen_ == Screen::Closed) {
+      screen_ = Screen::Window;
+    }
+  }
+  // The identity arrived another way (the 5 s re-ask, another sign-in) while the panel was up.
+  void player_known(const std::string& name, uint64_t now) {
+    if (open_ && screen_ != Screen::SignedIn) signed_in(name, now);
+  }
+
+  // Once per frame: the countdown, the busy wait's end (its one ask), the Signed in screen's end.
+  Ask tick(uint64_t now) {
+    if (!code_.empty() && now >= expires_at_) {
+      code_.clear();
+      if (screen_ == Screen::Code) screen_ = Screen::Expired;
+    }
+    if (screen_ == Screen::Busy && now >= retry_at_ && open_) {
+      const Ask a = retry_ask_;
+      retry_ask_ = Ask::None;
+      return ask(a == Ask::None ? Ask::Code : a);
+    }
+    if (screen_ == Screen::SignedIn && now >= shown_until_) { open_ = false; screen_ = Screen::Closed; }
+    return Ask::None;
+  }
+
+  View view(uint64_t now) const {
+    View v;
+    v.screen = open_ ? screen_ : Screen::Closed;
+    v.message = message_;
+    switch (v.screen) {
+      case Screen::Code:
+        v.user_code = code_;
+        v.verify_display = verify_;
+        v.qr_text = qr_;
+        v.seconds = expires_at_ > now ? (int)((expires_at_ - now + 999) / 1000) : 0;
+        v.buttons[0] = Button::Browser; v.buttons[1] = Button::Back;
+        break;
+      case Screen::Busy:
+        v.seconds = retry_at_ > now ? (int)((retry_at_ - now + 999) / 1000) : 0;
+        v.buttons[0] = Button::Back;
+        break;
+      case Screen::Expired: v.buttons[0] = Button::NewCode; v.buttons[1] = Button::Browser; v.buttons[2] = Button::Back; break;
+      case Screen::Failed: v.buttons[0] = Button::TryAgain; v.buttons[1] = Button::Browser; v.buttons[2] = Button::Back; break;
+      case Screen::NotYet: v.buttons[0] = Button::Browser; v.buttons[1] = Button::Back; break;
+      case Screen::Browser:
+      case Screen::Window: v.buttons[0] = Button::Back; break;
+      case Screen::SignedIn:
+        v.message = name_.empty() ? std::string(kSignedIn) : std::string(kSignedInAs) + " " + name_;
+        break;
+      case Screen::Asking: v.buttons[0] = Button::Back; break;
+      case Screen::Looking:
+      case Screen::AppClosed:
+      case Screen::NoApp:
+      case Screen::Admin:
+      case Screen::Opening:
+      case Screen::Closed: break;
+    }
+    return v;
+  }
+
+ private:
+  Ask ask(Ask a) {
+    if (a == Ask::None) return a;
+    in_flight_ = true;
+    screen_ = Screen::Asking;
+    return a;
+  }
+  Ask fail(const std::string& words) { message_ = words; screen_ = Screen::Failed; return Ask::None; }
+  Ask signed_in(const std::string& name, uint64_t now) {
+    code_.clear();
+    name_ = name;
+    screen_ = Screen::SignedIn;
+    shown_until_ = now + kSignedInShowMs;
+    return Ask::None;
+  }
+  static uint64_t wait_ms(const nlohmann::json& answer, int max_seconds) {
+    double s = answer.count("retryAfter") && answer["retryAfter"].is_number() ? answer["retryAfter"].get<double>() : max_seconds;
+    if (!(s >= 1)) s = 1;
+    if (s > max_seconds) s = max_seconds;
+    return (uint64_t)(s * 1000);
+  }
+
+  bool open_ = false, in_flight_ = false, rehello_ = false;
+  Screen screen_ = Screen::Closed;
+  std::string code_, verify_, qr_, message_, name_;
+  uint64_t expires_at_ = 0, retry_at_ = 0, shown_until_ = 0;
+  Ask retry_ask_ = Ask::None;
+};
+
+// "Play online with YouGame": Ranked, Unranked or Friends picked while no YouGame is connected. The
+// same panel as sign-in (signin_overlay.cpp) says why the row can't start and offers the one next step:
+// Open YouGame (installed, not running), Get YouGame (not installed: YouGame's download page) or, run
+// as administrator, starting the game normally. Pure; yougame_link.cpp looks, opens and holds the lock.
+class Reach {
+ public:
+  bool is_open() const { return screen_ != Screen::Closed; }
+  Screen screen() const { return screen_; }
+  void open(bool admin) { screen_ = admin ? Screen::Admin : Screen::Looking; note_.clear(); page_ = failed_ = false; }
+  // What the look found (a closed panel stays closed).
+  void looked(bool running, bool installed) {
+    if (screen_ == Screen::Looking) screen_ = running ? Screen::Opening : installed ? Screen::AppClosed : Screen::NoApp;
+  }
+  void opening() { if (is_open()) screen_ = Screen::Opening; }
+  // Open YouGame (or a running YouGame's channel) did not come up: say so, offer Open again and Get.
+  // Looking too: a panel reopened while that wait was still running started no look of its own.
+  void open_failed(const char* why) {
+    if (screen_ != Screen::Opening && screen_ != Screen::Looking) return;
+    screen_ = Screen::AppClosed;
+    note_ = why ? why : kDidntOpen;
+    failed_ = true;
+  }
+  void page_opened() { if (is_open()) page_ = true; }
+  void close() { screen_ = Screen::Closed; }
+
+  View view() const {
+    View v;
+    v.screen = screen_;
+    v.title = kReachTitle;
+    switch (screen_) {
+      case Screen::Looking: v.message = kLooking; v.buttons[0] = Button::Back; break;
+      case Screen::Opening: v.message = kOpening; v.buttons[0] = Button::Back; break;
+      case Screen::Admin: v.message = kAdmin; v.buttons[0] = Button::Back; break;
+      case Screen::AppClosed:
+        v.message = failed_ ? note_ + " Open YouGame to try again, or get the latest YouGame." : std::string(kAppClosed);
+        v.buttons[0] = Button::OpenApp;
+        if (failed_) { v.buttons[1] = Button::GetApp; v.buttons[2] = Button::Back; }
+        else v.buttons[1] = Button::Back;
+        break;
+      case Screen::NoApp:
+        v.message = kNoApp;
+        v.buttons[0] = Button::GetApp; v.buttons[1] = Button::Back;
+        break;
+      default: v.screen = Screen::Closed; break;
+    }
+    if (page_ && v.screen != Screen::Closed) v.message += std::string("\n\n") + kPageOpen;
+    return v;
+  }
+
+ private:
+  Screen screen_ = Screen::Closed;
+  std::string note_;
+  bool page_ = false, failed_ = false;
+};
+
+}  // namespace yougame::signin

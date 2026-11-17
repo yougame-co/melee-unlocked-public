@@ -69,12 +69,13 @@ void set_owner_tracking(bool) {}
 bool owner_tracking_enabled() { return false; }
 uint8_t observed_owner() { return 0xFF; }
 bool observed_skinned() { return false; }
+uint8_t observed_stage_map() { return 0xFF; }   // native GX tags stage draws itself (token 0xF7)
 #ifndef MELEE_LINUX_UNLOCKED
 AuthoredStats& authored_stats() { static AuthoredStats stats; return stats; }
 #endif
 void settings_guest_options_frame(uint8_t, uint16_t, uint32_t) {}
 } // namespace gx
-namespace replay_control { bool skip_render() { return false; } bool active() { return false; } }   // no replay player in this build
+namespace replay_control { bool skip_render() { return false; } bool active() { return false; } bool catching_up() { return false; } }   // no replay player in this build
 
 namespace linux_renderer {
 void connect_host() {

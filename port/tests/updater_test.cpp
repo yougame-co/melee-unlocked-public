@@ -30,7 +30,7 @@ bool make_zip(const std::filesystem::path& folder, const std::filesystem::path& 
   CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
   return code == 0;
 }
-// --download <dlss5|xess|fsr|compat|rtxpack> <game folder>: the real download and install of one optional
+// --download <dlss5|xess|fsr|compat|rtxpack|rr|lab> <game folder>: the real download and install of one optional
 // part, as the game's buttons run it (network; not part of ctest). Prints the outcome and its message.
 int run_download(const std::string& part, const std::string& dir) {
   using namespace host::updater;
@@ -40,7 +40,9 @@ int run_download(const std::string& part, const std::string& dir) {
       {"xess", xess_download, xess_state, xess_message},
       {"fsr", fsr_download, fsr_state, fsr_message},
       {"compat", compat_build_download, compat_build_state, compat_build_message},
-      {"rtxpack", rtx_pack_download, rtx_pack_state, rtx_pack_message}};
+      {"rtxpack", rtx_pack_download, rtx_pack_state, rtx_pack_message},
+      {"rr", rr_download, rr_state, rr_message},
+      {"lab", lab_packs_download, lab_packs_state, lab_packs_message}};   // lab: <folder> is the Lab folder itself
   for (const Part& p : parts) {
     if (part != p.name) continue;
     p.start(dir);

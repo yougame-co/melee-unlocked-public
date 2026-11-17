@@ -375,6 +375,24 @@ void apply_client_size(int w, int h) {
   if (w == g_client_w && h == g_client_h) return;
   SDL_SetWindowSize(sdl_window(), w, h);
 }
+
+// The thread that made the window. It alone reads the window's events and makes SDL video calls.
+// With the render thread (threaded_backend.cpp) that is not the game's thread, which still shows
+// start-up progress (loading_show while the disc is read): polling events there as well fed the
+// overlay's input queue from two threads at once while the render thread drew the overlay (a crash
+// report: abort in free under AddMousePosEvent when the window got the focus back during that read).
+std::atomic<std::thread::id> g_window_thread{};
+bool on_window_thread() { return g_window_thread.load(std::memory_order_acquire) == std::this_thread::get_id(); }
+// A title another thread asked for (UTF-8), shown by the window's thread at its next pump.
+std::mutex g_title_mutex;
+std::string g_title_for_window;
+bool g_title_for_window_pending = false;
+std::atomic<bool> g_loading_from_other_thread{false};
+void title_from_another_thread(std::string title) {
+  std::lock_guard<std::mutex> lock(g_title_mutex);
+  g_title_for_window = std::move(title);
+  g_title_for_window_pending = true;
+}
 }  // namespace
 
 void window_prefer_background(bool on) {
@@ -388,6 +406,7 @@ void window_prefer_vulkan(bool on) { g_vulkan_window = on; }
 void* window_create(int w, int h, const wchar_t* title, bool visible) {
   // Claim before SDL initialization and the Mac/X11 adapters, including their startup pumps.
   g_sdl_video_thread.claim();
+  g_window_thread.store(std::this_thread::get_id(), std::memory_order_release);
 #ifdef MELEE_LINUX_X11_EMBED
   const bool boxed = yougame::embedded();
   // The app and game must both use X11 (including XWayland), before video initialization.
@@ -609,6 +628,7 @@ void window_input_capture(bool capture) {
   // The pointer is hidden over the game and shown while a menu has input; applied by window_pump.
   g_ui_capture.store(capture);
 }
+void window_withhold_buttons(uint16_t mask) { g_ui_withheld.store(mask, std::memory_order_relaxed); }
 bool window_ui_gamecube_pad(PadState& pad) { std::lock_guard<std::mutex> lock(g_ui_pad_mutex); pad = g_ui_pad; return g_ui_gamecube; }
 bool window_ui_pads(PadState pads[4], PadState navigation_pads[4]) {
   std::lock_guard<std::mutex> lock(g_ui_pad_mutex);
@@ -669,6 +689,11 @@ void window_pump() {
 #endif
   if (uint64_t want = g_pending_client_size.exchange(0))
     apply_client_size((int)(want >> 32), (int)(want & 0xFFFFFFFFu));
+  {
+    std::lock_guard<std::mutex> lock(g_title_mutex);
+    if (g_title_for_window_pending && g_hwnd) SDL_SetWindowTitle(sdl_window(), g_title_for_window.c_str());
+    g_title_for_window_pending = false;
+  }
   SDL_Event e;
   while (SDL_PollEvent(&e)) {
     handle_event(e);
@@ -714,6 +739,16 @@ void window_set_title(const wchar_t* title) {
 // shows while the first frame is held back (no second window to steal focus).
 namespace { std::wstring g_title_before_loading; bool g_loading_shown = false; }
 void loading_show(const wchar_t* what, size_t done, size_t total) {
+  if (!on_window_thread()) {
+    // Another thread (the game's, at start, while the render thread runs the window): no events and
+    // no SDL calls here; the window's thread shows the line.
+    if (!g_hwnd) return;
+    wchar_t line[256];
+    swprintf(line, 256, L"%ls  |  %ls  %zu / %zu", window_title_base().c_str(), what, done, total);
+    title_from_another_thread(utf8_title(line));
+    g_loading_from_other_thread.store(true);
+    return;
+  }
   if (!video_thread(SdlVideoThread::Call::LoadingShow)) return;
 #ifdef MELEE_LINUX_X11_EMBED
   if (yougame::embedded()) {
@@ -736,6 +771,8 @@ void loading_show(const wchar_t* what, size_t done, size_t total) {
 #endif
 }
 void loading_close() {
+  if (g_loading_from_other_thread.exchange(false)) title_from_another_thread(utf8_title(window_title_base().c_str()));
+  if (!on_window_thread()) return;
   if (!video_thread(SdlVideoThread::Call::LoadingClose)) return;
   if (!g_loading_shown) return;
   g_loading_shown = false;

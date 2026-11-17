@@ -13,6 +13,19 @@
 namespace yougame::search_policy {
 inline constexpr const char* kLinkRetry = "We couldn't connect you two. Looking for another opponent...";
 inline constexpr const char* kLinkFailed = "Could not connect to your opponent directly";
+// Shown under the search for a while when this run first opens its own UDP port on Windows: that bind is
+// when Windows Firewall asks, and the prompt alone doesn't say why a game wants the network.
+inline constexpr const char* kFirewallNote = "Windows may ask whether Melee Unlocked can use the network.\n"
+                                            "Choose Allow so other players can reach you.";
+inline constexpr uint64_t kFirewallNoteMs = 20000;
+// A search starting this soon after a failed connect is the automatic re-search: it opens on the retry line.
+// Later (the player came back to it) it opens on the plain search line.
+inline constexpr uint64_t kRetryLineMs = 30000;
+// Own UDP (a seat started outside YouGame: no relay) failed twice with the same opponent: the retry line
+// plus what the player can do. set_status shows it in place of kLinkRetry while the hint holds.
+inline constexpr const char* kOwnUdpRetry = "We couldn't connect you two. Looking for another opponent...\n"
+                                           "Your firewall or network may be blocking direct play.\n"
+                                           "Allow Melee Unlocked through your firewall.";
 class LinkFailures {
  public:
   // Connection ids, seats, display names and connect codes can change between

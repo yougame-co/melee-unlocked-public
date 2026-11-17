@@ -71,6 +71,16 @@ enum NetMsg : uint8_t {
   // only to a peer whose build message carried MU_PICK_PREVIEW_CAP. Display only: the match is
   // still set up from 0x82 (and 0xE3).
   NP_MSG_MU_PICK_PREVIEW = MU_PICK_PREVIEW_MSG,
+  // Melee Unlocked only: arena room traffic (slippi_arena.h) on a room link, sent only to a peer
+  // whose build message said it takes it (MU_BUILD_CAPS2_ARENA). Never on a match connection's pads.
+  // Upstream numbers it 0xE3 and flags it with capability bit 0x10; this build already uses both
+  // (Squad Strike), so it rides 0xE7 and the second capability byte here.
+  NP_MSG_MU_ARENA = 0xE7,
+  // Melee Unlocked only: Gecko codes offered, answered and agreed for the match (gecko_online.h),
+  // sent only to a peer whose build message said it takes them (MU_BUILD_CAPS2_GECKO). Upstream
+  // gives it this build's pick preview id and capability bit 0x40 (the setup hash here), so it
+  // rides 0xE8 and the second capability byte here.
+  NP_MSG_MU_GECKO = 0xE8,
 };
 static_assert(NP_MSG_MU_SETUP_HASH == MU_SETUP_HASH_MSG, "one setup hash id");
 
@@ -275,6 +285,7 @@ class NetplayClient {
   void RefuseSquad(const char* text, const char* reason);
   bool SquadPeerDisconnect(uint32_t reason);
 #endif
+  void ResendSelections();   // the same selection again, with a fresh Gecko lock
   std::unique_ptr<RemotePadOutput> GetSlippiRemotePad(int index, int max_frame_count, int32_t frame = INT32_MAX);
   void DropOldRemoteInputs(int32_t finalized_frame);
   std::unordered_map<uint8_t, bool> GetActivePlayerIndices() const;
@@ -308,7 +319,10 @@ class NetplayClient {
                        bool static_engine = false; std::string ranked_rules_digest;   // their in-game slot
                        bool setup_hash = false;   // they send NP_MSG_MU_SETUP_HASH and wait for ours
                        bool pick_previews = false;   // takes NP_MSG_MU_PICK_PREVIEW
-                       uint8_t caps2 = 0; };   // the second capability byte (mu_friends_lobby.h), 0 when absent
+                       uint8_t caps2 = 0;   // the second capability byte (mu_friends_lobby.h), 0 when absent
+                       bool arena = false;         // takes arena room messages
+                       bool auto_lcancel = false;     // presses for L-cancels this session (automatic L-cancel)
+                       bool gecko = false; };         // takes Gecko code messages (NP_MSG_MU_GECKO)
   // The shield colour the opponent on in-game `slot` sent (0 none).
   uint32_t RemoteShieldColor(int slot);
   RemoteBuild GetRemoteBuild(int index);
@@ -331,6 +345,16 @@ class NetplayClient {
   // port, false when none arrived since the last game start or that player is gone.
   void SendPickPreview(const MuPickPreview& pick, uint32_t frame);
   bool RemotePickPreview(int index, MuPickPreview* out, uint8_t* port);
+  // Arena room links (one remote). SendArena queues one message for a peer that takes them (false
+  // when it does not, or before its build message arrived); `bulk` sends it on its own reliable
+  // channel so the live feed never holds up room messages. PopArena takes the oldest received.
+  bool ArenaReady();
+  bool SendArena(const uint8_t* data, size_t size, bool bulk);
+  bool PopArena(std::vector<uint8_t>& out);
+  // Gecko codes for the match (one remote): SendGecko queues one gecko_online message for a peer that
+  // takes them (false otherwise); PopGecko takes the oldest received.
+  bool SendGecko(const std::vector<uint8_t>& message);
+  bool PopGecko(std::vector<uint8_t>& out);
 
  private:
   struct FrameTiming { int32_t frame = 0; uint64_t time_us = 0; };
@@ -419,6 +443,10 @@ class NetplayClient {
   PeerSetupHash setup_hash_[REMOTE_PLAYER_MAX];   // under build_mutex_
   std::atomic<uint64_t> connected_at_ms_{0};
   host::early_input::Buffer early_pads_[REMOTE_PLAYER_MAX];   // under pad_mutex_
+  std::mutex arena_mutex_;                       // arena_inbox_ (network thread in, game thread out)
+  std::deque<std::vector<uint8_t>> arena_inbox_;
+  std::mutex gecko_mutex_;                       // gecko_inbox_ (network thread in, game thread out)
+  std::deque<std::vector<uint8_t>> gecko_inbox_;
   void SendBuild();
   // Pick previews. pick_mutex_ is a leaf: never held while taking another lock (SendAsync and
   // build_mutex_ included). It guards everything below it here.
@@ -509,6 +537,8 @@ class Matchmaking {
   explicit Matchmaking(User* user);
   ~Matchmaking();
   void FindMatch(MatchSearchSettings settings);
+  // This search's own local port (arena room links), instead of forced_port or a random one.
+  void SetLocalPort(uint16_t port) { port_override_ = port; }
   ProcessState GetMatchmakeState() const { return state_; }
   std::string GetErrorMessage() const { std::lock_guard<std::mutex> lk(result_mutex_); return error_msg_; }
   bool IsSearching() const { return state_ == INITIALIZING || state_ == MATCHMAKING || state_ == OPPONENT_CONNECTING; }
@@ -589,6 +619,7 @@ class Matchmaking {
   std::unique_ptr<NetplayClient> netplay_client_;
   // Matchmaking thread only.
   int host_port_ = 0;
+  uint16_t port_override_ = 0;
   std::vector<std::string> remote_ips_;
   std::vector<std::string> public_fallbacks_;
   bool is_host_ = false;

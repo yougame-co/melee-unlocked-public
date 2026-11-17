@@ -75,6 +75,7 @@ void mu_lag_test_default_rules(void)
 void mu_lag_test_css_enter(void)
 {
     int port;
+    mu_test_css_enter();   /* tests: a new visit for MELEE_TEST_CSS_CHAR (mu_lab.c) */
     if (!mu_lag_test()) {
         return;
     }

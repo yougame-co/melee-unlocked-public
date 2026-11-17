@@ -27,6 +27,9 @@ on:
         default: ''
 jobs:
   announce:
+    # Only game versions (v<version>) are announced: the parts-<version> and content-<n> releases
+    # hold files the game downloads by itself.
+    if: github.event_name != 'release' || startsWith(github.event.release.tag_name, 'v')
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -758,7 +758,8 @@ int mu_test_classic_stage(void)
 
 /* MELEE_TEST_VS_STAGE=<n> (tests only): VS mode goes straight to stage n, the external id the stage
  * select would pick (32 Final Destination, 31 Battlefield, 28 Dream Land, 2 Fountain of Dreams,
- * 3 Pokemon Stadium, 8 Yoshi's Story), so a hidden run reaches any stage. Unset: -1, the select. */
+ * 3 Pokemon Stadium, 8 Yoshi's Story, or an m-ex disc's added ids), so a hidden run reaches any stage.
+ * Unset: -1, the select. */
 int mu_test_vs_stage(void)
 {
     const char* v = mu_test_getenv("MELEE_TEST_VS_STAGE");
@@ -768,11 +769,97 @@ int mu_test_vs_stage(void)
     }
     while (*v >= '0' && *v <= '9') {
         n = n * 10 + (*v++ - '0');
-        if (n > 40) {
+        if (n > 1023) {
             return -1;
         }
     }
     return *v == '\0' ? n : -1;
+}
+
+/* MELEE_TEST_MEX_ICON=<n>[,<n>...] (tests only): on an m-ex disc's stage select, A or START picks
+ * icon n wherever the cursor is, the next number at the next stage select (the last one repeats),
+ * so a hidden run reaches any added stage, or a series of them. Unset: -1. */
+static int mu_test_mex_icon_index;
+int mu_test_mex_icon(void)
+{
+    const char* v = mu_test_getenv("MELEE_TEST_MEX_ICON");
+    int k = 0, n = -1;
+    if (v == NULL) {
+        return -1;
+    }
+    while (*v != '\0') {
+        int value = 0, digits = 0;
+        while (*v >= '0' && *v <= '9' && value <= 1023) {
+            value = value * 10 + (*v++ - '0');
+            ++digits;
+        }
+        if (digits == 0 || value > 1023 || (*v != ',' && *v != '\0')) {
+            return -1;
+        }
+        n = value;
+        if (k++ == mu_test_mex_icon_index) {
+            return n;
+        }
+        if (*v == ',') {
+            ++v;
+        }
+    }
+    return n;
+}
+void mu_test_mex_icon_next(void)
+{
+    ++mu_test_mex_icon_index;
+}
+
+/* MELEE_TEST_CSS_CHAR=<a>[,<b>,<c>,<d>] (tests only): on each visit to a character select, the hand
+ * of port 1 (2, 3, 4) is put once on the icon of external character id a (b, c, d), so a hidden run
+ * picks any fighter with a plain A. One value applies to every port; '-' or an empty field leaves
+ * that port's hand alone. Unset: -1, nothing moves. */
+static int css_char_visit = 1;
+static int css_char_done[4];
+void mu_test_css_enter(void)
+{
+    ++css_char_visit;
+}
+int mu_test_css_char(int port)
+{
+    const char* v;
+    int field = 0, n = -1, single = 1;
+    const char* p;
+    if (port < 0 || port > 3 || css_char_done[port] == css_char_visit) {
+        return -1;
+    }
+    css_char_done[port] = css_char_visit;   /* asked once per visit: no environment read each frame */
+    v = mu_test_getenv("MELEE_TEST_CSS_CHAR");
+    if (v == NULL) {
+        return -1;
+    }
+    for (p = v; *p; ++p) {
+        if (*p == ',') {
+            single = 0;
+        }
+    }
+    for (p = v; ; ++p) {
+        if (*p == ',' || *p == '\0') {
+            if (field == port || (single && field == 0)) {
+                break;
+            }
+            if (*p == '\0') {
+                n = -1;
+                break;
+            }
+            ++field;
+            n = -1;
+        } else if (*p >= '0' && *p <= '9') {
+            n = (n < 0 ? 0 : n * 10) + (*p - '0');
+            if (n > 40) {
+                return -1;
+            }
+        } else {
+            n = -1;
+        }
+    }
+    return n;
 }
 
 /* MELEE_TEST_ADVENTURE_SCENE=<n> (tests only): Adventure starts at scene n, the decimal minor id

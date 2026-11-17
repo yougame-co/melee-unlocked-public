@@ -5213,6 +5213,20 @@ void D3D12Backend::swap_in_ready_replacements() {
 // swap chain's buffers in place and the settings panel for the new format.
 void D3D12Backend::update_hdr() {
   if (!swapchain_) return;
+#ifdef GX_PC_SETTINGS
+  // Tests (MELEE_TEST_OVERLAY_REBUILD=<n>): the overlay is rebuilt n times, 300 frames apart from
+  // frame 300, as an HDR switch rebuilds it, so a test can check that its pictures survive.
+  {
+    static int rebuilds = [] { const char* v = host::test_env::getenv("MELEE_TEST_OVERLAY_REBUILD"); return v ? std::atoi(v) : 0; }();
+    if (rebuilds > 0 && settings_ui_ && frame_counter_ >= 300 && frame_counter_ % 300 == 0) {
+      --rebuilds;
+      wait_gpu();
+      settings_ui_.reset();
+      settings_ui_ = std::make_unique<PcSettingsUI>(hwnd_, device_.Get(), queue_.Get(), opts_, (int)backbuffer_format_);
+      host::log("d3d12: overlay rebuilt for a test (%d more)", rebuilds);
+    }
+  }
+#endif
   if (hdr_checked_frame_ == ~0ull || frame_counter_ - hdr_checked_frame_ >= 60) {
     hdr_checked_frame_ = frame_counter_;
     bool display_hdr = false;
@@ -6347,7 +6361,9 @@ bool d3d12_usable() {
       host::log("d3d12: this Intel GPU's highest level is Direct3D 11; starting on Direct3D 11 (test)");
       return false;
     }
-    if (desc.VendorId == 0x10DE && dxgi_test_fault() < 2) return true;
+    // NVIDIA too: a GeForce from before Direct3D 12 (a GT 330M, a DirectX 10.1 part, 0.9.117 report)
+    // was taken as able, so the game stopped on "D3D12: no adapter" where Direct3D 11, or the message
+    // that the card is older than DirectX 11, was due. The check creates nothing.
     const HRESULT device = guarded_device_check(adapter.Get());
     if (SUCCEEDED(device) && desc.VendorId == 0x8086 &&
         FAILED(guarded_device_check(adapter.Get(), D3D_FEATURE_LEVEL_12_0))) {

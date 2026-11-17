@@ -79,6 +79,11 @@ MU_EXPORT void mu_look_snapshot_v1(MuLookSnapshot* out)
             if (vs->state.match_result != OUTCOME_NONE) out->major |= MU_LOOK_SCENE_ENDED;
         }
         if (gm_GetDbPauseFlag(1)) out->major |= MU_LOOK_SCENE_PAUSED;
+        /* The VS controller's copy is empty outside its own scene: the stage that was actually loaded. */
+        if (out->stage <= 0) {
+            extern StKind Stage_80225194(void);
+            out->stage = Stage_80225194();
+        }
     }
     {
         MapCollData* map = mpLib_8004D164();
@@ -143,6 +148,43 @@ MU_EXPORT void mu_look_snapshot_v1(MuLookSnapshot* out)
                     b->bx = j->mtx[0][3]; b->by = j->mtx[1][3];
                 }
             }
+        }
+    }
+}
+
+/* Optional read-only extras for the Lab view (MuLookExtras): the values a replay's events carry
+ * that the geometry snapshot does not. Reads only. */
+int mu_replay_match_frame(void);                              /* mu_replay.c */
+void mu_replay_fountain_heights(float* left, float* right);   /* mu_replay.c */
+int mu_replay_lcancel_status_of(int port, int follower);      /* mu_replay.c */
+MU_EXPORT void mu_look_extras_v1(MuLookExtras* out)
+{
+    int slot, follower;
+    __builtin_memset(out, 0, sizeof *out);
+    out->frame = mu_replay_match_frame();
+    mu_replay_fountain_heights(&out->fod_left, &out->fod_right);
+    {
+        VsSceneController* vs = gmVs_GetSceneController();
+        if (vs && mu_is_game_memory(vs, sizeof *vs)) {
+            out->time_limit_seconds = (int) vs->start.time_limit;
+            out->timer_on = vs->start.timer_enabled && !vs->start.timer_counts_up;
+        }
+    }
+    for (slot = 0; slot < 4; ++slot) {
+        if (Player_GetPlayerState(slot) != 2) continue;
+        for (follower = 0; follower < 2; ++follower) {
+            HSD_GObj* gobj = Player_GetEntityAtIndex(slot, follower);
+            Fighter* fp;
+            MuLookExtraFighter* dst = &out->fighters[slot][follower];
+            if (!gobj || !mu_is_game_memory(gobj, sizeof *gobj)) continue;
+            fp = gobj->user_data;
+            if (!fp || !mu_is_game_memory(fp, sizeof *fp) || fp->gobj != gobj) continue;
+            dst->lcancel = mu_replay_lcancel_status_of(slot, follower);
+            /* As the post-frame event's byte 0x34 (mu_replay.c). */
+            dst->hurtbox = fp->x1988 != 0 ? (int) fp->x1988 : (int) fp->x198C;
+            dst->joy_x = fp->input.lstick[0].x;
+            dst->joy_y = fp->input.lstick[0].y;
+            dst->trigger = fp->input.triggers[0];
         }
     }
 }

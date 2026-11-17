@@ -39,6 +39,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "lcancel.h"
 #include "gameplay_policy.h"
+#include "test_env.h"
 #include "../abi/mu_lcancel_flash.h"
 
 #include <algorithm>
@@ -67,7 +68,7 @@ constexpr uint32_t kHsdPadLibData = 0x804C1F78;    // PadLibData HSD_PadLibData
 
 constexpr uint32_t kSpState = 0x00;      // enum_t player_state (0 = not playing)
 constexpr uint32_t kSpType = 0x08;       // Gm_PKind slot_type (0 = human)
-constexpr uint32_t kSpCtrl = 0x46;       // s8 controller_index
+constexpr uint32_t kSpCtrl = 0x48;       // u8 pad_port, the controller (0x46 is the costume tint, sub_color)
 constexpr uint32_t kSpEntity = 0xB0;     // HSD_GObj* player_entity[0]
 constexpr uint32_t kGObjUserData = 0x2C; // HSD_GObj::user_data -> Fighter*
 
@@ -78,6 +79,7 @@ constexpr uint32_t kFtX67F = 0x67F;      // u8 frames since the last trigger pre
 constexpr uint32_t kFtAnimFrame = 0x894; // float cur_anim_frame
 
 constexpr uint32_t kFcDeadzone = 0x10;   // float analog_shoulder_deadzone
+constexpr uint32_t kFcZAnalog = 0x14;    // float z_press_analog_value
 constexpr uint32_t kFcLcWindow = 0xE4;   // int, the L-cancel input window (7)
 
 constexpr uint32_t kPlShift = 0x20, kPlMax = 0x21, kPlMin = 0x22, kPlScale = 0x27;
@@ -85,9 +87,16 @@ constexpr uint32_t kPlShift = 0x20, kPlMax = 0x21, kPlMin = 0x22, kPlScale = 0x2
 // ftCommon_MotionState, melee/src/melee/ft/kinds/ftCommon/forward.h
 constexpr int32_t kAttackAirN = 65, kAttackAirLw = 69;
 constexpr int32_t kLandingAirN = 70, kLandingAirLw = 74;
+// The jump squat, jumps and falls: an attack press there starts an aerial.
+constexpr int32_t kKneeBend = 24, kFallAerialB = 34;
 
 // GameCube pad bits, as window.cpp:159 defines them.
 constexpr uint16_t kPadZ = 0x0010, kPadR = 0x0020, kPadL = 0x0040, kPadA = 0x0100;
+// The C-stick counts as pushed past this (of 127): it starts an aerial like an attack press.
+constexpr int kCStickPush = 40;
+// How long presses go on after an attack pressed in a jump, until the aerial itself is seen:
+// longer than the largest online input delay.
+constexpr int kPredictFrames = 9;
 
 // The Gecko code (External/FlashRedFailedLCancel) hands the fighter to Melee's own colour-overlay
 // effect, so its length lives in PlCo.dat rather than in the code: it reads as a short pop of red.
@@ -174,10 +183,18 @@ bool effective_lr(const host::PadState& p, const PadCal& c) {
 // ---- per controller port, carried across frames
 struct PortState {
   bool last_effective_lr = false;   // the emitted pad held a shoulder input last frame
-  uint16_t last_button = 0;         // the emitted pad's buttons last frame (for the A/Z rising edge)
+  uint16_t last_button = 0;         // the player's own buttons last frame (for rising edges)
+  bool last_c_out = false;          // the player's C-stick was pushed last frame
   int32_t last_motion = -1;
-  bool cached_inject = false;       // decision of the current retrace, replayed if PADRead repeats
-  uint8_t cached_value = 0;
+  // Shoulder buttons (L, R, Z) the player is holding that are being emitted in their analog form
+  // (see apply): set while an aerial is on, kept until he lets go of the button.
+  uint16_t converted = 0;
+  int since_edge = 255;             // emitted frames since the last emitted shoulder press edge
+  int predict = 0;                  // frames left of "an aerial is about to start" (attack pressed in a jump)
+  bool was_active = false;
+  bool cached = false;              // the emitted pad of the current retrace, replayed if PADRead repeats
+  uint16_t cached_button = 0;
+  uint8_t cached_l = 0, cached_r = 0;
 };
 PortState g_ports[4];
 uint32_t g_last_retrace = 0xFFFFFFFFu;
@@ -246,6 +263,7 @@ void gather(MuLcancelView& v) {
   if (mapped(common, kFcLcWindow + 4)) {
     v.have_common = 1;
     v.trigger_deadzone = rdf32(common + kFcDeadzone);
+    v.z_analog = rdf32(common + kFcZAnalog);
     v.lcancel_window = (int32_t)rd32(common + kFcLcWindow);
   }
   Target targets[4];
@@ -346,6 +364,11 @@ bool online_session_pending() {
   return slippi::online::session_mode() >= 0 && slippi::online::in_online_menus();
 }
 
+bool automatic_active_online() {
+  return automatic_enabled() && !host::gameplay::vanilla_only() &&
+         policy::automatic_allowed(slippi::online::session_mode(), true);
+}
+
 void apply(host::PadState pads[4], bool allow_automatic) {
   const bool want_indicator = indicator_enabled();
   const bool want_auto = automatic_enabled() && !host::gameplay::vanilla_only();
@@ -357,7 +380,7 @@ void apply(host::PadState pads[4], bool allow_automatic) {
     // PADRead called twice inside one retrace: replay the decision instead of taking a new one, so
     // the two reads cannot disagree about what the player pressed.
     for (int p = 0; p < 4; ++p)
-      if (allow_automatic && g_ports[p].cached_inject) pads[p].trig_l = std::max(pads[p].trig_l, g_ports[p].cached_value);
+      if (allow_automatic && g_ports[p].cached) { pads[p].button = g_ports[p].cached_button; pads[p].trig_l = g_ports[p].cached_l; pads[p].trig_r = g_ports[p].cached_r; }
     return;
   }
   g_last_retrace = retrace;
@@ -385,15 +408,31 @@ void apply(host::PadState pads[4], bool allow_automatic) {
     }
   }
 
+  // Online there is one local fighter, and which physical pad the game reads for it is not this
+  // code's to know (the view filed a second player under its slot, so the press went to a pad the
+  // game never read and player 2 got no automatic L-cancel at all). Every pad is treated as that
+  // fighter's; pads the game does not read are not looked at by anything.
+  const bool online = slippi::online::session_mode() >= 0;
+  const MuLcancelFighter* local = nullptr;
+  if (online)
+    for (int p = 0; p < 4; ++p) if (view.port[p].present) { local = &view.port[p]; break; }
+  const uint8_t full = (uint8_t)std::clamp(cal.max, cal.min + 1, 254);   // reads 1.0, as a digital press does
+  const float z_level = view.z_analog > cal.deadzone && view.z_analog < 1.0f ? view.z_analog : 0.35f;
+  const uint8_t z_value = (uint8_t)std::clamp((int)(z_level * (float)cal.scale + 0.5f) + (cal.shift ? cal.min : 0), cal.min + 1, 254);
+
   for (int p = 0; p < 4; ++p) {
     PortState& st = g_ports[p];
     host::PadState& pad = pads[p];
-    st.cached_inject = false;
-    const MuLcancelFighter& fighter = view.port[p];
+    st.cached = false;
+    static const MuLcancelFighter none{};
+    const MuLcancelFighter& fighter = online ? (local ? *local : none) : view.port[p];
+    const uint16_t raw_button = pad.button;
+    const bool c_out = std::abs((int)pad.sub_x) >= kCStickPush || std::abs((int)pad.sub_y) >= kCStickPush;
     if (!fighter.present) {
       st.last_motion = -1;
       st.last_effective_lr = effective_lr(pad, cal);
-      st.last_button = pad.button;
+      st.last_button = raw_button; st.last_c_out = c_out;
+      st.converted = 0; st.predict = 0; st.was_active = false; st.since_edge = 255;
       continue;
     }
 
@@ -403,34 +442,84 @@ void apply(host::PadState pads[4], bool allow_automatic) {
 
     // Indicator: the frame the fighter enters a LandingAir* state is the frame the game ran the
     // x67F < window test, and x67F has not moved since. Display only, so it is safe in every mode.
-    if (indicate && motion >= kLandingAirN && motion <= kLandingAirLw && motion != st.last_motion) {
+    // Online every pad stands for the one local fighter: raised once.
+    if (indicate && (!online || p == 0) && motion >= kLandingAirN && motion <= kLandingAirLw && motion != st.last_motion) {
       const bool success = since < (uint8_t)std::min(window, 255);
       if (mu_lcancel_renderer_reports(flash_mode(), success))
         raise_flash(fighter.slot, p, since, retrace, success);
     }
 
-    // Automatic press: only while the fighter is airborne in one of the five aerial attacks. An
-    // aerial cannot be interrupted into an air dodge or a shield, so a shoulder input there has no
-    // effect other than resetting x67F.
-    bool inject = false;
-    if (auto_allowed && ground_air == 1 && motion >= kAttackAirN && motion <= kAttackAirLw) {
-      const bool a_rising = (pad.button & kPadA) && !(st.last_button & kPadA);
-      const bool z_rising = (pad.button & kPadZ) && !(st.last_button & kPadZ);
-      // Press only when the previous emitted frame was not already holding a shoulder input: the
-      // game needs a rising edge, so a continuous hold would never register a second time.
-      inject = !st.last_effective_lr && !a_rising && !z_rising;
-    }
-    if (inject) {
-      pad.trig_l = std::max(pad.trig_l, press);
-      st.cached_inject = true;
-      st.cached_value = press;
-    }
+    // ---- Automatic L-cancel.
+    // The game L-cancels a landing when a shoulder input was PRESSED (went from not held to held)
+    // fewer than 7 frames before it, and for that test a light analog press counts like a click
+    // (fighter.c: HSD_PAD_LR). What only a click does (air dodge, tech and its 40 frame lockout, the
+    // shield's own press checks) reads the digital L/R bits, which this never presses or re-presses.
+    //
+    // While an aerial is on, the emitted pad therefore carries a fresh light press every third
+    // frame. A shoulder button the player himself holds through the aerial would hide those (a held
+    // input cannot be pressed again), so his hold is emitted in its analog form instead: the frame
+    // he presses goes out untouched, the click included, and from the next frame the hold is a full
+    // analog press (which the game reads exactly as a held click: 1.0, or Z's own level with A held)
+    // with one frame let go every third frame. The digital bit never comes back while he holds, so
+    // no click he did not make ever reaches the game; when he lets go, the button is his again.
+    //
+    // An attack pressed in a jump starts the aerial a frame later (and online a few frames after
+    // this read), so presses start with it and not only once the aerial is seen.
+    bool emitted_on;
+    bool changed = false;
+    if (!auto_allowed) {
+      st.converted = 0; st.predict = 0; st.was_active = false;
+      emitted_on = effective_lr(pad, cal);
+    } else {
+      const uint16_t shoulders = raw_button & (kPadL | kPadR | kPadZ);
+      const uint16_t fresh = shoulders & (uint16_t)~st.last_button;
+      const bool a_rising = (raw_button & kPadA) && !(st.last_button & kPadA);
+      const bool aerial = ground_air == 1 && motion >= kAttackAirN && motion <= kAttackAirLw;
+      const bool jumping = motion >= kKneeBend && motion <= kFallAerialB;
+      if ((a_rising || (c_out && !st.last_c_out) || (fresh & kPadZ)) && jumping) st.predict = kPredictFrames;
+      else if (st.predict > 0 && !(jumping || aerial)) st.predict = 0;
+      else if (st.predict > 0) --st.predict;
+      // The press that starts the aerial goes out alone: a held shoulder with it is another move
+      // (a tether for Link and Samus), so presses begin on the next frame.
+      const bool active = aerial || (st.predict > 0 && st.predict < kPredictFrames);
 
-    if (g_log) log_row(retrace, p, motion, ground_air, since, fighter.anim_frame, inject);
+      st.converted &= shoulders;                                  // let go: the button is his again
+      // Tests: MELEE_TEST_LCANCEL_ADD_ONLY=1 never alters a hold (presses are only ever added).
+      static const bool add_only = host::test_env::getenv("MELEE_TEST_LCANCEL_ADD_ONLY") != nullptr;
+      if (active && !add_only) st.converted |= shoulders & (uint16_t)~fresh;   // held, not pressed this frame
+      const bool own_analog = std::max(nml_trigger(pad.trig_l, cal), nml_trigger(pad.trig_r, cal)) > cal.deadzone;
+      const bool hold = st.converted != 0 || own_analog || (add_only && shoulders != 0);
+      bool on;   // whether a shoulder input goes out held this frame
+      if (!active) on = hold || fresh;
+      else if (fresh) on = true;                                           // his own press, as he made it
+      else if (a_rising) on = hold;                                        // with an attack press: exactly his own state
+      else if (hold) on = add_only || !(st.last_effective_lr && st.since_edge >= 2);   // let go one frame in three
+      else on = !st.last_effective_lr && (st.since_edge >= 3 || !st.was_active);
 
+      uint16_t button = raw_button & (uint16_t)~st.converted;
+      if (st.converted & kPadZ) button |= kPadA;   // Z holds A too; it stays held through the gaps
+      uint8_t l = pad.trig_l, r = pad.trig_r;
+      if (on) {
+        if (st.converted & kPadL) l = std::max(l, full);
+        if (st.converted & kPadR) r = std::max(r, full);
+        if (st.converted & kPadZ) l = std::max(l, z_value);
+        if (active && !hold && !fresh) l = std::max(l, press);
+      } else {
+        if (nml_trigger(l, cal) > cal.deadzone) l = 0;
+        if (nml_trigger(r, cal) > cal.deadzone) r = 0;
+      }
+      changed = button != pad.button || l != pad.trig_l || r != pad.trig_r;
+      pad.button = button; pad.trig_l = l; pad.trig_r = r;
+      st.cached = true; st.cached_button = button; st.cached_l = l; st.cached_r = r;
+      st.was_active = active;
+      emitted_on = effective_lr(pad, cal);
+    }
+    if (g_log) log_row(retrace, p, motion, ground_air, since, fighter.anim_frame, changed);
+
+    st.since_edge = emitted_on && !st.last_effective_lr ? 0 : std::min(st.since_edge + 1, 255);
     st.last_motion = motion;
-    st.last_effective_lr = effective_lr(pad, cal);
-    st.last_button = pad.button;
+    st.last_effective_lr = emitted_on;
+    st.last_button = raw_button; st.last_c_out = c_out;
   }
 
   if (indicate || g_tints_set) publish_tints(retrace);

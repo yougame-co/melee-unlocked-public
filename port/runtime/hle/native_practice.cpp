@@ -1,6 +1,7 @@
 #include "test_env.h"
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "native_practice.h"
+#include "slippi_arena.h"
 
 #include "host.h"
 #include "practice_cpu.h"
@@ -10,6 +11,7 @@
 #include "yougame_console_entry.h"
 #include "yougame_unranked.h"
 #include "yougame_ux.h"
+#include "yougame_game_state.h"
 #include "yougame_friends.h"
 #include "yougame_lobby_wire.h"
 #include "yougame_mode_policy.h"
@@ -675,7 +677,25 @@ void submit_acknowledge_failure() {
   g_commands.push_back({CommandKind::AcknowledgeFailure, {}});
 }
 
+// Playing, paused or a menu, for the YouGame button (yougame_game_state.h). Every retrace, before
+// any early return below, so online, friends and console sessions report too. Only reads: the
+// page-pause op's query (-1) changes nothing; the worker sends on a change.
+static void report_game_state() {
+  bool match = false, paused = false;
+  if (g_bridge) {
+    int32_t a[5] = {-1, 0, 0, 0, 0};
+    if (g_bridge(OP_PAGE_PAUSE, a, 5) == 0) { match = a[4] != 0; paused = a[0] > 0 || a[3] != 0; }
+  } else {
+    const uint32_t info = host::rd32(0x804D6720u);   // Static Recomp: the scene kind only
+    const int kind = info && host::try_ptr(info, 1) ? host::rd8(info) : -1;
+    match = kind == 2 || kind == 3 || kind == 4 || kind == 0x2C;
+  }
+  yougame::report_game_state(yougame::game_state::classify(
+      match, paused, yougame::game_state::overlay_menu_open.load(std::memory_order_relaxed)));
+}
+
 void tick() {
+  report_game_state();
   if (g_bridge && yougame::tournament_active()) g_bridge(MU_TOURNEY_TICK_OP, nullptr, 0);
 #ifdef MELEE_DOUBLES
   if (g_bridge && current_major()==1) {
@@ -1192,6 +1212,13 @@ void tick() {
     static std::string session_code;
     const bool session = slippi::online::session_mode() >= 0;
     const bool match_running = slippi::online::is_online_match();
+    // A session that was an arena room's (in the room, or its room just ended) is never a finished
+    // online session: the room's last game stays "in a match" on the select until its connection is
+    // cleaned up, which can be long after the room closed (0.9.201 test: the host closed the room).
+    static bool from_room = false, session_was = false;
+    if (slippi::arena::in_room() || slippi::arena::room_just_ended()) from_room = true;
+    else if (!session && !session_was) from_room = false;   // no session left over: the next one is plain
+    session_was = session;
     if (session) {
       session_mode_seen = slippi::online::session_mode();
       if (match_running) {
@@ -1218,10 +1245,14 @@ void tick() {
       // Unranked ends its session after every game, so there it would leave the online screens after
       // each one (two reports); the player stays on Unranked's character select, as on Slippi.
       const bool unranked = session_mode_seen == (int)MatchMode::Unranked;
-      if (allow_training && gx::RenderOptions::live_online_back_to_training() && !unranked && g_lifecycle.phase() == Phase::Idle &&
+      // In an arena room a pair ending is the rotation: the room starts the next match from here.
+      // Leaving a room, or the room closing, ends the pair too: the player stays on the select.
+      const bool arena_room = slippi::arena::in_room() || from_room;
+      from_room = false;
+      if (allow_training && !arena_room && gx::RenderOptions::live_online_back_to_training() && !unranked && g_lifecycle.phase() == Phase::Idle &&
           is_online_scene() && !slippi::playback::enabled()) {
         enter_training_after_session((MatchMode)session_mode_seen, local_index_seen);
-      } else if (allow_training && gx::RenderOptions::live_online_return_training() && g_lifecycle.phase() == Phase::Idle &&
+      } else if (allow_training && !arena_room && gx::RenderOptions::live_online_return_training() && g_lifecycle.phase() == Phase::Idle &&
           is_online_scene()) {
         g_origin_major = kTrainingMajor;
         g_restore_training = false;

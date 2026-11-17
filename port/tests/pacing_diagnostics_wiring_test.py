@@ -133,6 +133,15 @@ class PacingDiagnosticsWiringTest(unittest.TestCase):
       host::log("present: vsync %s (settings)", options.vsync ? "on" : "off");
 #endif'''
         self.assertIn(addition, s)
+        # Build 106 tells YouGame when MU's own menus are up (gameState "menu"): reverse its two hunks first.
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build106_gamestate_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
+        # Build 105 adds YouGame's Sign in by code panel (signin_overlay.cpp: drawn, captures input, Esc is
+        # Back): reverse exactly its pc_settings.cpp hunks first.
+        for approved in json.loads((ROOT / 'port/tests/fixtures/build105_signin_settings_ranges.json').read_text()):
+            self.assertEqual(s.count(approved['after']), 1, approved['after'])
+            s = s.replace(approved['after'], approved['before'], 1)
         # Build 103 scales the F1/Esc menu bar with the window height and makes it near-opaque: reverse
         # exactly that block first.
         for approved in json.loads((ROOT / 'port/tests/fixtures/build103_f1menu_settings_ranges.json').read_text()):

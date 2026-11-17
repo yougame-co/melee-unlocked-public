@@ -243,6 +243,7 @@ using Config = host::netplay::Config;
 inline Config& config() { return host::netplay::config(); }
 inline void init() {}
 inline void shutdown() {}
+inline void gecko_pump() {}   // no Slippi, no Gecko code exchange
 inline void set_native_gameplay_profile(NativeGameplayProfile) {}
 // The content identity a session may send to the other side; kept so the mod code is unchanged.
 struct LocalBuild {

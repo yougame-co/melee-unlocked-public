@@ -210,6 +210,7 @@ NativePoseBridgeStats g_native_pose_stats{};
 // Native game: draw owners arrive in the stream (token 0xF1), not from the render observer.
 bool g_native_owner_source = false;
 uint8_t g_native_owner = 0xFF;
+uint8_t g_native_stage_map = 0xFF;
 bool g_native_skinned = false;   // token 0xF2: the current native PObj is an envelope draw
 // Render semantics (tokens 0xF3-0xF6, rtx_semantics.h): the material, light set, camera and pass the
 // draws recorded now belong to. Indices into g_frame.rtx, so it is reset whenever a frame is handed on.
@@ -801,6 +802,7 @@ void record_draw(uint32_t primitive, uint32_t first, uint32_t count, uint32_t co
       dc.identity = hash_bytes(key, sizeof key) ^ 3;
     }
     dc.owner_player = g_native_owner_source ? g_native_owner : observed_owner();   // SkipInit above means this has to be written every draw
+    dc.stage_map = g_native_owner_source ? g_native_stage_map : observed_stage_map();
     if (native_pose_capture_enabled()) {
       dc.skinned = active_native_scope_is_skinned();
       dc.authored_pose = active_native_authored_pose();
@@ -1110,6 +1112,13 @@ static size_t parse_command_inner(const uint8_t* d, size_t len) {
     g_native_owner = d[1];
     return 2;
   }
+  // Private token from the native stage render (gobj.c render_gobj): the stage map gobj of the draws
+  // that follow, 0x80 set for scenery, 0xFF after. Only sent while owners are tracked.
+  if (op == 0xF7) {
+    if (len < 2) return incomplete(2);
+    g_native_stage_map = d[1];
+    return 2;
+  }
   // Private token from native HSD_PObjDisp while owners are tracked: the PObj is an envelope draw.
   if (op == 0xF2) {
     if (len < 2) return incomplete(2);
@@ -1204,12 +1213,18 @@ bool low_poly_fighters_active() {
   const LookLive& look = look_live();
   if (look.exact.load(std::memory_order_relaxed) && !look.exact_low_poly.load(std::memory_order_relaxed))
     return g_low_poly_fighters.load(std::memory_order_relaxed);
+  // A look that keeps the full models (Silhouettes): the Lightweight level's low poly swap stays off.
+  if (look.full_models.load(std::memory_order_relaxed))
+    return g_low_poly_fighters.load(std::memory_order_relaxed) || retro_textures_active();
   return g_low_poly_fighters.load(std::memory_order_relaxed) || lightweight_level() >= 1 || retro_textures_active();
 }
 
 static std::atomic<int> g_lightweight_level{0};
 static std::atomic<uint32_t> g_lw_drawn{0}, g_lw_skipped{0}, g_lw_last_drawn{0}, g_lw_last_skipped{0};
-void set_lightweight_level(int level) { g_lightweight_level.store(std::clamp(level, 0, kLightweightLevels - 1), std::memory_order_relaxed); }
+void set_lightweight_level(int level) {
+  g_lightweight_level.store(std::clamp(level, 0, kLightweightLevels - 1), std::memory_order_relaxed);
+  look_live().lightweight.store((uint8_t)std::clamp(level, 0, kLightweightLevels - 1), std::memory_order_relaxed);
+}
 int lightweight_level() { return g_lightweight_level.load(std::memory_order_relaxed); }
 void lightweight_count(bool skipped) { (skipped ? g_lw_skipped : g_lw_drawn).fetch_add(1, std::memory_order_relaxed); }
 // Called once per submitted frame (lightweight_filter): the counts of the frame before become the
@@ -1237,8 +1252,9 @@ void arcade_debug(const Frame& f, const LightweightFilter& e) {
 }
 void lightweight_debug(const Frame& f, const LightweightFilter& e) {
   static const bool on = [] { const char* v = host::test_env::getenv("MELEE_TEST_LIGHTWEIGHT_LOG"); return v && *v == '1'; }();
+  static const bool detail = [] { const char* v = host::test_env::getenv("MELEE_TEST_LIGHTWEIGHT_LOG"); return v && *v == '2'; }();
   static uint32_t n = 0;
-  if (!on || e.level < 2 || (n++ % 600) != 0) return;
+  if ((!on && !detail) || e.level < 2 || (n++ % 600) != 0) return;
   uint32_t world = 0, skinned = 0, owned = 0, other_camera = 0;
   float zmin = 1e30f, zmax = -1e30f;
   for (const auto& d : f.draws) {
@@ -1253,6 +1269,9 @@ void lightweight_debug(const Frame& f, const LightweightFilter& e) {
       back = std::min(back, z); front = std::max(front, z);
     }
     zmin = std::min(zmin, back); zmax = std::max(zmax, front);
+    if (detail && !lightweight_background(e, f, d))   // MELEE_TEST_LIGHTWEIGHT_LOG=2: every stage piece that stays
+      host::log("lightweight: kept draw %zu, %u vertices, z %.1f..%.1f, stage map %d%s", (size_t)(&d - f.draws.data()), d.vertex_count,
+                back, front, d.stage_map == 0xFF ? -1 : (int)(d.stage_map & 0x3F), (d.stage_map != 0xFF && (d.stage_map & 0x80)) ? " scenery" : "");
   }
   host::log("lightweight: draws %zu, world %u (skinned %u, owned %u), other cameras %u, fighters %s at z %.1f, stage z %.1f..%.1f",
             f.draws.size(), world, skinned, owned, other_camera, e.have_fighters ? "found" : "none", e.fighter_far, zmin, zmax);
@@ -1462,7 +1481,7 @@ void set_native_pose_capture_enabled(bool enabled) {
     g_native_pose_scope_ids.clear();
   }
 }
-void set_native_owner_source(bool native) { g_native_owner_source = native; g_native_owner = 0xFF; g_native_skinned = false; }
+void set_native_owner_source(bool native) { g_native_owner_source = native; g_native_owner = 0xFF; g_native_stage_map = 0xFF; g_native_skinned = false; }
 static std::atomic<bool> g_authored_capture_wanted{true};
 void set_authored_capture_wanted(bool wanted) { g_authored_capture_wanted.store(wanted, std::memory_order_relaxed); }
 bool authored_capture_wanted() { return g_authored_capture_wanted.load(std::memory_order_relaxed); }

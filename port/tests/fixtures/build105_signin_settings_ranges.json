@@ -1,0 +1,26 @@
+[
+  {
+    "before": "#include \"yougame_blend.h\"\n#include \"hid_pad.h\"\n",
+    "after": "#include \"yougame_blend.h\"\n#include \"signin_overlay.h\"\n#include \"hid_pad.h\"\n"
+  },
+  {
+    "before": "                               practice.phase == slippi::native_practice::Phase::ReturningToPractice;\n  const bool practice_force_capture =\n",
+    "after": "                               practice.phase == slippi::native_practice::Phase::ReturningToPractice;\n  // YouGame's Sign in by code panel (signin_overlay.cpp) takes the controllers like the Practice menu:\n  // the game gets none of them, and the panel's buttons move on the routed pad.\n  const bool signin_up = signin_overlay::open();\n  const bool practice_force_capture =\n"
+  },
+  {
+    "before": "  const bool practice_force_capture =\n      slippi::native_practice::phase_forces_input_capture(practice.phase);\n  const bool practice_nav = state.practice_open || practice.phase == slippi::native_practice::Phase::Failure;\n  // Platform gamepad polling is disabled (Win32 at build time, SDL in settings_context_create).\n",
+    "after": "  const bool practice_force_capture =\n      slippi::native_practice::phase_forces_input_capture(practice.phase) || signin_up;\n  const bool practice_nav = state.practice_open || practice.phase == slippi::native_practice::Phase::Failure || signin_up;\n  // Platform gamepad polling is disabled (Win32 at build time, SDL in settings_context_create).\n"
+  },
+  {
+    "before": "  // While rebinding, Escape cancels the capture without also changing the panel.\n  if (phob_native_open() && host::window_take_escape()) {\n",
+    "after": "  // While rebinding, Escape cancels the capture without also changing the panel.\n  if (signin_up && !state.open && !state.menu_open && host::window_take_escape()) signin_overlay::back();   // Esc: Back\n  if (phob_native_open() && host::window_take_escape()) {\n"
+  },
+  {
+    "before": "  // neutral-release capture still prevents a closing A/B/Start reaching Melee.\n  settings_input::navigation(ImGui::GetIO(), state.open || state.menu_open || state.practice_open ||\n      practice.phase == slippi::native_practice::Phase::Failure || state.fill_window);\n",
+    "after": "  // neutral-release capture still prevents a closing A/B/Start reaching Melee.\n  settings_input::navigation(ImGui::GetIO(), state.open || state.menu_open || state.practice_open || signin_overlay::open() ||\n      practice.phase == slippi::native_practice::Phase::Failure || state.fill_window);\n"
+  },
+  {
+    "before": "  if (!state.fill_window && !state.open && !state.menu_open) draw_community_code_overlays();\n  {\n",
+    "after": "  if (!state.fill_window && !state.open && !state.menu_open) draw_community_code_overlays();\n  {   // YouGame's Sign in by code panel, over the online menu's game picture (settings stay on top)\n    static bool signin_was = false;\n    if (!state.fill_window && !state.open && !state.menu_open && signin_overlay::open()) {\n      const ImVec2 screen = ImGui::GetIO().DisplaySize;\n      const float aspect = presented_aspect(options, (int)screen.x, (int)screen.y, true);\n      float gw = screen.x, gh = gw / std::max(aspect, 0.1f);\n      if (gh > screen.y) { gh = screen.y; gw = gh * aspect; }\n      const float gx0 = (screen.x - gw) * 0.5f, gy0 = (screen.y - gh) * 0.5f;\n      signin_overlay::draw(gx0, gy0, gx0 + gw, gy0 + gh);\n    }\n    // Closed: the A or B that closed it is still held; keep the game's input neutral until it is let go.\n    const bool signin_now = signin_overlay::open();\n    if (signin_was && !signin_now) state.practice_release_capture = true;\n    signin_was = signin_now;\n  }\n  {\n"
+  }
+]

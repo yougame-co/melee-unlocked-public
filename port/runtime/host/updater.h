@@ -90,6 +90,28 @@ ModelState rtx_pack_state(const std::string& game_dir_utf8);
 std::string rtx_pack_message();
 constexpr const char* kRtxPackSize = "about 500 MB";
 
+// The Lab view's fighter packs (<id>.lab in the Lab folder, 27 of them), their own download since
+// 0.9.204: one zip on the content release, checked against its SHA-256, unpacked into `lab_dir`. The
+// Lab view asks for them the first time it finds none and uses them as soon as they are in place.
+// Background thread.
+bool lab_packs_present(const std::string& lab_dir_utf8);
+void lab_packs_download(const std::string& lab_dir_utf8);
+ModelState lab_packs_state(const std::string& lab_dir_utf8);
+std::string lab_packs_message();
+constexpr const char* kLabPacksSize = "about 85 MB";
+// NVIDIA's DLSS Ray Reconstruction runtime (sl.dlss_d.dll and nvngx_dlssd.dll), its own download
+// since 0.9.204: only path tracing uses it. PC settings > Ray tracing has the button, and the RTX
+// Pack's install fetches it too. Each file is checked against NVIDIA's build before it goes beside
+// the game; the game loads them at its next start. Background thread.
+bool rr_present(const std::string& game_dir_utf8);
+void rr_download(const std::string& game_dir_utf8);
+ModelState rr_state(const std::string& game_dir_utf8);
+std::string rr_message();
+constexpr const char* kRrSize = "about 25 MB";
+// Where the parts that never change with a version live (Fight a pro's matchup policies, the Lab
+// packs): one release, so no update carries them again.
+constexpr const char* kContentBase = "https://github.com/hero88go/melee-unlocked/releases/download/content-1/";
+
 // AMD FSR (amd_fidelityfx_loader_dx12/vk.dll and amd_fidelityfx_upscaler_dx12/vk.dll), its own download:
 // AMD's signed files from their FSR SDK repository at a pinned tag (nothing re-hosted), each checked
 // against its SHA-256 before it goes beside the game; the game loads them at its next start.

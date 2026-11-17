@@ -117,6 +117,18 @@ class ThreadedBackend final : public Backend {
     std::vector<double> latency[LT_COUNT];
     const bool latency_trace = host::latency_trace_enabled();
     uint64_t latency_sequence = 0;
+    // Latency probe (with an input script): one line per injected press, from the first present of a
+    // frame that has it in, once the display time is known or known to be unavailable (1 s at most).
+    // "presented" is when the driver says the frame reached the screen (renderer probe_presented).
+    struct Probe { unsigned press; double inject, pad, present_return; uint64_t present_id; double give_up; };
+    std::vector<Probe> probes;
+    unsigned probe_logged = 0;
+    const auto log_probe = [](const Probe& p, const double* shown) {
+      char presented[32] = "n/a";
+      if (shown && *shown >= p.inject) std::snprintf(presented, sizeof presented, "%.2f", (*shown - p.inject) * 1000.0);
+      host::log("latency probe: press %u injected %.3f pad read %.2f present return %.2f presented %s", p.press,
+                p.inject * 1000.0, (p.pad - p.inject) * 1000.0, (p.present_return - p.inject) * 1000.0, presented);
+    };
     // Predict phases from the tick's schedule (above, where t is set). Measured 2026-10-23 on the
     // same scripted match back to back: steps in the shown time over 2 ms fell from 262 to 15 per
     // 40 s, over 1 ms from 1032 to 230, with latency, pair rejection and the endpoint check
@@ -201,7 +213,8 @@ class ThreadedBackend final : public Backend {
                     : live_options.fps_cap < 0 ? last_refresh
                     : present_uncapped ? 0.0 : 2.0 * last_refresh;
       // A display that follows the frames (G-Sync, FreeSync, read by the renderer from the display's
-      // own counts) is fed just under its refresh: at the ceiling it stops following the frames.
+      // own counts) is fed just under its refresh when the cap follows the monitor: at the ceiling it
+      // stops following the frames.
       // Detection controls the cap, never the player's V-Sync choice. Windows' VRR presentation
       // path uses interval 0 with ALLOW_TEARING; forcing interval 1 can add display queueing.
       int vrr = renderer->variable_refresh();
@@ -232,7 +245,10 @@ class ThreadedBackend final : public Backend {
         if (vrr < 0 && host::now_seconds() < probe_until) wanted = 0.9 * last_refresh;
         else probe_state = 2;
       }
-      if (vrr == 1 && (wanted <= 0.0 || wanted > vrr_cap)) wanted = vrr_cap;
+      // Only for "follow the monitor" (the default): a cap or "uncapped" the player chose is kept,
+      // since the game never lowers the frame rate on its own (B-953: uncapped on a 240 Hz G-Sync
+      // screen was held at 224).
+      if (vrr == 1 && live_options.fps_cap < 0 && (wanted <= 0.0 || wanted > vrr_cap)) wanted = vrr_cap;
       // NVIDIA frame generation 2x..6x: render the target rate divided by the multiplier and let
       // generation fill the rest. Rendering at the full target left no room for generated frames,
       // so none were shown (NVIDIA's guide: the frame limit applies to rendered frames).
@@ -564,6 +580,21 @@ class ThreadedBackend final : public Backend {
           host::log("%s adapter %.0f Hz", line.c_str(), host::gcadapter_poll_rate_hz());
         }
       }
+      if (latency_trace && current.tick.probe > probe_logged) {
+        probe_logged = current.tick.probe;
+        probes.push_back({current.tick.probe, current.tick.probe_inject, current.tick.probe_pad, render_end,
+                          renderer->probe_present_id(), render_end + 1.0});
+      }
+      if (latency_trace && !probes.empty()) {
+        const double now = host::now_seconds();
+        for (size_t i = 0; i < probes.size();) {
+          double shown = 0;
+          const int known = probes[i].present_id ? renderer->probe_presented(probes[i].present_id, &shown) : -1;
+          if (known == 0 && now < probes[i].give_up) { ++i; continue; }
+          log_probe(probes[i], known == 1 ? &shown : nullptr);
+          probes.erase(probes.begin() + (std::ptrdiff_t)i);
+        }
+      }
       if (last_submission > 0) {
         const double interval = render_end - last_submission;
         pacing_intervals.push_back((float)(interval * 1000.0));
@@ -621,12 +652,20 @@ class ThreadedBackend final : public Backend {
       double now = host::now_seconds();
       if (now - stats_time >= 1.0) {
         const SubFrameStats& s = solver.stats();
-        wchar_t title[256];
-        _snwprintf_s(title, _TRUNCATE, L"%ls  |  DISPLAY %.0f fps%s  |  game logic %.0f Hz (always 60, like Rivals' physics)  |  %s  |  draws %u paired %u",
-                     host::window_title_base().c_str(), stats_presented / (now - stats_time),
-                     cap_period <= 0 ? L" (uncapped)" : live_options.fps_cap == 0 ? L" (uncapped, held at 2x refresh)" : L" (capped)", stats_sim / (now - stats_time),
-                     !subframes ? L"locked" : authored ? L"authored" : interpolate ? L"interpolate" : L"extrapolate", s.draws, s.paired);
-        host::window_set_title(title);
+        // The rates in the title only with the Performance overlay on; otherwise just "Melee Unlocked".
+        static bool stats_title = false;
+        if (live_options.performance_overlay) {
+          wchar_t title[256];
+          _snwprintf_s(title, _TRUNCATE, L"%ls  |  DISPLAY %.0f fps%s  |  game logic %.0f Hz (always 60, like Rivals' physics)  |  %s  |  draws %u paired %u",
+                       host::window_title_debug().c_str(), stats_presented / (now - stats_time),
+                       cap_period <= 0 ? L" (uncapped)" : live_options.fps_cap == 0 ? L" (uncapped, held at 2x refresh)" : L" (capped)", stats_sim / (now - stats_time),
+                       !subframes ? L"locked" : authored ? L"authored" : interpolate ? L"interpolate" : L"extrapolate", s.draws, s.paired);
+          host::window_set_title(title);
+          stats_title = true;
+        } else if (stats_title) {
+          host::window_set_title(host::window_title_base().c_str());
+          stats_title = false;
+        }
         if (++stats_lines % 5 == 0) {
           // The cap the pacing actually used, not the setting: "uncapped" is held at twice the
           // display's refresh unless MELEE_PRESENT_UNCAPPED=1, and -1 is whatever the monitor runs at.

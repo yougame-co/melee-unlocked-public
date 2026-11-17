@@ -6,12 +6,15 @@
 #include <array>
 #include <string>
 #include <vector>
+#include <memory>
 #include "native_online_policy.h"
 #if MU_SQUAD
 #include "squad_costume_rule.h"
 #endif
 
 namespace yougame::lobby { enum class Profile; }   // yougame_lobby_wire.h: Friends4, Doubles
+
+namespace slippi { class Matchmaking; }
 
 namespace slippi::online {
 
@@ -98,6 +101,8 @@ void set_squad_standard_copy(squad_costume::Standard (*copy)(const std::string& 
 // it before it next reads or changes the rule.
 void squad_console_reset();
 #endif
+// Gecko codes agreed for the match (gecko_session.h): call every character select frame.
+void gecko_pump();
 // The in-game slot the local player occupies in the running online match (0-3).
 int local_player_slot();
 // The shield colour the opponent on in-game `slot` sent after connecting (0x1000000 | RGB), 0 none.
@@ -121,6 +126,9 @@ int local_player_index();
 bool in_online_menus();
 // Online submenu and CSS, including when the Friends row is hidden.
 bool online_status_visible();
+// Direct only: a connected opponent announced automatic L-cancel in its build message. Slippi
+// Dolphin and builds before 0.9.200 never send it, so it is false against them.
+bool opponent_auto_lcancel();
 
 // Native practice uses the same Slippi matchmaking implementation as the game's online menus.
 // These calls are simulation-thread only. native_poll_match is deliberately side-effecting and
@@ -178,5 +186,41 @@ bool local_css_selection(uint8_t* character, uint8_t* color);
 // The Direct code to keep searching for while practicing: the running Direct search's, else the
 // most recent one used. Empty when there is none.
 std::string direct_code_for_practice();
+
+// Arena rooms (slippi_arena.h). The online session as the room sees it: whether a Direct search or
+// connection is up, the connect code it is for (UTF-8), Matchmaking's ProcessState, and whether a
+// match is running. Simulation thread.
+struct ArenaMatchStatus {
+  bool active = false;     // searching, connected, or in the match
+  bool direct = false;     // and it is a Direct session
+  int mode = -1;           // the last search's Matchmaking::OnlinePlayMode
+  std::string code;
+  int state = 0;
+  bool in_match = false;
+  bool local_ready = false;
+};
+ArenaMatchStatus arena_match_status();
+// Starts a Direct search for `code` from the online character select. locked: lock in this
+// character with a random legal stage (the test harness); otherwise the player picks and presses
+// Start as usual once connected.
+// mode: Matchmaking::DIRECT for a singles pair, TEAMS for a doubles four (everyone searches the
+// same code; team 0 red, 1 blue).
+bool arena_start_search(int mode, const std::string& code, bool locked, uint8_t character, uint8_t color,
+                        uint8_t team, std::string* error);
+// The Slippi account's connect code and display name; false when not logged in.
+bool local_identity(std::string* code, std::string* name);
+// A matchmaking client of its own for an arena room link (the game's own search is untouched).
+std::unique_ptr<Matchmaking> arena_matchmaking();
+// A room message that reached the game's own Direct connection (its search met a room's link
+// instead of a plain Direct player): the oldest one, false when there is none.
+bool arena_pop_from_match(std::vector<uint8_t>& out);
+// Locks in this character and colour with a random legal stage when a Direct pair is connected and
+// not locked in (the arena test harness only, where nobody presses Start). True if it did.
+bool arena_lock_in(uint8_t character, uint8_t color);
+// Counts arena pairings: the room bumps it each time it starts a search for a new opponent, and the
+// online character select gives the first game's stage pick to player 1, as a peer-to-peer session
+// does (a fresh pair has no previous winner). 0 outside a room.
+void arena_note_new_pairing();
+uint32_t arena_pairing();
 
 }  // namespace slippi::online

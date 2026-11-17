@@ -7,6 +7,7 @@
 #include "gx_retro.h"
 #include "authored_pose.h"
 #include "../abi/mu_pose_view.h"
+#include "../abi/mu_stage_scenery.h"
 #include "gx_core.h"   // authored_capture_wanted
 #include <algorithm>
 #include <cmath>
@@ -58,7 +59,9 @@ bool owners_wanted() {
          l.effect_owners.load(std::memory_order_relaxed) || l.fighter.load(std::memory_order_relaxed) != 0 ||
          l.stage.load(std::memory_order_relaxed) != 0 || l.retro.load(std::memory_order_relaxed) ||
          // The Arcade look's 2D camera and background find the fighters by their skinned draws.
-         arcade_camera_2d_active() || arcade_backdrop_slot().load(std::memory_order_relaxed) != 0;
+         arcade_camera_2d_active() || arcade_backdrop_slot().load(std::memory_order_relaxed) != 0 ||
+         // Lightweight from level 2 leaves out scenery the native game names (token 0xF7 rides with the owners).
+         l.lightweight.load(std::memory_order_relaxed) >= 2;
 }
 
 uint8_t resolve_owner(uint8_t* memory) {
@@ -385,6 +388,22 @@ uint8_t observed_owner() {
   return resolve_owner(guest_memory);
 }
 bool observed_skinned() { return envelope; }
+// The stage map gobj being rendered, tagged as the Source Port's game tags it (token 0xF7): the GObj in
+// HSD_GObj_804D7814 is a stage object (classifier 3) with Ground user data (kind 3, +0x07), whose
+// map_id is at +0x14; stage_info (0x8049E6C8) +0x88 is the loaded stage's GrKind. Reads only.
+uint8_t observed_stage_map() {
+  if (!guest_memory || !owners_wanted()) return 0xFF;
+  Reader r{guest_memory};
+  const uint32_t gobj = r.word(0x804D7814);
+  if (!gobj) return 0xFF;
+  if ((r.word(gobj) >> 16) != 3 || (r.word(gobj + 4) & 0xFF) != 3) return 0xFF;
+  const uint32_t ground = r.word(gobj + 0x2C);
+  if (!ground) return 0xFF;
+  const int map_id = (int)r.word(ground + 0x14);
+  const int grkind = (int)r.word(0x8049E6C8 + 0x88);
+  if (!r.valid || map_id < 0 || map_id > 0x3F) return 0xFF;
+  return (uint8_t)((mu_stage_map_is_scenery(grkind, map_id) ? 0x80 : 0) | (mu_stage_map_is_tight(grkind, map_id) ? 0x40 : 0) | map_id);
+}
 std::shared_ptr<const AuthoredPose> capture_authored_pose() {
   if(!authored_enabled||!authored_capture_wanted()||!current_generation||!current_memory||!(rigid||envelope)){ ++authored_stats().capture[1]; return {}; }
   Reader r{current_memory};

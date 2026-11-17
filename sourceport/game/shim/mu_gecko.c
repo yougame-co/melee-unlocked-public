@@ -488,13 +488,11 @@ static unsigned int gecko_native_offset(const char* layout, unsigned int offset)
  * is not wholly inside one object of the table (the host's table said otherwise: the two were built
  * from different trees), -1 when skipped because a network match is running (a code the other
  * player does not run would take the match out of sync). */
-MU_EXPORT int mu_user_gecko_write(unsigned int addr, const unsigned char* bytes, unsigned int len)
+static int gecko_store(unsigned int addr, const unsigned char* bytes, unsigned int len)
 {
     unsigned int lo = 0, hi = sizeof gecko_targets / sizeof gecko_targets[0], k;
     const MuGeckoTarget* t;
 
-    if (mu_online_active())
-        return -1;
     while (hi - lo > 1) {
         unsigned int mid = lo + (hi - lo) / 2;
         if (gecko_targets[mid].addr <= addr)
@@ -512,13 +510,11 @@ MU_EXPORT int mu_user_gecko_write(unsigned int addr, const unsigned char* bytes,
 
 /* The same for a read: `len` bytes of the native variable at console address `addr`, handed back
  * big-endian. The same three results as the write. */
-MU_EXPORT int mu_user_gecko_read(unsigned int addr, unsigned char* bytes, unsigned int len)
+static int gecko_load(unsigned int addr, unsigned char* bytes, unsigned int len)
 {
     unsigned int lo = 0, hi = sizeof gecko_targets / sizeof gecko_targets[0], k;
     const MuGeckoTarget* t;
 
-    if (mu_online_active())
-        return -1;
     while (hi - lo > 1) {
         unsigned int mid = lo + (hi - lo) / 2;
         if (gecko_targets[mid].addr <= addr)
@@ -532,4 +528,27 @@ MU_EXPORT int mu_user_gecko_read(unsigned int addr, unsigned char* bytes, unsign
     for (k = 0; k < len; ++k)
         bytes[k] = t->native[gecko_native_offset(t->layout, addr - t->addr + k)];
     return 1;
+}
+
+MU_EXPORT int mu_user_gecko_write(unsigned int addr, const unsigned char* bytes, unsigned int len)
+{
+    return mu_online_active() ? -1 : gecko_store(addr, bytes, len);
+}
+
+MU_EXPORT int mu_user_gecko_read(unsigned int addr, unsigned char* bytes, unsigned int len)
+{
+    return mu_online_active() ? -1 : gecko_load(addr, bytes, len);
+}
+
+/* The same during a network match too, for the codes both players agreed to run (the host's
+ * gecko_session.h: each game runs the same list at the same point of every frame, so both stay in
+ * step). The host calls these for those codes only. */
+MU_EXPORT int mu_user_gecko_write_agreed(unsigned int addr, const unsigned char* bytes, unsigned int len)
+{
+    return gecko_store(addr, bytes, len);
+}
+
+MU_EXPORT int mu_user_gecko_read_agreed(unsigned int addr, unsigned char* bytes, unsigned int len)
+{
+    return gecko_load(addr, bytes, len);
 }

@@ -399,7 +399,7 @@ int main(int argc, char** argv) {
   // prewarm_variants.h: the start waits for one variant, the one this session's draws use.
   {
     namespace pv = gx::prewarm_variants;
-    // Upscaler off on a PC that has one (XeSS on a test PC's AMD iGPU): plain waited for, motion vectors after.
+    // Upscaler off on a PC that has one (XeSS on pc3's AMD iGPU): plain waited for, motion vectors after.
     auto p = pv::plan(false, true, 1, false);
     check(p.count == 2);
     check(p.variants[0].mvec == 0 && p.variants[0].wait);

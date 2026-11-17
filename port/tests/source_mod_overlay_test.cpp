@@ -236,7 +236,18 @@ int main(int argc, char** argv) {
   auto changed_movie = [](uint32_t, void* dst, uint32_t size) {
     std::memset(dst, 0, size); if (size) *(unsigned char*)dst = 1; return true;
   };
-  CHECK(!movies.add_iso(large_iso, "changed-movie", movie_lookup, changed_movie, error));
+  // A changed movie too large to map keeps the original disc's movie; the mod still loads.
+  CHECK(movies.add_iso(large_iso, "changed-movie", movie_lookup, changed_movie, error));
+  CHECK(movies.files().empty());
+  // Any other changed file that large still refuses the disc.
+  std::memcpy(large_image.data() + 0x518, "movie.dat", 10);
+  { std::fstream f(large_iso, std::ios::binary | std::ios::in | std::ios::out); f.seekp(0x518); f.write("movie.dat", 10); }
+  auto data_lookup = [=](const std::string& path, Overlay::DiscFile* file) {
+    if (path != "/movie.dat") return false;
+    *file = {0x1000, movie_size}; return true;
+  };
+  Overlay big_data;
+  CHECK(!big_data.add_iso(large_iso, "changed-data", data_lookup, changed_movie, error));
   CHECK(error.find("replacement file is too large") != std::string::npos);
   CHECK(fs::remove(large_iso));
   CHECK(fs::remove(iso));

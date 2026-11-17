@@ -10,6 +10,7 @@
 // 32x32 I4 at 0x8040CD40, their margins at 0x8040CB00, the Shift-JIS table at 0x8040C8C0, the
 // glyph codes at 0x8040C680). Nothing of the game is stored here.
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "user_texture.h"
 #include "practice_menu.h"
 
 #include "host.h"
@@ -120,6 +121,24 @@ void font_load() {
         }
   }
   g_font.tex.UsedRect = ImTextureRect{0, 0, 1024, 288};
+  // A disc whose main.dol is not the retail one (a mod disc) can hold other data at these
+  // addresses: the letters would then come out as empty cells, and the menu would draw no words.
+  // Every letter and digit must have ink, or the PC font is used.
+  int inked = 0, checked = 0;
+  for (const char* p = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; *p; ++p) {
+    const int g = g_font.glyph[(unsigned char)*p].index;
+    if (g < 0) continue;
+    ++checked;
+    int sum = 0;
+    const int ox = (g % 32) * 32, oy = (g / 32) * 32;
+    for (int y = 0; y < 32 && sum < 64; ++y)
+      for (int x = 0; x < 32; ++x) sum += out[((oy + y) * 1024 + ox + x) * 4 + 3] > 64;
+    if (sum >= 8) ++inked;
+  }
+  if (checked < 30 || inked < checked) {
+    host::log("practice menu: the disc's font looks wrong (%d of %d letters and digits drawn); the PC font is used", inked, checked);
+    return;
+  }
   g_font.ok = true;
   host::log("practice menu: the game's font is ready (%d characters)", mapped);
 }
@@ -127,12 +146,7 @@ void font_load() {
 bool font_ready() {
   if (!g_font.tried) font_load();
   if (!g_font.ok) return false;
-  if (g_font.context != ImGui::GetCurrentContext()) {
-    g_font.context = ImGui::GetCurrentContext();
-    if (g_font.tex.Status == ImTextureStatus_Destroyed || g_font.tex.TexID == ImTextureID_Invalid)
-      g_font.tex.Status = ImTextureStatus_WantCreate;
-    ImGui::RegisterUserTexture(&g_font.tex);
-  }
+  gx::keep_user_texture(&g_font.tex, g_font.context);   // a rebuilt overlay gets it again (user_texture.h)
   return true;
 }
 
@@ -1407,7 +1421,8 @@ void draw_intro(ImDrawList* dl, const Frame& f) {
     const float u = gu * 0.82f;
     const float fa = std::min(ease((since - kFrom) / 0.35f), ease((kTo - since) / 0.45f));
     const float slide = (1.0f - ease((since - kFrom) / 0.3f)) * 30.0f * u;
-    const char* title = "Practice menu";
+    // Searching for a match while training is what players missed (owner, 0.9.201): it leads.
+    const char* title = "Find a match while you train";
     const float cx = (f.game_x0 + f.game_x1) * 0.5f;
     const float w = text_width(25 * u, title) + 110 * u, left = cx - w * 0.5f, top = f.game_y0 + 170 * u, h = 50 * u;
     draw_bar(dl, left - slide, top, left + w - slide, h, u, true, title, "", true, fa, false);
@@ -1415,7 +1430,8 @@ void draw_intro(ImDrawList* dl, const Frame& f) {
     const float kw = hints(dl, 0, 0, u, keys, fa, false);
     hints(dl, cx - kw * 0.5f, top + h + 8 * u, u, keys, fa);
     // Kept between the Training logo and its damage display.
-    const char* about = "Set up the CPU, use training tools, fight a pro, or find a match while you train.";
+    const char* about = "Search Unranked or Direct and keep practicing: the match starts by itself when one is found. "
+                        "The same menu sets up the CPU and the training tools.";
     float y = top + h + 28 * u;
     for (const std::string& line : wrap(about, 16 * u, 430 * u)) {
       text(dl, cx - text_width(16 * u, line.c_str()) * 0.5f, y, 16 * u, with_alpha(IM_COL32(255, 255, 255, 255), fa), line.c_str());
@@ -1425,7 +1441,7 @@ void draw_intro(ImDrawList* dl, const Frame& f) {
   }
   // Then small at the top right: the buttons and what they open (dimmer after half a minute).
   const float u = gu * 0.8f, alpha = since < 30.0f ? 0.95f : 0.55f;
-  const char* spec = "S:+|D:Up  +|Z:Practice menu";
+  const char* spec = "S:+|D:Up  +|Z:Find a match, practice menu";
   const float hw = hints(dl, 0, 0, u, spec, alpha, false);
   hints(dl, f.game_x1 - hw - 8 * u, f.game_y0 + 30 * u, u, spec, alpha);
 }

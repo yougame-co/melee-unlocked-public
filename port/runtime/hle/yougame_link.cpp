@@ -4,6 +4,7 @@
 #include "test_env.h"
 #include "yougame_link.h"
 #include "yougame_channel.h"
+#include "yougame_signin.h"
 #include "yougame_udp.h"
 #include "yougame_tourney.h"
 #include "yougame_tourney_queue.h"
@@ -38,6 +39,7 @@
 #endif
 #include "yougame_search.h"
 #include "yougame_match_state.h"
+#include "yougame_game_state.h"
 #include "gameplay_policy.h"
 #ifdef YOUGAME_AGENT_TEST_HOOK
 #include "yougame_agent_static.h"
@@ -228,11 +230,17 @@ std::atomic<bool> g_channel_allowed{false};          // start(): nothing started
 std::mutex g_channel_mutex;
 std::shared_ptr<channel::Connection> g_channel;      // g_channel_mutex; set while probing and while up
 std::atomic<bool> g_channel_up{false};               // verified and hello answered
+std::atomic<uint64_t> g_channel_epoch{0};            // +1 each time a connection comes up (gameState resends)
+uint64_t g_links_epoch = ~uint64_t(0);                // g_channel_epoch when direct links last attached (g_mutex)
 std::atomic<bool> g_channel_probing{false};
 std::atomic<bool> g_channel_account_changed{false};  // the host's last refusal was accountChanged
 channel::RetryGate g_channel_retry;                  // g_channel_mutex
 channel::PlayerWait g_player_wait;                   // g_channel_mutex
 std::atomic<bool> g_player_wait_running{false};
+// The channel's last hello said nobody is signed in (signin::hello_signed_out): the YouGame rows offer
+// Sign in by code (yougame_signin.h) instead of staying locked.
+std::atomic<bool> g_channel_signed_out{false};
+void sign_in_push(const json& push);   // the sign-in panel's pushes (signedIn, signInExpired, signInFailed)
 std::atomic<uint64_t> g_probe_started{0};           // now_ms() when the last probe began (timing lines)
 uint64_t since_probe() { const uint64_t at = g_probe_started.load(); return at ? now_ms() - at : 0; }
 relay_pads::State g_relay_pads([](const std::string& line) { host::log("%s", line.c_str()); }, false);
@@ -418,6 +426,7 @@ void handle_app_line(const std::string& line) {
         doubles::ui.back_if_active();
 #endif
         friends::lobby.leave(); console::entry.stop(); } // no-op outside a held room
+      if (!g_stdio && g_channel_allowed) sign_in_push(push);   // signedIn, signInExpired, signInFailed
       const bool taken = friends::events.push(push, now_ms());
       if (taken && friends::version_reason(push)) log_friend_version();
       // Receipt only (no names or text): proves the app's notice reached the game, shown or not.
@@ -630,12 +639,16 @@ void start_player_wait();
 json bridge_channel(const json& body, int timeout_ms, const std::function<bool()>& cancelled = {}, bool probing = false) {
   if (!probing && !g_channel_up) throw BridgeNoAnswer(kChannelClosed);
   const bool hello = body.is_object() && body.value("type", "") == "hello";
+  const uint64_t sent_at = now_ms();
   json j = bridge_stdio(hello ? channel::hello_request(body, build_version()) : body, timeout_ms, cancelled);
   if (hello && j.value("ok", false)) {
     const json result = j.count("result") ? j["result"] : json::object();
     const bool pending = channel::hello_pending(result), player = channel::hello_player(result);
-    host::log("yougame channel: hello answered %llu ms (%s)", (unsigned long long)since_probe(),
-              player ? "player" : pending ? "pending" : "no player");
+    g_channel_signed_out = signin::hello_signed_out(result);
+    // This hello's own round trip, then the time since the probe began (a later hello, after sign-in or a
+    // reconnect, is minutes after the probe: that is not a slow answer).
+    host::log("yougame channel: hello answered in %llu ms, %llu ms after the probe (%s)", (unsigned long long)(now_ms() - sent_at),
+              (unsigned long long)since_probe(), player ? "player" : pending ? "pending" : "no player");
     bool tell = false;
     {
       std::lock_guard<std::mutex> lock(g_channel_mutex);
@@ -839,6 +852,24 @@ void yg_match_state(int open, yg_callback, void*) {
 }
 match_state::Worker& match_hint_worker() {
   static match_state::Worker worker;
+  return worker;
+}
+// gameState (contract section 9) goes the same narrow way as matchState: stdio or the local channel,
+// never bridge()'s refusal policy; the answer is ignored. The channel's state waits for its hello
+// (g_channel_up is set only after hello answered) and every new connection hears it once.
+void yg_game_state(int state) {
+  const char* name = game_state::name(state);
+  if (!name) return;
+  const json body = {{"type", "gameState"}, {"state", name}};
+  if (g_stdio) bridge_stdio(body, 1000, {}, tourney::DeliveryClock::now() + std::chrono::seconds(1));
+  else if (g_channel_allowed && g_channel_up) bridge_channel(body, 1000);
+}
+uint64_t game_state_epoch() {
+  if (g_stdio) return 1;   // one app for the process's life
+  return g_channel_allowed && g_channel_up ? g_channel_epoch.load() : 0;
+}
+game_state::Worker& game_state_worker() {
+  static game_state::Worker worker;
   return worker;
 }
 
@@ -1185,6 +1216,10 @@ uint64_t g_identity_at = 0;   // GetTickCount64 of the last answer
 std::string g_status = "offline";
 uint64_t g_status_since = 0;
 search_policy::LinkFailures g_direct_link_failures; // g_mutex; survives replacement searches
+uint64_t g_firewall_note_until = 0;  // g_mutex; kFirewallNote shows until then (0: not yet this run)
+bool g_own_udp_blocked = false;
+uint64_t g_last_link_failure = 0;  // g_mutex; when a connect last failed (kRetryLineMs)
+bool g_firewall_bound = false;       // g_mutex; this run has bound its own UDP port once (Windows asks then)  // g_mutex; own UDP failed twice in a row (kOwnUdpRetry); cleared on any connect
 
 // The room of the current online session. Stays open through the match for results.
 struct Room : transport::RoomState<Socket> {
@@ -1212,13 +1247,17 @@ std::unique_ptr<Room> g_room;
 std::unique_ptr<Room> g_parked_lobby;
 std::atomic<unsigned> g_update_searches{0};
 bool g_slippi_match = false;  // g_mutex; identity refresh must not switch a live Slippi match's ENet
+// g_mutex; this YouGame match plays over own UDP although the hello gave links: a seat has none (links:false,
+// a standalone copy). Set when such a match is found, cleared when a search starts or the session ends, so
+// an identity refresh mid-match never moves its ENet back onto links.
+bool g_own_udp_match = false;
 
 void select_match_transport(bool slippi) {
   g_slippi_match = slippi;
 #ifdef _WIN32
-  yg_enet_select(!slippi && g_direct);
+  yg_enet_select(!slippi && g_direct && !g_own_udp_match);
 #else
-  yg_enet_select(!slippi && g_broker);
+  yg_enet_select(!slippi && g_broker && !g_own_udp_match);
 #endif
 }
 #ifdef YOUGAME_AGENT_TEST_HOOK
@@ -1244,10 +1283,14 @@ int g_rank_local = 0;
 constexpr uint64_t kDrainMs = 30000;   // a ranked room stays open this long at most for its result
 
 std::string g_blend_reason; // guarded by g_mutex; reset for each search
+// The room's own line for a search with nobody to meet yet (rooms "searching".paused, e.g. a lone
+// standalone seat or a test build's pool). Guarded by g_mutex; reset for each search.
+std::string g_search_paused;
 void set_status(const std::string& s) {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (search_stopped()) return;
-  const std::string shown = !g_blend_reason.empty() && s == blend::kSearchBoth ? blend::kSearchYouGameOnly : s;
+  const std::string shown = !g_blend_reason.empty() && s == blend::kSearchBoth ? blend::kSearchYouGameOnly
+      : g_own_udp_blocked && s == search_policy::kLinkRetry ? std::string(search_policy::kOwnUdpRetry) : s;
   if (g_status != shown) host::log("yougame: %s", shown.c_str());
   g_status = shown;
   g_status_since = now_ms();
@@ -1602,7 +1645,11 @@ Identity fetch_identity(const std::function<bool()>& cancelled = nullptr) {
       std::lock_guard<std::mutex> lock(g_mutex);
       if (search_stopped()) return id;
       g_broker = g_stdio && mode.broker;
-      g_direct = g_stdio && mode.direct;
+      // A game the player started itself (local channel) takes direct links when the app's hello offers them:
+      // the app has the game's process and its page puts the ticket in the links pool. Without `direct` (an old
+      // app, an elevated game, a build without links) it keeps own UDP, as before. Read again on every hello.
+      g_direct = (g_stdio || via_channel) && mode.direct;
+      if (via_channel) host::log("yougame channel: hello direct=%d", mode.direct ? 1 : 0);
       select_match_transport(g_slippi_match);
     }
     if (g_stdio && mode.unsupported) throw std::runtime_error("This YouGame direct-link version is not supported");
@@ -1740,6 +1787,7 @@ void channel_closed(const std::shared_ptr<channel::Connection>& conn) {
     if (g_channel != conn) return;   // a later connection replaced it
     g_channel.reset();
     was_up = g_channel_up.exchange(false);
+    g_channel_signed_out = false;
     std::lock_guard<std::mutex> io(g_io.mutex);
     g_io.eof = true;
   }
@@ -1751,7 +1799,20 @@ void channel_closed(const std::shared_ptr<channel::Connection>& conn) {
   host::log("yougame channel: closed");
   { std::lock_guard<std::mutex> lock(g_mutex); g_identity = Identity{}; g_identity_asked = false; }
   // accountChanged: connect again (and hello) to hear the new player.
-  if (account_changed) start_channel_probe(true);
+  if (account_changed) { start_channel_probe(true); return; }
+  // Otherwise YouGame may be coming back (a tray update quits and restarts it in ~45 s, a slow Windows
+  // update longer): look every 5 s for five minutes, as yougame.h's yg_update does (YouGame PR 2355), so
+  // the player gets YouGame back without leaving the menu (A2 walk, 11-17).
+  static std::atomic<bool> looking{false};
+  if (looking.exchange(true)) return;
+  std::thread([] {
+    for (int i = 0; i < 60 && !g_channel_up.load(); ++i) {
+      std::this_thread::sleep_for(std::chrono::seconds(5));
+      start_channel_probe(true);
+    }
+    if (g_channel_up.load()) host::log("yougame channel: back after close");
+    looking = false;
+  }).detach();
 }
 // One probe: production first, then staging (Linux: three folders each). The first that connects,
 // passes the checks and answers hello is kept. One line in the log per probe.
@@ -1795,7 +1856,7 @@ bool probe_channel() {
       // hello (its reader may already have dropped it) is no host, never a channel stuck up.
       std::lock_guard<std::mutex> lock(g_channel_mutex);
       up = channel::may_promote(g_channel, conn);
-      if (up) { g_channel_up = true; g_channel_probing = false; }   // in the same section: a close
+      if (up) { g_channel_epoch.fetch_add(1); g_channel_up = true; g_channel_probing = false; }   // in the same section: a close
       // right after promotion still finds nothing probing, so its forced re-probe is never lost
     }
     if (!up) {
@@ -2658,10 +2719,16 @@ void start() {
   // whole log to stdout, which in stdio mode is the bridge. fetch_identity says which mode this is.
   try { match_hint_worker().start([](int open) { yg_match_state(open, nullptr, nullptr); }); }
   catch (...) {} // A host without resources for hints still starts the game.
+  try { game_state_worker().start(game_state_epoch, yg_game_state); }
+  catch (...) {} // Without it the button keeps its old fade; the game still starts.
 }
 
 void online_match_state(bool open) {
   match_hint_worker().set(open);
+}
+
+void report_game_state(int state) {
+  game_state_worker().set(state);
 }
 
 bool active() { return g_stdio || (!g_launcher && !g_bridge_url.empty() && !g_bridge_token.empty()); }
@@ -2831,7 +2898,7 @@ const char* tray_from(bool staging) {
 #ifdef MELEE_YOUGAME_MAC_PROD_TRAY_FROM
     return MELEE_YOUGAME_MAC_PROD_TRAY_FROM;
 #else
-    return "0.13.25";   // the first Mac YouGame that starts hidden (11-15)
+    return "0.13.25";   // the first Mac YouGame that starts hidden
 #endif
   }
   return nullptr;
@@ -2840,7 +2907,7 @@ const char* tray_from(bool staging) {
 #ifdef MELEE_YOUGAME_PROD_TRAY_FROM
   return MELEE_YOUGAME_PROD_TRAY_FROM;
 #else
-  return "0.13.25";   // the first Windows YouGame that starts hidden in the tray (11-15)
+  return "0.13.25";   // the first Windows YouGame that starts hidden in the tray
 #endif
 #endif
 }
@@ -2852,9 +2919,10 @@ int start_once(bool staging, bool quiet) {
   o.tray_from = tray_from(staging);
   return yg_start(&o);
 }
-int run_start_hook(const char* why, bool automated) {
-  bool staging = kStartStaging;
-  int r = start_once(staging, true);   // first only look
+// Only looks (quiet): which YouGame is there and whether it runs.
+int look_for_app(bool& staging) {
+  staging = kStartStaging;
+  int r = start_once(staging, true);
   if (!kStartStaging && (r == YG_START_MISSING || r == YG_START_INSTALLED)) {
     // YouGame is not running. A running (or updating) YouGame Staging is the tester's app: use it.
     // With no YouGame at all, an installed YouGame Staging is used too.
@@ -2864,6 +2932,11 @@ int run_start_hook(const char* why, bool automated) {
       r = rs;
     }
   }
+  return r;
+}
+int run_start_hook(const char* why, bool automated) {
+  bool staging = kStartStaging;
+  int r = look_for_app(staging);   // first only look
   g_app_staging = staging;
   const bool quiet = start_hook_quiet(automated);
   if ((r == YG_START_MISSING || r == YG_START_INSTALLED) && !quiet) r = start_once(staging, false);
@@ -2872,6 +2945,8 @@ int run_start_hook(const char* why, bool automated) {
   return r;
 }
 }  // namespace
+
+namespace { void reach_open(); }
 
 void start_hook_at_boot(bool automated) {
   // The app started this game (its rows are open from the start), or a build without the hook.
@@ -2907,31 +2982,11 @@ void open_get_page() {
   host::log(ok ? "yougame: Get YouGame picked: download page opened" : "yougame: Get YouGame picked: download page could not be opened");
 }
 void first_row_picked() {
-#if defined(_WIN32) || defined(__APPLE__)
-  // Ranked, Unranked or Friends before YouGame was connected: YouGame's start hook, off the game's
-  // frame, then look for YouGame's channel every second for a minute (the Online menu keeps looking
-  // after that and continues into the row once the rows open).
-  std::thread([] {
-    bool idle = false;
-    if (!g_app_opening.compare_exchange_strong(idle, true)) return;   // one at a time
-    run_start_hook("online row picked", false);
-    for (int i = 0; i < 60 && !g_channel_up.load(); ++i) {
-      start_channel_probe(true);
-      std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-    if (g_channel_up.load()) host::log("yougame: YouGame answered");
-    g_app_opening = false;
-  }).detach();
-  return;
-#endif
-  // Off the game's frame: an installed app is opened, otherwise the download page.
-  std::thread([] {
-    if (app_installed_now()) {
-      if (!open_app("first row") && g_app_stale.load()) open_get_page();   // the open failed: the page instead
-    } else {
-      open_get_page();
-    }
-  }).detach();
+  // Ranked, Unranked or Friends before YouGame was connected: the "Play online with YouGame" panel
+  // says why and offers Open or Get YouGame (reach_open, with the sign-in panel's code below). The
+  // menu still continues into the row once YouGame answers.
+  if (g_channel_up.load()) return;
+  reach_open();
 }
 const char* first_row_text() {
   if (g_app_opening.load()) return "Opening YouGame...";
@@ -3066,6 +3121,215 @@ std::vector<std::string> take_box_commands() {
   return commands;
 }
 #endif
+
+// ------------------------------------------------------------------ sign in by code (yougame_signin.h)
+// The local channel's app is signed out: a YouGame row picked opens the panel (signin_overlay.cpp),
+// which asks the app for a code (contract section 8). Asks run on their own threads, never the frame.
+namespace {
+std::mutex g_signin_mutex;
+signin::Model g_signin;                       // g_signin_mutex
+std::atomic<bool> g_signin_rehello{false};    // the hello after signedIn is on its way
+const char* ask_name(signin::Ask a) { return a == signin::Ask::Code ? "code" : "browser"; }
+// signedIn or alreadySignedIn: say hello again (the identity ask), then tell the panel who came back.
+void sign_in_rehello() {
+  if (g_signin_rehello.exchange(true)) return;
+  std::thread([] {
+    player_arrived();   // the identity is asked again now; an ask in flight runs once more
+    for (int i = 0; i < 400 && g_identity_fetching.load(); ++i) Sleep(50);
+    Identity id;
+    { std::lock_guard<std::mutex> lock(g_mutex); id = g_identity; }
+    host::log("yougame sign-in: hello again: %s", id.ok ? "player" : "no player yet");
+    { std::lock_guard<std::mutex> lock(g_signin_mutex); g_signin.rehello_result(id.ok, id.name, now_ms()); }
+    g_signin_rehello = false;
+  }).detach();
+}
+// One ask, then whatever its answer asks next (badRequest: the browser). The user code never goes in the log.
+void sign_in_send(signin::Ask ask) {
+  if (ask == signin::Ask::None) return;
+  std::thread([ask] {
+    for (signin::Ask next = ask; next != signin::Ask::None;) {
+      const signin::Ask asked = next;
+      json answer;
+      try { answer = bridge_channel(asked == signin::Ask::Code ? signin::code_request() : signin::browser_request(), 15000); }
+      catch (const std::exception&) { answer = json(); }
+      if (!answer.is_object()) host::log("yougame sign-in: %s asked: no answer", ask_name(asked));
+      else if (signin::true_of(answer, "ok")) {
+        const json result = answer.count("result") && answer["result"].is_object() ? answer["result"] : json::object();
+        host::log("yougame sign-in: %s asked: ok, where %.16s%s", ask_name(asked), channel::log_text(signin::text_of(result, "where")).c_str(),
+                  result.count("code") && result["code"].is_object() ? ", code shown" : "");
+      } else {
+        const std::string code = ranked::str(answer, "code");
+        host::log("yougame sign-in: %s asked: refused %.24s", ask_name(asked), channel::log_text(code.empty() ? "no code" : code).c_str());
+      }
+      bool rehello = false;
+      {
+        std::lock_guard<std::mutex> lock(g_signin_mutex);
+        try { next = g_signin.answered(asked, answer, now_ms()); }
+        catch (const std::exception&) { next = g_signin.answered(asked, json(), now_ms()); }   // read as no answer
+        rehello = g_signin.take_rehello();
+      }
+      if (rehello) sign_in_rehello();
+    }
+  }).detach();
+}
+void sign_in_push(const json& push) {
+  bool took, rehello;
+  {
+    std::lock_guard<std::mutex> lock(g_signin_mutex);
+    try { took = g_signin.push(push, now_ms()); } catch (const std::exception&) { took = false; }
+    rehello = g_signin.take_rehello();
+  }
+  if (took) host::log("yougame sign-in: push %.16s", channel::log_text(signin::text_of(push, "type")).c_str());
+  if (rehello) sign_in_rehello();
+}
+}  // namespace
+
+// ------------------------------------------------------------------ "Play online with YouGame" (signin::Reach)
+// Drawn by the sign-in panel: sign_in_showing, sign_in_view and sign_in_press serve it first.
+namespace {
+std::mutex g_reach_mutex;
+signin::Reach g_reach;                        // g_reach_mutex
+std::atomic<bool> g_reach_busy{false};        // a look or an Open in flight
+// Looks for YouGame's channel every second; true once it answered.
+bool reach_wait_for_channel(int seconds) {
+  for (int i = 0; i < seconds && !g_channel_up.load(); ++i) {
+    start_channel_probe(true);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+  }
+  for (int i = 0; i < 6 && g_channel_probing.load() && !g_channel_up.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  return g_channel_up.load();
+}
+void reach_open() {
+  bool admin = false;
+#ifdef _WIN32
+  admin = yg__start_raised() != 0;   // YouGame is never started from a game run as administrator
+#endif
+  {
+    std::lock_guard<std::mutex> lock(g_reach_mutex);
+    if (g_reach.is_open()) return;
+    g_reach.open(admin);
+  }
+  host::log("yougame: online row picked, no YouGame connected%s", admin ? ": run as administrator" : "");
+  if (admin) return;
+  bool idle = false;
+  if (!g_reach_busy.compare_exchange_strong(idle, true)) return;
+  std::thread([] {
+    bool staging = kStartStaging;
+    const int r = look_for_app(staging);
+    const bool known = r != YG_START_UNAVAILABLE;
+    const bool running = r == YG_START_RUNNING || r == YG_START_UPDATING;
+    const bool installed = known ? r == YG_START_INSTALLED : app_installed_now();   // Linux: the link type
+    if (known) g_app_staging = staging;
+    { std::lock_guard<std::mutex> lock(g_reach_mutex); g_reach.looked(running, installed); }
+    host::log("yougame: looked for YouGame: %s", running ? "running" : installed ? "installed, not running" : "not on this computer");
+    if (running && !reach_wait_for_channel(25)) {
+      std::lock_guard<std::mutex> lock(g_reach_mutex);
+      g_reach.open_failed(signin::kNoAnswer);
+    }
+    g_reach_busy = false;
+  }).detach();
+}
+// Open YouGame: the start hook's own open (the verified app, hidden in the tray, or its small window),
+// the app's link on Linux; then 25 s for its channel.
+void reach_open_app() {
+  bool idle = false;
+  if (!g_reach_busy.compare_exchange_strong(idle, true)) return;
+  { std::lock_guard<std::mutex> lock(g_reach_mutex); g_reach.opening(); }
+  std::thread([] {
+#if defined(_WIN32) || defined(__APPLE__)
+    g_app_opening = true;
+    const int r = run_start_hook("Open YouGame pressed", false);
+    const bool asked = r == YG_START_OPENED || r == YG_START_RUNNING;
+#else
+    const bool asked = open_app("Open YouGame pressed") || g_app_opening.load();
+#endif
+    const bool up = asked && reach_wait_for_channel(25);
+#if defined(_WIN32) || defined(__APPLE__)
+    g_app_opening = false;
+#endif
+    host::log(up ? "yougame: Open YouGame: YouGame answered" : "yougame: Open YouGame: YouGame did not answer");
+    {
+      std::lock_guard<std::mutex> lock(g_reach_mutex);
+      if (up) g_reach.close();
+      else g_reach.open_failed(signin::kDidntOpen);
+    }
+    g_reach_busy = false;
+  }).detach();
+}
+void reach_press(signin::Button button) {
+  switch (button) {
+    case signin::Button::OpenApp: reach_open_app(); break;
+    case signin::Button::GetApp: {
+      open_get_page();   // https://yougame.co/desktop (a staging test build: staging's page)
+      std::lock_guard<std::mutex> lock(g_reach_mutex);
+      g_reach.page_opened();
+      break;
+    }
+    case signin::Button::Back: {
+      std::lock_guard<std::mutex> lock(g_reach_mutex);
+      g_reach.close();
+      host::log("yougame: Play online with YouGame: Back");
+      break;
+    }
+    default: break;
+  }
+}
+bool reach_showing() {
+  std::lock_guard<std::mutex> lock(g_reach_mutex);
+  return g_reach.is_open();
+}
+// The panel's view, or false when it is closed (closing it once YouGame answered).
+bool reach_view(signin::View& out) {
+  if (!reach_showing()) return false;
+  // A YouGame the player opens by hand is found too: a look every 2 s while the panel is up (never waits).
+  static std::atomic<uint64_t> looked_at{0};
+  const uint64_t now = now_ms();
+  if (now - looked_at.load() > 2000) { looked_at = now; start_channel_probe(true); }
+  std::lock_guard<std::mutex> lock(g_reach_mutex);
+  if (!g_reach.is_open()) return false;
+  if (g_channel_up.load()) { g_reach.close(); return false; }
+  out = g_reach.view();
+  return true;
+}
+}  // namespace
+
+bool sign_in_needed() {
+  if (g_stdio || !g_channel_allowed || !g_channel_up.load() || !g_channel_signed_out.load()) return false;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  return !g_identity.ok;
+}
+void sign_in_open() {
+  signin::Ask ask;
+  { std::lock_guard<std::mutex> lock(g_signin_mutex); ask = g_signin.open(now_ms()); }
+  host::log("yougame sign-in: panel opened%s", ask == signin::Ask::None ? "" : ", asking for a code");
+  sign_in_send(ask);
+}
+bool sign_in_showing() {
+  if (reach_showing()) return true;
+  std::lock_guard<std::mutex> lock(g_signin_mutex);
+  return g_signin.is_open();
+}
+void sign_in_view(signin::View& out) {
+  if (reach_view(out)) return;
+  Identity id;
+  { std::lock_guard<std::mutex> lock(g_mutex); id = g_identity; }
+  signin::Ask ask;
+  {
+    std::lock_guard<std::mutex> lock(g_signin_mutex);
+    const uint64_t now = now_ms();
+    if (id.ok) g_signin.player_known(id.name, now);
+    ask = g_signin.tick(now);
+    out = g_signin.view(now);
+  }
+  sign_in_send(ask);
+}
+void sign_in_press(signin::Button button) {
+  if (reach_showing()) { reach_press(button); return; }
+  signin::Ask ask;
+  { std::lock_guard<std::mutex> lock(g_signin_mutex); ask = g_signin.press(button, now_ms()); }
+  if (button == signin::Button::Back) host::log("yougame sign-in: Back");
+  sign_in_send(ask);
+}
 
 void refresh_identity() {
   if (g_identity_fetching.exchange(true)) return;
@@ -3290,6 +3554,41 @@ std::string status_line() {
   return g_update_notice.available() ? update::kMessage : g_status;
 }
 
+// One row over the character select: printable text only, "…" as "..." (the overlay font has no
+// ellipsis), at most kPausedMax bytes cut on a UTF-8 boundary. An empty or missing paused clears it.
+std::string paused_line(const std::string& raw) {
+  constexpr size_t kPausedMax = 72;
+  std::string out;
+  for (size_t i = 0; i < raw.size(); ++i) {
+    const unsigned char c = (unsigned char)raw[i];
+    if (c == 0xE2 && i + 2 < raw.size() && (unsigned char)raw[i + 1] == 0x80 && (unsigned char)raw[i + 2] == 0xA6) {
+      out += "..."; i += 2;
+    } else if (c >= 0x20 && c != 0x7F) out += (char)c;
+  }
+  if (out.size() > kPausedMax) {
+    size_t cut = kPausedMax;
+    while (cut > 0 && ((unsigned char)out[cut] & 0xC0) == 0x80) --cut;
+    out.resize(cut);
+  }
+  return out;
+}
+
+void set_search_paused(const std::string& raw) {
+  const auto line = paused_line(raw);
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (search_stopped() || line == g_search_paused) return;
+  host::log("yougame: search paused line: %s", line.empty() ? "(none)" : line.c_str());
+  g_search_paused = line;
+}
+
+std::string search_paused_line() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  if (!g_search_paused.empty()) return g_search_paused;
+  // The firewall note takes the search line's place while the run's first own UDP port is new.
+  return g_firewall_note_until && now_ms() < g_firewall_note_until && !search_stopped()
+      ? std::string(search_policy::kFirewallNote) : std::string();
+}
+
 std::string slippi_link_status(const std::string& status) {
   std::lock_guard<std::mutex> lock(g_mutex);
   if (status == blend::kSearchYouGameOnly && !g_blend_reason.empty()) return status + "\n" + g_blend_reason;
@@ -3411,7 +3710,7 @@ bool lobby_parked() {
 uint64_t begin_search(bool keep_lobby) {
   const auto epoch = close_room(keep_lobby ? Leave::Next : Leave::Quit);
   std::lock_guard<std::mutex> lock(g_mutex);
-  if (g_search_generation.current(epoch)) g_blend_reason.clear();
+  if (g_search_generation.current(epoch)) { g_blend_reason.clear(); g_search_paused.clear(); }
   return epoch;
 }
 
@@ -3434,6 +3733,7 @@ bool prepare_slippi_match(const std::function<bool()>& cancelled, uint64_t epoch
     if (cancelled()) return false;
   std::lock_guard<std::mutex> lock(g_mutex);
   if (!g_search_generation.current(epoch) || cancelled()) return false;
+  g_own_udp_match = false;
   select_match_transport(true);
   yg_enet_enable(0);
 #ifdef YOUGAME_AGENT_TEST_HOOK
@@ -3531,6 +3831,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
                             ? "Sign in to YouGame to play Ranked." : me.error);
   { std::lock_guard<std::mutex> lock(g_mutex);
     if (cancelled()) { Match out; out.error = "Cancelled"; return out; }
+    g_own_udp_match = false;
     select_match_transport(false);
   }
 #ifndef _WIN32
@@ -3618,7 +3919,10 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   // The base listing's Unranked says which pools it searches (yougame_blend.h kSearch*).
   const std::string searching = search.status.empty() ? std::string("searching") : search.status;
   bool repeated_link_failure;
-  { std::lock_guard<std::mutex> lock(g_mutex); repeated_link_failure = g_direct_link_failures.repeated(); }
+  { std::lock_guard<std::mutex> lock(g_mutex);
+    // Only the automatic re-search right after a failure, and never Direct (it never looks for another).
+    repeated_link_failure = !direct && g_direct_link_failures.repeated() &&
+        now_ms() - g_last_link_failure < search_policy::kRetryLineMs; }
   set_status(doubles_home ? std::string(lobby::kDoublesWaiting) : lobby_match ? std::string(lobby::kWaiting) : team_code ? friends::kTeamWaiting : friends_mode ? friends::kWaiting :
              repeated_link_failure ? search_policy::kLinkRetry : searching);
   // The lobby's next match: the room parked after the last one (close_room(Leave::Next)), with its socket,
@@ -3819,6 +4123,8 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       const std::string t = m.value("t", "");
       if (!cancelled() && t == "searching" && search.on_searching && m.count("waiting") && m["waiting"].is_number_integer())
         search.on_searching((int)std::clamp<int64_t>(m["waiting"].get<int64_t>(), 0, 1000000));
+      if (!cancelled() && t == "searching")
+        set_search_paused(m.count("paused") && m["paused"].is_string() ? m["paused"].get<std::string>() : std::string());
       if (t == "matched" && m.count("room") && m["room"].is_string()) {
         room_code = m["room"].get<std::string>();
         if (blend && !search.claim()) { decline(); return fail("Cancelled"); }
@@ -3928,8 +4234,18 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     return fail("Cancelled");
   }
 
-  const bool links_mode = g_direct;
-  const auto requested_port = udp::port(links_mode ? nullptr : std::getenv("YOUGAME_UDP_PORT"));
+  // Direct links when the hello gave them, unless a seat in the room has none (links:false, a standalone copy):
+  // then the whole match plays over own UDP + STUN, every seat alike (the pool merge, 11-17). Decided again
+  // whenever the roster changes; the own socket opens only when a match needs it.
+  const bool links_hello = g_direct;
+  bool links_mode = links_hello;
+  // Own sockets: always on Windows (an app-started seat's sandbox may still have no network: then the punch
+  // fails and Unranked searches again); never under a Unix broker, whose sandbox has no sockets at all.
+#ifdef _WIN32
+  const bool own_udp_allowed = true;
+#else
+  const bool own_udp_allowed = !g_broker;
+#endif
   uint16_t bound_port = search.udp_port;
   udp::Ingress ingress(&udp::own_udp_drops);
   SOCKET udp = INVALID_SOCKET;
@@ -3938,15 +4254,29 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
 #ifndef _WIN32
   if (g_broker && !links_mode) return fail("YouGame broker requires direct links v1 (1200-byte datagrams)");
 #endif
-  if (!links_mode) {
+  // Binds the own UDP port, then STUN (up to ~3 s) and the LAN address. Empty on success, else the message.
+  const auto open_own_udp = [&]() -> std::string {
+    const auto requested_port = udp::port(std::getenv("YOUGAME_UDP_PORT"));
     if (!requested_port.valid) {
       host::log("%s", udp::port_error(requested_port, "invalid decimal port").c_str());
-      return fail("The own UDP port is unavailable");
+      return "The own UDP port is unavailable";
     }
+#ifdef _WIN32
+    { std::lock_guard<std::mutex> lock(g_mutex);   // once per run: the first bind is when Windows asks
+      // The note shows where the search line can carry it (plain or YouGame-only search); a blend search,
+      // Friends or a lobby shows its own line, so their first bind passes without it.
+      if (!g_firewall_bound) {
+        g_firewall_bound = true;
+        if (g_status == "searching" || g_status == blend::kSearchYouGameOnly) {
+          g_firewall_note_until = now_ms() + search_policy::kFirewallNoteMs;
+          host::log("yougame: first own UDP port this run: showing the firewall note");
+        } else host::log("yougame: first own UDP port this run: no firewall note under \"%s\"", g_status.c_str());
+      } }
+#endif
     udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (udp == INVALID_SOCKET) {
       if (requested_port.set) host::log("%s", udp::port_error(requested_port, "socket creation failed").c_str());
-      return fail("Could not open the network port");
+      return "Could not open the network port";
     }
     sockaddr_in bind_addr{};
     bind_addr.sin_family = AF_INET;
@@ -3954,17 +4284,22 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       bind_addr.sin_port = htons(p); // zero-initialized INADDR_ANY: all interfaces
       return bind(udp, (sockaddr*)&bind_addr, sizeof bind_addr) == 0;
     }, [](const char* message) { host::log("%s", message); }))
-      return fail("The network port is in use");
+      return "The network port is in use";
     SocketLength length = sizeof bind_addr;
     if (getsockname(udp, (sockaddr*)&bind_addr, &length) != 0 ||
         (requested_port.set && ntohs(bind_addr.sin_port) != requested_port.value)) {
       if (requested_port.set) host::log("%s", udp::port_error(requested_port, "bound port check failed").c_str());
-      return fail("The own UDP port is unavailable");
+      return "The own UDP port is unavailable";
     }
     bound_port = ntohs(bind_addr.sin_port);
     if (!stun(udp, external, cancelled)) host::log("yougame: STUN unavailable");
     lan_addr = udp::lan_candidate(std::getenv("YOUGAME_HOST_LAN_IP"), bound_port, lan_ip,
         [](const char* message) { host::log("%s", message); });
+    return "";
+  };
+  if (!links_mode) {
+    const std::string why = open_own_udp();
+    if (!why.empty()) return fail(why);
   }
   if (cancelled()) return fail("Cancelled");
   // Seat 0 names the match: Slippi's match id slot and replays get this, never the room's code.
@@ -4048,9 +4383,15 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     early.links.by_peer = std::move(adopted_links);
     reopen_seated = true;
   }
-  // Idempotent once per run. The app refuses every directOpen until the game has attached.
+  // Once per app connection. The app refuses every directOpen until the game has attached. A copy the
+  // player started itself can outlive the app (a tray update, a crash): the old section may still read
+  // live, so a new channel connection (g_channel_epoch) attaches again to the new app's section.
   const auto attach_links = [&] {
-    if (yg_enet_channel_ready()) return;
+    // A copy the app launched (stdio) shares the app's life, so its one attach stays good.
+    const uint64_t epoch = g_channel_epoch.load();
+    bool same_app;
+    { std::lock_guard<std::mutex> lock(g_mutex); same_app = g_stdio || g_links_epoch == epoch; }
+    if (same_app && yg_enet_channel_ready()) return;
     json h = bridge({{"type", "directAttach"}}, 10000, cancelled);
     std::lock_guard<std::mutex> lock(g_mutex);
     if (cancelled()) throw std::runtime_error("Cancelled");
@@ -4063,7 +4404,32 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     if (!transport::posix_attachment(h, p) || yg_enet_attach_posix(p.section, p.wake, p.wait, p.size))
       throw std::runtime_error("Could not attach YouGame POSIX direct links");
 #endif
+    g_links_epoch = epoch;
   };
+  // The room's roster decides links or own UDP for every seat alike (links_hello seats only; a seat without
+  // links never had a choice). A change restarts the address exchange in the new shape; a lobby back on
+  // links attaches and opens its seated friends' links again.
+  const auto decide_transport = [&] {
+    if (!links_hello) return;
+    const bool want = !transport::any_seat_without_links(participants);
+    if (want == links_mode) return;
+    links_mode = want;
+    cands.clear();
+    sent_at.clear();
+    if (!links_mode) {
+      host::log("yougame: a seat has no YouGame links: this match plays over own UDP%s",
+                own_udp_allowed ? "" : ", which this copy can't open");
+      return;
+    }
+    host::log("yougame: every seat has YouGame links again: back to direct links");
+    if (lobby_route) {
+      reopen_seated = true;
+      try { attach_links(); }
+      catch (const update::Required&) { throw; }
+      catch (const std::exception& e) { host::log("yougame: direct attach in the lobby failed: %s", e.what()); }
+    }
+  };
+  decide_transport();
   // A lobby opens each friend's link when they take a seat, so attach first: a game whose first online
   // mode this run is the lobby was refused no_direct there while a host already attached waited on it.
   if (links_mode && lobby_route) {
@@ -4114,7 +4480,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
           friends::events.room_seen(room_code, kind);
         } else if (t == "welcome" && !welcome_at) welcome_at = std::max<uint64_t>(now_ms(), 1);
       }
-      if (m.count("participants") && m["participants"].is_array()) participants = m["participants"];
+      if (m.count("participants") && m["participants"].is_array()) { participants = m["participants"]; decide_transport(); }
       read_roster(*room, m);
       if (doubles_home && (t == "lobby" || t == "welcome") && party.observe(m) && !party.generation.empty() &&
           party.generation != queue_generation)
@@ -4440,6 +4806,17 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       begin_sent = now_ms();
     }
 #endif
+    // A links seat in a match with a seat that has none: its own socket, STUN and LAN address, once.
+    if (full && !links_mode && udp == INVALID_SOCKET) {
+      if (!own_udp_allowed) {
+        host::log("yougame: a seat has no YouGame links and this copy has no sockets of its own (the app's broker)");
+        if (!lobby_session) room->socket->send({{"t", "leave"}});
+        return fail("This opponent's game can't connect through the YouGame app yet", !direct);
+      }
+      const std::string why = open_own_udp();
+      if (!why.empty()) return fail(why, !direct);
+      if (cancelled()) return fail("Cancelled");
+    }
     // My addresses, point to point, each peer with a token of its own.
     if (full) {
       for (auto& p : active) {
@@ -4496,6 +4873,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     if (peer.port == 1) match_id = c.value("match", "");
     peers.push_back(peer);
   }
+  const uint64_t connect_start = now_ms();   // linkReport's ms
   if (links_mode) {
     try {
       // Idempotent once per run. Mapping stays alive across matches; only the host owns ring I/O.
@@ -4562,8 +4940,11 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       { std::lock_guard<std::mutex> lock(g_mutex);
         if (cancelled()) { Match out; out.error = "Cancelled"; return out; }
         if (linked) g_direct_link_failures.successful();
+        g_own_udp_blocked = false;   // links relay: this failure is not the player's firewall
+        g_last_link_failure = now_ms();
         repeated = g_direct_link_failures.failed(failed_participants, room->me);
       }
+      room->socket->send(transport::link_report(false, "links", now_ms() - connect_start, false));
       // The lobby never looks for another opponent (g_lobby_search: no retry), so it never says it does.
       return fail(repeated && !lobby_match ? search_policy::kLinkRetry : search_policy::kLinkFailed,
                   transport::retry_link_failure(search.mode));
@@ -4571,15 +4952,44 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   } else if (!punch(udp, my_seat + 1, peers, ingress, cancelled)) {
     if (cancelled()) return fail("Cancelled");
     host::log("yougame: connect failed (own UDP): my STUN %s, my LAN %s", external.empty() ? "none" : "ok", lan_addr.empty() ? "none" : "ok");
-    // Unranked searches again, as Slippi does when a found opponent cannot be reached.
-    return fail("Could not connect to your opponent directly", !direct);
+    // Unranked searches again, as Slippi does when a found opponent cannot be reached. The second failure in
+    // a row with the same opponent says so on screen, with what to try (own UDP has no relay to fall back on).
+    bool repeated;
+    { std::lock_guard<std::mutex> lock(g_mutex);
+      if (cancelled()) { Match out; out.error = "Cancelled"; return out; }
+      // Only the seats that never answered count, as on the links path.
+      json unreached = json::array();
+      for (const auto& p : participants) {
+        if (p.value("connectionId", "") == room->me) continue;
+        for (const auto& peer : peers)
+          if (peer.port == p.value("slot", -1) + 1 && !(peer.found && peer.acked)) unreached.push_back(p);
+      }
+      g_last_link_failure = now_ms();
+      repeated = g_direct_link_failures.failed(unreached, room->me);
+      if (repeated) g_own_udp_blocked = true;
+    }
+    room->socket->send(transport::link_report(false, "none", now_ms() - connect_start, true));
+    if (repeated) host::log("yougame: own UDP failed twice with this opponent: showing the firewall line");
+    return fail(repeated && !direct && !lobby_match ? search_policy::kLinkRetry : search_policy::kLinkFailed, !direct);
   }
 
   if (cancelled()) return fail("Cancelled");
   { std::lock_guard<std::mutex> lock(g_mutex);
     if (!cancelled()) g_direct_link_failures.successful();
+    if (!cancelled()) g_own_udp_blocked = false;
+    // The match's ENet takes native sockets (slippi_net: own_udp is !yg_enet_selected()) until the next
+    // search or the session's end, whatever an identity refresh selects meanwhile.
+    if (!cancelled() && links_hello && !links_mode) { g_own_udp_match = true; select_match_transport(g_slippi_match); }
   }
-  host::log("yougame: transport %s", links_mode ? "YouGame direct links" : "own UDP");
+  room->socket->send(transport::link_report(true, links_mode ? std::string("links")
+      : peers.empty() ? std::string("none") : std::string(answered_via(peers.front(), peers.front().chosen)),
+      now_ms() - connect_start, !links_mode, links_mode ? transport::links_path(room->links.ids, [](unsigned id) {
+        std::lock_guard<std::mutex> lock(g_link_mutex);
+        const auto it = g_link_routes.find(id);
+        return it == g_link_routes.end() ? std::string() : it->second;
+      }) : std::string()));
+  host::log("yougame: transport %s", links_mode ? "YouGame direct links"
+            : links_hello ? "own UDP (a seat has no YouGame links)" : "own UDP");
   Match out;
   out.ok = true;
   out.udp_port = links_mode ? 0 : bound_port;
@@ -4661,7 +5071,9 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   g_pending_input_roster = {};
 #endif
   friends_setup.keep = true;
-  early.keep = true;   // the match's links now belong to the room
+  // The match's links now belong to the room. An own UDP match closes any a lobby opened before a seat
+  // without links came in (three slots: none may linger).
+  early.keep = links_mode;
   raw->pump = std::thread(pump_room, raw);
   return out;
   } catch (const update::Required&) {
@@ -4925,7 +5337,7 @@ uint8_t local_rank() {
 void end_session(Leave why) {
   online_match_state(false);
   close_room(why);
-  { std::lock_guard<std::mutex> lock(g_mutex); select_match_transport(false); }
+  { std::lock_guard<std::mutex> lock(g_mutex); g_own_udp_match = false; select_match_transport(false); }
   set_status("offline");
 }
 

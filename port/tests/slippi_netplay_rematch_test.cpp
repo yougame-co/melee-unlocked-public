@@ -1,6 +1,7 @@
 // Four real loopback clients: every opponent must discard its previous game's
 // input queue and accept the new match's confirmed input numbering.
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <enet/enet.h>
 #include "slippi_net.h"
 #include <chrono>
 #include <cstdio>
@@ -28,6 +29,25 @@ void select(NetplayClient& client, int player, int round) {
   s.stage_id = 31; s.rng_offset = 100 + round;
   client.SetMatchSelections(s);
 }
+// Four consecutive UDP ports nobody holds. The test used 51970 to 51973 every time, so a second copy
+// running at once (the two Windows builds' ctest side by side) failed to connect.
+uint16_t free_base() {
+  const uint32_t seed = (uint32_t)std::chrono::steady_clock::now().time_since_epoch().count();
+  for (uint32_t attempt = 0; attempt < 64; ++attempt) {
+    const uint16_t base = (uint16_t)(42000u + ((seed + attempt * 7919u) % 3800u) * 4u);
+    ENetSocket socks[4] = {ENET_SOCKET_NULL, ENET_SOCKET_NULL, ENET_SOCKET_NULL, ENET_SOCKET_NULL};
+    int bound = 0;
+    for (int j = 0; j < 4; ++j) {
+      socks[j] = enet_socket_create(ENET_SOCKET_TYPE_DATAGRAM);
+      ENetAddress a; a.host = ENET_HOST_ANY; a.port = (enet_uint16)(base + j);
+      if (socks[j] == ENET_SOCKET_NULL || enet_socket_bind(socks[j], &a) != 0) break;
+      ++bound;
+    }
+    for (ENetSocket s : socks) if (s != ENET_SOCKET_NULL) enet_socket_destroy(s);
+    if (bound == 4) return base;
+  }
+  return 51970;
+}
 void send(NetplayClient& client, int player, int frame, int round) {
   auto pad = std::make_unique<Pad>(frame);
   std::memset(pad->buf, round * 16 + player, PAD_DATA_SIZE);
@@ -38,7 +58,7 @@ int main() {
   try {
     require(enet_ready(), "ENet initialization");
     std::unique_ptr<NetplayClient> clients[4];
-    constexpr uint16_t base = 51970;
+    const uint16_t base = free_base();
     for (int i = 0; i < 4; ++i) {
       std::vector<std::string> addresses(3, "127.0.0.1");
       std::vector<uint16_t> ports;

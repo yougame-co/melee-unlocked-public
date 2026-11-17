@@ -9,8 +9,13 @@ ROOT = Path(__file__).resolve().parents[2]
 class MatchStateWiring(unittest.TestCase):
     def test_native_headers_are_the_supplied_0b5798f46_copies(self):
         for name, digest in {
-            'yougame_start.h': '2e0ba3ca0b2372bd103b23008bba98f3b682936b66af23c795cafc454c4956a1',
-            'yougame.h': '67f9e2053e91ba00b95e2821437a675d46c5d68caf82c9ec378454e65acab34e',
+            # 106: MU's copy adds Open YouGame and the administrator text to the start window.
+            # 113: merged with YouGame 823c0f3ce (window to the front, taskbar flash, no "smaller helper").
+            # 113: the administrator window offers only OK (YouGame is installed there, Get YouGame can't help).
+            # 115: both headers verbatim from YouGame v2 a678bb7b (MU's Open YouGame and one-OK window upstreamed).
+            # 114: YouGame v2 6db35802e raised rule (UAC off / Windows Sandbox: an elevated game whose shell is the same elevated user starts YouGame).
+            'yougame_start.h': 'd2692569763facbb3535dd57777a81f52b9fd259c9aaecc900f676ce9e012e91',
+            'yougame.h': 'f0796dd3ab37c6cc6ae96c554458f6638cadeff7268962d99da54baf9b9839de',
         }.items():
             self.assertEqual(hashlib.sha256((ROOT / 'port/third_party/yougame_start' / name).read_bytes()).hexdigest(), digest)
 

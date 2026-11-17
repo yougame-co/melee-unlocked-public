@@ -70,7 +70,10 @@ struct ItemFrame {
 struct GameInfo {
   uint16_t stage = 0;
   bool teams = false;
-  struct Port { bool present = false; uint8_t external = 0, team = 0, shade = 0; } ports[4];
+  // The match's time limit in seconds (game start 0x15), and whether the timer counts down.
+  uint32_t timer_start = 0;
+  bool timer_on = false;
+  struct Port { bool present = false; uint8_t external = 0, team = 0, shade = 0; std::string name; } ports[4];
 };
 
 // One collision line of the stage as the game has it this frame (world units, y up).
@@ -109,6 +112,9 @@ bool g_in_match = false;
 std::atomic<int> g_fighter_style{0}, g_stage_style{0};   // set_style
 ImFont* g_hud_font = nullptr;   // set_hud_font
 uint64_t g_match_serial = 0;   // bumps each game start, so the camera starts fresh
+// The replay being played on the Source Port: its players' names (set_replay_names).
+std::mutex g_replay_names_mutex;
+std::string g_replay_names[4];
 std::chrono::steady_clock::time_point g_last_commit{};
 
 // ---- Character packs (tools/build_lab_assets.py) ----
@@ -131,11 +137,20 @@ constexpr int kCharacters = 27;
 std::mutex g_pack_mutex;
 std::shared_ptr<Pack> g_packs[kCharacters];
 std::atomic<int> g_pack_state[kCharacters];   // 0 not requested, 1 loading, 2 ready, 3 unavailable
+std::atomic<void (*)(const std::string&)> g_missing_handler{nullptr};
+std::atomic<bool> g_missing_reported{false};
+std::mutex g_notice_mutex;
+std::string g_notice;
 
 std::shared_ptr<Pack> load_pack(int id) {
   const std::string path = host::options.lab_dir + "/" + std::to_string(id) + ".lab";
   FILE* f = std::fopen(path.c_str(), "rb");
-  if (!f) { host::log("lab: no silhouettes for character %d (%s); run tools/build_lab_assets.py", id, path.c_str()); return nullptr; }
+  if (!f) {
+    host::log("lab: no silhouettes for character %d (%s)", id, path.c_str());
+    // The packs are a download of their own: ask the host for them once.
+    if (auto handler = g_missing_handler.load()) if (!g_missing_reported.exchange(true)) handler(host::options.lab_dir);
+    return nullptr;
+  }
   std::vector<uint8_t> b;
   std::fseek(f, 0, SEEK_END); long n = std::ftell(f); std::fseek(f, 0, SEEK_SET);
   b.resize(n > 0 ? (size_t)n : 0);
@@ -206,6 +221,27 @@ const int8_t kInternalByExternal[26][2] = {
 constexpr uint8_t kFox = 1, kFalco = 22;
 
 // ---- Event intake (simulation thread) ----
+
+std::string sjis_text(const uint8_t* p, size_t max) {
+  std::string out;
+  for (size_t i = 0; i < max && p[i];) {
+    const uint8_t a = p[i];
+    if (a < 0x80) { out += (char)a; ++i; continue; }
+    if (i + 1 >= max) break;
+    const uint8_t b = p[i + 1];
+    if (a == 0x82 && b >= 0x4F && b <= 0x58) out += (char)('0' + b - 0x4F);
+    else if (a == 0x82 && b >= 0x60 && b <= 0x79) out += (char)('A' + b - 0x60);
+    else if (a == 0x82 && b >= 0x81 && b <= 0x9A) out += (char)('a' + b - 0x81);
+    else if (a == 0x81 && b == 0x40) out += ' ';
+    else if (a == 0x81 && b == 0x94) out += '#';
+    else if (a == 0x81 && b == 0x44) out += '.';
+    else if (a == 0x81 && b == 0x5B) out += '-';
+    else if (a == 0x81 && b == 0x48) out += '?';
+    else if (a == 0x81 && b == 0x49) out += '!';
+    i += 2;
+  }
+  return out;
+}
 
 void begin_frame(int32_t number) {
   if (g_building.number == number) return;
@@ -384,7 +420,8 @@ static bool fight_scene(const gx::Frame& scene) {
   return !vs || scene.scene_minor == 2;
 }
 
-void native_frame(const MuLookSnapshot& snapshot, const MuLookItems* items) {
+void native_frame(const MuLookSnapshot& snapshot, const MuLookItems* items, const MuLookExtras* extras,
+                  const std::string* names) {
   gx::Frame scene;
   scene.scene_major = (uint8_t)snapshot.major;
   scene.scene_minor = (uint8_t)snapshot.minor;
@@ -403,12 +440,33 @@ void native_frame(const MuLookSnapshot& snapshot, const MuLookItems* items) {
     }
     g_info.stage = (uint16_t)snapshot.stage;
     g_info.teams = snapshot.teams != 0;
+    g_info.timer_start = extras ? (uint32_t)std::max(0, extras->time_limit_seconds) : 0;
+    g_info.timer_on = extras && extras->timer_on && extras->time_limit_seconds > 0;
+    {   // one line a match: what the HUD's timer is going by
+      static uint64_t logged = 0;
+      if (logged != g_match_serial && extras) {
+        logged = g_match_serial;
+        host::log("lab view: Source Port match, time limit %d s, countdown %s, frame %d", extras->time_limit_seconds,
+                  extras->timer_on ? "on" : "off", extras->frame);
+      }
+    }
     for (int port = 0; port < 4; ++port) {
       const auto& src = snapshot.fighters[port][0];
-      g_info.ports[port] = {src.present != 0, (uint8_t)src.external, (uint8_t)src.team, (uint8_t)src.costume};
+      std::string name = names ? names[port] : std::string();
+      {
+        std::lock_guard<std::mutex> names_lock(g_replay_names_mutex);
+        if (!g_replay_names[port].empty()) name = g_replay_names[port];
+      }
+      g_info.ports[port] = {src.present != 0, (uint8_t)src.external, (uint8_t)src.team, (uint8_t)src.costume, name};
     }
   }
-  begin_frame(snapshot.frame);
+  // The Slippi frame number (first frame -123) when the game exports it: Randall's lap and the
+  // timer count from it, as they do in a replay.
+  begin_frame(extras ? extras->frame : snapshot.frame);
+  if (extras) {
+    if (std::isfinite(extras->fod_left)) g_fod_left = extras->fod_left;
+    if (std::isfinite(extras->fod_right)) g_fod_right = extras->fod_right;
+  }
   if (items) {
     g_building.items.clear();
     for (int i = 0; i < std::clamp(items->count, 0, MU_LOOK_ITEMS); ++i) {
@@ -438,6 +496,12 @@ void native_frame(const MuLookSnapshot& snapshot, const MuLookItems* items) {
     dst.character = (uint8_t)src.kind; dst.action = (uint16_t)src.action;
     dst.x = src.x; dst.y = src.y; dst.facing = src.facing; dst.percent = src.percent;
     dst.shield = src.shield; dst.stocks = (uint8_t)src.stocks; dst.counter = src.animation;
+    if (extras) {
+      const MuLookExtraFighter& x = extras->fighters[port][follower];
+      dst.lcancel = (uint8_t)x.lcancel; dst.hurtbox = (uint8_t)x.hurtbox;
+      dst.joy_x = std::isfinite(x.joy_x) ? x.joy_x : 0; dst.joy_y = std::isfinite(x.joy_y) ? x.joy_y : 0;
+      dst.trigger = std::isfinite(x.trigger) ? x.trigger : 0;
+    }
     for (int i = 0; i < std::clamp(src.capsule_count, 0, MU_LOOK_CAPSULES); ++i) {
       const MuLookCapsule& c = src.capsules[i];
       if (std::isfinite(c.ax) && std::isfinite(c.ay) && std::isfinite(c.bx) && std::isfinite(c.by) &&
@@ -461,7 +525,17 @@ void feed(const uint8_t* e, uint32_t size) {
       GameInfo info;
       info.stage = be16(e + 0x13);
       info.teams = e[0x0D] != 0;
+      if (size >= 0x19) {
+        info.timer_start = be32(e + 0x15);
+        info.timer_on = info.timer_start > 0;
+      }
       for (int i = 0; i < 4; ++i) {
+        // Slippi Lab's PlayerHUD: the display name, else the connect code, else the name tag.
+        std::string name;
+        if (size >= 0x1A5 + 0x1F * 4) name = sjis_text(e + 0x1A5 + 0x1F * i, 0x1F);
+        if (name.empty() && size >= 0x221 + 0x0A * 4) name = sjis_text(e + 0x221 + 0x0A * i, 0x0A);
+        if (name.empty() && size >= 0x161 + 0x10 * 4) name = sjis_text(e + 0x161 + 0x10 * i, 0x10);
+        info.ports[i].name = name;
         const uint8_t type = e[0x66 + 0x24 * i];
         auto& port = info.ports[i];
         port.present = type != 3;
@@ -894,36 +968,42 @@ void draw_stage(ImDrawList* dl, const View& v, const GameInfo& info, const Frame
     if (live) draw_stage_lines(dl, v, f);
     return;
   }
-  // Grid every 5 units inside the blast zones.
+  // Grid every 5 units (Stage.tsx Grid). Slippi Lab steps its horizontal lines over the blast zones'
+  // x range, so they reach past the top and bottom of the zone; kept, so the page looks the same.
   const ImU32 grid = rgb(kGrid);
   const float grid_w = std::max(1.0f, 0.1f * v.px);
   for (float x = shape->bz_min.x; x < shape->bz_max.x; x += 5)
     dl->AddLine(v(x, shape->bz_min.y), v(x, shape->bz_max.y), grid, grid_w);
-  for (float y = shape->bz_min.y; y < shape->bz_max.y; y += 5)
+  for (float y = shape->bz_min.x; y < shape->bz_max.x; y += 5)
     dl->AddLine(v(shape->bz_min.x, y), v(shape->bz_max.x, y), grid, grid_w);
   // Main platform.
   std::vector<ImVec2> pts;
   pts.reserve(shape->main.size());
   for (const ImVec2& p : shape->main) pts.push_back(v(p));
   const ImU32 stage = rgb(stage_color());
-  dl->AddConcavePolyFilled(pts.data(), (int)pts.size(), stage);
-  dl->AddPolyline(pts.data(), (int)pts.size(), stage, ImDrawFlags_Closed, std::max(1.0f, 0.5f * v.px));
-  const float line_w = std::max(1.0f, 1.0f * v.px);   // SVG's default stroke, one world unit
-  if (live) {
-    // Platforms, Randall, the Fountain's moving platforms and whatever a Stadium transformation
-    // puts down, all from the game itself. The filled body above is Slippi Lab's outline of the
-    // part that never changes.
-    draw_stage_lines(dl, v, f);
-  } else {
-    for (const auto& pl : shape->platforms) dl->AddLine(v(pl[0]), v(pl[1]), stage, line_w);
-    if (info.stage == 2) {   // Fountain of Dreams side platforms
-      constexpr float k = 0.80625f;   // game platform height to drawn height (Slippi Lab)
-      dl->AddLine(v(-49.5f, f.fod_left * k), v(-21, f.fod_left * k), stage, line_w);
-      dl->AddLine(v(21, f.fod_right * k), v(49.5f, f.fod_right * k), stage, line_w);
+  {  // earcut, as for the silhouettes: ImGui's own concave fill left the stage body empty
+    std::vector<std::vector<std::array<float, 2>>> polygon(1);
+    for (const ImVec2& q : pts) polygon[0].push_back({q.x, q.y});
+    const std::vector<uint32_t> tris = mapbox::earcut<uint32_t>(polygon);
+    if (!tris.empty()) {
+      const ImVec2 uv = ImGui::GetFontTexUvWhitePixel();
+      dl->PrimReserve((int)tris.size(), (int)pts.size());
+      const ImDrawIdx base = (ImDrawIdx)dl->_VtxCurrentIdx;
+      for (uint32_t i : tris) dl->PrimWriteIdx((ImDrawIdx)(base + i));
+      for (const ImVec2& q : pts) dl->PrimWriteVtx(q, uv, stage);
     }
-    ImVec2 l, r;
-    if (info.stage == 8 && randall(f.number, l, r)) dl->AddLine(v(l), v(r), rgb(kRandall), line_w);
   }
+  const float line_w = std::max(1.0f, 1.0f * v.px);   // SVG's default stroke, one world unit
+  if (info.stage == 8) dl->AddPolyline(pts.data(), (int)pts.size(), stage, ImDrawFlags_Closed, line_w);
+  for (const auto& pl : shape->platforms) dl->AddLine(v(pl[0]), v(pl[1]), stage, line_w);
+  if (info.stage == 2) {   // Fountain of Dreams side platforms, at the game's own heights
+    constexpr float k = 0.80625f;   // game platform height to drawn height (Slippi Lab)
+    dl->AddLine(v(-49.5f, f.fod_left * k), v(-21, f.fod_left * k), stage, line_w);
+    dl->AddLine(v(21, f.fod_right * k), v(49.5f, f.fod_right * k), stage, line_w);
+  }
+  ImVec2 l, r;
+  if (info.stage == 8 && randall(f.number, l, r)) dl->AddLine(v(l), v(r), rgb(kRandall), line_w);
+  (void)live;
   dl->AddRect(v(shape->bz_min.x, shape->bz_max.y), v(shape->bz_max.x, shape->bz_min.y), stage, 0, 0, std::max(1.0f, v.px));
 }
 
@@ -1148,12 +1228,11 @@ void draw_player_signals(ImDrawList* dl, const View& v, const GameInfo& info, co
     trigger = std::clamp(trigger, 0.3f, 1.0f);
     const float trig_mult = 1 - (0.5f * (trigger - 0.3f)) / 0.7f;
     const float size_mult = ((std::clamp(p.shield, 0.0f, 60.0f) * trig_mult) / 60) * 0.85f + 0.15f;
-    draw_circle(dl, v, x, y, radius * size_mult, (inner & 0x00FFFFFF) | ((ImU32)(0.35f * 255) << IM_COL32_A_SHIFT));
-    dl->AddCircle(v(x, y), radius * size_mult * v.px, inner, 0, std::max(1.5f, v.px * 0.35f));
+    draw_circle(dl, v, x, y, radius * size_mult, (inner & 0x00FFFFFF) | ((ImU32)(0.6f * 255) << IM_COL32_A_SHIFT));
   }
   if ((p.character == kFox || p.character == kFalco) &&
       ((p.action >= 360 && p.action <= 369) || (anim && anim->shine)))
-    draw_hexagon_ring(dl, v, x, y, 6, 0.6f, rgb(0x8ABCE9));
+    draw_hexagon_ring(dl, v, p.x, pack ? p.y + pack->shield_y * 3 / 4 : y, 6, 0.6f, rgb(0x8ABCE9));
 }
 
 void draw_items(ImDrawList* dl, const View& v, const Frame& f) {
@@ -1175,9 +1254,6 @@ void draw_items(ImDrawList* dl, const View& v, const Frame& f) {
       case 79: draw_circle(dl, v, it.x, it.y, 500.0f / 256, gray); break;   // Sheik's needle
       case 48: draw_circle(dl, v, it.x, it.y, 600.0f / 256, gray); break;   // Mario's fireball
       case 105: draw_circle(dl, v, it.x, it.y, 500.0f / 256, gray); break;  // Luigi's fireball
-      case 69: draw_circle(dl, v, it.x, it.y, 2.5f, rgb(0x38BDF8)); break; // PK Thunder head
-      case 70: case 71: case 72: case 73:
-        draw_circle(dl, v, it.x, it.y, 1.2f, rgb(0x38BDF8)); break;       // PK Thunder trail
       case 95: draw_circle(dl, v, it.x, it.y, (it.missile_type == 0 ? 500.0f : 600.0f) / 256, gray); break;
       case 93: draw_circle(dl, v, it.x, it.y, (it.state == 3 ? 1536.0f : 500.0f) / 256, gray); break;   // Samus's bomb
       case 94: {   // Samus's charge shot, charge levels 0 to 7
@@ -1198,48 +1274,70 @@ void draw_items(ImDrawList* dl, const View& v, const Frame& f) {
         break;
       }
       case 210: draw_circle(dl, v, it.x, it.y, 5 * 0.85f, rgb(0xAA0000)); break;   // Fly Guy
-      default: draw_circle(dl, v, it.x, it.y, 2.0f, gray); break;   // unknown items remain visible
+      default: break;   // Slippi Lab draws no other item
     }
   }
 }
 
-// Percent and stocks per port along the bottom. Slippi Lab's HUD is laid out for a replay viewer
-// (timeline, names); this keeps only what a player needs mid-match.
+const char* const kCharacterNames[] = {
+  "Mario", "Fox", "Captain Falcon", "Donkey Kong", "Kirby", "Bowser", "Link", "Sheik", "Ness", "Peach",
+  "Popo", "Nana", "Pikachu", "Samus", "Yoshi", "Jigglypuff", "Mewtwo", "Luigi", "Marth", "Zelda",
+  "Young Link", "Dr. Mario", "Falco", "Pichu", "Mr. Game & Watch", "Ganondorf", "Roy", "Master Hand",
+  "Crazy Hand", "Wireframe Male (Boy)", "Wireframe Female (Girl)", "Giga Bowser",
+};
+
+// SVG text with a one unit black stroke: the outline drawn around the glyphs, then the fill.
+void outlined_text(ImDrawList* dl, ImFont* font, float size, ImVec2 center_baseline, ImU32 fill, const char* text, float unit) {
+  const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0, text);
+  const ImVec2 at(center_baseline.x - ts.x / 2, center_baseline.y - size * 0.8f);
+  const float o = std::max(0.75f, unit * 0.5f);
+  const ImU32 black = rgb(0x000000);
+  for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx)
+      if (dx || dy) dl->AddText(font, size, ImVec2(at.x + dx * o, at.y + dy * o), black, text);
+  dl->AddText(font, size, at, fill, text);
+}
+
 void draw_hud(ImDrawList* dl, const GameInfo& info, const Frame& f, float w, float h) {
-  int ports[4], count = 0;
-  for (int i = 0; i < 4; ++i) if (info.ports[i].present && f.players[i][0].present) ports[count++] = i;
-  if (!count) return;
-  // Its own strip along the bottom, so the stage's lines never run through it: one card a player,
-  // the percent large in a heavy face with the "%" smaller beside it (as the game sets it), the
-  // stocks as dots under it.
   ImFont* font = g_hud_font ? g_hud_font : ImGui::GetFont();
-  const float size = std::clamp(h * 0.095f, 26.0f, 140.0f), strip = size * 1.6f;
-  dl->AddRectFilled(ImVec2(0, h - strip), ImVec2(w, h), rgb(0xE2E8F0));
-  dl->AddLine(ImVec2(0, h - strip), ImVec2(w, h - strip), rgb(0xCBD5E1), std::max(1.0f, size * 0.03f));
-  for (int k = 0; k < count; ++k) {
-    const int port = ports[k];
+  // The SVG's 730 x 600 box, fitted and centred the same way as the stage.
+  const float fit = std::min(w / 730.0f, h / 600.0f);
+  const float bw = 730 * fit, bh = 600 * fit, left = (w - bw) / 2, top = (h - bh) / 2;
+  auto at = [&](float xp, float yp) { return ImVec2(left + bw * (0.5f + xp / 100), top + bh * (0.5f + yp / 100)); };
+  const float text = 15 * fit;
+  if (info.timer_on) {   // Timer.tsx: timerStart * 60 - frame index + 123, the game's hundredths
+    static const char* const hundredths[60] = {
+      "00", "02", "04", "06", "07", "09", "11", "12", "14", "16", "17", "19", "21", "22", "24", "26", "27", "29", "31", "32",
+      "34", "36", "37", "39", "41", "42", "44", "46", "47", "49", "51", "53", "54", "56", "58", "59", "61", "63", "64", "66",
+      "68", "69", "71", "73", "74", "76", "78", "79", "81", "83", "84", "86", "88", "89", "91", "93", "94", "96", "98", "99"};
+    const int frames = std::max(0, (int)info.timer_start * 60 - f.number);
+    char t[24];
+    std::snprintf(t, sizeof t, "%02d:%02d:%s", frames / 3600, (frames % 3600) / 60, hundredths[frames % 60]);
+    const ImVec2 ts = font->CalcTextSizeA(text, FLT_MAX, 0, t);
+    const ImVec2 c = at(0, -42);
+    dl->AddText(font, text, ImVec2(c.x - ts.x / 2, c.y - text * 0.8f), rgb(stage_color()), t);
+  }
+  for (int port = 0; port < 4; ++port) {
+    if (!info.ports[port].present || !f.players[port][0].present) continue;
     const PlayerFrame& p = f.players[port][0];
-    const uint32_t colour = player_color(info, port, false);
-    const ImU32 col = rgb(colour), dark = rgb(0x0F172A, 0.22f);
-    const float cx = w * (k + 1) / (count + 1);
-    char number[16];
-    std::snprintf(number, sizeof number, "%d", (int)std::floor(std::max(0.0f, p.percent)));
-    const float small = size * 0.55f;
-    const ImVec2 ns = font->CalcTextSizeA(size, FLT_MAX, 0, number), ps = font->CalcTextSizeA(small, FLT_MAX, 0, "%");
-    const float top = h - strip + size * 0.08f, left = cx - (ns.x + ps.x) / 2;
-    const float shadow = std::max(1.0f, size * 0.025f);
-    dl->AddText(font, size, ImVec2(left + shadow, top + shadow), dark, number);
-    dl->AddText(font, size, ImVec2(left, top), col, number);
-    const ImVec2 pct(left + ns.x + size * 0.03f, top + ns.y - ps.y - size * 0.06f);
-    dl->AddText(font, small, ImVec2(pct.x + shadow * 0.7f, pct.y + shadow * 0.7f), dark, "%");
-    dl->AddText(font, small, pct, col, "%");
-    const float r = size * 0.09f, gap = r * 2.7f;
-    const float sx = cx - gap * (p.stocks - 1) / 2.0f, sy = top + ns.y + r * 1.4f;
-    for (int s = 0; s < p.stocks && s < 8; ++s) dl->AddCircleFilled(ImVec2(sx + gap * s, sy), r, col);
+    const ImU32 col = rgb(player_color(info, port, false));
+    const float xp = -30.0f + 20.0f * port;
+    for (int i = 0; i < p.stocks && i < 8; ++i) {
+      const ImVec2 c = at(xp - 2 * (1.5f - i), 40);
+      dl->AddCircleFilled(c, 5 * fit, col, 0);
+      dl->AddCircle(c, 5 * fit, rgb(0x000000), 0, std::max(1.0f, fit));
+    }
+    char pct[16];
+    std::snprintf(pct, sizeof pct, "%d%%", (int)std::floor(p.percent));
+    outlined_text(dl, font, text, at(xp, 44), col, pct, fit);
+    std::string name = info.ports[port].name;
+    if (name.empty() && p.character < sizeof kCharacterNames / sizeof *kCharacterNames) name = kCharacterNames[p.character];
+    outlined_text(dl, font, text, at(xp, 47), col, name.c_str(), fit);
   }
 }
 
 std::atomic<bool> g_covering{false};
+std::atomic<float> g_bottom_reserve{0.0f};
 
 }  // namespace
 
@@ -1247,6 +1345,11 @@ bool covering() { return g_covering.load(std::memory_order_relaxed); }
 
 void draw(bool enabled, float width, float height) {
   g_covering.store(false, std::memory_order_relaxed);
+  {  // one line each time the reason the view is not showing changes (test runs read it)
+    static int last = -1;
+    const int why = !enabled ? 1 : (width <= 0 || height <= 0) ? 2 : !match_in_progress() ? 3 : 0;
+    if (why != last) { last = why; host::log("lab view: %s", why == 1 ? "off" : why == 2 ? "no window" : why == 3 ? "waiting for a match frame" : "drawing"); }
+  }
   if (!enabled || width <= 0 || height <= 0 || !match_in_progress()) return;
   GameInfo info;
   Frame f;
@@ -1262,9 +1365,11 @@ void draw(bool enabled, float width, float height) {
   g_covering.store(true, std::memory_order_relaxed);
 
   // Slippi Lab's viewBox is 730 x 600 world-scaled units around the camera center; here that box
-  // is fitted to the window, and a wider window simply shows more of the stage to the sides.
-  const float fit = std::min(width / 730.0f, height / 600.0f);
-  const View v{width / 2, height / 2, g_camera.scale * fit, g_camera.cx, g_camera.cy};
+  // is fitted to the window above any controls kept at the bottom (a replay's), and a wider window
+  // simply shows more of the stage to the sides.
+  const float area_h = std::max(height * 0.5f, height - std::max(0.0f, g_bottom_reserve.load(std::memory_order_relaxed)));
+  const float fit = std::min(width / 730.0f, area_h / 600.0f);
+  const View v{width / 2, area_h / 2, g_camera.scale * fit, g_camera.cx, g_camera.cy};
 
   ImDrawList* dl = ImGui::GetBackgroundDrawList();
   // Covers the game image entirely; the game still renders underneath (and the other player's
@@ -1290,7 +1395,17 @@ void draw(bool enabled, float width, float height) {
       draw_player_signals(dl, v, info, p, caps, port, fol == 1);
     }
   draw_items(dl, v, f);
-  draw_hud(dl, info, f, width, height);
+  draw_hud(dl, info, f, width, area_h);
+  {
+    std::string notice;
+    { std::lock_guard<std::mutex> lock(g_notice_mutex); notice = g_notice; }
+    if (!notice.empty()) {
+      ImFont* font = ImGui::GetFont();
+      const float size = std::max(13.0f, 13.0f * area_h / 600.0f);
+      const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0, notice.c_str());
+      dl->AddText(font, size, ImVec2((width - ts.x) / 2, area_h * 0.14f), rgb(stage_color()), notice.c_str());
+    }
+  }
 }
 
 void set_style(int fighters, int stage) {
@@ -1306,6 +1421,26 @@ void set_colors(const uint32_t players[4], uint32_t background, uint32_t stage) 
 
 void set_hud_font(ImFont* font) { g_hud_font = font; }
 
+void set_missing_packs_handler(void (*handler)(const std::string& lab_dir)) { g_missing_handler.store(handler); }
+void packs_changed() {
+  for (auto& state : g_pack_state) { int unavailable = 3; state.compare_exchange_strong(unavailable, 0); }
+  g_missing_reported.store(false);
+}
+void set_notice(const std::string& text) { std::lock_guard<std::mutex> lock(g_notice_mutex); g_notice = text; }
+
+void set_bottom_reserve(float pixels) { g_bottom_reserve.store(pixels, std::memory_order_relaxed); }
+
+std::string name_from_sjis(const uint8_t* bytes, size_t max) { return sjis_text(bytes, max); }
+
+void set_replay_names(const std::string names[4]) {
+  std::lock_guard<std::mutex> lock(g_replay_names_mutex);
+  for (int i = 0; i < 4; ++i) g_replay_names[i] = names ? names[i] : std::string();
+}
+
 bool styles_on() { return g_fighter_style.load(std::memory_order_relaxed) != 0; }
+
+static std::atomic<bool> g_enabled{false};
+void set_enabled(bool on) { g_enabled.store(on, std::memory_order_relaxed); }
+bool active() { return styles_on() || g_enabled.load(std::memory_order_relaxed); }
 
 }  // namespace lab

@@ -264,6 +264,15 @@ inline constexpr int kRoom1v1 = 0, kRoomFriends4 = 1, kRoomDoubles = 2;
 inline bool doubles_hint(const json& invite) {
   return invite.is_object() && invite.value("mode", json()) == "teams" && !invite.count("md");
 }
+// The kind an accepted invite opens, from the page's inviteMode (Player.tsx hello reply and join push, PR 2280):
+// "singles" (MU's 1v1 picker) kRoom1v1, "default" (an invite with no mode: MU's 4-player Friends lobby)
+// kRoomFriends4, "teams" (a Teams invite; its push also has teamsLobby:1) kRoomDoubles. -1 when absent (not from
+// an invite) or anything else (unknown): the older hints (players, compatibility, Teams marks) then decide as before.
+inline int invite_mode_kind(const json& value) {
+  if (!value.is_object() || !value.count("inviteMode") || !value["inviteMode"].is_string()) return -1;
+  const auto& mode = value["inviteMode"].get_ref<const std::string&>();
+  return mode == "singles" ? kRoom1v1 : mode == "default" ? kRoomFriends4 : mode == "teams" ? kRoomDoubles : -1;
+}
 // The ticket route's refusals of a Doubles home ticket that mean "not a Doubles home for this build", not "gone"
 // (web/src/app/api/multiplayer/ticket/route.ts): teams_lobby_off 403 (Teams is off on this site), bad_teams_lobby
 // 400/403 (no Teams for this listing or room), teams_lobby_branch 409 (a test build without Teams). Since build 94
@@ -368,6 +377,9 @@ class Events {
       // 4-seat Doubles home also reads as players 4.
       pending_first_ = doubles_hint(inv) && room(inv) == code ? kRoomDoubles
                      : pending_players_ == 4 ? kRoomFriends4 : kRoom1v1;
+      // The page's inviteMode outranks both (invite_mode_kind); a legacy md:1 Teams invite keeps its own path.
+      if (!(inv.is_object() && inv.value("md", json()) == 1 && room(inv) == code))
+        invite_mode_locked(invite_mode_kind(value));
       pending_doubles_ = pending_first_ == kRoomDoubles;
       tried_.erase(code);
 #ifdef MELEE_DOUBLES
@@ -412,6 +424,9 @@ class Events {
       const bool teams_marked = value.value("teamsLobby", json()) == 1 && !value.count("md") &&
                                 value.value("mu_doubles", json()) != 1;
       pending_first_ = pending_players_ == 4 ? kRoomFriends4 : teams_marked ? kRoomDoubles : kRoom1v1;
+      // The page's inviteMode outranks the size and the Teams mark (invite_mode_kind). Not for md:1 /
+      // mu_doubles:1: that legacy join keeps its own strict path.
+      if (!pending_strict_) invite_mode_locked(invite_mode_kind(value));
       pending_doubles_ = pending_first_ == kRoomDoubles;
       tried_.erase(code);
 #ifdef MELEE_DOUBLES
@@ -673,6 +688,18 @@ class Events {
     if (room_kinds_.size() >= 32 && !room_kinds_.count(code)) room_kinds_.clear();
     room_kinds_[code] = kind;
     tried_.erase(code);
+  }
+  // A join whose invite named its mode (invite_mode_kind; -1 changes nothing): that kind goes first and the join
+  // counts as hinted, so a refusal means another build or remix, not another kind, while the room's own kind
+  // refusal can still reroute it (mismatch_reroutes, mismatch_next). Not strict: the room has the final word.
+  // The size follows the mode, which is what the menu reads for a Friends lobby (join_players 4) or a 1v1 room;
+  // a Teams invite keeps the page's size (join_doubles decides it). mutex_ held.
+  void invite_mode_locked(int kind) {
+    if (kind < 0 || kind > 2) return;
+    pending_first_ = kind;
+    pending_hinted_ = true;
+    if (kind == kRoomFriends4) pending_players_ = 4;
+    else if (kind == kRoom1v1) pending_players_ = 2;
   }
   void requeue(const std::string& code, int kind) {
     retired_.erase(code);

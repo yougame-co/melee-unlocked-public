@@ -506,6 +506,16 @@ void check(const std::string& current_version, bool install_experimental) {
     std::string body; int status = 0;
     if (!http_get(REPO_API, &body, &status) || status != 200) { set_message(status ? "Update check failed (HTTP " + std::to_string(status) + ")" : "Update check failed (no connection)"); host::log("updater: GET %s failed, HTTP %d, error %lu", REPO_API, status, (unsigned long)GetLastError()); g_state = State::Failed; return; }
     auto list = nlohmann::json::parse(body, nullptr, false);
+    // GitHub gives at most 100 releases a page: the older ones (157 by 0.9.200) are on the next
+    // pages, and the version picker lists every release. A page that fails only shortens the list.
+    for (int page = 2; list.is_array() && list.size() == (size_t)(page - 1) * 100 && page <= 20; ++page) {
+      std::string more; int more_status = 0;
+      const std::string url = std::string(REPO_API) + "&page=" + std::to_string(page);
+      if (!http_get(url.c_str(), &more, &more_status) || more_status != 200) { host::log("updater: GET %s failed, HTTP %d", url.c_str(), more_status); break; }
+      const auto next = nlohmann::json::parse(more, nullptr, false);
+      if (!next.is_array() || next.empty()) break;
+      for (const auto& r : next) list.push_back(r);
+    }
     nlohmann::json j;
     std::vector<Download> catalog;
     if (list.is_array()) for (auto& r : list) {
@@ -529,6 +539,7 @@ void check(const std::string& current_version, bool install_experimental) {
       if (!j.is_object()) j = r;
     }
     if (!j.is_object()) { set_message("Update check failed (bad response)"); g_state = State::Failed; return; }
+    host::log("updater: %zu releases on GitHub, %zu with a download for this platform", list.is_array() ? list.size() : (size_t)0, catalog.size());
     std::string tag = j["tag_name"].get<std::string>();
     if (!tag.empty() && tag[0] == 'v') tag.erase(0, 1);
     std::string zip, zip_digest;
@@ -1058,6 +1069,8 @@ PartFetch& g_compat = *new PartFetch;
 PartFetch& g_xess = *new PartFetch;
 PartFetch& g_fsr = *new PartFetch;
 PartFetch& g_rtx_pack = *new PartFetch;
+PartFetch& g_lab = *new PartFetch;
+PartFetch& g_rr = *new PartFetch;
 void part_message(PartFetch& p, const std::string& m) { std::lock_guard<std::mutex> lk(g_mutex); p.message = m; }
 std::string part_message(PartFetch& p) { std::lock_guard<std::mutex> lk(g_mutex); return p.message; }
 
@@ -1184,9 +1197,10 @@ bool compat_build_needed(const std::string& game_dir_utf8) {
 void compat_build_download(const std::string& game_dir_utf8) {
   std::string sha, file;
   if (!compat_record(game_dir_utf8, &sha, &file)) return;
-  // MeleeUnlocked-<version>-compat-win64.zip comes from that version's release.
+  // MeleeUnlocked-<version>-compat-win64.zip comes from that version's parts release (parts-<version>,
+  // beside the release itself since 0.9.204, so the release page lists only what a player downloads).
   const std::string version = file.substr(14, file.find("-compat-") - 14);
-  const std::string url = "https://github.com/hero88go/melee-unlocked/releases/download/v" + version + "/" + file;
+  const std::string url = "https://github.com/hero88go/melee-unlocked/releases/download/parts-" + version + "/" + file;
   fetch_part(g_compat, "the build for your processor", "about 80 MB", url, sha, game_dir_utf8, "compat-download",
              [sha](const std::filesystem::path& files, const std::filesystem::path& dir) -> std::string {
                namespace fs = std::filesystem;
@@ -1278,7 +1292,7 @@ void rtx_pack_download(const std::string& game_dir_utf8) {
   std::string sha, file;
   if (!rtx_pack_record(game_dir_utf8, &sha, &file)) return;
   const std::string version = file.substr(14, file.find("-RTX-Pack") - 14);
-  const std::string url = "https://github.com/hero88go/melee-unlocked/releases/download/v" + version + "/" + file;
+  const std::string url = "https://github.com/hero88go/melee-unlocked/releases/download/parts-" + version + "/" + file;
   fetch_part(g_rtx_pack, "the RTX Pack", kRtxPackSize, url, sha, game_dir_utf8, "rtxpack-download",
              [sha](const std::filesystem::path& files, const std::filesystem::path& dir) -> std::string {
                namespace fs = std::filesystem;
@@ -1301,6 +1315,7 @@ void rtx_pack_download(const std::string& game_dir_utf8) {
                  if (!marker) return std::string("Cannot record the installed RTX Pack"); }
                part_message(g_rtx_pack, "The RTX Pack is installed. NVIDIA RTX and RTX Remix start with the game's next start.");
                host::log("rtx pack download: installed");
+               if (!rr_present(dir.u8string())) rr_download(dir.u8string());   // its denoiser, a download of its own
                return {};
              });
 }
@@ -1360,6 +1375,92 @@ ModelState fsr_state(const std::string& game_dir_utf8) {
 }
 std::string fsr_message() { return part_message(g_fsr); }
 
+// ---------------- DLSS Ray Reconstruction ----------------
+namespace {
+// NVIDIA's files as the game was built with them (Streamline SDK, port/third_party/streamline).
+struct RrFile { const char* name; const char* sha256; };
+constexpr RrFile kRrFiles[] = {
+    {"sl.dlss_d.dll", "8dff36fd063094eb1f659e8d4dcd52c7423859a9c4a3df3796084c48412d60ac"},
+    {"nvngx_dlssd.dll", "b49435ae346f227feafe7bbe937d88277ea0ee7323975ec06488f377fdb46cee"},
+};
+constexpr const char* kRrZip = "MeleeUnlocked-DLSS-RR.zip";
+}  // namespace
+
+bool rr_present(const std::string& game_dir_utf8) {
+  std::error_code ec;
+  for (const RrFile& f : kRrFiles)
+    if (!std::filesystem::is_regular_file(std::filesystem::u8path(game_dir_utf8) / f.name, ec)) return false;
+  return true;
+}
+
+void rr_download(const std::string& game_dir_utf8) {
+  fetch_part(g_rr, "NVIDIA Ray Reconstruction", kRrSize, std::string(kContentBase) + kRrZip, "", game_dir_utf8, "rr-download",
+             [](const std::filesystem::path& files, const std::filesystem::path& dir) -> std::string {
+               namespace fs = std::filesystem;
+               std::error_code ec;
+               for (const RrFile& f : kRrFiles) {
+                 std::string data;
+                 { std::ifstream in(files / f.name, std::ios::binary); data.assign(std::istreambuf_iterator<char>(in), {}); }
+                 if (data.empty()) return std::string("Ray Reconstruction: the download has no ") + f.name + " in it";
+                 if (sha256_hex(data) != f.sha256) return std::string("Ray Reconstruction: ") + f.name + " does not match NVIDIA's build; not installed";
+               }
+               for (const RrFile& f : kRrFiles)
+                 if (!place_file(files / f.name, dir / f.name, ec)) return place_error("Ray Reconstruction could not be put", dir, ec);
+               part_message(g_rr, "Ray Reconstruction is installed. It starts with the game's next start.");
+               host::log("rr download: NVIDIA's Ray Reconstruction runtime installed beside the game");
+               return {};
+             });
+}
+
+ModelState rr_state(const std::string& game_dir_utf8) {
+  if (g_rr.busy.load()) return ModelState::Downloading;
+  if (rr_present(game_dir_utf8)) return ModelState::Present;
+  return g_rr.failed.load() ? ModelState::Failed : ModelState::Missing;
+}
+std::string rr_message() { return part_message(g_rr); }
+
+// ---------------- Lab view fighter packs ----------------
+namespace {
+constexpr int kLabPacks = 27;
+constexpr const char* kLabZip = "MeleeUnlocked-Lab.zip";
+// tools/package_release.py builds the zip the same way every time and refuses a release whose packs
+// no longer give this hash (new packs mean a new content release and a new hash here).
+constexpr const char* kLabSha256 = "6fcb60586ee0b73a42b3b7521546b554d3b105299bc97d74720b849075febb75";
+}  // namespace
+
+bool lab_packs_present(const std::string& lab_dir_utf8) {
+  std::error_code ec;
+  const auto dir = std::filesystem::u8path(lab_dir_utf8);
+  for (int i = 0; i < kLabPacks; ++i)
+    if (!std::filesystem::is_regular_file(dir / (std::to_string(i) + ".lab"), ec)) return false;
+  return true;
+}
+
+void lab_packs_download(const std::string& lab_dir_utf8) {
+  fetch_part(g_lab, "the Lab view's fighters", kLabPacksSize, std::string(kContentBase) + kLabZip, kLabSha256, lab_dir_utf8, "lab-download",
+             [](const std::filesystem::path& files, const std::filesystem::path& dir) -> std::string {
+               namespace fs = std::filesystem;
+               std::error_code ec;
+               for (int i = 0; i < kLabPacks; ++i)
+                 if (!fs::is_regular_file(files / (std::to_string(i) + ".lab"), ec)) return std::string("The Lab view download is incomplete; not installed");
+               fs::create_directories(dir, ec);
+               for (int i = 0; i < kLabPacks; ++i) {
+                 const std::string name = std::to_string(i) + ".lab";
+                 if (!place_file(files / name, dir / name, ec)) return place_error("The Lab view's fighters could not be put", dir, ec);
+               }
+               part_message(g_lab, "");
+               host::log("lab download: %d fighter packs installed", kLabPacks);
+               return {};
+             });
+}
+
+ModelState lab_packs_state(const std::string& lab_dir_utf8) {
+  if (g_lab.busy.load()) return ModelState::Downloading;
+  if (lab_packs_present(lab_dir_utf8)) return ModelState::Present;
+  return g_lab.failed.load() ? ModelState::Failed : ModelState::Missing;
+}
+std::string lab_packs_message() { return part_message(g_lab); }
+
 ModelState xess_state(const std::string& game_dir_utf8) {
   if (g_xess.busy.load()) return ModelState::Downloading;
   if (xess_present(game_dir_utf8)) return ModelState::Present;
@@ -1375,7 +1476,7 @@ void shutdown() {
   // destroyed at exit calls std::terminate (B-905: quitting after the RTX Pack downloaded aborted).
   // A finished download is joined; one still running is left to end with the process, so quitting
   // never waits minutes for a 467 MB download.
-  for (PartFetch* p : {&g_compat, &g_xess, &g_fsr, &g_rtx_pack}) {
+  for (PartFetch* p : {&g_compat, &g_xess, &g_fsr, &g_rtx_pack, &g_lab, &g_rr}) {
     if (!p->thread.joinable()) continue;
     if (p->busy.load()) p->thread.detach();
     else p->thread.join();

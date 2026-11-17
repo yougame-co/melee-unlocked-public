@@ -70,7 +70,7 @@
  * quit), to updating.json in its profile folder (Electron's userData) under FOLDERID_RoamingAppData.
  * Production: "yougame-desktop" (the packaged app's folder) first, then "YouGame" (should a later
  * build add a productName); the first valid one wins (see yg__start_profiles). Staging: "YouGame
- * Staging (agent build)" only. The hook only reads it, never writes or deletes it, and only on a
+ * Staging" first, then "YouGame Staging (agent build)" (its name before 11-15). The hook only reads it, never writes or deletes it, and only on a
  * fixed local drive: a Roaming folder redirected to a network share or a removable drive is never
  * opened, so it cannot stall the game. It takes the marker only when it is a regular
  * file under 1 KiB, `v` is 1, `at` is at most 5 minutes old and at most 60 s ahead of this
@@ -123,11 +123,13 @@ typedef struct yg_start_options {
   unsigned open_wait_ms; /* Windows, after starting YouGame in the tray: wait up to this long for it
                             to be running (0 = return at once, the usual choice; at most 60000). If it
                             is not running by then, the small window says "YouGame didn't open". */
-  int no_open;           /* 1 = never start an installed YouGame; show the small window instead */
+  int no_open;           /* 1 = never start an installed YouGame on its own; show the small window
+                            instead (Windows: its Open YouGame button still starts it, the player's choice) */
   const char *tray_from; /* Windows: the first YouGame version that starts hidden in the tray, as
                             "0.13.1407". An installed YouGame older than this is never started (it
                             would show its whole window); the small window says it needs an update.
-                            NULL (or not three dot-separated numbers) = never start it. */
+                            NULL (or not three dot-separated numbers) = never start it on its own
+                            (Windows: Open YouGame in the small window starts it at any version). */
   /* Last, so a caller that zeroes the struct (= {0} or memset) keeps working.
      Give a valid buffer and size, or leave both zero. On YG_START_UPDATING the version is written,
      magic or not; with update_to_magic = YG_START_UPDATE_TO_MAGIC it is also cleared at entry. */
@@ -151,17 +153,33 @@ yg_start_result yg_start(const yg_start_options *options);
 #include <stdlib.h>
 #include <string.h>
 
+/* Raised, for the start hook on Windows: the game holds rights the player's own programs don't have.
+   - A full token from UAC (TokenElevationTypeFull, "Run as administrator"): raised.
+   - Any other elevated token: raised, unless the player's shell (the desktop's Explorer) is the
+     same user and elevated too. Then every program the player starts, YouGame included, already
+     runs with those rights, so starting YouGame from the game gives it nothing new: UAC turned off
+     (Windows Sandbox runs this way; on pc4 11-17 the old rule refused every start) or the built-in
+     Administrator with admin approval off. Another user's token (runas), a service or a SYSTEM
+     task (no shell on their desktop) stays raised.
+   Pure, so the seam tests check it on every system. */
+#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
+static int yg__start_raised_rule(int full, int elevated, int shell_peer) {
+  return full || (elevated && !shell_peer);
+}
+#endif
+
 /* Every text the small window shows, on every system: {title, body}. Paragraphs split by "\n\n";
    Windows turns "\n" into "\r\n". Plain ASCII only. */
 #define YG__START_TEXT_MISSING 0     /* not installed */
 #define YG__START_TEXT_DIDNT_OPEN 1  /* started in the tray, but not running within open_wait_ms */
 #define YG__START_TEXT_UPDATE 2      /* installed, older than tray_from (or its version unreadable) */
 #define YG__START_TEXT_NOT_RUNNING 3 /* installed, not started by the hook */
-static const char *const yg__start_texts[4][2] = {
+#define YG__START_TEXT_RAISED 4      /* Windows: the game runs as administrator, so nothing is started */
+static const char *const yg__start_texts[5][2] = {
   {"Play online with YouGame",
    "This game uses YouGame for online matches, friends and feedback. "
    "YouGame isn't on this computer yet.\n\n"
-   "Get YouGame opens YouGame's download page. It installs the YouGame app; a smaller helper is coming."},
+   "Get YouGame opens YouGame's download page. Not now starts the game."},
   {"YouGame didn't open",
    "This game uses YouGame for online matches, friends and feedback. "
    "YouGame is on this computer, but it didn't open just now.\n\n"
@@ -175,9 +193,23 @@ static const char *const yg__start_texts[4][2] = {
    "This game uses YouGame for online matches, friends and feedback. "
    "YouGame is on this computer but isn't running.\n\n"
    "Open YouGame to play online, or Get YouGame opens its download page to get the latest version. "
-   "Not now starts the game."}};
+   "Not now starts the game."},
+  {"YouGame can't open from here",
+   "This game was started as administrator, so it can't open YouGame. "
+   "To play online, close it and start it normally (not as administrator).\n\n"
+   "OK starts the game now, for offline play."}};
 #define YG__START_GET "Get YouGame"
 #define YG__START_LATER "Not now"
+#define YG__START_OPEN "Open YouGame"
+#define YG__START_OK "OK"
+/* The administrator window (YouGame is installed, so Get YouGame would not help): one button, OK. */
+#define YG__START_ONLY_OK(text) ((text) == YG__START_TEXT_RAISED)
+/* yg__start_offer's answers. Open is offered (Windows) when YouGame is installed and the game can
+   start it: "isn't running" and "didn't open". */
+#define YG__START_ANSWER_LATER 0
+#define YG__START_ANSWER_GET 1
+#define YG__START_ANSWER_OPEN 2
+#define YG__START_OFFERS_OPEN(text) ((text) == YG__START_TEXT_NOT_RUNNING || (text) == YG__START_TEXT_DIDNT_OPEN)
 #define YG__START_WIDE_(s) L##s
 #define YG__START_WIDE(s) YG__START_WIDE_(s)
 
@@ -415,12 +447,13 @@ static int yg__start_env_drop(const wchar_t *entry) {
    userData for production, and desktop/WINDOWS_HANDOFF.md and the agent-test proof look under
    %APPDATA%\yougame-desktop. So "yougame-desktop" is the folder, read first; "YouGame" is read too,
    since a later build that sets productName would move it there and games already shipped must keep
-   working. The first valid marker wins. [1] staging: main.ts sets userData to "YouGame Staging (agent
-   build)" (STAGING.userDataName), and the installed signed staging app's folder really is that. */
+   working. The first valid marker wins. [1] staging: main.ts sets userData to "YouGame Staging"
+   (STAGING.userDataName, desktop/src/staging-profile.ts), read first; "YouGame Staging (agent build)"
+   is the folder it had until 11-15 (the app renames it once, and keeps it when the rename fails). */
 #define YG__START_PROFILES 2
 static const wchar_t *const yg__start_profiles[2][YG__START_PROFILES] = {
   {L"yougame-desktop", L"YouGame"},
-  {L"YouGame Staging (agent build)", NULL}};
+  {L"YouGame Staging", L"YouGame Staging (agent build)"}};
 #define YG__START_MARKER_MAX 1024        /* a marker is under 1 KiB */
 #define YG__START_MARKER_AGE_MS 300000.0 /* `at` at most 5 minutes before this computer's clock */
 #define YG__START_MARKER_SKEW_MS 60000.0 /* and at most 60 s after it */
@@ -870,6 +903,7 @@ static int yg__start_app_launch(yg__start_app *app, int staging);
 static void yg__start_app_close(yg__start_app *app);
 static int yg__start_shell_open(const char *url);
 static int yg__start_offer(int text);
+static int yg__start_raised(void);
 static int yg__start_quiet_env(void);
 static void yg__start_sleep(unsigned ms);
 static unsigned long yg__start_ms(void);
@@ -901,13 +935,15 @@ static int yg__start_marker(int staging, yg__start_mark *mark, char to[YG__START
 #define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
 #endif
 /* GetFinalPathNameByHandleW flags (FILE_NAME_NORMALIZED with VOLUME_NAME_DOS / VOLUME_NAME_NT),
-   FileRemoteProtocolInfo and PROCESS_NAME_NATIVE, written out so a game that sets an old
-   _WIN32_WINNT still builds; the functions themselves are looked up in kernel32 at run time. */
+   FileRemoteProtocolInfo, PROCESS_NAME_NATIVE and PROCESS_QUERY_LIMITED_INFORMATION, written out so
+   a game that sets an old _WIN32_WINNT still builds; the functions themselves are looked up in
+   kernel32 at run time. */
 #define YG__START_FINAL_DOS 0x0
 #define YG__START_FINAL_NT 0x2
 #define YG__START_REMOTE_INFO 13
 #define YG__START_IMAGE_NATIVE 0x1
 #define YG__START_VER_NEUTRAL 0x2 /* FILE_VER_GET_NEUTRAL */
+#define YG__START_QUERY_LIMITED 0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */
 
 /* The installed program: its path, a handle that stops it being changed, replaced or deleted from
    the moment it is checked until it has been started, and what its version resource says. */
@@ -993,10 +1029,38 @@ static int yg__start_installed(int staging) {
   return yg__start_command(staging, command, 2048) && command[0];
 }
 
-/* A game run as administrator would start YouGame with the same rights: never do that. Raised means
-   a full token from UAC (TokenElevationTypeFull) or any elevated token (TokenIsElevated), which also
-   covers UAC turned off and the built-in Administrator, whose full tokens have type Default. A
-   question that cannot be answered counts as raised. */
+/* The player's shell: the desktop's shell window (Explorer) belongs to the game's own user, and is
+   elevated too? No shell window (a service, session 0, a SYSTEM task) or a question that cannot be
+   answered: no. */
+static int yg__start_shell_peer(HANDLE game) {
+  /* 68: SECURITY_MAX_SID_SIZE; the union keeps the buffer aligned for TOKEN_USER. */
+  union { TOKEN_USER user; BYTE raw[sizeof(TOKEN_USER) + 68]; } mine, theirs;
+  TOKEN_ELEVATION elevation;
+  HWND shell = GetShellWindow();
+  DWORD pid = 0, len = 0;
+  HANDLE proc, tok = NULL;
+  int peer = 0;
+  /* The game's own window never counts as the player's shell. */
+  if (!shell || !GetWindowThreadProcessId(shell, &pid) || !pid || pid == GetCurrentProcessId())
+    return 0;
+  proc = OpenProcess(YG__START_QUERY_LIMITED, FALSE, pid);
+  if (!proc) return 0;
+  if (OpenProcessToken(proc, TOKEN_QUERY, &tok)) {
+    elevation.TokenIsElevated = 0;
+    if (GetTokenInformation(tok, TokenElevation, &elevation, sizeof elevation, &len) &&
+        elevation.TokenIsElevated &&
+        GetTokenInformation(tok, TokenUser, &theirs, sizeof theirs, &len) &&
+        GetTokenInformation(game, TokenUser, &mine, sizeof mine, &len) &&
+        EqualSid(mine.user.User.Sid, theirs.user.User.Sid))
+      peer = 1;
+    CloseHandle(tok);
+  }
+  CloseHandle(proc);
+  return peer;
+}
+
+/* A game run as administrator would start YouGame with the same rights: never do that. The rule is
+   yg__start_raised_rule; a question that cannot be answered counts as raised. */
 static int yg__start_raised(void) {
   HANDLE tok = NULL;
   TOKEN_ELEVATION_TYPE type = TokenElevationTypeFull;
@@ -1006,8 +1070,12 @@ static int yg__start_raised(void) {
   if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) return 1;
   elevation.TokenIsElevated = 1;
   if (GetTokenInformation(tok, TokenElevationType, &type, sizeof type, &len) &&
-      GetTokenInformation(tok, TokenElevation, &elevation, sizeof elevation, &len))
-    raised = type == TokenElevationTypeFull || elevation.TokenIsElevated != 0;
+      GetTokenInformation(tok, TokenElevation, &elevation, sizeof elevation, &len)) {
+    int full = type == TokenElevationTypeFull, elevated = elevation.TokenIsElevated != 0;
+    /* The shell is looked at only when it decides the answer. */
+    raised = yg__start_raised_rule(full, elevated,
+                                   full || !elevated ? 0 : yg__start_shell_peer(tok));
+  }
   CloseHandle(tok);
   return raised;
 }
@@ -1586,17 +1654,30 @@ static int yg__start_shell_open(const char *url) {
   return (INT_PTR)ShellExecuteW(NULL, L"open", what, NULL, NULL, SW_SHOWNORMAL) > 32;
 }
 
-/* The small window: YouGame's own, two buttons. Returns 1 for Get YouGame, 0 otherwise. */
+/* The small window: YouGame's own, two buttons, or three with Open YouGame (the default then).
+   Returns YG__START_ANSWER_*. */
 #define YG__START_ID_GET 101
 #define YG__START_ID_NOT_NOW 102
+#define YG__START_ID_OPEN 103
 static int yg__start_choice;
 static int yg__start_done; /* the small window has been destroyed */
 
 static LRESULT CALLBACK yg__start_wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
   switch (m) {
     case WM_COMMAND:
-      if (LOWORD(wp) == YG__START_ID_GET) { yg__start_choice = 1; DestroyWindow(w); return 0; }
+      if (LOWORD(wp) == YG__START_ID_GET) { yg__start_choice = YG__START_ANSWER_GET; DestroyWindow(w); return 0; }
+      if (LOWORD(wp) == YG__START_ID_OPEN) { yg__start_choice = YG__START_ANSWER_OPEN; DestroyWindow(w); return 0; }
       if (LOWORD(wp) == YG__START_ID_NOT_NOW || LOWORD(wp) == IDCANCEL) { DestroyWindow(w); return 0; }
+      break;
+    case WM_ACTIVATE: /* clicked in later (after a flash): focus the default button (Open YouGame when
+                         offered, else Get YouGame), so Enter works */
+      if (LOWORD(wp) != WA_INACTIVE) {
+        HWND open = GetDlgItem(w, YG__START_ID_OPEN), get = GetDlgItem(w, YG__START_ID_GET);
+        if (open) SetFocus(open);
+        else if (get) SetFocus(get);
+        else SetFocus(GetDlgItem(w, YG__START_ID_NOT_NOW));
+        return 0;
+      }
       break;
     case WM_CLOSE: DestroyWindow(w); return 0;
     case WM_DESTROY: yg__start_done = 1; return 0; /* never a WM_QUIT: that would end the game */
@@ -1619,11 +1700,50 @@ static size_t yg__start_widen(const char *s, wchar_t *out, size_t at, size_t cap
   return at;
 }
 
+/* Puts the small window in front. A game that just started often isn't the foreground process yet,
+   and then Windows refuses SetForegroundWindow (the window opened behind a browser on pc3, 11-17).
+   So: try it; else, only while the player isn't typing or clicking somewhere else (no input for a
+   second) and the foreground window answers within 200 ms (never hang the game on a busy launcher),
+   join the foreground window's input queue for the one call; else flash it in the taskbar so the
+   player sees it and clicks it when ready. Never synthetic key presses. */
+static void yg__start_front(HWND w) {
+  HWND fg;
+  DWORD me = GetCurrentThreadId(), them = 0;
+  BOOL joined = FALSE;
+  if (SetForegroundWindow(w) && GetForegroundWindow() == w) return;
+  fg = GetForegroundWindow();
+  if (fg) them = GetWindowThreadProcessId(fg, NULL);
+  if (them && them != me) {
+    LASTINPUTINFO li;
+    DWORD_PTR answer = 0;
+    memset(&li, 0, sizeof li);
+    li.cbSize = sizeof li;
+    if (GetLastInputInfo(&li) && GetTickCount() - li.dwTime >= 1000 &&
+        SendMessageTimeoutW(fg, WM_NULL, 0, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 200, &answer))
+      joined = AttachThreadInput(me, them, TRUE);
+  }
+  if (joined) {
+    BringWindowToTop(w);
+    SetForegroundWindow(w);
+    SetActiveWindow(w);
+    AttachThreadInput(me, them, FALSE);
+  }
+  if (GetForegroundWindow() != w) {
+    FLASHWINFO f;
+    memset(&f, 0, sizeof f);
+    f.cbSize = sizeof f;
+    f.hwnd = w;
+    f.dwFlags = FLASHW_ALL | FLASHW_TIMERNOFG;
+    FlashWindowEx(&f);
+  }
+}
+
 static int yg__start_offer(int which) {
   static const wchar_t *cls = L"YouGameStartOffer";
   HINSTANCE inst = GetModuleHandleW(NULL);
   WNDCLASSW wc;
-  HWND w, text, get, later;
+  HWND w, text, get = NULL, later, open = NULL;
+  const int offers_open = YG__START_OFFERS_OPEN(which), only_ok = YG__START_ONLY_OK(which);
   HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
   MSG msg;
   wchar_t wide[1024];
@@ -1649,20 +1769,28 @@ static int yg__start_offer(int which) {
   if (!w) return 0;
   text = CreateWindowExW(0, L"STATIC", wide, WS_CHILD | WS_VISIBLE, 20, 16, width - 46, 130, w,
                          NULL, inst, NULL);
-  get = CreateWindowExW(0, L"BUTTON", YG__START_WIDE(YG__START_GET),
-                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                        width - 290, 154, 130, 32, w, (HMENU)(INT_PTR)YG__START_ID_GET, inst, NULL);
-  later = CreateWindowExW(0, L"BUTTON", YG__START_WIDE(YG__START_LATER),
-                          WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+  if (offers_open)
+    open = CreateWindowExW(0, L"BUTTON", YG__START_WIDE(YG__START_OPEN),
+                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                           width - 430, 154, 130, 32, w, (HMENU)(INT_PTR)YG__START_ID_OPEN, inst, NULL);
+  if (!only_ok)
+    get = CreateWindowExW(0, L"BUTTON", YG__START_WIDE(YG__START_GET),
+                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | (offers_open ? 0 : BS_DEFPUSHBUTTON),
+                          width - 290, 154, 130, 32, w, (HMENU)(INT_PTR)YG__START_ID_GET, inst, NULL);
+  later = CreateWindowExW(0, L"BUTTON", only_ok ? YG__START_WIDE(YG__START_OK) : YG__START_WIDE(YG__START_LATER),
+                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | (only_ok ? BS_DEFPUSHBUTTON : 0),
                           width - 150, 154, 110, 32, w, (HMENU)(INT_PTR)YG__START_ID_NOT_NOW, inst, NULL);
   if (font) {
     if (text) SendMessageW(text, WM_SETFONT, (WPARAM)font, TRUE);
     if (get) SendMessageW(get, WM_SETFONT, (WPARAM)font, TRUE);
     if (later) SendMessageW(later, WM_SETFONT, (WPARAM)font, TRUE);
+    if (open) SendMessageW(open, WM_SETFONT, (WPARAM)font, TRUE);
   }
   ShowWindow(w, SW_SHOWNORMAL);
-  SetForegroundWindow(w);
-  if (get) SetFocus(get);
+  yg__start_front(w);
+  if (open) SetFocus(open);
+  else if (get) SetFocus(get);
+  else if (later) SetFocus(later);
   /* Its own short message loop, until the window is gone: Tab, Enter and Escape work like in a dialog.
      It also pumps the game's windows on this thread. A WM_QUIT it receives is the game's (the player
      closed the game meanwhile): the small window goes, the quit is posted again for the game's own
@@ -1670,7 +1798,7 @@ static int yg__start_offer(int which) {
   while (!yg__start_done) {
     BOOL got = GetMessageW(&msg, NULL, 0, 0);
     if (got == 0 || got == -1) {
-      yg__start_choice = 0;
+      yg__start_choice = YG__START_ANSWER_LATER;
       if (IsWindow(w)) DestroyWindow(w);
       if (got == 0) PostQuitMessage((int)msg.wParam);
       break;
@@ -2238,11 +2366,53 @@ static yg_start_result yg__start_updating(const yg_start_options *o, const char 
   }
   return YG_START_UPDATING;
 }
+
+#endif
+
+#if defined(_WIN32) || defined(__APPLE__) || defined(YOUGAME_START_TESTING)
+/* After a tray start: wait up to open_wait_ms (at most 60 s) for YouGame to be running. Polled every
+   500 ms: the channel first, then (Windows only) the update marker. The wait is bounded by the clock as
+   well as by the sleeps it adds up, so slow checks never stretch it. YG_START_OPENED, YG_START_UPDATING,
+   or -1 when it is not up in time. */
+#define YG__START_WAIT_MARK &mark, to
+#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
+static int yg__start_wait_up(const yg_start_options *o, int staging, const unsigned have[3],
+                             yg__start_mark *mark, char to[YG__START_TO_CAP]) {
+#else
+#undef YG__START_WAIT_MARK
+#define YG__START_WAIT_MARK 0
+static int yg__start_wait_up(const yg_start_options *o, int staging, const unsigned have[3], int unused) {
+#endif
+  unsigned wait = o->open_wait_ms > 60000 ? 60000 : o->open_wait_ms, waited = 0;
+  unsigned long start, elapsed;
+#if !defined(_WIN32) && !defined(YOUGAME_START_TESTING)
+  (void)have;
+  (void)unused;
+#endif
+  if (wait == 0) return YG_START_OPENED;
+  start = yg__start_ms();
+  while (waited < wait) {
+    unsigned step = wait - waited < 500 ? wait - waited : 500;
+    yg__start_sleep(step);
+    waited += step;
+    elapsed = (yg__start_ms() - start) & 0xFFFFFFFFUL;
+    if (elapsed > waited) waited = elapsed < wait ? (unsigned)elapsed : wait;
+    if (yg__start_running(staging)) return YG_START_OPENED;
+#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
+    /* An older YouGame that finds an update quits to install it: say so, not "didn't open".
+       The version it was started at (have) tells a leftover marker from a new one. */
+    if (YG__START_UPDATE_SYSTEM && yg__start_marker(staging, mark, to) &&
+        (mark->age_ms < 20000 || !yg__start_version_reached(have, to)))
+      return yg__start_updating(o, to);
+#endif
+  }
+  return -1;
+}
 #endif
 
 #if defined(_WIN32) || defined(__APPLE__) || defined(__linux__) || defined(YOUGAME_START_TESTING)
 yg_start_result yg_start(const yg_start_options *o) {
-  int staging, quiet, installed, text;
+  int staging, quiet, installed, text, answer;
 #if defined(_WIN32) || defined(YOUGAME_START_TESTING)
   char to[YG__START_TO_CAP];
   yg__start_mark mark;
@@ -2276,27 +2446,8 @@ yg_start_result yg_start(const yg_start_options *o) {
       if (tray == YG__START_TRAY_OLD) text = YG__START_TEXT_UPDATE;
       else if (tray == YG__START_TRAY_FAILED) text = YG__START_TEXT_DIDNT_OPEN;
       else if (tray == YG__START_TRAY_STARTED) {
-        /* Polled every 500 ms: the channel first, then (Windows only) the update marker. The wait is bounded by
-           the clock as well as by the sleeps it adds up, so slow checks never stretch it. */
-        unsigned wait = o->open_wait_ms > 60000 ? 60000 : o->open_wait_ms, waited = 0;
-        unsigned long start, elapsed;
-        if (wait == 0) return YG_START_OPENED;
-        start = yg__start_ms();
-        while (waited < wait) {
-          unsigned step = wait - waited < 500 ? wait - waited : 500;
-          yg__start_sleep(step);
-          waited += step;
-          elapsed = (yg__start_ms() - start) & 0xFFFFFFFFUL;
-          if (elapsed > waited) waited = elapsed < wait ? (unsigned)elapsed : wait;
-          if (yg__start_running(staging)) return YG_START_OPENED;
-#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
-          /* An older YouGame that finds an update quits to install it: say so, not "didn't open".
-             The version it was started at (have) tells a leftover marker from a new one. */
-          if (YG__START_UPDATE_SYSTEM && yg__start_marker(staging, &mark, to) &&
-              (mark.age_ms < 20000 || !yg__start_version_reached(have, to)))
-            return yg__start_updating(o, to);
-#endif
-        }
+        int up = yg__start_wait_up(o, staging, have, YG__START_WAIT_MARK);
+        if (up >= 0) return (yg_start_result)up;
         text = YG__START_TEXT_DIDNT_OPEN;
       }
     }
@@ -2307,7 +2458,30 @@ yg_start_result yg_start(const yg_start_options *o) {
   (void)yg__start_version_at_least;
   (void)yg__start_sleep;
 #endif
-  if (!yg__start_offer(text)) return YG_START_DECLINED;
+#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
+  /* Run as administrator: no tray start was tried, and Open could not work either. */
+  if (installed && YG__START_UPDATE_SYSTEM && yg__start_raised()) text = YG__START_TEXT_RAISED;
+#endif
+  answer = yg__start_offer(text);
+#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
+  /* Open YouGame: the same checked tray start as above, at any version, now the player asked (also
+     with no_open or no tray_from: pressing Open is the player's own choice). The window may have been
+     up a while: a YouGame that came up meanwhile is taken as is, and one that quit to install an
+     update says so, before anything is started. Then open_wait_ms applies as on the first try. */
+  if (answer == YG__START_ANSWER_OPEN && YG__START_UPDATE_SYSTEM && YG__START_OFFERS_OPEN(text)) {
+    unsigned any[3] = {0, 0, 0}, have[3] = {0, 0, 0};
+    if (yg__start_running(staging)) return YG_START_OPENED;
+    if (yg__start_marker(staging, &mark, to) && (mark.age_ms < 20000 || !yg__start_update_done(staging, to)))
+      return yg__start_updating(o, to);
+    if (yg__start_tray(staging, any, have) == YG__START_TRAY_STARTED) {
+      int up = yg__start_wait_up(o, staging, have, YG__START_WAIT_MARK);
+      /* Started but slow to come up: never send the player to download an app that is starting. */
+      return up >= 0 ? (yg_start_result)up : YG_START_DECLINED;
+    }
+    answer = YG__START_ANSWER_GET;   /* it would not start: the download page puts it right */
+  }
+#endif
+  if (answer != YG__START_ANSWER_GET) return YG_START_DECLINED;
   if (!yg__start_shell_open(staging ? "https://staging.yougame.co/desktop" : "https://yougame.co/desktop"))
     return YG_START_UNAVAILABLE;
   return YG_START_OFFERED;

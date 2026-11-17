@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "walter_egg.h"
+#include "settings_search.h"
+#include "gecko_session.h"
 #include "test_env.h"
 #include "pc_settings.h"
 #include "settings_imgui_input.h"
@@ -60,6 +63,7 @@ namespace gecko { int option_screen_shake_percent = 100; }
 #include "lag_test_codes.h"
 #include "gecko_data.h"
 #include "yougame_link.h"
+#include "yougame_game_state.h"
 #include "yougame_parity.h"
 #include "yougame_embed_fullscreen.h"
 #include "yougame_friends.h"
@@ -72,6 +76,8 @@ namespace gecko { int option_screen_shake_percent = 100; }
 #endif
 #include "yougame_display_defaults.h"
 #include "yougame_blend.h"
+#include "yougame_search.h"
+#include "signin_overlay.h"
 #include "hid_pad.h"
 #include "phob_menu.h"
 #include "updater.h"
@@ -96,10 +102,18 @@ static constexpr bool kShowFasterSoundEffects = true;
 #include "replay_control.h"
 #include "replay_coach.h"
 #include "replay_hud.h"
+#ifndef MELEE_NO_SLIPPI
+#include "arena_panel.h"
+#include "slippi_arena.h"
+static bool arena_capture() { return arena_panel::wants_capture(); }
+static uint16_t arena_withheld() { return arena_panel::withheld_buttons(); }
+#else
+static bool arena_capture() { return false; }
+static uint16_t arena_withheld() { return 0; }
+#endif
 #include "practice_menu.h"
-// Lab view is hidden until its silhouette packs can ship at a reasonable size: no F3 toggle, no
-// Overlays switch, never drawn (so the renderers never skip the scene for it). Code kept intact.
-constexpr bool kLabViewAvailable = false;
+// Lab view: the release ships its silhouette packs in Lab\ (tools/build_lab_assets.py), on both engines.
+constexpr bool kLabViewAvailable = true;
 #ifndef MELEE_PORT_VERSION
 #define MELEE_PORT_VERSION "dev"
 #endif
@@ -2054,6 +2068,27 @@ static void draw_lcancel_overlays() {
       ImGui::End();
     }
   }
+#ifndef MELEE_NO_SLIPPI
+  // A Direct opponent on 0.9.200 or later says in its build message whether its automatic
+  // L-cancel is on; Slippi Dolphin and older builds never do, so nothing shows against them.
+  // Shown on the character select, and for the first eight seconds after the opponent's game says
+  // so: with both players locked in before they connect, the select closes half a second later,
+  // which nobody could read.
+  static double opponent_said_at = -1.0;
+  const bool opponent_auto = slippi::online::opponent_auto_lcancel();
+  if (!opponent_auto) opponent_said_at = -1.0;
+  else if (opponent_said_at < 0.0) opponent_said_at = ImGui::GetTime();
+  if (opponent_auto && (lcancel::online_session_pending() || ImGui::GetTime() - opponent_said_at < 8.0)) {
+    const OverlayBounds bounds = overlay_bounds();
+    ImGui::SetNextWindowPos(ImVec2((bounds.left + bounds.right) * 0.5f, bounds.top + 10), ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.75f);
+    ImGui::Begin("LCancelOpponentNotice", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                                       ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
+    clamp_overlay_window();
+    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Your opponent has automatic L-cancel on.");
+    ImGui::End();
+  }
+#endif
 }
 
 // A friend pressed Join on the player's Discord presence. All that does inside the game is put
@@ -2312,6 +2347,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "audio_device") options.audio_device = value;
       else if (key == "audio_buffer_ms") options.audio_buffer_ms = std::clamp(std::stoi(value), 5, 120);
       else if (key == "audio_early_keyon") gx::RenderOptions::live_audio_early_keyon() = kShowFasterSoundEffects && value == "1";
+      else if (key == "mute_voices") gx::RenderOptions::live_mute_voices() = value == "1";
       else if (key == "quickchat") slippi::online::config().chat = std::clamp(std::atoi(value.c_str()), 0, 2);
       else if (key == "blockcode1" || key == "blockcode2" || key == "blockcode3")
         slippi::online::config().blocked_codes[key.back() - '1'] = value.substr(0, 16);
@@ -2391,6 +2427,10 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "look_menus") { int n = std::atoi(value.c_str()); if (n >= 0 && n < kSurfaceCount) options.look_menus = n; }
       else if (key == "look_unfiltered") options.look_unfiltered = value == "1";
       else if (key == "look_own") options.look_own = value == "1";
+      else if (key == "look_full_models") options.look_full_models = value == "1";
+      else if (key == "look_cap_lifted") options.look_cap_lifted = value == "1";
+      else if (key == "look_saved_fps") options.look_saved_fps_cap = std::atof(value.c_str());
+      else if (key == "look_saved_subframe") options.look_saved_subframe = std::clamp(std::atoi(value.c_str()), 0, 4);
       else if (key == "look_colours") { int n = std::atoi(value.c_str()); if (n >= 0 && n <= 1) options.look_colours = n; }
       else if (key == "look_background") { int n = std::atoi(value.c_str()); if (n >= 0 && n <= 2) options.look_background = n; }
       else if (key == "look_background_rgb") options.look_background_rgb = (uint32_t)std::strtoul(value.c_str(), nullptr, 16) & 0xFFFFFFu;
@@ -2439,6 +2479,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "proaistronger") options.pro_ai_stronger = std::clamp(std::atoi(value.c_str()), 0, 2);
       else if (key == "community_codes") options.community_codes = (uint32_t)std::strtoul(value.c_str(), nullptr, 16) & (MU_DISPLAY_OPTION_CODES_ALL | MU_DISPLAY_OPTION_OFFLINE_CODES);
       else if (key == "unlock_all") options.unlock_all = value != "0";
+      else if (key == "zelda_as_sheik") options.zelda_as_sheik = value == "1";
       else if (key == "results_screen") options.results_screen = value != "0";
 #ifndef MELEE_NO_SLIPPI
       else if (key == "slippi_spectator") options.slippi_spectator = value != "0";
@@ -2695,6 +2736,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   host::g_community_codes.store(options.community_codes, std::memory_order_relaxed);
   phillip_ai::set_stronger_choice(options.pro_ai_stronger);
   RenderOptions::live_unlock_all() = options.unlock_all;
+  RenderOptions::live_zelda_as_sheik() = options.zelda_as_sheik;
   RenderOptions::live_results_screen() = options.results_screen;
   RenderOptions::live_offline_delay() = options.offline_delay;
   // Old files used the online slider for offline play. Preserve that value once, independent
@@ -3487,7 +3529,43 @@ void settings_context_create(void* window, bool open_at_startup) {
   if (std::filesystem::exists(heading_font_path))
     g_settings_heading_font = io.Fonts->AddFontFromFileTTF(heading_font_path.c_str(), 28.0f);
   if (std::filesystem::exists(heading_font_path))   // the Lab view's percent, drawn large: rasterised at that size
-    lab::set_hud_font(io.Fonts->AddFontFromFileTTF(heading_font_path.c_str(), 72.0f));
+    {
+      // The Lab view's HUD is Slippi Lab's: bold 15 px sans-serif, which a browser on Windows draws in
+      // Arial Bold. Without it, the heading font.
+      ImFont* lab_font = nullptr;
+#ifdef _WIN32
+      if (std::filesystem::exists("C:\\Windows\\Fonts\\arialbd.ttf"))
+        lab_font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\arialbd.ttf", 48.0f);
+#endif
+      if (!lab_font) lab_font = io.Fonts->AddFontFromFileTTF(heading_font_path.c_str(), 72.0f);
+      lab::set_hud_font(lab_font);
+    }
+#ifndef MELEE_NO_SLIPPI
+  {
+    // The arena room's lettering (gx/arena_panel.h): Arial Black for the corners, records and tags,
+    // Segoe UI Bold and Black for names, Bahnschrift for the small print. A missing one falls back to
+    // the heading font or the body font.
+    auto load = [&](const char* windows_name) -> ImFont* {
+#ifdef _WIN32
+      const std::string path = std::string("C:\\Windows\\Fonts\\") + windows_name;
+      if (std::filesystem::exists(path)) return io.Fonts->AddFontFromFileTTF(path.c_str(), 32.0f);
+#else
+      (void)windows_name;
+#endif
+      return nullptr;
+    };
+    arena_panel::Fonts fonts;
+    fonts.title = load("ariblk.ttf");
+    fonts.black = load("seguibl.ttf");
+    fonts.bold = load("segoeuib.ttf");
+    fonts.body = load("bahnschrift.ttf");
+    if (!fonts.title) fonts.title = g_settings_heading_font;
+    if (!fonts.black) fonts.black = g_settings_heading_font;
+    if (!fonts.bold) fonts.bold = g_settings_body_font;
+    if (!fonts.body) fonts.body = g_settings_body_font;
+    arena_panel::set_fonts(fonts);
+  }
+#endif
   // ImGui's outline version of the old font, for scaled frames (see settings_old_font). Added last,
   // so the fonts above keep their places, and nothing is rasterised from it until it is used.
   g_settings_old_vector_font = io.Fonts->AddFontDefaultVector();
@@ -4201,7 +4279,8 @@ static void draw_native_practice(SettingsState& state, RenderOptions& options,
     if (show_hint && practice.in_practice && practice.tab_available && practice.phase == Phase::Idle) {
       ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetTime() < 20.0 ? 1.0f : 0.5f);
       practice_card_begin("##native_practice_hint", ImVec2(screen.x - 12, 52), ImVec2(1, 0), false);
-      practice_card_title("Practice menu: Tab or Start + D-pad Up + Z", false);
+      practice_card_title("Find a match while you train", false);
+      ImGui::TextDisabled("Start + D-pad Up + Z (Tab on a keyboard), then Search");
       practice_card_end();
       ImGui::PopStyleVar();
     }
@@ -4376,6 +4455,94 @@ static void draw_replay_practice(RenderOptions& options, const host::PadState& p
   replay_hud::frame(std::clamp(options.practice_style, 0, practice_menu::kStyleCount - 1), f);
 }
 
+#ifndef MELEE_NO_SLIPPI
+// An arena room in the bars beside the picture, on the online character select (gx/arena_panel.h).
+// Gecko codes online (gecko_session.h): the opponent's codes on the character select, each with what
+// it does and a box, none ticked; this player answers with the ones to run. Then one line saying
+// what was agreed. Direct and arenas between Melee Unlocked players only.
+static void draw_gecko_offer_panel() {
+  const std::string line = gecko_session::status();
+  if (!gecko_session::asking()) {
+    if (!line.empty() && !slippi::online::is_online_match()) {
+      ImDrawList* dl = ImGui::GetForegroundDrawList();
+      const ImVec2 size = ImGui::CalcTextSize(line.c_str());
+      const ImVec2 at(ImGui::GetIO().DisplaySize.x * 0.5f - size.x * 0.5f, 8.0f);
+      dl->AddRectFilled(ImVec2(at.x - 10, at.y - 4), ImVec2(at.x + size.x + 10, at.y + size.y + 4), IM_COL32(10, 12, 24, 210), 6.0f);
+      dl->AddText(at, IM_COL32(235, 240, 250, 255), line.c_str());
+    }
+    return;
+  }
+  static std::map<std::string, bool> ticked;
+  const auto offered = gecko_session::incoming();
+  const ImVec2 display = ImGui::GetIO().DisplaySize;
+  ImGui::SetNextWindowPos(ImVec2(display.x * 0.5f, display.y * 0.42f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+  ImGui::SetNextWindowSize(ImVec2(std::min(560.0f, display.x - 40.0f), 0.0f), ImGuiCond_Always);
+  ImGui::Begin("Gecko codes##online_offer", nullptr,
+               ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove);
+  ImGui::TextWrapped("Your opponent wants to use these Gecko codes this match. Tick the ones you are OK with: only codes you both agree on run, on both games.");
+  ImGui::Separator();
+  for (const auto& code : offered) {
+    ImGui::PushID(code.id.c_str());
+    bool on = ticked[code.id] && code.runnable;
+    ImGui::BeginDisabled(!code.runnable);
+    if (ImGui::Checkbox(code.name.c_str(), &on)) ticked[code.id] = on;
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%s)", code.kind.c_str());
+    ImGui::Indent();
+    ImGui::TextWrapped("%s", code.runnable ? code.what.c_str() : ("Cannot run here: " + code.why_not).c_str());
+    ImGui::Unindent();
+    ImGui::PopID();
+  }
+  ImGui::Separator();
+  if (ImGui::Button("Use the ticked codes")) {
+    std::vector<std::string> ids;
+    for (const auto& code : offered) if (ticked[code.id] && code.runnable) ids.push_back(code.id);
+    gecko_session::answer(ids);
+    ticked.clear();
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("No codes")) { gecko_session::answer({}); ticked.clear(); }
+  ImGui::End();
+}
+
+static void draw_arena_panel(RenderOptions& options, const host::PadState* pads, const host::PadState& followed, bool have_followed) {
+  // The local player's controller: any port can drive the online select's hand (a controller in
+  // port 2 moves it while port 1 reads as connected and idle, as with an adapter), so the panel
+  // reads the pad in use: the one pushing its stick furthest or holding a button, else the followed one.
+  static int arena_port = -1;
+  int best = -1, best_amount = 0;
+  for (int i = 0; i < 4; ++i) {
+    if (pads[i].err != 0) continue;
+    const int amount = std::max(std::abs((int)pads[i].stick_x), std::abs((int)pads[i].stick_y)) + (pads[i].button ? 200 : 0);
+    if (amount > 40 && amount > best_amount) { best = i; best_amount = amount; }
+  }
+  if (best >= 0) arena_port = best;
+  const bool use_kept = arena_port >= 0 && pads[arena_port].err == 0;
+  const host::PadState& pad = use_kept ? pads[arena_port] : followed;
+  const bool have_pad = use_kept || have_followed;
+  const ImVec2 screen = ImGui::GetIO().DisplaySize;
+  arena_panel::Frame f;
+  f.display_w = screen.x;
+  f.display_h = screen.y;
+  const float aspect = presented_aspect(options, (int)screen.x, (int)screen.y, true);
+  float gw = screen.x, gh = gw / std::max(aspect, 0.1f);
+  if (gh > screen.y) { gh = screen.y; gw = gh * aspect; }
+  f.game_x0 = (screen.x - gw) * 0.5f;
+  f.game_y0 = (screen.y - gh) * 0.5f;
+  f.game_x1 = f.game_x0 + gw;
+  f.game_y1 = f.game_y0 + gh;
+  if (have_pad) { f.buttons = pad.button; f.stick_x = pad.stick_x; f.stick_y = pad.stick_y; f.sub_x = pad.sub_x; f.sub_y = pad.sub_y; }
+  f.time = ImGui::GetTime();
+  // Rooms ride on the Source Port's character select, whose game library reports the hand (cmd
+  // 0xEF). The Static Recomp's select never does: it drew an ARENA tab there that nothing opens.
+  float hand_x = 0, hand_y = 0;
+  f.on_online_menus = (slippi::online::in_online_menus() && slippi::arena::css_hand(&hand_x, &hand_y)) ||
+                      slippi::arena::test_fixture_active();
+  arena_panel::frame(f);
+}
+#endif
+
 // The settings file. Written by the panel after a change, and at once when the game changes a
 // saved value itself (the 20XX TE menu song).
 // A Lab view colour as saved: "-" for the look's own, otherwise RRGGBB.
@@ -4418,6 +4585,7 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\nwindow " << (options.window_pinned ? std::to_string(options.window_w) + "x" + std::to_string(options.window_h) : std::string("follow"))
        << "\nvolume " << g_volume << "\nperformance " << options.performance_overlay
        << "\naudio_early_keyon " << (gx::RenderOptions::live_audio_early_keyon() ? 1 : 0)
+       << "\nmute_voices " << (gx::RenderOptions::live_mute_voices() ? 1 : 0)
        << "\naudio_mode " << options.audio_mode << "\naudio_buffer_ms " << options.audio_buffer_ms << "\naudio_device " << options.audio_device
        << "\naudio_asio_driver " << options.audio_asio_driver << "\naudio_asio_buffer " << options.audio_asio_buffer
        << "\nshowfps " << (g_display_keys.yougame ? g_display_keys.show_fps : options.show_fps)
@@ -4514,6 +4682,8 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\nretro " << (options.retro ? 1 : 0)
        << "\nlook_fighter " << options.look_fighter << "\nlook_stage " << options.look_stage
        << "\nlook_menus " << options.look_menus << "\nlook_unfiltered " << (options.look_unfiltered ? 1 : 0) << "\nlook_own " << (options.look_own ? 1 : 0)
+       << "\nlook_full_models " << (options.look_full_models ? 1 : 0) << "\nlook_cap_lifted " << (options.look_cap_lifted ? 1 : 0)
+       << "\nlook_saved_fps " << options.look_saved_fps_cap << "\nlook_saved_subframe " << options.look_saved_subframe
        << "\nlook_colours " << options.look_colours << "\nlook_background " << options.look_background
        << "\nlook_background_rgb " << std::hex << options.look_background_rgb << std::dec
        << "\nstadium_frozen " << (options.stadium_frozen ? 1 : 0)
@@ -4563,6 +4733,7 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\ncommunity_codes " << std::hex << options.community_codes << std::dec
        << "\nproaistronger " << options.pro_ai_stronger
        << "\nunlock_all " << (options.unlock_all ? 1 : 0)
+       << "\nzelda_as_sheik " << (options.zelda_as_sheik ? 1 : 0)
        << "\nresults_screen " << (options.results_screen ? 1 : 0)
 #ifndef MELEE_NO_SLIPPI
        << "\nslippi_spectator " << (options.slippi_spectator ? 1 : 0)
@@ -4893,7 +5064,7 @@ static void game_mods_panel(const RenderOptions& options) {
   namespace mods = source_port::mods;
   auto view = mods::panel_view();
   if (!view.scanned && !view.scanning && !view.importing && mods::auto_detect()) mods::rescan_async();
-  ImGui::TextUnformatted("Game mods");
+  settings_section("Game mods");
   ImGui::TextWrapped("Put your mod files in the Mods folder. Recognized packs turn on once; your On/Off choices are saved. "
                      "To get, update or remove a pack, use Mods in the launcher.");
   if (settings_widgets::Button("Open Mods folder")) mods::open_mods_folder();
@@ -5012,9 +5183,12 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   const bool practice_forced = practice.phase == slippi::native_practice::Phase::Handoff ||
                                practice.phase == slippi::native_practice::Phase::Failure ||
                                practice.phase == slippi::native_practice::Phase::ReturningToPractice;
+  // YouGame's Sign in by code panel (signin_overlay.cpp) takes the controllers like the Practice menu:
+  // the game gets none of them, and the panel's buttons move on the routed pad.
+  const bool signin_up = signin_overlay::open();
   const bool practice_force_capture =
-      slippi::native_practice::phase_forces_input_capture(practice.phase);
-  const bool practice_nav = state.practice_open || practice.phase == slippi::native_practice::Phase::Failure;
+      slippi::native_practice::phase_forces_input_capture(practice.phase) || signin_up;
+  const bool practice_nav = state.practice_open || practice.phase == slippi::native_practice::Phase::Failure || signin_up;
   // Platform gamepad polling is disabled (Win32 at build time, SDL in settings_context_create).
   // ImGui 1.92.8 polls even with NavEnableGamepad off: clearing that flag alone did not stop
   // XInput's X/menu key or its competing events. Keep the window-switcher fix and practice's
@@ -5023,6 +5197,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   {
     auto& io = ImGui::GetIO();
     settings_input::navigation(io, state.open || state.menu_open || practice_nav || state.fill_window);
+    // The YouGame button shows over MU's own menus (gameState "menu"), as overlay_visible() counts them.
+    yougame::game_state::overlay_menu_open.store(state.open || state.menu_open || state.practice_open ||
+                                                 settings_fills_window(), std::memory_order_relaxed);
     io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
   }
 #ifdef _WIN32
@@ -5177,7 +5354,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     }
   }
   ImGui::NewFrame();
-  if (yougame::active() || slippi::online::online_status_visible()) {
+  // A copy the player started itself reaches YouGame only through the local channel (active() is false
+  // there), and its search lines (a lone seat's paused line) must show all the same.
+  if (yougame::active() || yougame::channel_connected() || slippi::online::online_status_visible()) {
     const auto now = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     const auto toast = yougame::friends::events.toast(now);
@@ -5228,10 +5407,15 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     }
 #endif
     // Online menu/CSS visibility alone must not create an empty or version-only pill.
+    // The room's paused line (a lone standalone seat, a test build's pool) replaces a YouGame-only search
+    // line, plain "searching" included; "Searching Slippi + YouGame" keeps its own line (Slippi may still find one).
+    const auto paused = console_status.empty() && (status == "searching" || status == yougame::blend::kSearchYouGameOnly)
+        ? yougame::search_paused_line() : std::string();
     const bool show_status = !console_status.empty() || status == yougame::update::kMessage ||
         status == yougame::friends::kWaiting || status == yougame::friends::kJoined ||
         status == yougame::friends::kFailed || status == yougame::friends::kVersion ||
-        status == yougame::blend::kSearchBoth || status == yougame::blend::kSearchYouGameOnly;
+        status == yougame::search_policy::kLinkRetry || status == yougame::search_policy::kOwnUdpRetry ||
+        status == yougame::blend::kSearchBoth || status == yougame::blend::kSearchYouGameOnly || !paused.empty();
     if (!slippi::online::is_online_match() && show_status) {
       // One row on the picture's bottom edge, sized to the picture: 60 px up it sat on the retail menus'
       // description box (VS. Mode, Name Entry) and on the CSS name cards.
@@ -5243,7 +5427,12 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * font / ImGui::GetFontSize());
       ImGui::Begin("##yougame_friend_waiting", nullptr, passive_flags);
       screen_label::reserve_bottom(ImGui::GetWindowPos().y);
-      ImGui::TextUnformatted(yougame::slippi_link_status(status).c_str());
+      if (paused.empty()) ImGui::TextUnformatted(yougame::slippi_link_status(status).c_str());
+      else {
+        const auto text = yougame::slippi_link_status(status);
+        const auto nl = text.find('\n');   // keep a second line (why Slippi stopped) under the room's line
+        ImGui::TextUnformatted((paused + (nl == std::string::npos ? "" : text.substr(nl))).c_str());
+      }
       if (status == yougame::friends::kWaiting || !console_status.empty()) {
         ImGui::SameLine();
         ImGui::TextDisabled("Z: cancel");
@@ -5273,8 +5462,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // --settings-tab (the launcher's "Choose skins" opens the Mods tab), or the test hook.
     const int initial = g_initial_tab.load(std::memory_order_relaxed);
     if (initial >= 0) state.active_tab = std::clamp(initial, 0, 7);
-    else if (const char* tab = host::test_env::getenv("MELEE_TEST_SETTINGS_TAB"))
+    else if (const char* tab = host::test_env::getenv("MELEE_TEST_SETTINGS_TAB")) {
       state.active_tab = std::clamp(std::atoi(tab), 0, 7);
+      // The page itself, not the category screen, whatever the menu style.
+      state.clean_detail_open = state.dashboard_detail_open = state.radial_detail_open = state.gd_detail_open = true;
+    }
     if (test_menu_style() >= 0) options.overlay_style = test_menu_style();
   }
   const auto reset_settings_home = [&state](const char* why) {
@@ -5485,14 +5677,41 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   if (ImGui::IsKeyPressed(ImGuiKey_F2, false) && ImGui::GetIO().KeyCtrl) { request_frame_capture(90); host::log("capture: Ctrl+F2, writing the next 90 presented frames into capture\\"); }
   // F3: Lab view on or off. Marked dirty, so it is saved with the other settings the next time the
   // panel is open (the panel is what writes the settings file).
-  // The Lab view draws from the Slippi frame data the translated guest sends; the Source Port has
-  // none, so F3 stays off there.
-  if (kLabViewAvailable && !options.native_source && ImGui::IsKeyPressed(ImGuiKey_F3, false)) { options.lab_view = !options.lab_view; state.dirty = true; host::log("lab view: %s", options.lab_view ? "on" : "off"); }
+  // Both engines feed it: the Static Recomp its Slippi frame data, the Source Port a geometry snapshot.
+  if (kLabViewAvailable && ImGui::IsKeyPressed(ImGuiKey_F3, false)) { options.lab_view = !options.lab_view; state.dirty = true; host::log("lab view: %s", options.lab_view ? "on" : "off"); }
   // Drawn first, on the background list, so every overlay and window below lands on top of it.
   // Called every frame, off or on, so lab::covering() always describes this frame.
   lab::set_style(options.look_lab_fighters, options.look_lab_stage);
+  lab::set_enabled(options.lab_view && kLabViewAvailable);
   lab::set_colors(options.lab_colour, options.lab_colour_background, options.lab_colour_stage);
   const bool lab_on = options.lab_view && (kLabViewAvailable || options.look_lab_fighters != 0);   // the styles need no packs
+  {   // a replay's controls keep the bottom: the Lab view's box and HUD sit above them
+    float reserve = 0.0f;
+    if (replay_bar::active() && !replay_bar::all_hidden()) {
+      reserve = 80.0f * ImGui::GetIO().DisplaySize.y / 720.0f;
+      if (replay_bar::shown()) reserve = std::max(reserve, 2.0f * ImGui::GetFontSize() + 46.0f);
+    }
+    lab::set_bottom_reserve(reserve);
+  }
+  {   // The Lab view's fighter packs are a download of their own (host/updater.cpp lab_packs_download):
+      // fetched the first time the silhouette look finds none (the stick figure and capsule looks need
+      // none), with its progress under the timer, and used as soon as they are in place.
+    static std::atomic<bool> missing{false};
+    static bool fetching = false, tried = false;
+    static const bool wired = (lab::set_missing_packs_handler([](const std::string&) { missing = true; }), true);
+    (void)wired;
+    if (missing.load() && !tried && options.lab_view && options.look_lab_fighters == 0 &&
+        !std::getenv("MELEE_LAB_NO_DOWNLOAD")) {
+      tried = fetching = true;   // once per run: a failure says why and waits for the next start
+      host::updater::lab_packs_download(host::options.lab_dir);
+    }
+    if (fetching) {
+      const auto fetch_state = host::updater::lab_packs_state(host::options.lab_dir);
+      if (fetch_state == host::updater::ModelState::Present) { fetching = false; lab::set_notice(""); lab::packs_changed(); }
+      else if (fetch_state == host::updater::ModelState::Failed) { fetching = false; lab::set_notice(host::updater::lab_packs_message()); }
+      else lab::set_notice(host::updater::lab_packs_message());
+    }
+  }
   lab::draw(lab_on && !state.fill_window, ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y);
   // 20XX TE's Input display is the same switch as the Controller overlay (te_pairs_linked), and the
   // overlay already shows the controllers: with it on, TE's own display is not drawn as well.
@@ -5530,6 +5749,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   // The menu key (F1 under YouGame, Esc standalone) leaves Settings safely at the main menu.
   // Only selecting its quit row may open the confirmation. Legacy/launcher settings keep close.
   // While rebinding, Escape cancels the capture without also changing the panel.
+  if (signin_up && !state.open && !state.menu_open && host::window_take_escape()) signin_overlay::back();   // Esc: Back
   if (phob_native_open() && host::window_take_escape()) {
     phob_native_close();   // Esc leaves the PhobGCC menu for the Controls tab
   } else if (host::window_take_escape() && state.rebind_action < 0) {
@@ -5610,11 +5830,30 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   const bool panel_visible = (state.open || state.panel_slide_x > -720.0f) && !phob_native_open();
   const bool practice_capture = state.practice_open || practice_force_capture ||
                                 state.practice_release_capture;
-  host::window_input_capture(state.open || state.menu_open || practice_capture || replay_bar::wants_cursor());
+  host::window_input_capture(state.open || state.menu_open || practice_capture || replay_bar::wants_cursor() || arena_capture());
+  host::window_withhold_buttons(state.open || state.menu_open ? 0 : arena_withheld());
   state.intervals[state.cursor++ % state.intervals.size()] = ImGui::GetIO().DeltaTime*1000.f;
   if (streamline::reflex_available() || streamline::reflex_latency_ms() > 0.0f)   // Vulkan on NVIDIA too
     state.latencies[state.latency_cursor++ % state.latencies.size()] = streamline::reflex_latency_ms();
   bool changed = false;
+  // Hidden test hook: MELEE_TEST_LOOK_SEQUENCE="<frame>:<look>,..." picks those looks (by their number
+  // in look_presets) at those panel frames, exactly as the Look list does, so going from one look to
+  // another in one run can be captured (a look that leaves something of itself behind).
+  if (const char* seq = host::test_env::getenv("MELEE_TEST_LOOK_SEQUENCE")) {
+    static size_t next = 0;
+    const char* p = seq;
+    for (size_t i = 0; i < next && p && *p; ++i) { p = std::strchr(p, ','); if (p) ++p; }
+    int at = 0, look = 0;
+    if (p && *p && std::sscanf(p, "%d:%d", &at, &look) == 2 && ImGui::GetFrameCount() >= at) {
+      apply_look_preset(options, look, d3d11_available());
+      set_lightweight_level(options.lightweight);
+      host::log("look test: frame %d, look %d: frame cap %.0f, sub-frame %d, lightweight %d, full models %d, cap lifted %d",
+                ImGui::GetFrameCount(), look, options.fps_cap, (int)options.subframe, options.lightweight,
+                options.look_full_models ? 1 : 0, options.look_cap_lifted ? 1 : 0);
+      ++next;
+      changed = true;
+    }
+  }
   if (panel_visible) {
     g_settings_palette = options.overlay_palettes[std::clamp(options.overlay_style, 0, 6)];
     g_settings_custom_color_enabled = options.settings_custom_color_enabled;
@@ -6090,6 +6329,10 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // controls their own inset instead of relying on inherited child padding, which can be zero
     // under the legacy child flags used by some builds. This keeps rows away from the glass edge.
     ImGui::PushTextWrapPos(0.0f);
+    // Search every page at once (settings_search_box, pc_settings_visuals.inl). "Go to" on a result
+    // switches to its page first.
+    if (g_goto_page >= 0 && !g_goto_label.empty() && state.active_tab != g_goto_page) state.active_tab = g_goto_page;
+    settings_search_box();
     static constexpr const char* titles[] = {
         "VIDEO", "AUDIO", "GAME", "CONTROLS", "OVERLAYS", "CUSTOMIZE", "GECKO CODES", "MODS"};
     if (wide_detail_theme) {
@@ -6124,7 +6367,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       state.page_navigation.begin(state.active_tab, options.overlay_style);
       settings_page::observer = &state.page_navigation;
     }
-    if (state.active_tab == 0) {
+    if (settings_page_shown(state.active_tab, 0)) {
     // One width for every combo and slider on this tab, so their labels all begin at the same x.
     // Left to itself ImGui sizes each control from the space its own label needs, which staggered
     // the labels down the column.
@@ -6414,46 +6657,6 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       float used = 0, total = 0;
       if (vram_usage(&used, &total)) settings_hint("Video memory in use: %.1f / %.1f GB", used, total);
     }
-    // ---- Shield colours ----
-    // Each port's shield (and KO blast) colour: a colour wheel, the game's preset colours one click away,
-    // and the port's own. "Online" is the player's own colour in online matches; Melee Unlocked opponents
-    // are sent it and show it, Slippi Dolphin opponents keep the port colour. Display only.
-    if (settings_widgets::CollapsingHeader("Shield colours##shields")) {
-      ImGui::Indent(8.0f);
-      auto shield_row = [&](const char* label, uint32_t* value, int port_colour) {
-        ImGui::PushID(label);
-        const uint32_t shown = *value ? (*value & 0xFFFFFFu)
-                                      : ((uint32_t)kShieldColorRgb[port_colour][0] << 16 | (uint32_t)kShieldColorRgb[port_colour][1] << 8 |
-                                         kShieldColorRgb[port_colour][2]);
-        float c[3] = {((shown >> 16) & 0xFF) / 255.0f, ((shown >> 8) & 0xFF) / 255.0f, (shown & 0xFF) / 255.0f};
-        if (settings_widgets::ColorEdit3(label, c, ImGuiColorEditFlags_PickerHueWheel | ImGuiColorEditFlags_DisplayRGB)) {
-          *value = 0x1000000u | ((uint32_t)(c[0] * 255 + 0.5f) << 16) | ((uint32_t)(c[1] * 255 + 0.5f) << 8) | (uint32_t)(c[2] * 255 + 0.5f);
-          changed = true;
-        }
-        ImGui::SameLine();
-        if (!*value) ImGui::TextDisabled("port colour");
-        else if (settings_widgets::SmallButton("Port colour")) { *value = 0; changed = true; }
-        // The game's own presets, one click each.
-        for (int i = 0; i < kShieldColorCount; ++i) {
-          const uint8_t* rgb = kShieldColorRgb[i];
-          if (i) ImGui::SameLine(0.0f, 3.0f);
-          ImGui::PushID(i);
-          if (settings_widgets::ColorButton(kShieldColorNames[i], ImVec4(rgb[0] / 255.0f, rgb[1] / 255.0f, rgb[2] / 255.0f, 1.0f), 0, ImVec2(16, 16))) {
-            *value = 0x1000000u | ((uint32_t)rgb[0] << 16) | ((uint32_t)rgb[1] << 8) | rgb[2];
-            changed = true;
-          }
-          ImGui::PopID();
-        }
-        ImGui::PopID();
-      };
-      static const char* const ports[4] = {"P1 shield", "P2 shield", "P3 shield", "P4 shield"};
-      for (int port = 0; port < 4; ++port) shield_row(ports[port], &options.shield_color[port], port);
-      ImGui::Separator();
-      shield_row("Online (you)", &options.shield_color_online, 0);
-      settings_hint("Your shield and KO blast colours. Online, \"Online (you)\" is yours (left empty, your P1 colour): players"
-                    " on Melee Unlocked see it, players on Slippi Dolphin see your port colour. Team matches keep team colours.");
-      ImGui::Unindent(8.0f);
-    }
     // ---- Get mod looks ----
     // One click each: the authors' own download, checked against its published file and built from the
     // player's own disc (host::cosmetics::install_official_look). Open until all three are installed; once
@@ -6574,7 +6777,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       static const char* const gain[] = {"", "High", "High", "High", "High", "Modest", "Modest",
                                          "High", "High", "Very high", "Very high", "Very high", "High", "High", "High"};
       const char* preview = current < 0 ? "Custom" : current == 11 ? presets[9].name : presets[current].name;
-      if (settings_widgets::BeginCombo("Look", preview, ImGuiComboFlags_HeightLarge)) {
+      if (settings_begin_combo("Look", preview, ImGuiComboFlags_HeightLarge)) {
         auto group = [&](const char* title, std::initializer_list<int> entries) {
           ImGui::Separator(); ImGui::TextDisabled("%s", title);
           for (int i : entries) {
@@ -6596,7 +6799,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         group("Faster", {0, 1, 2, 7, 8});
         group("Built-in styles", {14, 12, 13, 9, 10});
         group("Mod artwork (setup required)", {3, 4, 5});
-        ImGui::EndCombo();
+        settings_end_combo();
       }
       if (ImGui::IsItemHovered())
         ImGui::SetTooltip("%s\nPerformance varies by computer, stage and settings.",
@@ -6763,7 +6966,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       if (options.look_background == 2) {
         float rgb[3] = {((options.look_background_rgb >> 16) & 0xFF) / 255.0f, ((options.look_background_rgb >> 8) & 0xFF) / 255.0f,
                         (options.look_background_rgb & 0xFF) / 255.0f};
-        if (settings_widgets::ColorEdit3("Background colour", rgb, ImGuiColorEditFlags_NoInputs)) {
+        if (settings_color_edit3("Background colour", rgb, ImGuiColorEditFlags_NoInputs)) {
           options.look_background_rgb = ((uint32_t)(rgb[0] * 255 + 0.5f) << 16) | ((uint32_t)(rgb[1] * 255 + 0.5f) << 8) | (uint32_t)(rgb[2] * 255 + 0.5f);
           changed = true;
         }
@@ -6779,7 +6982,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         const auto colour_row = [&changed](const char* label, uint32_t* value, uint32_t look_colour) {
           const uint32_t shown = *value ? (*value & 0xFFFFFFu) : look_colour;
           float c[3] = {((shown >> 16) & 0xFF) / 255.0f, ((shown >> 8) & 0xFF) / 255.0f, (shown & 0xFF) / 255.0f};
-          if (settings_widgets::ColorEdit3(label, c, ImGuiColorEditFlags_DisplayRGB)) {
+          if (settings_color_edit3(label, c, ImGuiColorEditFlags_DisplayRGB)) {
             *value = 0x1000000u | ((uint32_t)(c[0] * 255 + 0.5f) << 16) | ((uint32_t)(c[1] * 255 + 0.5f) << 8) | (uint32_t)(c[2] * 255 + 0.5f);
             changed = true;
           }
@@ -6837,7 +7040,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       if (options.arcade_backdrop >= 1) {
         const uint32_t c = options.arcade_background_rgb;
         float rgb[3] = {((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f, (c & 0xFF) / 255.0f};
-        if (settings_widgets::ColorEdit3("Background colour##arcade", rgb, ImGuiColorEditFlags_DisplayRGB)) {
+        if (settings_color_edit3("Background colour##arcade", rgb, ImGuiColorEditFlags_DisplayRGB)) {
           options.arcade_background_rgb = ((uint32_t)(rgb[0] * 255 + 0.5f) << 16) | ((uint32_t)(rgb[1] * 255 + 0.5f) << 8) |
                                           (uint32_t)(rgb[2] * 255 + 0.5f);
           changed = true;
@@ -6847,7 +7050,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         if (options.arcade_backdrop == 2) {
           const uint32_t g = options.arcade_grid_rgb;
           float grid[3] = {((g >> 16) & 0xFF) / 255.0f, ((g >> 8) & 0xFF) / 255.0f, (g & 0xFF) / 255.0f};
-          if (settings_widgets::ColorEdit3("Grid colour##arcade", grid, ImGuiColorEditFlags_DisplayRGB)) {
+          if (settings_color_edit3("Grid colour##arcade", grid, ImGuiColorEditFlags_DisplayRGB)) {
             options.arcade_grid_rgb = ((uint32_t)(grid[0] * 255 + 0.5f) << 16) | ((uint32_t)(grid[1] * 255 + 0.5f) << 8) |
                                       (uint32_t)(grid[2] * 255 + 0.5f);
             changed = true;
@@ -7130,7 +7333,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         ++scroll_frames;
       }
     }
-    ImGui::SeparatorText("HDR");
+    settings_section("HDR");
     ImGui::BeginDisabled(d3d11 || !hdr_display_available());
     if (settings_toggle("HDR output", &options.hdr_output)) changed = true;
     ImGui::EndDisabled();
@@ -7142,7 +7345,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       if (settings_slider("Peak brightness", &options.hdr_peak, 0, 4000, options.hdr_peak ? "%d nits" : "From Windows")) changed = true;
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("The brightest highlights (path tracing). From Windows uses the display's own value.");
     }
-    ImGui::SeparatorText("Ray tracing");
+    settings_section("Ray tracing");
     ImGui::BeginDisabled(!path_available);
     if (settings_toggle("Path tracing", &options.path_tracing)) changed = true;
     ImGui::EndDisabled();
@@ -7337,7 +7540,28 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         if (settings_toggle("NVIDIA Ray Reconstruction", &options.ray_reconstruction)) changed = true;
         ImGui::EndDisabled();
         if (!rr_available)
-          settings_hint("Needs the DLSS Ray Reconstruction runtime (sl.dlss_d.dll and nvngx_dlssd.dll).");
+        {   // NVIDIA's runtime for it is a download of its own (host/updater.cpp rr_download)
+          std::string rr_dir;
+          char module[MAX_PATH]{};
+          const DWORD length = GetModuleFileNameA(nullptr, module, MAX_PATH);
+          if (length > 0 && length < MAX_PATH) rr_dir = std::filesystem::path(module).parent_path().u8string();
+          using host::updater::ModelState;
+          const ModelState rs = rr_dir.empty() ? ModelState::Present : host::updater::rr_state(rr_dir);
+          if (rs == ModelState::Downloading) {
+            settings_hint("%s", host::updater::rr_message().c_str());
+          } else if (rs == ModelState::Present && !host::updater::rr_message().empty()) {
+            settings_hint("Ray Reconstruction is installed. Restart the game to use it.");
+            restart_now_button("rr");
+          } else if (rs != ModelState::Present) {
+            char label[80];
+            std::snprintf(label, sizeof label, "Download Ray Reconstruction (%s)", host::updater::kRrSize);
+            if (ImGui::Button(label, ImVec2(0, 32))) host::updater::rr_download(rr_dir);
+            settings_hint("%s", rs == ModelState::Failed ? host::updater::rr_message().c_str()
+                                                         : "NVIDIA's denoiser for path tracing is a separate download. It goes beside the game and stays there through updates.");
+          } else {
+            settings_hint("Needs an NVIDIA RTX card and a driver with DLSS Ray Reconstruction.");
+          }
+        }
       }
     }
 #ifdef GX_DLSS5
@@ -7479,14 +7703,14 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           ImGui::TextUnformatted("Profile");
           ImGui::SameLine();
           ImGui::SetNextItemWidth(200.0f);
-          if (settings_widgets::BeginCombo("##dlss5_profile", active_name.empty() ? "(unsaved)" : active_name.c_str())) {
+          if (settings_begin_combo("##dlss5_profile", active_name.empty() ? "(unsaved)" : active_name.c_str())) {
             for (const std::string& name : list) {
               if (settings_widgets::Selectable(name.c_str(), name == active_name)) {
                 if (dlss5::profile_load(name, t)) { active_name = name; status = "Loaded " + name + "."; changed = true; }
                 else status = "Could not read " + name + ".";
               }
             }
-            ImGui::EndCombo();
+            settings_end_combo();
           }
           ImGui::SameLine();
           if (settings_widgets::Button("Save as...")) { new_name[0] = 0; status.clear(); ImGui::OpenPopup("dlss5_save"); }
@@ -7591,7 +7815,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     }
     // Two different things draw a CRT here: the game's own tube model (crt_shader.h) and a RetroArch
     // preset of the player's choice. Each has its own heading so nobody mistakes one for the other.
-    ImGui::SeparatorText("Built-in CRT");
+    settings_section("Built-in CRT");
     settings_hint("Melee Unlocked's own tube model, made for Melee. Light on frame time.");
     ImGui::BeginDisabled(!options.shader_preset.empty());
     static const char* crt_looks[] = {"Off", "Studio monitor", "Home television"};
@@ -7611,7 +7835,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     ImGui::EndDisabled();
     if (!options.shader_preset.empty() && options.crt_filter)
       settings_hint("Off while a RetroArch shader preset is applied (set the preset to None to use it).");
-    ImGui::SeparatorText("RetroArch shader presets");
+    settings_section("RetroArch shader presets");
     settings_hint("Community shaders, grouped by the people who made them. Applying one turns the built-in CRT off.");
     // A shader preset of the player's choice (RetroArch slang presets in the Shaders folder).
     {
@@ -7878,7 +8102,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       const std::string preview = current.empty() ? "Choose observed texture..." : current;
       ImGui::PushID(slot == 0 ? "css-video-target" : "sss-video-target");
       ImGui::SetNextItemWidth(-1.0f);
-      if (settings_widgets::BeginCombo(label, preview.c_str())) {
+      if (settings_begin_combo(label, preview.c_str())) {
         for (const auto& texture : observed) {
           const std::string item = texture.name + ": " + std::to_string(texture.width) + "x" +
               std::to_string(texture.height) + ", " +
@@ -7888,7 +8112,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             video_bg::choose_target(slot, texture.name);
           if (texture.name == current) ImGui::SetItemDefaultFocus();
         }
-        ImGui::EndCombo();
+        settings_end_combo();
       }
       ImGui::PopID();
     };
@@ -7996,7 +8220,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     }
         ImGui::PopItemWidth();
       }
-      if (state.active_tab == 1) {
+      if (settings_page_shown(state.active_tab, 1)) {
     ImGui::PushItemWidth(330.0f);
     int music = slippi::jukebox::user_volume();
     if (settings_slider("Music", &music, 0, 100, "%d%%")) { slippi::jukebox::set_user_volume(music); changed = true; }
@@ -8049,10 +8273,10 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       static const std::string asio_at_start = options.audio_asio_driver;
       static const int asio_buffer_at_start = options.audio_asio_buffer;
       if (options.audio_asio_driver.empty() && !drivers.empty()) { options.audio_asio_driver = drivers.front(); changed = true; }
-      if (settings_widgets::BeginCombo("ASIO driver", options.audio_asio_driver.empty() ? "No ASIO driver installed" : options.audio_asio_driver.c_str())) {
+      if (settings_begin_combo("ASIO driver", options.audio_asio_driver.empty() ? "No ASIO driver installed" : options.audio_asio_driver.c_str())) {
         for (const auto& d : drivers)
           if (settings_widgets::Selectable(d.c_str(), d == options.audio_asio_driver)) { options.audio_asio_driver = d; changed = true; }
-        ImGui::EndCombo();
+        settings_end_combo();
       }
       const char* buffer_names[] = {"Driver default", "64 samples", "96 samples", "128 samples", "192 samples", "256 samples", "384 samples", "512 samples"};
       const int buffer_values[] = {0, 64, 96, 128, 192, 256, 384, 512};
@@ -8085,6 +8309,15 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                           "always use console timing. Source Port only.");
     }
     {
+      // Mute character voices (Source Port: the game library plays the fighters' voices at volume 0).
+      ImGui::BeginDisabled(!g_settings_standalone && host::game_image == nullptr);
+      if (settings_toggle("Mute character voices", &gx::RenderOptions::live_mute_voices())) changed = true;
+      ImGui::EndDisabled();
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("The fighters' voices are silent: shouts, grunts, taunts and KO screams. Every other sound\n"
+                          "plays as before. Only you hear the difference; online and in replays too. Source Port only.");
+    }
+    {
       // Output device picker: the Windows default, or one named device (virtual cables, interfaces).
       static std::vector<host::AudioDevice> devices;
       static bool listed = false;
@@ -8093,11 +8326,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       std::string current = "Windows default";
       for (const auto& d : devices) if (d.id == options.audio_device) current = d.name;
       ImGui::BeginDisabled(options.audio_mode == 3);
-      if (settings_widgets::BeginCombo("Output device", current.c_str())) {
+      if (settings_begin_combo("Output device", current.c_str())) {
         if (settings_widgets::Selectable("Windows default", options.audio_device.empty())) { options.audio_device.clear(); changed = true; }
         for (const auto& d : devices)
           if (settings_widgets::Selectable(d.name.c_str(), d.id == options.audio_device)) { options.audio_device = d.id; changed = true; }
-        ImGui::EndCombo();
+        settings_end_combo();
       }
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("Used by Windows shared and WASAPI exclusive modes, and by Auto if ASIO cannot start.");
@@ -8142,7 +8375,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("A short tick when you move through the settings, and when a page opens or closes.");
       }
-      if (state.active_tab == 5) {
+      if (settings_page_shown(state.active_tab, 5)) {
         ImGui::TextUnformatted("Customize");
         ImGui::TextDisabled("Choose the menu layout, colors, and transparency.");
         ImGui::Spacing();
@@ -8512,7 +8745,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           }
           ImGui::Spacing();
           ImGui::TextUnformatted("Custom menu accent");
-          settings_widgets::Checkbox("Use custom accent",&options.settings_custom_color_enabled);
+          settings_checkbox("Use custom accent",&options.settings_custom_color_enabled);
           if (ImGui::IsItemDeactivatedAfterEdit()) changed=true;
           // Collapsed by default: the full wheel is large and most players never open it.
           if (settings_widgets::TreeNode("Show colour picker")) {
@@ -8631,7 +8864,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         ImGui::Spacing();
         ImGui::Separator();
       }
-      if (state.active_tab == 7) {
+      if (settings_page_shown(state.active_tab, 7)) {
         static std::string mod_message;
         if (host::gameplay::vanilla_only())
           ImGui::TextWrapped("Vanilla-only session: gameplay mods are disabled. Your saved mod choices are kept for normal launches.");
@@ -8826,9 +9059,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           ImGui::Spacing();
           ImGui::Separator();
         }
-        ImGui::TextUnformatted("Cosmetic mods");
+        settings_section("Cosmetic mods");
         bool random_stage_skins = host::cosmetics::random_stage_skins();
-        if (settings_widgets::Checkbox("Random installed stage skin each match", &random_stage_skins)) {
+        if (settings_checkbox("Random installed stage skin each match", &random_stage_skins)) {
           std::string error;
           if (!host::cosmetics::set_random_stage_skins(random_stage_skins, &error)) mod_message = error;
         }
@@ -8842,7 +9075,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
           const std::string label = pack.name + ": " + std::to_string(pack.skins) +
               (pack.skins == 1 ? " stage skin" : " stage skins") + " for " + std::to_string(pack.stages) +
               (pack.stages == 1 ? " stage" : " stages") + ", in the random pick";
-          if (settings_widgets::Checkbox(label.c_str(), &in_pick)) {
+          if (settings_checkbox(label.c_str(), &in_pick)) {
             std::string error;
             mod_message = host::cosmetics::set_stage_pack_random(pack.key, in_pick, &error) ?
                 host::cosmetics::last_message() : error;
@@ -9185,7 +9418,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                 // it, what online play does with it.
                 int selected = current;
                 ImGui::SetNextItemWidth(280.0f);
-                if (settings_widgets::BeginCombo("##variant", option_storage[(size_t)current].c_str(), ImGuiComboFlags_HeightLarge)) {
+                if (settings_begin_combo("##variant", option_storage[(size_t)current].c_str(), ImGuiComboFlags_HeightLarge)) {
                   float names_w = 0.0f;
                   for (const auto& option : option_storage) names_w = std::max(names_w, ImGui::CalcTextSize(option.c_str()).x);
                   for (int i = 0; i < (int)option_storage.size(); ++i) {
@@ -9211,7 +9444,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                     ImGui::Dummy(ImVec2(tile_w + 16.0f + names_w, 0.0f));
                     ImGui::PopID();
                   }
-                  ImGui::EndCombo();
+                  settings_end_combo();
                 }
                 if (selected != current) {
                   std::string error;
@@ -9376,7 +9609,8 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
                                    details->kind == "stage_visual" ? "stage" : "file", details->online_message.c_str());
             }
             draw_cosmetic_preview(*details);
-            if (!details->availability_message.empty())
+            // A stage's note is the same for every stage: said once, at the top of Stages.
+            if (!details->availability_message.empty() && details->kind != "stage_visual")
               ImGui::TextWrapped("%s", details->availability_message.c_str());
             ImGui::PopID();
           };
@@ -9384,11 +9618,20 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
             draw_resource_slot("Pause screen", pause_screens);
             settings_hint("Choose a pause-screen style or Vanilla. Restart to apply it.");
           }
-          if (!pictures.empty() && settings_widgets::CollapsingHeader("Portraits and stock icons", ImGuiTreeNodeFlags_DefaultOpen))
+          // Folded until opened: each holds a row per character or stage.
+          if (!pictures.empty() && settings_widgets::CollapsingHeader("Portraits and stock icons"))
             for (const auto& slot : pictures) draw_resource_slot(slot.first, slot.second);
-          if (!stages.empty() && settings_widgets::CollapsingHeader("Stages", ImGuiTreeNodeFlags_DefaultOpen))
+          if (!stages.empty() && settings_widgets::CollapsingHeader("Stages")) {
+            const std::string note = [&]() -> std::string {
+              for (const auto& stage : stages)
+                for (const CosmeticAsset* a : stage.second)
+                  if (!a->availability_message.empty()) return a->availability_message;
+              return {};
+            }();
+            if (!note.empty()) ImGui::TextDisabled("%s", note.c_str());
             for (const auto& stage : stages) draw_resource_slot(stage.second.back()->costume, stage.second);
-          if (!fighter_sounds.empty() && settings_widgets::CollapsingHeader("Fighter move sounds", ImGuiTreeNodeFlags_DefaultOpen))
+          }
+          if (!fighter_sounds.empty() && settings_widgets::CollapsingHeader("Fighter move sounds"))
             for (const auto& sounds : fighter_sounds) draw_resource_slot(sounds.first + " move sounds", sounds.second);
           if (!effects.empty() && settings_widgets::CollapsingHeader("Effects")) {
             if (settings_widgets::Button("Enable project effects")) {
@@ -9433,7 +9676,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         if (mod_message.empty()) mod_message = host::cosmetics::last_message();
         if (!mod_message.empty()) ImGui::TextWrapped("%s", mod_message.c_str());
       }
-      if (state.active_tab == 2) {
+      if (settings_page_shown(state.active_tab, 2)) {
 
     ImGui::TextUnformatted("In-game overlay");
     changed |= settings_toggle("Auto-open in-game overlay on startup", &options.settings_open);
@@ -9441,7 +9684,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SetTooltip("%s", yougame::stdio_bridge() ? yougame::parity::kSettingsHint : "Off starts directly in the game. Press F1 to open the overlay anytime.");
 
     // ---- Input ----
-    ImGui::TextUnformatted("Input");
+    settings_section("Input");
     if (settings_toggle("Background input", &host::g_background_input)) changed = true;
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip("On: controllers keep playing while another window is in front\n"
@@ -9451,7 +9694,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // The game's own language option (Options > Language) lives in its save. This offers the same
     // choice here: the game is answered with it wherever it asks for its saved language, on both
     // engines, and the save is left as it is.
-    ImGui::TextUnformatted("Language");
+    settings_section("Language");
     {
       int language = host::g_game_language.load();
       const char* languages[] = {"The game's own choice", "Japanese", "English"};
@@ -9482,6 +9725,18 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SetTooltip("On: every fighter, stage and mode is available from the start.\n"
                         "Off: your save file decides, and the game unlocks things as you play.\n"
                         "Offline only: online play always has everything. Takes effect on the next screen.");
+    // GitHub #75: rogueMelee has no "hold A at the start", and a run that swaps Down B away would
+    // keep Zelda for good. Offline only (the opponent's game would disagree), never in replays.
+    ImGui::BeginDisabled(!g_settings_standalone && host::game_image == nullptr);
+    if (settings_toggle("Zelda starts as Sheik", &options.zelda_as_sheik)) {
+      RenderOptions::live_zelda_as_sheik() = options.zelda_as_sheik;
+      changed = true;
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      ImGui::SetTooltip("When you pick Zelda, the match starts as Sheik, as holding A at the start does in Versus.\n"
+                        "Works in every mode, rogueMelee included. Down B still changes between them.\n"
+                        "Offline only: online, use Slippi's own character choice. Source Port only.");
     if (settings_toggle("Show results screen", &options.results_screen)) {
       RenderOptions::live_results_screen() = options.results_screen;
       changed = true;
@@ -9490,307 +9745,49 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SetTooltip("On: the results screen after each offline match.\n"
                         "Off: straight back to character select, for playing sets back to back.\n"
                         "Online play always goes back to character select.");
-    ImGui::TextUnformatted("Stages");
-    if (settings_toggle("Freeze Final Destination", &options.freeze_fd)) {
-      RenderOptions::live_freeze_fd() = options.freeze_fd;
-      host::g_freeze_fd.store(options.freeze_fd, std::memory_order_relaxed);
-      changed = true;
-    }
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Final Destination's background stays on its first form: no transformations and no white flash.\n"
-                        "Also keeps a Final Destination skin's own background in view. Yours alone, online too.\n"
-                        "Takes effect immediately.");
-    // Slippi's Frozen Pokemon Stadium for offline play. It changes the match, so never online.
-    ImGui::BeginDisabled(!options.native_source || host::gameplay::vanilla_only());
-    if (settings_toggle("Freeze Pokemon Stadium (offline only)", &options.stadium_frozen)) {
-      RenderOptions::live_stadium_frozen() = options.stadium_frozen;
-      changed = true;
-    }
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-      ImGui::SetTooltip("Pokemon Stadium stays on its base form all match, never transforming.\n"
-                        "Offline only: it does not apply to online matches, which follow Slippi's own rules.\n"
-                        "Replays record it and play back frozen. Source Port only.");
-    ImGui::TextUnformatted("CPU players");
-    ImGui::BeginDisabled(host::gameplay::vanilla_only());
-    if (settings_toggle("20XX CPUs", &options.cpu_20xx)) {
-      RenderOptions::live_cpu_20xx() = options.cpu_20xx;
-      host::g_cpu_20xx.store(options.cpu_20xx, std::memory_order_relaxed);
-      if (options.cpu_20xx && !options.native_source) host::hackpack_ai::reload();   // the disc may have arrived since boot
-      changed = true;
-    }
-#ifdef MELEE_NO_SLIPPI   // one engine, no replays: the rest of the line is about the other build
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("CPUs play with the 20XX Hack Pack's AI. Offline matches only, never online.");
-#else
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("CPUs play with the 20XX Hack Pack's AI. Offline matches only, never online or in replays.\n"
-                        "Static Recomp: needs the 20XX Hack Pack disc under Mods (the Source Port has its own version).");
-#endif
-    if (!options.native_source && !host::hackpack_ai::status().blob_ok)
-      ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.40f, 1.0f), "Install the 20XX Hack Pack under Mods");
-    // 20XX Hack Pack training options for CPUs (Source Port, shim/mu_20xx_cpu.c): plain offline
-    // options carried in option word 3. They work with the game's own CPUs and with "20XX CPUs".
-    if (options.native_source) {
-      bool cpu_changed = false;
-      static const char* cpu_tech_names[] = {"Off", "In place", "Roll forward", "Roll back", "Miss", "Random"};
-      cpu_changed |= settings_combo("CPU tech", &options.cpu_tech, cpu_tech_names, 6);
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("How a CPU techs when it lands in tumble. Offline only.");
-      static const char* cpu_getup_names[] = {"Off", "Stand", "Roll forward", "Roll back", "Getup attack", "Random"};
-      cpu_changed |= settings_combo("CPU getup", &options.cpu_getup, cpu_getup_names, 6);
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("What a CPU does from the floor after a missed tech. Offline only.");
-      static const char* cpu_di_names[] = {"Off", "None", "Random", "Survival"};
-      cpu_changed |= settings_combo("CPU DI", &options.cpu_di, cpu_di_names, 4);
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Which way a CPU holds the stick when it is launched. Offline only.");
-      static const char* cpu_sdi_names[] = {"Off", "None", "Random", "With the hit", "Against the hit", "Up", "Down"};
-      cpu_changed |= settings_combo("CPU smash DI", &options.cpu_sdi, cpu_sdi_names, 7);
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Which way a CPU shifts during hitlag. Offline only.");
-      cpu_changed |= settings_toggle("CPUs never taunt", &options.cpu_no_taunt);
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("CPUs never start a taunt. Offline only.");
-      cpu_changed |= settings_toggle("CPUs always L-cancel", &options.cpu_lcancel);
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Every CPU aerial landing is L-cancelled. Offline only.");
-      cpu_changed |= settings_toggle("CPU Falcon: no rapid jab", &options.cpu_no_rapid_jab);
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("A CPU Captain Falcon never starts his rapid jab. Offline only.");
-      cpu_changed |= settings_toggle("CPU Zelda and Sheik: no transform", &options.cpu_no_transform);
-      if (ImGui::IsItemHovered()) ImGui::SetTooltip("A CPU Zelda or Sheik never uses the down special. Offline only.");
-      if (options.cpu_training_word() != 0) {
-        ImGui::TextWrapped("CPU training overrides are on. They also affect Training CPUs set to Stand "
-                           "and stay on when mod packs are disabled.");
-        if (ImGui::Button("Reset CPU training options")) {
-          options.cpu_tech = options.cpu_getup = options.cpu_di = options.cpu_sdi = 0;
-          options.cpu_no_taunt = options.cpu_lcancel = options.cpu_no_rapid_jab = options.cpu_no_transform = false;
-          cpu_changed = true;
-        }
-      }
-      if (cpu_changed) {
-        RenderOptions::live_cpu_training() = options.cpu_training_word();
-        changed = true;
-      }
-    }
-    ImGui::EndDisabled();
-
-    // Slippi's Lagless FoD code is a real game patch, so expose it as an offline/direct setting
-    // instead of silently forcing the performance-oriented variant on every player.
-    ImGui::TextUnformatted("Stage effects");
-    // Both engines. The Source Port reads it (MU_DISPLAY_OPTION_FOD_REFLECTIONS) as each Fountain of
-    // Dreams match is set up. It was greyed there with "always Lagless FoD", so a player who had
-    // turned it on (Static Recomp) kept the reflection on the Source Port with no way to turn it off.
-    if (settings_toggle("Fountain of Dreams reflections", &options.fod_reflections)) changed = true;
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip(options.native_source
-                          ? "On: keep Fountain of Dreams' water reflection and particles.\n"
-                            "Off: use the Lagless FoD code for lower GPU cost. Offline; online always uses Lagless FoD,\n"
-                            "as Slippi does. Applies from the next match on Fountain of Dreams."
-                          : "On: keep Fountain of Dreams' water reflection and particles.\n"
-                            "Off: use the Lagless FoD code for lower GPU cost. Takes effect at the next retrace.");
-    // Both engines, every mode: it changes only how the menu background moves, never the game.
-    if (settings_toggle("Character select background plays through", &options.css_background_free)) changed = true;
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("On: the character select background plays its whole animation instead of starting\n"
-                        "over every few seconds, so a custom background with a longer animation is not cut off.\n"
-                        "Menu visuals only, so it also works online.");
-
-    // ---- L-cancel helpers ----
-    // The indicator reads the fighter's action state and never writes anything, so it is display
-    // only and safe in every mode. The automatic press is a real analog trigger press injected into
-    // the local pad before the game reads it, so it is transmitted like any other input and both
-    // clients compute the same landing lag: it cannot desync. It is still gated to offline and
-    // Direct because it is a fairness question, not a safety one.
-    ImGui::TextUnformatted("L-cancel");
-    {
-      if (settings_lcancel_flash(options)) changed = true;
-      const bool ranked = lcancel::automatic_setting_locked();
-      bool automatic = ranked ? false : lcancel::automatic_enabled();
-      ImGui::BeginDisabled(host::gameplay::vanilla_only() || ranked);
-      if (settings_toggle("Auto L-cancel", &automatic)) {
-        lcancel::set_automatic(automatic);
-        host::log("settings: Auto L-cancel %s", automatic ? "on" : "off");
-        changed = true;
-      }
-      // Disabled controls cannot take navigation focus. Log the lock once on entering it,
-      // and on a mouse attempt, while preserving the saved preference and vanilla-only gate.
-      static bool auto_ranked_seen = false;
-      static int auto_ranked_frame = -2;
-      if (ranked && (!auto_ranked_seen || auto_ranked_frame + 1 != ImGui::GetFrameCount() ||
-          (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && ImGui::IsMouseClicked(0))))
-        host::log("settings: Auto L-cancel off (locked in Ranked)");
-      auto_ranked_seen = ranked;
-      auto_ranked_frame = ImGui::GetFrameCount();
-      ImGui::EndDisabled();
-      if (ranked) settings_hint(lcancel::policy::ranked_hint);
-      if (host::gameplay::vanilla_only()) settings_hint("Disabled for this vanilla-only session.");
-      ImGui::SameLine();
-#ifdef MELEE_NO_SLIPPI   // this build's matches are all the one kind, where it works
-      settings_hint("(NOTE: Works offline and in online matches)");
-      if (automatic) {
-        ImGui::TextWrapped("Presses the analog trigger for you during an aerial. It is a real input, sent over the "
-                           "network like any other, so it cannot desync. In an online match both players should agree "
-                           "to use it: it is a fairness question, not a safety one.");
-#else
-      settings_hint("(NOTE: Works offline and in Direct; disabled in Ranked, Unranked, Teams and Party)");
-      if (automatic) {
-        ImGui::TextWrapped("Presses the analog trigger for you during an aerial. It is a real input, sent over the "
-                           "network like any other, so it cannot desync. In a Direct match both players should agree "
-                           "to use it: it is a fairness question, not a safety one.");
-#endif
-        if (const char* mode = lcancel::auto_suppressed_mode())
-          ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "Disabled right now: this is %s.", mode);
-      }
-    }
-
-    // ---- HUD ----
-    // A port code compiled into the game (recomp/gecko.py PORT_CODES): the stock row drawn at PAL's
-    // size and height. Display only, read when the HUD is built, so it applies from the next match.
-    // The native game has its own versions of both (MuHostApi.game_options), so both engines show them.
-    ImGui::TextUnformatted("HUD");
-    // The two size sliders rescale the HUD roots: in guest RAM on the Static Recomp, from the HUD's
-    // draw callbacks in the native game (sourceport/game/shim/mu_hud_scale.c).
-    {
-      ImGui::SetNextItemWidth(170.0f);
-      if (settings_slider("Stock icon size", &options.stock_hud_scale, 75, 175, "%d%%")) {
-        gecko::option_pal_stock_icons = false;
-        changed = true;
-      }
-      ImGui::SetNextItemWidth(170.0f);
-      changed |= settings_slider("Damage number size", &options.damage_hud_scale, 75, 175, "%d%%");
-      settings_hint("Display only; updates during play. Larger values may overlap in four-player matches.");
-    }
-    if (settings_toggle("PAL style stock icons", &gecko::option_pal_stock_icons)) {
-      if (gecko::option_pal_stock_icons) options.stock_hud_scale = 85;
-      changed = true;
-    }
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Smaller stock icons, set a little higher, as in the PAL version.\n"
-                        "Display only. Applies from the next match.");
-    // A player asked for the P1 / P2 markers to stay up: the game shows them at the start of a match
-    // and then only for a name tag or an off-screen fighter.
-    {
-      bool tags = options.player_tags_always != 0;
-      if (settings_toggle("Always show player tags", &tags)) { options.player_tags_always = tags ? 1 : 0; changed = true; }
-      if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("The P1, P2, P3 and P4 markers over the fighters stay up for the whole match.\n"
-                          "Display only, so it is yours alone online. Takes effect immediately.");
-    }
-    {
-      // Screenshot tooling (MELEE_SETTINGS_SCROLL_TO=screenshake): bring the shake settings into view once.
-      static int scroll_frames = 0;
-      if (scroll_frames < 30) {
-        const char* target = std::getenv("MELEE_SETTINGS_SCROLL_TO");
-        if (target && std::strcmp(target, "screenshake") == 0) ImGui::SetScrollHereY(0.3f);
-        ++scroll_frames;
-      }
-    }
-    // Also a port code: zeroes the camera's shake offset before the game applies it. With 20XX TE on
-    // it is the same setting as TE's "Disable screen rumble" (te_pairs_linked).
-    if (settings_toggle("Disable screen shake", &gecko::option_no_screen_shake)) {
-      te_follow_ours(options, kTeNoScreenRumble, gecko::option_no_screen_shake);
-      changed = true;
-    }
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("The camera no longer shakes on hard hits, explosions and stage effects.\n"
-                        "Camera only: fighters and hits are unchanged. Takes effect immediately.%s",
-                        te_pair_hover(kTeNoScreenRumble));
-    // Strength in between: the native camera scales its quake offset (camera.c, host API 27). Greyed
-    // only over a running Static Recomp: the launcher's settings window has no game behind it, and a
-    // Source Port player sets it there too (it was greyed for everyone in that window).
-    if (!gecko::option_no_screen_shake) {
-      ImGui::BeginDisabled(!g_settings_standalone && host::game_image == nullptr);
-      if (ImGui::SliderInt("Screen shake strength", &gecko::option_screen_shake_percent, 0, 200, "%d%%",
-                           ImGuiSliderFlags_AlwaysClamp))
-        changed = true;
-      ImGui::EndDisabled();
-      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("How strongly the camera shakes on hard hits, explosions and stage effects.\n"
-                          "100%% is the game's own. Offline only; network sessions use 100%%. Source Port only.");
-    }
-    // The explosion still runs, out of sight (ft_0D31.c, host.cpp apply_ko_explosions): its particles
-    // draw random numbers, so leaving it out would change the match.
-    if (settings_toggle("Hide KO explosions", &options.hide_ko_explosions)) {
-      host::g_hide_ko_explosions.store(options.hide_ko_explosions, std::memory_order_relaxed);
-      changed = true;
-    }
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("No burst of colour when a fighter is KO'd off the side, top or bottom.\n"
-                        "The match is exactly the same, so it also works online and in replays.\n"
-                        "Picture only, yours alone. Both engines. Takes effect from the next KO.");
-    if (settings_toggle("Hide emblems behind percents", &options.hide_hud_emblems)) {
-      host::g_hide_hud_emblems.store(options.hide_hud_emblems, std::memory_order_relaxed);
-      changed = true;
-    }
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("No character emblem behind each player's damage percent.\n"
-                        "Picture only, yours alone: the match is the same, online and in replays too. Both engines.");
-
-    // Community codes: players' favourite Gecko codes, built in (shim/mu_code_features.c). Picture and
-    // sound only, so each is yours alone, online and in replays too.
-    ImGui::TextUnformatted("Community codes");
-    {
-      struct Code { uint32_t bit; const char* name; const char* tip; };
-      static const Code kCodes[] = {
-        {MU_DISPLAY_OPTION_HUD_FADE, "HUD transparency",
-         "A player's damage and stock icons turn see-through while a fighter is behind them."},
-        {MU_DISPLAY_OPTION_NANA_PERCENT, "Show Nana's percent",
-         "Nana's damage under each Ice Climbers player's percent."},
-        {MU_DISPLAY_OPTION_ALLY_INDICATORS, "Ally indicators online",
-         "Online: YOU over your fighter, and a heart over your teammate in teams."},
-        {MU_DISPLAY_OPTION_ANGEL_STOCK_COLORS, "Respawn platform by stocks",
-         "The respawn platform turns green with three stocks left, orange with two, red with one."},
-        {MU_DISPLAY_OPTION_NO_GO_TEXT, "Hide GO! at match start",
-         "No GO! graphic when a match starts. Its sound and timing are unchanged."},
-        {MU_DISPLAY_OPTION_VCANCEL_SOUND, "V-cancel sound",
-         "The menu's confirm sound plays on a successful V-cancel."},
-        {MU_DISPLAY_OPTION_NO_FIGHTER_SHADOWS, "Hide fighter shadows",
-         "Fighters cast no shadow on the stage (the No Character Shadows code)."},
-        {MU_DISPLAY_OPTION_CENTER_2P_HUD, "Center the HUD for two players",
-         "With only players 1 and 2 in a match, their percents sit in the middle of the screen\n"
-         "(the Center Align 2P HUD code)."},
-        {MU_DISPLAY_OPTION_HITBOX_ID_COLORS, "Hitbox colours by ID",
-         "Shown hitboxes: ID 0 red, 1 green, 2 cyan, 3 purple."},
-        {MU_DISPLAY_OPTION_HITBOX_ID_ORDER, "Highest-priority hitbox on top",
-         "Shown hitboxes are drawn 3 to 0, so ID 0 is in front."},
-        {MU_DISPLAY_OPTION_HITBOX_ANGLES, "Hitbox knockback angles",
-         "Shown hitboxes carry a line along their knockback angle."},
-        {MU_DISPLAY_OPTION_HQ_FOD_REFLECTIONS, "Full Fountain of Dreams reflections",
-         "With Fountain of Dreams reflections on: the reflection at full resolution with full\n"
-         "fighter models and live background scenery. Applies from the next match on the stage.\n"
-         "Stage skins with a different reflection layout keep their own background artwork."},
-      };
-      for (const Code& c : kCodes) {
-        bool on = (options.community_codes & c.bit) != 0;
-        if (settings_toggle(c.name, &on)) {
-          options.community_codes = on ? (options.community_codes | c.bit) : (options.community_codes & ~c.bit);
-          host::g_community_codes.store(options.community_codes, std::memory_order_relaxed);
+    // ---- Shield colours (here since 0.9.201; they were under Video) ----
+    // Each port's shield (and KO blast) colour: a colour wheel, the game's preset colours one click away,
+    // and the port's own. "Online" is the player's own colour in online matches; Melee Unlocked opponents
+    // are sent it and show it, Slippi Dolphin opponents keep the port colour. Display only.
+    if (settings_widgets::CollapsingHeader("Shield colours##shields")) {
+      ImGui::Indent(8.0f);
+      auto shield_row = [&](const char* label, uint32_t* value, int port_colour) {
+        ImGui::PushID(label);
+        const uint32_t shown = *value ? (*value & 0xFFFFFFu)
+                                      : ((uint32_t)kShieldColorRgb[port_colour][0] << 16 | (uint32_t)kShieldColorRgb[port_colour][1] << 8 |
+                                         kShieldColorRgb[port_colour][2]);
+        float c[3] = {((shown >> 16) & 0xFF) / 255.0f, ((shown >> 8) & 0xFF) / 255.0f, (shown & 0xFF) / 255.0f};
+        if (settings_color_edit3(label, c, ImGuiColorEditFlags_PickerHueWheel | ImGuiColorEditFlags_DisplayRGB)) {
+          *value = 0x1000000u | ((uint32_t)(c[0] * 255 + 0.5f) << 16) | ((uint32_t)(c[1] * 255 + 0.5f) << 8) | (uint32_t)(c[2] * 255 + 0.5f);
           changed = true;
         }
-        if (ImGui::IsItemHovered())
-          ImGui::SetTooltip("%s\nPicture or sound only, yours alone. Source Port.", c.tip);
-      }
-      // Offline only: these change menu timing and the pause, so online they stay off.
-      static const Code kOffline[] = {
-        {MU_DISPLAY_OPTION_INSTANT_MELEE, "Instant Melee",
-         "Faster stage, stage select and character select loads, and pausing during the\n"
-         "match countdown."},
-        {MU_DISPLAY_OPTION_FREE_PAUSE_CAMERA, "Unrestricted pause camera",
-         "The pause camera turns all the way down, left and right and zooms much further."},
-        {MU_DISPLAY_OPTION_BOOT_TO_CSS, "Boot to character select",
-         "The game starts at the character select, past the title screen and menus\n"
-         "(the Boot to CSS code)."},
-      };
-      for (const Code& c : kOffline) {
-        bool on = (options.community_codes & c.bit) != 0;
-        if (settings_toggle(c.name, &on)) {
-          options.community_codes = on ? (options.community_codes | c.bit) : (options.community_codes & ~c.bit);
-          host::g_community_codes.store(options.community_codes, std::memory_order_relaxed);
-          changed = true;
+        ImGui::SameLine();
+        if (!*value) ImGui::TextDisabled("port colour");
+        else if (settings_widgets::SmallButton("Port colour")) { *value = 0; changed = true; }
+        // The game's own presets, one click each.
+        for (int i = 0; i < kShieldColorCount; ++i) {
+          const uint8_t* rgb = kShieldColorRgb[i];
+          if (i) ImGui::SameLine(0.0f, 3.0f);
+          ImGui::PushID(i);
+          if (settings_widgets::ColorButton(kShieldColorNames[i], ImVec4(rgb[0] / 255.0f, rgb[1] / 255.0f, rgb[2] / 255.0f, 1.0f), 0, ImVec2(16, 16))) {
+            *value = 0x1000000u | ((uint32_t)rgb[0] << 16) | ((uint32_t)rgb[1] << 8) | rgb[2];
+            changed = true;
+          }
+          ImGui::PopID();
         }
-        if (ImGui::IsItemHovered())
-          ImGui::SetTooltip("%s\nOffline only: off in online matches. Source Port (on the Static Recomp, add the\n"
-                            "Gecko code itself).", c.tip);
-      }
+        ImGui::PopID();
+      };
+      static const char* const ports[4] = {"P1 shield", "P2 shield", "P3 shield", "P4 shield"};
+      for (int port = 0; port < 4; ++port) shield_row(ports[port], &options.shield_color[port], port);
+      ImGui::Separator();
+      shield_row("Online (you)", &options.shield_color_online, 0);
+      settings_hint("Your shield and KO blast colours. Online, \"Online (you)\" is yours (left empty, your P1 colour): players"
+                    " on Melee Unlocked see it, players on Slippi Dolphin see your port colour. Team matches keep team colours.");
+      ImGui::Unindent(8.0f);
     }
-
-
-    ImGui::TextUnformatted("Input delay");
+    // Input delay, Online and Discord sit here, right below the game's own switches (owner, 0.9.201);
+    // they were at the very end of this tab.
+    settings_section("Input delay");
     {
       static const char* offline_choices[] = {"Off (0 frames)", "1 frame", "2 frames", "3 frames",
                                               "4 frames", "5 frames", "6 frames", "7 frames", "8 frames", "9 frames"};
@@ -9829,7 +9826,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     }
 
 #ifndef MELEE_NO_SLIPPI
-    ImGui::TextUnformatted("Online");
+    settings_section("Online");
     {
       // Early inputs (host/early_input.h): the other player's game learns of a press up to a frame
       // sooner, so it guesses right more often and rolls back less. Only between two Melee Unlocked
@@ -9924,13 +9921,46 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         settings_hint(("Serving on port " + std::to_string(slippi::spectate::port()) + ".").c_str());
       else if (options.slippi_spectator)
         settings_hint("Not serving: starts with the game (see the log if the port is taken).");
+      // Arena rooms: the panel beside the picture on the Direct character select. Its two choices
+      // are also on the room's Rules page; nothing here changes anything until a room is opened.
+      if (slippi::arena::rooms_enabled()) {
+      ImGui::Spacing();
+      ImGui::TextUnformatted("Arena rooms");
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("On the Direct character select, push your hand against the right edge of the screen to open a room.\n"
+                          "Friends join by code; two play while the others watch live and rotate in.");
+      int room_look = arena_panel::look();
+      ImGui::SetNextItemWidth(180.0f);
+      if (settings_begin_combo("Room look", arena_panel::look_name(room_look))) {
+        for (int i = 0; i < arena_panel::kLookCount; ++i)
+          if (ImGui::Selectable(arena_panel::look_name(i), i == room_look)) arena_panel::set_look(i);
+        settings_end_combo();
+      }
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("How the room shows in the bars beside the picture. Only you see this choice.");
+      int arena_button = arena_panel::button_mode();
+      ImGui::SetNextItemWidth(180.0f);
+      if (settings_begin_combo("Arena button", arena_panel::button_mode_name(arena_button))) {
+        for (int i = 0; i < arena_panel::kButtonModeCount; ++i)
+          if (ImGui::Selectable(arena_panel::button_mode_name(i), i == arena_button)) arena_panel::set_button_mode(i);
+        settings_end_combo();
+      }
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("The Arena card beside the Direct character select, out of a room.\n"
+                          "Show briefly: for ten seconds the first time, then when your hand or mouse comes near the right side.\n"
+                          "Never: no card. Friends can still add your code and bring you into their room.");
+      bool room_tabs = arena_panel::tabs();
+      if (settings_toggle("Hide the room panels until the hand comes near", &room_tabs)) arena_panel::set_tabs(room_tabs);
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("In a room, the panels fold into thin tabs at the screen edges and slide out when your hand\n"
+                          "or mouse comes near that side.");
+      }
     }
 #endif
 
     // ---- Discord presence ----
     // Off by default, and inert without an application ID. Nothing reaches Discord until the box
     // below is ticked. See scratchpad/discord_invite_design.md for the whole design.
-    ImGui::TextUnformatted("Discord");
+    settings_section("Discord");
     char app_id[32];
     std::snprintf(app_id, sizeof app_id, "%s", options.discord_app_id.c_str());
     if (settings_widgets::InputText("Application ID", app_id, sizeof app_id, ImGuiInputTextFlags_CharsDecimal)) {
@@ -9960,9 +9990,307 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     } else {
       settings_hint("Off. Nothing is sent to Discord. Needs an Application ID from discord.com/developers/applications.");
     }
+    settings_section("Stages");
+    if (settings_toggle("Freeze Final Destination", &options.freeze_fd)) {
+      RenderOptions::live_freeze_fd() = options.freeze_fd;
+      host::g_freeze_fd.store(options.freeze_fd, std::memory_order_relaxed);
+      changed = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Final Destination's background stays on its first form: no transformations and no white flash.\n"
+                        "Also keeps a Final Destination skin's own background in view. Yours alone, online too.\n"
+                        "Takes effect immediately.");
+    // Slippi's Frozen Pokemon Stadium for offline play. It changes the match, so never online.
+    ImGui::BeginDisabled(!options.native_source || host::gameplay::vanilla_only());
+    if (settings_toggle("Freeze Pokemon Stadium (offline only)", &options.stadium_frozen)) {
+      RenderOptions::live_stadium_frozen() = options.stadium_frozen;
+      changed = true;
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      ImGui::SetTooltip("Pokemon Stadium stays on its base form all match, never transforming.\n"
+                        "Offline only: it does not apply to online matches, which follow Slippi's own rules.\n"
+                        "Replays record it and play back frozen. Source Port only.");
+    ImGui::TextUnformatted("CPU players");
+    ImGui::BeginDisabled(host::gameplay::vanilla_only());
+    if (settings_toggle("20XX CPUs", &options.cpu_20xx)) {
+      RenderOptions::live_cpu_20xx() = options.cpu_20xx;
+      host::g_cpu_20xx.store(options.cpu_20xx, std::memory_order_relaxed);
+      if (options.cpu_20xx && !options.native_source) host::hackpack_ai::reload();   // the disc may have arrived since boot
+      changed = true;
+    }
+#ifdef MELEE_NO_SLIPPI   // one engine, no replays: the rest of the line is about the other build
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("CPUs play with the 20XX Hack Pack's AI. Offline matches only, never online.");
+#else
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("CPUs play with the 20XX Hack Pack's AI. Offline matches only, never online or in replays.\n"
+                        "Static Recomp: needs the 20XX Hack Pack disc under Mods (the Source Port has its own version).");
+#endif
+    if (!options.native_source && !host::hackpack_ai::status().blob_ok)
+      ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.40f, 1.0f), "Install the 20XX Hack Pack under Mods");
+    // 20XX Hack Pack training options for CPUs (Source Port, shim/mu_20xx_cpu.c): plain offline
+    // options carried in option word 3. They work with the game's own CPUs and with "20XX CPUs".
+    if (options.native_source) {
+      bool cpu_changed = false;
+      static const char* cpu_tech_names[] = {"Off", "In place", "Roll forward", "Roll back", "Miss", "Random"};
+      cpu_changed |= settings_combo("CPU tech", &options.cpu_tech, cpu_tech_names, 6);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("How a CPU techs when it lands in tumble. Offline only.");
+      static const char* cpu_getup_names[] = {"Off", "Stand", "Roll forward", "Roll back", "Getup attack", "Random"};
+      cpu_changed |= settings_combo("CPU getup", &options.cpu_getup, cpu_getup_names, 6);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("What a CPU does from the floor after a missed tech. Offline only.");
+      static const char* cpu_di_names[] = {"Off", "None", "Random", "Survival"};
+      cpu_changed |= settings_combo("CPU DI", &options.cpu_di, cpu_di_names, 4);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Which way a CPU holds the stick when it is launched. Offline only.");
+      static const char* cpu_sdi_names[] = {"Off", "None", "Random", "With the hit", "Against the hit", "Up", "Down"};
+      cpu_changed |= settings_combo("CPU smash DI", &options.cpu_sdi, cpu_sdi_names, 7);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Which way a CPU shifts during hitlag. Offline only.");
+      cpu_changed |= settings_toggle("CPUs never taunt", &options.cpu_no_taunt);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("CPUs never start a taunt. Offline only.");
+      cpu_changed |= settings_toggle("CPUs always L-cancel", &options.cpu_lcancel);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("Every CPU aerial landing is L-cancelled. Offline only.");
+      cpu_changed |= settings_toggle("CPU Falcon: no rapid jab", &options.cpu_no_rapid_jab);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("A CPU Captain Falcon never starts his rapid jab. Offline only.");
+      cpu_changed |= settings_toggle("CPU Zelda and Sheik: no transform", &options.cpu_no_transform);
+      if (ImGui::IsItemHovered()) ImGui::SetTooltip("A CPU Zelda or Sheik never uses the down special. Offline only.");
+      if (options.cpu_training_word() != 0) {
+        ImGui::TextWrapped("CPU training overrides are on. They also affect Training CPUs set to Stand "
+                           "and stay on when mod packs are disabled.");
+        if (ImGui::Button("Reset CPU training options")) {
+          options.cpu_tech = options.cpu_getup = options.cpu_di = options.cpu_sdi = 0;
+          options.cpu_no_taunt = options.cpu_lcancel = options.cpu_no_rapid_jab = options.cpu_no_transform = false;
+          cpu_changed = true;
+        }
+      }
+      if (cpu_changed) {
+        RenderOptions::live_cpu_training() = options.cpu_training_word();
+        changed = true;
+      }
+    }
+    ImGui::EndDisabled();
+
+    // Slippi's Lagless FoD code is a real game patch, so expose it as an offline/direct setting
+    // instead of silently forcing the performance-oriented variant on every player.
+    settings_section("Stage effects");
+    // Both engines. The Source Port reads it (MU_DISPLAY_OPTION_FOD_REFLECTIONS) as each Fountain of
+    // Dreams match is set up. It was greyed there with "always Lagless FoD", so a player who had
+    // turned it on (Static Recomp) kept the reflection on the Source Port with no way to turn it off.
+    if (settings_toggle("Fountain of Dreams reflections", &options.fod_reflections)) changed = true;
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip(options.native_source
+                          ? "On: keep Fountain of Dreams' water reflection and particles.\n"
+                            "Off: use the Lagless FoD code for lower GPU cost. Offline; online always uses Lagless FoD,\n"
+                            "as Slippi does. Applies from the next match on Fountain of Dreams."
+                          : "On: keep Fountain of Dreams' water reflection and particles.\n"
+                            "Off: use the Lagless FoD code for lower GPU cost. Takes effect at the next retrace.");
+    // Both engines, every mode: it changes only how the menu background moves, never the game.
+    if (settings_toggle("Character select background plays through", &options.css_background_free)) changed = true;
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("On: the character select background plays its whole animation instead of starting\n"
+                        "over every few seconds, so a custom background with a longer animation is not cut off.\n"
+                        "Menu visuals only, so it also works online.");
+
+    // ---- L-cancel helpers ----
+    // The indicator reads the fighter's action state and never writes anything, so it is display
+    // only and safe in every mode. The automatic press is a real analog trigger press injected into
+    // the local pad before the game reads it, so it is transmitted like any other input and both
+    // clients compute the same landing lag: it cannot desync. It is still gated to offline and
+    // Direct because it is a fairness question, not a safety one.
+    ImGui::TextUnformatted("L-cancel");
+    {
+      if (settings_lcancel_flash(options)) changed = true;
+      const bool ranked = lcancel::automatic_setting_locked();
+      bool automatic = ranked ? false : lcancel::automatic_enabled();
+      ImGui::BeginDisabled(host::gameplay::vanilla_only() || ranked);
+      if (settings_toggle("Auto L-cancel", &automatic)) {
+        lcancel::set_automatic(automatic);
+        host::log("settings: Auto L-cancel %s", automatic ? "on" : "off");
+        changed = true;
+      }
+      // Disabled controls cannot take navigation focus. Log the lock once on entering it,
+      // and on a mouse attempt, while preserving the saved preference and vanilla-only gate.
+      static bool auto_ranked_seen = false;
+      static int auto_ranked_frame = -2;
+      if (ranked && (!auto_ranked_seen || auto_ranked_frame + 1 != ImGui::GetFrameCount() ||
+          (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && ImGui::IsMouseClicked(0))))
+        host::log("settings: Auto L-cancel off (locked in Ranked)");
+      auto_ranked_seen = ranked;
+      auto_ranked_frame = ImGui::GetFrameCount();
+      ImGui::EndDisabled();
+      if (ranked) settings_hint(lcancel::policy::ranked_hint);
+      if (host::gameplay::vanilla_only()) settings_hint("Disabled for this vanilla-only session.");
+      ImGui::SameLine();
+#ifdef MELEE_NO_SLIPPI   // this build's matches are all the one kind, where it works
+      settings_hint("(NOTE: Works offline and in online matches)");
+      if (automatic) {
+        ImGui::TextWrapped("Presses the analog trigger for you during an aerial. It is a real input, sent over the "
+                           "network like any other, so it cannot desync. In an online match both players should agree "
+                           "to use it: it is a fairness question, not a safety one.");
+#else
+      settings_hint("(NOTE: Works offline and in Direct; disabled in Ranked, Unranked, Teams and Party)");
+      if (automatic) {
+        ImGui::TextWrapped("Presses the analog trigger for you during an aerial. It is a real input, sent over the "
+                           "network like any other, so it cannot desync. In a Direct match both players should agree "
+                           "to use it: it is a fairness question, not a safety one.");
+#endif
+        if (const char* mode = lcancel::auto_suppressed_mode())
+          ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "Disabled right now: this is %s.", mode);
+      }
+    }
+
+    // ---- HUD ----
+    // A port code compiled into the game (recomp/gecko.py PORT_CODES): the stock row drawn at PAL's
+    // size and height. Display only, read when the HUD is built, so it applies from the next match.
+    // The native game has its own versions of both (MuHostApi.game_options), so both engines show them.
+    settings_section("HUD");
+    // The two size sliders rescale the HUD roots: in guest RAM on the Static Recomp, from the HUD's
+    // draw callbacks in the native game (sourceport/game/shim/mu_hud_scale.c).
+    {
+      ImGui::SetNextItemWidth(170.0f);
+      if (settings_slider("Stock icon size", &options.stock_hud_scale, 75, 175, "%d%%")) {
+        gecko::option_pal_stock_icons = false;
+        changed = true;
+      }
+      ImGui::SetNextItemWidth(170.0f);
+      changed |= settings_slider("Damage number size", &options.damage_hud_scale, 75, 175, "%d%%");
+      settings_hint("Display only; updates during play. Larger values may overlap in four-player matches.");
+    }
+    if (settings_toggle("PAL style stock icons", &gecko::option_pal_stock_icons)) {
+      if (gecko::option_pal_stock_icons) options.stock_hud_scale = 85;
+      changed = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Smaller stock icons, set a little higher, as in the PAL version.\n"
+                        "Display only. Applies from the next match.");
+    // A player asked for the P1 / P2 markers to stay up: the game shows them at the start of a match
+    // and then only for a name tag or an off-screen fighter.
+    {
+      bool tags = options.player_tags_always != 0;
+      if (settings_toggle("Always show player tags", &tags)) { options.player_tags_always = tags ? 1 : 0; changed = true; }
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("The P1, P2, P3 and P4 markers over the fighters stay up for the whole match.\n"
+                          "Display only, so it is yours alone online. Takes effect immediately.");
+    }
+    {
+      // Screenshot tooling (MELEE_SETTINGS_SCROLL_TO=screenshake): bring the shake settings into view once.
+      static int scroll_frames = 0;
+      if (scroll_frames < 30) {
+        const char* target = std::getenv("MELEE_SETTINGS_SCROLL_TO");
+        if (target && std::strcmp(target, "screenshake") == 0) ImGui::SetScrollHereY(0.3f);
+        ++scroll_frames;
+      }
+    }
+    // Also a port code: zeroes the camera's shake offset before the game applies it. With 20XX TE on
+    // it is the same setting as TE's "Disable screen rumble" (te_pairs_linked).
+    if (settings_toggle("Disable screen shake", &gecko::option_no_screen_shake)) {
+      te_follow_ours(options, kTeNoScreenRumble, gecko::option_no_screen_shake);
+      changed = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("The camera no longer shakes on hard hits, explosions and stage effects.\n"
+                        "Camera only: fighters and hits are unchanged. Takes effect immediately.%s",
+                        te_pair_hover(kTeNoScreenRumble));
+    // Strength in between: the native camera scales its quake offset (camera.c, host API 27). Greyed
+    // only over a running Static Recomp: the launcher's settings window has no game behind it, and a
+    // Source Port player sets it there too (it was greyed for everyone in that window).
+    if (!gecko::option_no_screen_shake) {
+      ImGui::BeginDisabled(!g_settings_standalone && host::game_image == nullptr);
+      if (settings_slider_int("Screen shake strength", &gecko::option_screen_shake_percent, 0, 200, "%d%%",
+                           ImGuiSliderFlags_AlwaysClamp))
+        changed = true;
+      ImGui::EndDisabled();
+      if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("How strongly the camera shakes on hard hits, explosions and stage effects.\n"
+                          "100%% is the game's own. Offline only; network sessions use 100%%. Source Port only.");
+    }
+    // The explosion still runs, out of sight (ft_0D31.c, host.cpp apply_ko_explosions): its particles
+    // draw random numbers, so leaving it out would change the match.
+    if (settings_toggle("Hide KO explosions", &options.hide_ko_explosions)) {
+      host::g_hide_ko_explosions.store(options.hide_ko_explosions, std::memory_order_relaxed);
+      changed = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("No burst of colour when a fighter is KO'd off the side, top or bottom.\n"
+                        "The match is exactly the same, so it also works online and in replays.\n"
+                        "Picture only, yours alone. Both engines. Takes effect from the next KO.");
+    if (settings_toggle("Hide emblems behind percents", &options.hide_hud_emblems)) {
+      host::g_hide_hud_emblems.store(options.hide_hud_emblems, std::memory_order_relaxed);
+      changed = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("No character emblem behind each player's damage percent.\n"
+                        "Picture only, yours alone: the match is the same, online and in replays too. Both engines.");
+
+    // Community codes: players' favourite Gecko codes, built in (shim/mu_code_features.c). Picture and
+    // sound only, so each is yours alone, online and in replays too.
+    settings_section("Community codes");
+    {
+      struct Code { uint32_t bit; const char* name; const char* tip; };
+      static const Code kCodes[] = {
+        {MU_DISPLAY_OPTION_HUD_FADE, "HUD transparency",
+         "A player's damage and stock icons turn see-through while a fighter is behind them."},
+        {MU_DISPLAY_OPTION_NANA_PERCENT, "Show Nana's percent",
+         "Nana's damage under each Ice Climbers player's percent."},
+        {MU_DISPLAY_OPTION_ALLY_INDICATORS, "Ally indicators online",
+         "Online: YOU over your fighter, and a heart over your teammate in teams."},
+        {MU_DISPLAY_OPTION_ANGEL_STOCK_COLORS, "Respawn platform by stocks",
+         "The respawn platform turns green with three stocks left, orange with two, red with one."},
+        {MU_DISPLAY_OPTION_NO_GO_TEXT, "Hide GO! at match start",
+         "No GO! graphic when a match starts. Its sound and timing are unchanged."},
+        {MU_DISPLAY_OPTION_VCANCEL_SOUND, "V-cancel sound",
+         "The menu's confirm sound plays on a successful V-cancel."},
+        {MU_DISPLAY_OPTION_NO_FIGHTER_SHADOWS, "Hide fighter shadows",
+         "Fighters cast no shadow on the stage (the No Character Shadows code)."},
+        {MU_DISPLAY_OPTION_CENTER_2P_HUD, "Center the HUD for two players",
+         "With only players 1 and 2 in a match, their percents sit in the middle of the screen\n"
+         "(the Center Align 2P HUD code)."},
+        {MU_DISPLAY_OPTION_HITBOX_ID_COLORS, "Hitbox colours by ID",
+         "Shown hitboxes: ID 0 red, 1 green, 2 cyan, 3 purple."},
+        {MU_DISPLAY_OPTION_HITBOX_ID_ORDER, "Highest-priority hitbox on top",
+         "Shown hitboxes are drawn 3 to 0, so ID 0 is in front."},
+        {MU_DISPLAY_OPTION_HITBOX_ANGLES, "Hitbox knockback angles",
+         "Shown hitboxes carry a line along their knockback angle."},
+        {MU_DISPLAY_OPTION_HQ_FOD_REFLECTIONS, "Full Fountain of Dreams reflections",
+         "With Fountain of Dreams reflections on: the reflection at full resolution with full\n"
+         "fighter models and live background scenery. Applies from the next match on the stage.\n"
+         "Stage skins with a different reflection layout keep their own background artwork."},
+      };
+      for (const Code& c : kCodes) {
+        bool on = (options.community_codes & c.bit) != 0;
+        if (settings_toggle(c.name, &on)) {
+          options.community_codes = on ? (options.community_codes | c.bit) : (options.community_codes & ~c.bit);
+          host::g_community_codes.store(options.community_codes, std::memory_order_relaxed);
+          changed = true;
+        }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("%s\nPicture or sound only, yours alone. Source Port.", c.tip);
+      }
+      // Offline only: these change menu timing and the pause, so online they stay off.
+      static const Code kOffline[] = {
+        {MU_DISPLAY_OPTION_INSTANT_MELEE, "Instant Melee",
+         "Faster stage, stage select and character select loads, and pausing during the\n"
+         "match countdown."},
+        {MU_DISPLAY_OPTION_FREE_PAUSE_CAMERA, "Unrestricted pause camera",
+         "The pause camera turns all the way down, left and right and zooms much further."},
+        {MU_DISPLAY_OPTION_BOOT_TO_CSS, "Boot to character select",
+         "The game starts at the character select, past the title screen and menus\n"
+         "(the Boot to CSS code)."},
+      };
+      for (const Code& c : kOffline) {
+        bool on = (options.community_codes & c.bit) != 0;
+        if (settings_toggle(c.name, &on)) {
+          options.community_codes = on ? (options.community_codes | c.bit) : (options.community_codes & ~c.bit);
+          host::g_community_codes.store(options.community_codes, std::memory_order_relaxed);
+          changed = true;
+        }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("%s\nOffline only: off in online matches. Source Port (on the Static Recomp, add the\n"
+                            "Gecko code itself).", c.tip);
+      }
+    }
 
       }
-      if (state.active_tab == 3) {
+      if (settings_page_shown(state.active_tab, 3)) {
 
     bool rumble_enabled = host::g_rumble_enabled.load(std::memory_order_relaxed);
     if (settings_toggle("Controller rumble", &rumble_enabled)) {
@@ -10224,7 +10552,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::TextUnformatted("Editing");
       ImGui::SameLine();
       ImGui::SetNextItemWidth(std::max(100.0f, ImGui::GetContentRegionAvail().x - 40.0f));
-      if (settings_widgets::BeginCombo("##editing", label_of(edit_tab).c_str())) {
+      if (settings_begin_combo("##editing", label_of(edit_tab).c_str())) {
         static const int kOrder[] = {9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 15, 16, 17, 18, 19, 20, 0};
         for (int t : kOrder)
           if (t == 0 || tab_connected(t))
@@ -10236,7 +10564,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
               if (settings_widgets::Selectable((label_of(t) + "  (not plugged in)##dev" + std::to_string(t)).c_str(), t == edit_tab)) select_tab(t, true);
           ImGui::EndMenu();
         }
-        ImGui::EndCombo();
+        settings_end_combo();
       }
       ImGui::SameLine();
       {
@@ -10544,7 +10872,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       }
     }
       }
-      if (state.active_tab == 4) {
+      if (settings_page_shown(state.active_tab, 4)) {
     if (settings_toggle("Clean replays", &options.clean_replays)) {
       RenderOptions::live_clean_replays().store(options.clean_replays, std::memory_order_relaxed);
       changed = true;
@@ -10590,22 +10918,22 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // Render latency, a developer readout, is under Advanced at the bottom of this tab.
 #ifndef MELEE_NO_SLIPPI   // the Lab view is the Static Recomp's: no switch for it in the build without that engine
     if (kLabViewAvailable) {
-    ImGui::BeginDisabled(options.native_source);
     changed |= settings_toggle("Lab view (F3)", &options.lab_view);
-    ImGui::EndDisabled();
-    if (options.native_source)
-      engine_only_reason("Static Recomp only. The Lab view draws from the Slippi frame data the Static\n"
-                         "Recomp sends, and the Source Port has none.");
-    else if (ImGui::IsItemHovered())
+    if (ImGui::IsItemHovered())
       ImGui::SetTooltip("Draws matches the way Slippi Lab draws replays: flat character silhouettes\n"
                         "on a plain stage, over the game image. Display only, so it is safe online;\n"
-                        "menus and character select look normal. Needs the Lab folder from\n"
-                        "tools/build_lab_assets.py for the silhouettes.\n"
+                        "menus and character select look normal.\n"
                         "A different tool from 20XX TE's Collision bubbles (Mods, Source Port), which\n"
                         "draws hitboxes inside the match itself.");
     // Its "Skip the 3D scene underneath" switch is under Advanced.
     }
 #endif
+    // Screenshot tooling (MELEE_SETTINGS_SCROLL_TO=controller): bring the controller overlay's rows into view.
+    if (static int scroll_frames = 0; scroll_frames < 30) {
+      const char* target = std::getenv("MELEE_SETTINGS_SCROLL_TO");
+      if (target && std::strcmp(target, "controller") == 0) ImGui::SetScrollHereY(0.0f);
+      ++scroll_frames;
+    }
     // With 20XX TE on this is also TE's "Input display" (te_pairs_linked).
     if (settings_toggle("Controller overlay", &options.input_overlay)) {
       te_follow_ours(options, kTeInputDisplay, options.input_overlay);
@@ -10614,7 +10942,10 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip("An on-screen controller for streams. Drag it to move it while this panel is open.%s",
                         te_pair_hover(kTeInputDisplay));
-    if (options.input_overlay) {
+    // Its own choices always show under it (greyed while it is off), so Hide background and the rest
+    // can be found before switching it on; they were hidden until then.
+    {
+      ImGui::BeginDisabled(!options.input_overlay);
       ImGui::SameLine();
       changed |= settings_toggle("Show values", &options.input_overlay_values);
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Each stick's position as the game reads it. A full press is 1.0000.");
@@ -10622,9 +10953,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SetNextItemWidth(110.0f);
       changed |= settings_slider("Stick size", &options.input_overlay_stick, 1, 10);
       // Several ports can be shown at once (doubles and crew streams want every player visible);
-      // they stack upward from the bottom left corner.
+      // they stack upward from the bottom left corner. On a row of their own with Hide background:
+      // on the one row above, that switch ran off the panel's right edge and could not be reached.
+      ImGui::Indent(22.0f);
       for (int i = 0; i < 4; ++i) {
-        ImGui::SameLine();
+        if (i) ImGui::SameLine();
         char label[16];
         std::snprintf(label, sizeof label, "P%d", i + 1);
         bool on = (options.input_overlay_ports & (1 << i)) != 0;
@@ -10636,7 +10969,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       ImGui::SameLine();
       changed |= settings_toggle("Hide background", &options.input_overlay_hide_border);
       if (ImGui::IsItemHovered()) ImGui::SetTooltip("Removes the panel behind the overlay, leaving only the buttons and sticks.");
-      settings_hint("  Drag an overlay to move it, and its edges to resize, while this panel is open.");
+      ImGui::Unindent(22.0f);
+      ImGui::EndDisabled();
+      if (options.input_overlay) settings_hint("  Drag an overlay to move it, and its edges to resize, while this panel is open.");
     }
     // ---- Advanced: developer readouts, apart from the player HUD above ----
     if (settings_advanced_group(1, &changed)) {
@@ -10649,12 +10984,10 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
 #ifndef MELEE_NO_SLIPPI   // as for the Lab view switch above
       if (kLabViewAvailable) {
         // Only with the Lab view on, and only on the engine that has it.
-        ImGui::BeginDisabled(options.native_source || !options.lab_view);
+        ImGui::BeginDisabled(!options.lab_view);
         changed |= settings_toggle("Skip the 3D scene underneath", &options.lab_skip_scene);
         ImGui::EndDisabled();
-        if (options.native_source)
-          engine_only_reason("Static Recomp only, with the Lab view (the Source Port has no Lab view).");
-        else if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
           ImGui::SetTooltip("While the Lab view is showing, the game's own 3D scene is not drawn at all,\n"
                             "since it would be covered anyway. Much lighter on the graphics card, so a\n"
                             "weak laptop runs smoother. The game itself runs exactly the same.%s",
@@ -10663,7 +10996,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
 #endif
     }
       }
-      if (state.active_tab == 6 && options.native_source) {
+      if (settings_page_shown(state.active_tab, 6) && options.native_source) {
     // The Source Port runs the game as C: a Gecko code is PowerPC written over console addresses,
     // so there is nothing for it to patch. Slippi's optional codes are rebuilt in C instead, and
     // these switches are the same settings as their copies on the other tabs.
@@ -10774,7 +11107,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     ImGui::Separator();
     if (gecko_add_code_button()) changed = true;
     ImGui::EndDisabled();
-      } else if (state.active_tab == 6) {
+      } else if (settings_page_shown(state.active_tab, 6)) {
     // ---- Gecko codes (the player's own, from GeckoCodes.ini beside the settings file) ----
     ImGui::TextWrapped("Imported Gecko codes run offline. They are suspended online and during replay playback.");
     if (host::gameplay::vanilla_only())
@@ -10817,6 +11150,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     if (gecko_add_code_button()) changed = true;
     ImGui::EndDisabled();
     }
+    settings_pages_end();   // the last section closes; a search sizes the list to its results
     settings_page::observer = nullptr;
     if (gd_page && g_settings_gd_list && g_settings_gd_list == ImGui::GetCurrentWindow() &&
         g_settings_gd_snap_found) {
@@ -11082,6 +11416,31 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     draw_native_practice(state, options, practice, pad, have_pad);
   if (!state.fill_window && !state.open && !state.menu_open && replay_control::active() && !gx::clean_replay_active())
     draw_replay_practice(options, pad, have_pad);
+  // A watcher's window that opened after the match began: while it catches up (not drawn), a plain
+  // card; the match appears as it is now, never as a fast-forward.
+  if (replay_control::catching_up()) {
+    const ImVec2 screen = ImGui::GetIO().DisplaySize;
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    dl->AddRectFilled(ImVec2(0, 0), screen, IM_COL32(8, 10, 16, 255));
+    const char* line = "Joining the match live...";
+    const ImVec2 size = ImGui::CalcTextSize(line);
+    dl->AddText(ImVec2((screen.x - size.x) * 0.5f, (screen.y - size.y) * 0.5f), IM_COL32(230, 232, 240, 255), line);
+  }
+#ifndef MELEE_NO_SLIPPI
+  if (!state.fill_window && !state.open && !state.menu_open && !replay_control::active()) draw_arena_panel(options, pads, pad, have_pad);
+  if (!state.fill_window && !state.open && !state.menu_open && !replay_control::active()) draw_gecko_offer_panel();
+#endif
+  if (!state.fill_window && !state.open && !state.menu_open && !replay_control::active() && walter_egg::active()) {
+    const ImVec2 screen = ImGui::GetIO().DisplaySize;
+    const float aspect = presented_aspect(options, (int)screen.x, (int)screen.y, true);
+    float gw = screen.x, gh = gw / std::max(aspect, 0.1f);
+    if (gh > screen.y) { gh = screen.y; gw = gh * aspect; }
+    walter_egg::Frame ef;
+    ef.game_x0 = (screen.x - gw) * 0.5f; ef.game_y0 = (screen.y - gh) * 0.5f;
+    ef.game_x1 = ef.game_x0 + gw; ef.game_y1 = ef.game_y0 + gh;
+    ef.time = ImGui::GetTime();
+    walter_egg::draw(ef);
+  }
   if (practice_was_open && !state.practice_open) state.practice_release_capture = true;
   // Practice menu changes (the CPU, your setups, skipped codes, the hint count) are saved as they happen.
   // The panel's own autosave runs only while the panel shows, so these were lost at exit before.
@@ -11274,10 +11633,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   // Same rule as at the top of the frame. With only the in-game (Esc) menu open, this used to say
   // "not captured" while the top said "captured", so the pointer was shown and hidden every frame.
   host::window_input_capture(state.open || state.menu_open || practice_capture ||
-                             state.practice_release_capture || replay_bar::wants_cursor());
+                             state.practice_release_capture || replay_bar::wants_cursor() || arena_capture());
+  host::window_withhold_buttons(state.open || state.menu_open ? 0 : arena_withheld());
   // Open/close actions above also apply to this frame's resulting state. The
   // neutral-release capture still prevents a closing A/B/Start reaching Melee.
-  settings_input::navigation(ImGui::GetIO(), state.open || state.menu_open || state.practice_open ||
+  settings_input::navigation(ImGui::GetIO(), state.open || state.menu_open || state.practice_open || signin_overlay::open() ||
       practice.phase == slippi::native_practice::Phase::Failure || state.fill_window);
   if (!state.fill_window && !state.open && !state.menu_open && options.show_player_nicknames)
     draw_player_nicknames();
@@ -11285,6 +11645,21 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     draw_back_to_yougame_hint();
   if (!state.fill_window && !state.open && !state.menu_open) draw_combo_counter();
   if (!state.fill_window && !state.open && !state.menu_open) draw_community_code_overlays();
+  {   // YouGame's Sign in by code panel, over the online menu's game picture (settings stay on top)
+    static bool signin_was = false;
+    if (!state.fill_window && !state.open && !state.menu_open && signin_overlay::open()) {
+      const ImVec2 screen = ImGui::GetIO().DisplaySize;
+      const float aspect = presented_aspect(options, (int)screen.x, (int)screen.y, true);
+      float gw = screen.x, gh = gw / std::max(aspect, 0.1f);
+      if (gh > screen.y) { gh = screen.y; gw = gh * aspect; }
+      const float gx0 = (screen.x - gw) * 0.5f, gy0 = (screen.y - gh) * 0.5f;
+      signin_overlay::draw(gx0, gy0, gx0 + gw, gy0 + gh);
+    }
+    // Closed: the A or B that closed it is still held; keep the game's input neutral until it is let go.
+    const bool signin_now = signin_overlay::open();
+    if (signin_was && !signin_now) state.practice_release_capture = true;
+    signin_was = signin_now;
+  }
   {
     // Menu sounds: a tick when the highlighted category or control changes, a brighter one when
     // a page opens or the panel opens, a lower one when a page or the panel closes.

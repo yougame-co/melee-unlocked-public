@@ -635,7 +635,13 @@ void end() {
 }
 
 bool active() { return g.active.load(std::memory_order_relaxed); }
-bool skip_render() { return g.skip_render.load(std::memory_order_relaxed); }
+// A live recording opened late (an arena watcher joining mid-match): the frames on the way to the
+// live one are simulated but not drawn, so the window shows "joining live" and then the match as it
+// is now, never a fast-forward.
+std::atomic<bool> g_catching_up{false};
+void set_catching_up(bool on) { g_catching_up.store(on, std::memory_order_relaxed); }
+bool catching_up() { return g_catching_up.load(std::memory_order_relaxed); }
+bool skip_render() { return g.skip_render.load(std::memory_order_relaxed) || g_catching_up.load(std::memory_order_relaxed); }
 bool repaint_wanted() {
   return g.active.load(std::memory_order_relaxed) &&
          (g.paused.load(std::memory_order_relaxed) || g.holding.load(std::memory_order_relaxed));

@@ -26,6 +26,7 @@ struct _XINPUT_STATE;
 
 namespace yougame {
 namespace lobby { struct Plan; class Control; }   // yougame_lobby_setup.h, yougame_lobby.h
+namespace signin { struct View; enum class Button; }   // yougame_signin.h
 namespace relay_pads {
 // After the host selects --log-file; releases controller messages buffered during startup.
 void logging_ready();
@@ -49,6 +50,9 @@ namespace mode_policy { enum class ModRefusal; }
 void start();
 // Host-only, lock-free handoff to the best-effort match hint worker. Never affects gameplay.
 void online_match_state(bool open);
+// Host-only, lock-free: the game's state for the YouGame button (yougame_game_state.h kPlaying,
+// kPaused, kMenu). A worker sends gameState on a change and again after each reconnect.
+void report_game_state(int state);
 
 // Launched by the YouGame desktop app (including Slippi-routed Unranked).
 bool active();
@@ -88,6 +92,16 @@ void first_row_picked();
 void start_hook_at_boot(bool automated);
 const char* first_row_text();
 bool channel_connected();
+// Sign in by code (yougame_signin.h, contract section 8): the local channel is up and its app is signed
+// out, so the YouGame rows offer sign-in instead of staying locked (the menu's Coming soon bit: picking a
+// row opens the panel and the menu carries on into that row once the player is in). sign_in_open on
+// the row's pick; the overlay (port/runtime/gx/signin_overlay.cpp) reads sign_in_view each frame while
+// sign_in_showing and sends the player's presses. Never blocks: asks run on their own threads.
+bool sign_in_needed();
+void sign_in_open();
+bool sign_in_showing();
+void sign_in_view(signin::View& out);
+void sign_in_press(signin::Button button);
 // The current search or match is a YouGame one: always in the app, and under the launcher from the
 // moment a YouGame row is picked until a Slippi row is picked.
 bool session();
@@ -346,5 +360,10 @@ void update_notice_presented(); // renderer, after drawing Updating...
 
 // Status for logs and the YouGame page: "searching", "connecting", "playing", the opponent.
 std::string status_line();
+// The room's line for a search with nobody to meet yet (rooms "searching".paused), cleaned for one
+// overlay row; empty when the room sent none. The overlay shows it in place of a YouGame-only search line.
+std::string search_paused_line();
+std::string paused_line(const std::string& raw);
+void set_search_paused(const std::string& raw);
 
 }  // namespace yougame

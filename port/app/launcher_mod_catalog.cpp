@@ -127,6 +127,7 @@ std::vector<Installed> detected(const std::string& text) {
     if (row.count("enabled") && !row["enabled"].is_boolean()) ok = false;
     if (!ok || (m.needs_engine != "source" && m.needs_engine != "recomp" && m.needs_engine != "either")) continue;
     m.enabled = row.value("enabled", false);
+    m.copy = row.count("copy") && row["copy"].is_boolean() && row["copy"].get<bool>();
     if (m.id.empty()) m.id = m.key;
     if (!valid_id(m.id)) continue;
     out.push_back(std::move(m));

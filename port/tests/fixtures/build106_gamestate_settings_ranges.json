@@ -1,0 +1,10 @@
+[
+  {
+    "before": "#include \"yougame_link.h\"\n#include \"yougame_parity.h\"\n",
+    "after": "#include \"yougame_link.h\"\n#include \"yougame_game_state.h\"\n#include \"yougame_parity.h\"\n"
+  },
+  {
+    "before": "    settings_input::navigation(io, state.open || state.menu_open || practice_nav || state.fill_window);\n    io.BackendFlags",
+    "after": "    settings_input::navigation(io, state.open || state.menu_open || practice_nav || state.fill_window);\n    // The YouGame button shows over MU's own menus (gameState \"menu\"), as overlay_visible() counts them.\n    yougame::game_state::overlay_menu_open.store(state.open || state.menu_open || state.practice_open ||\n                                                 settings_fills_window(), std::memory_order_relaxed);\n    io.BackendFlags"
+  }
+]

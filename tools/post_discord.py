@@ -156,7 +156,7 @@ def latest_releases(repo, count):
     """Return the newest published GitHub releases, newest first."""
     if count <= 0:
         raise SystemExit("--last must be greater than zero")
-    url = "https://api.github.com/repos/%s/releases?per_page=%d" % (repo, max(count, 1))
+    url = "https://api.github.com/repos/%s/releases?per_page=%d" % (repo, max(count * 3, 3))
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "melee-unlocked-release-notes"}
     token = os.environ.get("GITHUB_TOKEN")
     if token:
@@ -167,7 +167,8 @@ def latest_releases(repo, count):
             releases = json.loads(response.read().decode("utf-8"))
     except (urllib.error.HTTPError, urllib.error.URLError) as error:
         raise SystemExit("could not read GitHub releases: %s" % error)
-    published = [r for r in releases if isinstance(r, dict) and not r.get("draft")]
+    published = [r for r in releases if isinstance(r, dict) and not r.get("draft")
+                 and str(r.get("tag_name", "")).startswith("v")]   # not the parts-/content- file releases
     if len(published) < count:
         raise SystemExit("GitHub returned only %d published release(s); need %d" % (len(published), count))
     return published[:count]
@@ -177,7 +178,7 @@ def latest_releases(repo, count):
     """Return the newest published GitHub releases, newest first."""
     if count <= 0:
         raise SystemExit("--last must be greater than zero")
-    url = "https://api.github.com/repos/%s/releases?per_page=%d" % (repo, max(count, 1))
+    url = "https://api.github.com/repos/%s/releases?per_page=%d" % (repo, max(count * 3, 3))
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "melee-unlocked-release-notes"}
     token = os.environ.get("GITHUB_TOKEN")
     if token:
@@ -188,7 +189,8 @@ def latest_releases(repo, count):
             releases = json.loads(response.read().decode("utf-8"))
     except (urllib.error.HTTPError, urllib.error.URLError) as error:
         raise SystemExit("could not read GitHub releases: %s" % error)
-    published = [r for r in releases if isinstance(r, dict) and not r.get("draft")]
+    published = [r for r in releases if isinstance(r, dict) and not r.get("draft")
+                 and str(r.get("tag_name", "")).startswith("v")]   # not the parts-/content- file releases
     if len(published) < count:
         raise SystemExit("GitHub returned only %d published release(s); need %d" % (len(published), count))
     return published[:count]

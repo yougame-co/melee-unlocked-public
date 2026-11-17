@@ -1,6 +1,6 @@
 """Build 103: the window and caps come before the slow startup work, and startup lines carry timing.
 
-11-15 (a test PC, 0.6 GB free): sysgen, the retail-disc check, the card and the disc prefetch took about
+11-15 (pc4, 0.6 GB free): sysgen, the retail-disc check, the card and the disc prefetch took about
 90 s before the window existed, past the YouGame app's 30 s caps wait for a first run, and the app
 then kept the game in child mode with a frozen picture.
 """
@@ -33,7 +33,7 @@ class StartupWindowWiringTest(unittest.TestCase):
                      "gx::init(backend.get());"):
             self.assertLess(early, body.index(slow), slow)
         # The title and the embedded exclusive-fullscreen rule come before the window, as before.
-        self.assertLess(body.index("host::window_title_base() = base;"), early)
+        self.assertLess(body.index("host::window_title_debug() = base;"), early)
         self.assertLess(body.index("if (yougame::embedded()) gfx.exclusive_fullscreen = false;"), early)
         # One creation path, made once: the old site only makes it when the early one did not.
         self.assertEqual(body.count("gx::create_threaded_backend(gfx, !hidden)"), 1)

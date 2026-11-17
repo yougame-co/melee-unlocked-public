@@ -176,6 +176,13 @@ bool ModOverlay::add_iso(const fs::path& iso, const std::string& profile,
       // Retail movies can exceed the replacement-file limit. They are safe to
       // leave on the original disc; apply this limit only to changed content.
       if (length > 256u * 1024u * 1024u) {
+        // A changed movie (the intro and attract-mode videos) too large for the virtual disc range:
+        // the original disc's movie plays instead and the rest of the mod loads.
+        if (path.size() > 4 && path.compare(path.size() - 4, 4, ".mth") == 0) {
+          std::fprintf(stderr, "mods: %s keeps the original disc's %s (changed movie of %llu MB is too large)\n",
+                       profile.c_str(), path.c_str(), (unsigned long long)(length >> 20));
+          continue;
+        }
         error = "mod ISO replacement file is too large: " + path; return false;
       }
       File file;

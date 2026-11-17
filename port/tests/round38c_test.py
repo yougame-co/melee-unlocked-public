@@ -108,16 +108,18 @@ int main(){
         production += 'std::string slippi_link_status(const std::string& status) {' + body(link, 'slippi_link_status') + '}\n'
         self.compile('38c-status', r'''
 #include "yougame_blend.h"
+#include "yougame_search.h"
 #include <mutex>
 #include <string>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 namespace blend=yougame::blend;
+namespace search_policy=yougame::search_policy;
 namespace host {void log(const char*,...) {}}
 namespace slippi_linking {const char* kSearching="other-search";enum class Screen{Search};struct P {std::string line(Screen){return "link";}} presentation;}
 std::mutex g_mutex;
-std::string g_status=blend::kSearchBoth,g_blend_reason;
+std::string g_status=blend::kSearchBoth,g_blend_reason;bool g_own_udp_blocked=false;
 uint64_t g_status_since=0;
 uint64_t now_ms(){return 7;}
 bool search_stopped(){return false;}

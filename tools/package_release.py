@@ -20,6 +20,8 @@ import subprocess
 import zipfile
 from pathlib import Path
 from verify_generated_gct import verify_generated_gct
+import build_content_release
+from build_content_release import CONTENT_BASE
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -69,7 +71,10 @@ Game Builds
 The launcher's Build tab picks the Game Build: the Source Port (the game built from source) or the
 Static Recomp (the original game code translated ahead of time; mod discs such as Akaneia run on
 it). The launcher downloads the matching compatibility build for older processors when needed.
-For manual installs, extract MeleeUnlocked-{version}-compat-win64.zip into this folder.
+For manual installs, extract MeleeUnlocked-{version}-compat-win64.zip from
+https://github.com/hero88go/melee-unlocked/releases/tag/parts-{version} into this folder.
+The Lab view's fighters download the first time the Lab view is used, and Fight a pro's matchup
+AIs the first time that matchup is played; each pro's own AI is included.
 Intel XeSS and AMD FSR are optional downloads from Settings > Video. Optional experimental DLSS 5 uses
 NVIDIA's separate model, which is not included in this archive.
 
@@ -387,13 +392,21 @@ def main():
                 raise SystemExit(f"{catalog_path}: no policies")
             out_dir = folder / "ProAI"
             out_dir.mkdir()
-            # Each pro's imitation policy ships; matchup policies download in game on first use.
+            # Each pro's own policy (the imitation one) ships, so every pro plays at once and offline.
+            # A matchup policy is 20 MB and plays one pairing: the game downloads it the first time
+            # that pairing is played (phillip_ai.cpp fetch_later), Phillip's from the pinned Hugging
+            # Face commit and the ones trained here from the content release
+            # (tools/build_content_release.py), so each needs a source the game accepts.
+            sources = ("https://huggingface.co/vladfi/phillip-models/resolve/", CONTENT_BASE)
             for model in catalog["models"]:
                 source = args.pro_ai_dir / model["file"]
-                if not source.is_file():
-                    if model["kind"] == "imitation" or not model.get("source"):   # ours have nowhere to download from
-                        raise SystemExit(f"missing Fight a pro policy: {source}")
+                if model["kind"] != "imitation":
+                    if not str(model.get("source") or "").startswith(sources):
+                        raise SystemExit(f"Fight a pro policy {model['file']} has nowhere to download from: "
+                                         f"run tools/build_content_release.py and upload it to the content release")
                     continue
+                if not source.is_file():
+                    raise SystemExit(f"missing Fight a pro policy: {source}")
                 if hashlib.sha256(source.read_bytes()).hexdigest() != model["sha256"]:
                     raise SystemExit(f"Fight a pro policy changed: {source}")
                 shutil.copy2(source, out_dir / source.name)
@@ -439,8 +452,11 @@ def main():
     lang_src = ROOT / "lang"
     if lang_src.is_dir():
         shutil.copytree(lang_src, folder / "lang", dirs_exist_ok=True)
+    # DLSS Ray Reconstruction (sl.dlss_d.dll, nvngx_dlssd.dll: 46 MB that only path tracing uses) is
+    # its own download since 0.9.204: MeleeUnlocked-DLSS-RR.zip on the content release
+    # (tools/build_content_release.py; host/updater.cpp rr_download checks both files).
     runtime_dlls = ("sl.interposer.dll", "sl.common.dll", "sl.dlss.dll", "nvngx_dlss.dll",
-                    "sl.dlss_d.dll", "nvngx_dlssd.dll", "sl.dlss_g.dll", "nvngx_dlssg.dll",
+                    "sl.dlss_g.dll", "nvngx_dlssg.dll",
                     "sl.reflex.dll", "sl.pcl.dll", "libxess.dll", "nvngx.dll_meleedlss5.dll",
                     "librashader.dll", "dxcompiler.dll", "dxil.dll")
     missing_dlls = [name for name in runtime_dlls if not (args.exe.parent / name).is_file()]
@@ -598,6 +614,26 @@ def main():
         if not src.is_file():
             raise SystemExit(f"missing license text: {src}")
         shutil.copy2(src, licenses / dst)
+    # The Lab view's fighter packs (tools/build_lab_assets.py from Slippi Lab, MIT) are their own
+    # download since 0.9.204 (81 MB zipped that no update needs to carry): MeleeUnlocked-Lab.zip on
+    # the content release, fetched the first time the Lab view is used (host/updater.cpp
+    # lab_packs_download). The game names that zip by its SHA-256, so a release whose packs changed
+    # since the zip was made is refused: new packs need a new content release and a new hash.
+    lab_src = ROOT / "build/lab"
+    lab_packs = sorted(lab_src.glob("*.lab")) if lab_src.is_dir() else []
+    if len(lab_packs) != 27:
+        raise SystemExit(f"Lab packs missing: {len(lab_packs)} of 27 in {lab_src} (run tools/build_lab_assets.py)")
+    lab_zip = ROOT / "release/content-1/MeleeUnlocked-Lab.zip"
+    if not lab_zip.is_file():
+        raise SystemExit(f"missing {lab_zip} (run tools/build_content_release.py)")
+    if hashlib.sha256(lab_zip.read_bytes()).hexdigest() != build_content_release.pinned_lab_sha():
+        raise SystemExit(f"{lab_zip} is not the zip the game checks for (kLabSha256 in port/runtime/host/updater.cpp)")
+    if not build_content_release.lab_zip_matches(lab_zip, lab_src):
+        raise SystemExit(f"the Lab packs in {lab_src} differ from {lab_zip}: publish them as a new content release")
+    (folder / "Lab").mkdir(exist_ok=True)
+    (folder / "Lab" / "README.txt").write_text(
+        "The Lab view's fighters are a separate download (about 85 MB). The game fetches them the first\n"
+        "time the Lab view is turned on (F3) and keeps them here through updates.\n", encoding="utf-8")
     mod_tools = ROOT / "port/third_party/mod_tools"
     (folder / "tools").mkdir(exist_ok=True)
     for tool, digest in (("xdelta3.exe", "d81f59b2fe5e8589c0ee9782e231c805084f4d23dfade413903a4cad63b4e342"),
@@ -626,8 +662,11 @@ def main():
     # The builds for processors without AVX2 are their own download since 0.9.98, so nobody else
     # downloads them: MeleeUnlocked-<version>-compat-win64.zip, named with its SHA-256 in compat.sha256,
     # which the launcher fetches on a PC that needs it (host/updater.cpp compat_build_download).
+    # The crash symbols (melee_game.dbg, melee_game_compat.dbg: 57 MB zipped each) are in neither zip
+    # since 0.9.204: the game never opens them. They stay in this unpacked release folder, which is
+    # where tools/crash_triage.py reads them to name the frames of a crash report.
     compat_files = [folder / n for n in ("melee_port_compat.exe", "melee_source_compat.exe", "melee_game_compat.dll",
-                                         "melee_game_compat.snapexcl", "melee_game_compat.dbg") if (folder / n).is_file()]
+                                         "melee_game_compat.snapexcl") if (folder / n).is_file()]
     if compat_files:
         compat_zip = args.out / f"{name}-compat-win64.zip"
         with zipfile.ZipFile(compat_zip, "w", zipfile.ZIP_DEFLATED) as z:
@@ -652,8 +691,10 @@ def main():
     def zip_folder(zip_path):
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
             for path in folder.rglob("*"):
+                if path.suffix == ".dbg":
+                    continue   # crash symbols: kept here, not shipped
                 z.write(path, path.relative_to(args.out))
-        total = sum(p.stat().st_size for p in folder.rglob("*") if p.is_file())
+        total = sum(p.stat().st_size for p in folder.rglob("*") if p.is_file() and p.suffix != ".dbg")
         print(f"{zip_path} ({zip_path.stat().st_size / 1e6:.1f} MB zipped, {total / 1e6:.1f} MB unpacked)")
 
     # The path tracer's shaders. A build made with the local NVIDIA SDK module (its RTXDI and SHaRC

@@ -645,6 +645,18 @@ void install_file_job(std::wstring file, std::string id, const std::string& iso,
     if (!catalog_core::copy_pack(file, out, true, &error, cancel)) { set_status(key, error); return; }
     scan_installed();
     if (!id.empty()) enable_installed(id);
+    if (id.empty()) {
+      // A copy of Melee (picked as the game disc, most often) stays off: say so, and why.
+      for (const auto& entry : installed()) {
+        std::error_code same;
+        if (entry.second.enabled || !fs::equivalent(fs::u8path(entry.second.path), out, same)) continue;
+        if (entry.second.copy) {
+          set_status(key, "Added to Mods, switched off. " + entry.second.message +
+                          " Your game disc has to be the original Melee NTSC 1.02 ISO.");
+          return;
+        }
+      }
+    }
     set_status(key, id.empty() ? "Added to Mods. Online compatibility is unverified; different builds can desync." : "Installed and turned on.");
     return;
   }
@@ -880,12 +892,15 @@ void set_shown(HWND h, bool shown) {
   if ((IsWindowVisible(h) != FALSE) != shown) ShowWindow(h, shown ? SW_SHOWNA : SW_HIDE);
 }
 
+// What one row's five buttons are to show: where, the label, on or off, the look, shown or not.
+struct ButtonPlan { RECT place{}; std::wstring label; bool enabled = false; LONG_PTR style = 0; bool shown = false; };
+std::wstring g_buttons_drawn;   // the buttons as they were last laid out (refresh_window)
+// Tests (MELEE_LAUNCHER_TEST_MODS_DRAWS=1): how often a mod button was drawn and the buttons laid out,
+// written to mods-draws.log on every tick of the page's timer. An idle page must stop drawing them.
+int g_test_button_draws = 0, g_test_layouts = 0;
+
 void refresh_window() {
   if (!g_window) return;
-  // Scrolling moves every visible button: with drawing paused until the whole page is laid out,
-  // the page and its buttons repaint once, together, instead of each button flashing on its own at
-  // its old place and then its new one (0.9.97 report).
-  SendMessageW(g_window, WM_SETREDRAW, FALSE, 0);
   const View current = view();
   const auto& found = current.installed;
   std::vector<CatalogMod> catalog;
@@ -917,48 +932,85 @@ void refresh_window() {
   }
   const int shown = visible_rows();
   g_top = std::max(0, std::min(g_top, std::max(0, (int)g_rows.size() - shown)));
-  SCROLLINFO scroll{sizeof scroll, SIF_RANGE | SIF_PAGE | SIF_POS}; scroll.nMax = (int)g_rows.size() - 1; scroll.nPage = shown; scroll.nPos = g_top;
-  SetScrollInfo(g_window, SB_VERT, &scroll, TRUE);
+
+  // What every button is to show, worked out before anything is touched. The page asks every two
+  // seconds (and again when the mod list has been read), and almost always nothing has changed: then
+  // no button is moved, hidden, shown or redrawn at all. Redrawing them all each time, with drawing
+  // switched off and on around it, is what made them blink (the Melee 3D row's most of all).
+  // Per row: the main button, Update, Remove, the On/Off switch, Choose skins.
+  std::vector<std::array<ButtonPlan, 5>> plan(g_buttons.size());
+  std::wstring drawn = std::to_wstring(g_top) + L"/" + std::to_wstring(shown) + L"/" + std::to_wstring(g_rows.size()) + L"/" + std::to_wstring(g_buttons.size());
   for (size_t i = 0; i < g_buttons.size(); ++i) {
     const bool visible = i < g_rows.size() && (int)i >= g_top && (int)i < g_top + shown;
-    HWND controls[] = {g_buttons[i], g_updates[i], g_removes[i], g_toggles[i], g_skins[i]};
-    if (!visible) { for (HWND h : controls) set_shown(h, false); continue; }
+    if (!visible) continue;
     const RECT card = card_rect((int)i - g_top);
     const int right = units(card.right) - 16, top = units(card.top);
-    MoveWindow(g_toggles[i], S(right - 84), S(top + 12), S(84), S(28), FALSE);
-    MoveWindow(g_removes[i], S(right - 84), S(top + 92), S(84), S(28), FALSE);
-    MoveWindow(g_updates[i], S(right - 176), S(top + 92), S(84), S(28), FALSE);
-    MoveWindow(g_buttons[i], S(right - 308), S(top + 92), S(124), S(28), FALSE);
-    MoveWindow(g_skins[i], S(right - 428), S(top + 92), S(112), S(28), FALSE);
+    const auto place = [](int x, int y, int w, int h) { return RECT{S(x), S(y), S(w), S(h)}; };   // left, top, width, height
     const auto& row = g_rows[i]; const auto& m = row.catalog; const auto& f = row.installed;
+    auto& p = plan[i];
+    p[0].place = place(right - 308, top + 92, 124, 28);
+    p[1].place = place(right - 176, top + 92, 84, 28);
+    p[2].place = place(right - 84, top + 92, 84, 28);
+    p[3].place = place(right - 84, top + 12, 84, 28);
+    p[4].place = place(right - 428, top + 92, 112, 28);
     // "Choose skins" opens the Settings window on the Mods tab, where the disc's costumes are picked.
     // Only once the game has listed them (disc-skins.txt), so the button never leads to an empty list.
     const bool has_skins = row.found && view_skins(current, f.path, nullptr) > 0;
-    set_label(g_skins[i], launcher::lang::txw(L"Choose skins"));
-    EnableWindow(g_skins[i], has_skins && !g_playing);
+    p[4].label = launcher::lang::txw(L"Choose skins");
+    p[4].enabled = has_skins && !g_playing;
     const bool busy = is_busy(m.id), playable = row.found && runs_here(f);
     std::string primary; bool enabled = true; LONG_PTR style = 0;
     if (busy) primary = "Cancel";
     else if (row.found) { primary = playable ? "Play" : scanning() ? "Checking..." : "Not supported yet"; enabled = playable && !g_playing; style = STYLE_ACCENT; }
     else if (m.one_click) { primary = "Get"; style = STYLE_ACCENT; enabled = !m.url.empty() || !m.repo.empty(); }
     else { primary = "Open download page"; enabled = !m.page.empty(); }
-    set_label(g_buttons[i], widen(tx(primary)));
-    SetWindowLongPtrW(g_buttons[i], GWLP_USERDATA, style);
-    EnableWindow(g_buttons[i], enabled);
-    const bool current = row.found && !m.version.empty() && same_version(m.version, f.version);
+    p[0].label = widen(tx(primary)); p[0].style = style; p[0].enabled = enabled;
+    const bool up_to_date = row.found && !m.version.empty() && same_version(m.version, f.version);
     // A mod that is not one click and not installed yet: this slot picks the downloaded file (the same
     // as dropping it on the window, which players did not find; 0.9.116 Animelee report).
     const bool add_file = !row.found && !m.one_click;
-    set_label(g_updates[i], launcher::lang::txw(add_file ? L"Add file..." : current ? L"Up to date" : L"Update"));
-    SetWindowLongPtrW(g_updates[i], GWLP_USERDATA, add_file ? STYLE_ACCENT : 0);
-    EnableWindow(g_updates[i], add_file ? !busy && !g_playing
-                                        : row.found && !busy && m.one_click && !m.version.empty() && !current && !g_playing);
-    set_label(g_removes[i], launcher::lang::txw(L"Remove"));
-    EnableWindow(g_removes[i], row.found && !busy && !g_playing);
-    set_label(g_toggles[i], launcher::lang::txw(f.enabled && row.found ? L"On" : L"Off"));
-    SetWindowLongPtrW(g_toggles[i], GWLP_USERDATA, row.found && f.enabled ? STYLE_ON : 0);
-    EnableWindow(g_toggles[i], playable && !busy && !g_playing);
-    for (HWND h : controls) set_shown(h, !(h == g_skins[i] && !has_skins));
+    p[1].label = launcher::lang::txw(add_file ? L"Add file..." : up_to_date ? L"Up to date" : L"Update");
+    p[1].style = add_file ? STYLE_ACCENT : 0;
+    p[1].enabled = add_file ? !busy && !g_playing
+                            : row.found && !busy && m.one_click && !m.version.empty() && !up_to_date && !g_playing;
+    p[2].label = launcher::lang::txw(L"Remove");
+    p[2].enabled = row.found && !busy && !g_playing;
+    p[3].label = launcher::lang::txw(f.enabled && row.found ? L"On" : L"Off");
+    p[3].style = row.found && f.enabled ? STYLE_ON : 0;
+    p[3].enabled = playable && !busy && !g_playing;
+    for (int k = 0; k < 5; ++k) {
+      p[k].shown = !(k == 4 && !has_skins);
+      drawn += L"|" + std::to_wstring(i) + L":" + std::to_wstring(k) + L":" + std::to_wstring(p[k].place.left) + L"," + std::to_wstring(p[k].place.top) +
+               L"," + std::to_wstring(p[k].place.right) + L"," + std::to_wstring(p[k].place.bottom) + L":" + p[k].label + L":" +
+               (p[k].enabled ? L"1" : L"0") + std::to_wstring((long long)p[k].style) + (p[k].shown ? L"1" : L"0");
+    }
+  }
+  if (drawn == g_buttons_drawn) {
+    // Nothing about the buttons changed: only the page's own words may have (a download's progress, a
+    // status line). It is painted whole in memory and copied once, and its buttons are left out of it.
+    InvalidateRect(g_window, nullptr, FALSE);
+    return;
+  }
+  g_buttons_drawn = drawn;
+  ++g_test_layouts;
+  // The buttons did change (a scroll step, a mod found, a download started): with drawing paused
+  // until the whole page is laid out, the page and its buttons repaint once, together, instead of
+  // each button flashing on its own at its old place and then its new one (0.9.97 report).
+  SendMessageW(g_window, WM_SETREDRAW, FALSE, 0);
+  SCROLLINFO scroll{sizeof scroll, SIF_RANGE | SIF_PAGE | SIF_POS}; scroll.nMax = (int)g_rows.size() - 1; scroll.nPage = shown; scroll.nPos = g_top;
+  SetScrollInfo(g_window, SB_VERT, &scroll, TRUE);
+  for (size_t i = 0; i < g_buttons.size(); ++i) {
+    HWND controls[] = {g_buttons[i], g_updates[i], g_removes[i], g_toggles[i], g_skins[i]};
+    const bool visible = i < g_rows.size() && (int)i >= g_top && (int)i < g_top + shown;
+    if (!visible) { for (HWND h : controls) set_shown(h, false); continue; }
+    for (int k = 0; k < 5; ++k) {
+      const ButtonPlan& b = plan[i][k];
+      MoveWindow(controls[k], b.place.left, b.place.top, b.place.right, b.place.bottom, FALSE);
+      set_label(controls[k], b.label);
+      SetWindowLongPtrW(controls[k], GWLP_USERDATA, b.style);
+      EnableWindow(controls[k], b.enabled);
+      set_shown(controls[k], b.shown);
+    }
   }
   SendMessageW(g_window, WM_SETREDRAW, TRUE, 0);
   RedrawWindow(g_window, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
@@ -1102,6 +1154,7 @@ void draw_item_direct(DRAWITEMSTRUCT* di);
 // A button is drawn whole in memory and then copied to the screen at once: drawn straight onto the
 // screen, its background, shape and label showed one after another while the list scrolled.
 void draw_item(DRAWITEMSTRUCT* di) {
+  ++g_test_button_draws;
   const RECT r = di->rcItem;
   const int w = r.right - r.left, h = r.bottom - r.top;
   if (w <= 0 || h <= 0) return;
@@ -1215,7 +1268,7 @@ LRESULT CALLBACK proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
       EndPaint(w, &ps); return 0;
     }
     case WM_DRAWITEM: draw_item((DRAWITEMSTRUCT*)lp); return TRUE;
-    case WM_SIZE: layout_footer(); refresh_window(); return 0;
+    case WM_SIZE: g_buttons_drawn.clear(); layout_footer(); refresh_window(); return 0;
     case WM_MODS_REFRESH: refresh_window(); return 0;
     case WM_MOUSEWHEEL: g_top -= GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA; refresh_window(); return 0;
     case WM_VSCROLL: {
@@ -1273,7 +1326,12 @@ LRESULT CALLBACK proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
       }
       return 0;
     }
-    case WM_TIMER: request_view(); refresh_window(); return 0;
+    case WM_TIMER:
+      request_view(); refresh_window();
+      if (static int tick = 0; g_launcher_test && std::getenv("MELEE_LAUNCHER_TEST_MODS_DRAWS"))
+        std::ofstream(fs::u8path(g_dir + "/mods-draws.log"), std::ios::app)
+            << "tick " << ++tick << " layouts " << g_test_layouts << " draws " << g_test_button_draws << '\n';
+      return 0;
   }
   return DefWindowProcW(w, msg, wp, lp);
 }
@@ -1298,6 +1356,7 @@ void show_page(bool show) {
   }
   RECT client{}; GetClientRect(g_main, &client);
   SetWindowPos(g_window, HWND_TOP, S(RAIL_W), 0, client.right - S(RAIL_W), client.bottom, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+  g_buttons_drawn.clear();   // shown again: lay the buttons out afresh
   layout_footer(); refresh_window();
   SetTimer(g_window, 1, 2000, nullptr);
   std::thread(rescan).detach();

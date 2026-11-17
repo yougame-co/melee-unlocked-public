@@ -27,6 +27,8 @@
 #include "host.h"
 #include "gx_core.h"   // the player's own shield colour for the build message
 #include "early_input.h"
+#include "lcancel.h"   // automatic L-cancel, announced in the build message
+#include "gecko_session.h"   // Gecko codes agreed for the match, locked with each selection
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -83,6 +85,25 @@ static bool bool_or(const json& j, const char* key, bool def) {
 
 uint64_t time_us() { return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 uint64_t time_ms() { return time_us() / 1000; }
+
+// Test only. MELEE_NET_LOSS_PCT=P (1 to 99) drops P percent of the datagrams a game's netplay link
+// receives, before ENet sees them, as a lossy connection does (ENet resends what was sent reliably;
+// inputs carry their recent history). With MELEE_NET_LAG_MS / MELEE_NET_JITTER_MS it gives the test
+// links of one PC a real connection's lag, jitter and loss. Unset, as it always is for a player
+// (host::test_env), nothing changes.
+static uint32_t test_loss_pct() {
+  static const uint32_t pct = [] {
+    const char* s = host::test_env::getenv("MELEE_NET_LOSS_PCT");
+    const long v = s ? std::atol(s) : 0;
+    return v > 0 && v < 100 ? (uint32_t)v : 0u;
+  }();
+  return pct;
+}
+static int ENET_CALLBACK test_loss_intercept(ENetHost*, ENetEvent*) {
+  static thread_local uint64_t state = 0x2545F4914F6CDD1Dull ^ (uint64_t)time_us();
+  state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+  return (state % 100) < test_loss_pct() ? 1 : 0;   // 1: taken (dropped); 0: ENet reads it
+}
 
 // ---------------------------------------------------------------- strings
 static std::wstring utf8_to_wide(const std::string& s) {
@@ -169,6 +190,7 @@ static void wakeup_thread(ENetHost* host) {
   enet_socket_send(host->socket, &address, &buf, 1);
 }
 static int ENET_CALLBACK intercept_callback(ENetHost* host, ENetEvent* event) {
+  if (test_loss_pct() > 0 && test_loss_intercept(host, event)) return 1;   // tests: stays lossy once connected
   if (host->receivedDataLength == 1 && host->receivedData[0] == 0) { event->type = (ENetEventType)42; return 1; }
   return 0;
 }
@@ -195,6 +217,18 @@ Packet& Packet::operator>>(std::string& s) {
   return *this;
 }
 
+// Tests only (MELEE_TEST_MM_HOST=<ip>:<port>): the matchmaking stand-in (port/tests/mm_standin.cpp)
+// answers in place of mm.slippi.gg, and while it is set no other Slippi server is asked either (the
+// profile refresh and the version check), so test identities never reach Slippi.
+static bool mm_test_server(std::string* host, int* port) {
+  static const std::string spec = [] { const char* v = host::test_env::getenv("MELEE_TEST_MM_HOST"); return std::string(v ? v : ""); }();
+  const size_t colon = spec.rfind(':');
+  if (spec.empty() || colon == std::string::npos) return false;
+  if (host) *host = spec.substr(0, colon);
+  if (port) *port = std::atoi(spec.c_str() + colon + 1);
+  return true;
+}
+
 // ---------------------------------------------------------------- user
 User::User(std::string user_dir, bool slippi_only) : dir_(std::move(user_dir)), slippi_only_(slippi_only) {
   if (host::test_env::agent_copy()) host::log("agent: skipping Slippi Launcher search and server refresh");
@@ -213,6 +247,7 @@ void User::RefreshFromServer() {
   if (me.uid.empty()) return;
   if (yougame::active()) return;                 // app Unranked uses the local profile and explicit version check
   if (Matchmaking::local_peer.enabled) return;   // local test peering stays off Slippi's servers
+  if (mm_test_server(nullptr, nullptr)) return;  // so does the matchmaking stand-in
   std::shared_ptr<std::atomic<bool>> alive = alive_;
   refresh_ = std::async(std::launch::async, [this, me, alive] {
     // Nothing may leave this thread as an exception: that would end the process.
@@ -296,6 +331,7 @@ bool User::CheckOnlineCompatibility(std::string* error, VersionFetch fetch) {
   };
   const UserInfo me = GetUserInfo();
   if (me.uid.empty()) { *error = "Sign in to Slippi before playing online."; return failed("signed-out", 0); }
+  if (mm_test_server(nullptr, nullptr)) { error->clear(); return true; }   // tests: the stand-in, no version server
   try {
     // Three tries, then the version the account last reported (user.json, which the Slippi
     // Launcher keeps current, or the profile refresh). One failed request used to block online
@@ -580,7 +616,12 @@ NetplayClient::NetplayClient(std::vector<std::string> addrs, std::vector<uint16_
     }
     host::log("slippi: cannot create ENet client"); status_.store(ConnectStatus::FAILED); return;
   }
+  // Both take ENet's one intercept: the own-port ingress wins; the loss test runs without it.
   if (own_udp_ingress_) own_udp_ingress_->attach(client_);
+  else if (test_loss_pct() > 0) {
+    client_->intercept = test_loss_intercept;
+    host::log("slippi: MELEE_NET_LOSS_PCT: dropping %u%% of received datagrams (testing)", test_loss_pct());
+  }
   for (int i = 0; i < remote_player_count; ++i) {
     ENetAddress addr;
     enet_address_set_host(&addr, addrs[i].c_str());
@@ -843,6 +884,11 @@ void NetplayClient::OnData(Packet& packet, ENetPeer* peer) {
       // Then the second capability byte (the first is full), which builds before it do not send.
       uint8_t caps2 = 0;
       if (!(packet >> caps2)) caps2 = 0;
+      // Upstream Melee Unlocked (0.9.200 on) sets caps 0x10 (arena rooms) and 0x20 (automatic L-cancel),
+      // 0.9.205 also 0x40 (Gecko codes), and sends no second byte; every YouGame build sends a non-zero
+      // one. Without it those bits are upstream's, never Squad Strike, its friend rooms, pick previews
+      // or the setup hash (a setup hash wait on an upstream peer would never end).
+      if (!caps2) caps &= (uint8_t)~(0x10u | MU_PICK_PREVIEW_CAP | MU_SETUP_HASH_CAP | 0x80u);   // + MU_SQUAD_CAP, MU_SQUAD_FRIEND_CAP
       const uint8_t pidx = PlayerIdxFromPort(port);
       if (pidx >= remote_player_count_) { host::log("slippi: build message with invalid player idx %u", pidx); break; }
       // A connection speaks for its own player only: the capabilities below decide how this match reads a leaver.
@@ -855,11 +901,17 @@ void NetplayClient::OnData(Packet& packet, ENetPeer* peer) {
         remote_build_[pidx].setup_hash = (caps & MU_SETUP_HASH_CAP) != 0;
         remote_build_[pidx].pick_previews = (caps & MU_PICK_PREVIEW_CAP) != 0;
         remote_build_[pidx].caps2 = caps2;
+        // Upstream flags these with caps 0x10/0x20, which this build reads as Squad Strike and pick
+        // previews: here they ride the second capability byte.
+        remote_build_[pidx].arena = (caps2 & MU_BUILD_CAPS2_ARENA) != 0;
+        remote_build_[pidx].auto_lcancel = (caps2 & MU_BUILD_CAPS2_AUTO_LCANCEL) != 0;
+        remote_build_[pidx].gecko = (caps2 & MU_BUILD_CAPS2_GECKO) != 0;
       }
       host::log("setup hash: opponent %u %s", port, (caps & MU_SETUP_HASH_CAP) ? "sends a setup hash" : "has no setup hash (not checked)");
       host::log("slippi: opponent %u build: %s%s%s%s, shield colour %s%06X", port, mod_view ? "mod " : "retail game",
                 mod_view ? name.c_str() : "", mod_view ? (" " + fp.substr(0, 16)).c_str() : "",
                 (caps & 1) ? ", takes early inputs" : "", shield ? "" : "none ", shield & 0xFFFFFFu);
+      if (caps2 & MU_BUILD_CAPS2_AUTO_LCANCEL) host::log("slippi: opponent %u has automatic L-cancel on", port);
 #if MU_SQUAD
       // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
       if (remote_player_count_ == 1 && port == 1 - player_idx_) {
@@ -989,6 +1041,36 @@ void NetplayClient::OnData(Packet& packet, ENetPeer* peer) {
       pick_remote_set_[pidx] = true;
       break;
     }
+    case NP_MSG_MU_ARENA: {
+      // 'M' 'U' 'A' version, then one arena message. Kept for the game thread, from a peer that
+      // announced room messages only.
+      uint8_t m, u, a, version;
+      if (!(packet >> m >> u >> a >> version) || m != 'M' || u != 'U' || a != 'A' || version != 1) break;
+      {
+        std::lock_guard<std::mutex> lk(build_mutex_);
+        if (!remote_build_[0].arena) break;
+      }
+      const size_t head = 6;   // the id, the four bytes above and the channel flag
+      if (packet.size() <= head) break;
+      std::lock_guard<std::mutex> lk(arena_mutex_);
+      if (arena_inbox_.size() >= 60000) { host::log("slippi: arena inbox full, message dropped"); break; }
+      arena_inbox_.emplace_back(packet.data() + head, packet.data() + packet.size());
+      break;
+    }
+    case NP_MSG_MU_GECKO: {
+      // A gecko_online message ('M' 'U' 'G' ...), from a peer that announced it takes them. Kept as is
+      // for the game thread, which decodes and checks it (gecko_online::decode).
+      {
+        std::lock_guard<std::mutex> lk(build_mutex_);
+        if (!remote_build_[0].gecko) break;
+      }
+      const size_t head = 1;   // the id
+      if (packet.size() <= head || packet.size() > 64 * 1024) break;
+      std::lock_guard<std::mutex> lk(gecko_mutex_);
+      if (gecko_inbox_.size() >= 16) { host::log("slippi: gecko inbox full, message dropped"); break; }
+      gecko_inbox_.emplace_back(packet.data() + head, packet.data() + packet.size());
+      break;
+    }
     case NP_MSG_SLIPPI_CONN_SELECTED: break;
     case NP_MSG_SLIPPI_COMPLETE_STEP: {
       if (!yougame::session()) break;
@@ -1050,8 +1132,12 @@ void NetplayClient::SendBuild() {
   if (shield) *p << (uint8_t)1 << (uint8_t)(shield >> 16) << (uint8_t)(shield >> 8) << (uint8_t)shield;
   else *p << (uint8_t)0;
   // The second capability byte: MU_BUILD_CAPS2_FRIENDS_LOBBY, this game plays the Friends lobby's frozen
-  // setup (CPUs, rules). Builds before it stop reading at the shield bytes.
-  *p << (uint8_t)(MU_BUILD_CAPS2_FRIENDS_LOBBY | MU_BUILD_CAPS2_LOCAL_PARTNER | MU_BUILD_CAPS2_GONE_OWN_FRAMES);
+  // setup (CPUs, rules). Builds before it stop reading at the shield bytes. MU_BUILD_CAPS2_ARENA: this
+  // side takes arena room messages (NP_MSG_MU_ARENA). MU_BUILD_CAPS2_AUTO_LCANCEL: automatic L-cancel
+  // is on for this session (the opponent's character select says so; older builds ignore the bit).
+  *p << (uint8_t)(MU_BUILD_CAPS2_FRIENDS_LOBBY | MU_BUILD_CAPS2_LOCAL_PARTNER | MU_BUILD_CAPS2_GONE_OWN_FRAMES |
+                  MU_BUILD_CAPS2_ARENA | (lcancel::automatic_active_online() ? MU_BUILD_CAPS2_AUTO_LCANCEL : 0) |
+                  MU_BUILD_CAPS2_GECKO);
   host::log("slippi: sending build: %s%s%s", me.mod_view ? "mod " : "retail game", me.mod_view ? name.c_str() : "",
             early ? " (takes early inputs)" : "");
   SendAsync(std::move(p));
@@ -1073,6 +1159,51 @@ void NetplayClient::SendPrematchPing() {
   Packet p;
   p << (uint8_t)NP_MSG_MU_PING << (uint8_t)'M' << (uint8_t)'U' << (uint8_t)'P' << (uint8_t)1 << (uint8_t)0 << player_idx_ << (uint32_t)time_us();
   Send(p);
+}
+
+bool NetplayClient::ArenaReady() {
+  if (status_.load(std::memory_order_acquire) != ConnectStatus::CONNECTED) return false;
+  std::lock_guard<std::mutex> lk(build_mutex_);
+  return remote_player_count_ == 1 && remote_build_[0].received && remote_build_[0].arena;
+}
+
+bool NetplayClient::SendArena(const uint8_t* data, size_t size, bool bulk) {
+  if (!data || !size || !ArenaReady()) return false;
+  auto p = std::make_unique<Packet>();
+  *p << (uint8_t)NP_MSG_MU_ARENA << (uint8_t)'M' << (uint8_t)'U' << (uint8_t)'A' << (uint8_t)1 << (uint8_t)(bulk ? 1 : 0);
+  p->append(data, size);
+  SendAsync(std::move(p));
+  return true;
+}
+
+bool NetplayClient::SendGecko(const std::vector<uint8_t>& message) {
+  if (message.empty() || message.size() > 64 * 1024) return false;
+  if (status_.load(std::memory_order_acquire) != ConnectStatus::CONNECTED) return false;
+  {
+    std::lock_guard<std::mutex> lk(build_mutex_);
+    if (remote_player_count_ != 1 || !remote_build_[0].received || !remote_build_[0].gecko) return false;
+  }
+  auto p = std::make_unique<Packet>();
+  *p << (uint8_t)NP_MSG_MU_GECKO;
+  p->append(message.data(), message.size());
+  SendAsync(std::move(p));
+  return true;
+}
+
+bool NetplayClient::PopGecko(std::vector<uint8_t>& out) {
+  std::lock_guard<std::mutex> lk(gecko_mutex_);
+  if (gecko_inbox_.empty()) return false;
+  out = std::move(gecko_inbox_.front());
+  gecko_inbox_.pop_front();
+  return true;
+}
+
+bool NetplayClient::PopArena(std::vector<uint8_t>& out) {
+  std::lock_guard<std::mutex> lk(arena_mutex_);
+  if (arena_inbox_.empty()) return false;
+  out = std::move(arena_inbox_.front());
+  arena_inbox_.pop_front();
+  return true;
 }
 
 uint32_t NetplayClient::RemoteShieldColor(int slot) {
@@ -1257,6 +1388,16 @@ void NetplayClient::Send(Packet& packet) {
       std::lock_guard<std::mutex> lk(build_mutex_);
       if (i >= (size_t)REMOTE_PLAYER_MAX || !remote_build_[i].early_pads) continue;
       flags = ENET_PACKET_FLAG_UNSEQUENCED; channel = 1;
+    }
+    if (mid == NP_MSG_MU_ARENA) {
+      std::lock_guard<std::mutex> lk(build_mutex_);
+      if (i >= (size_t)REMOTE_PLAYER_MAX || !remote_build_[i].arena) continue;
+      if (packet.size() > 5 && packet.data()[5] == 1) channel = 2;   // the live feed: its own reliable channel
+    }
+    if (mid == NP_MSG_MU_GECKO) {
+      // Only to a peer whose build said it takes them; reliable, on the control channel.
+      std::lock_guard<std::mutex> lk(build_mutex_);
+      if (i >= (size_t)REMOTE_PLAYER_MAX || !remote_build_[i].gecko) continue;
     }
     ENetPacket* epac = enet_packet_create(packet.data(), packet.size(), flags);
     enet_peer_send(server_[i], channel, epac);
@@ -1730,6 +1871,21 @@ void NetplayClient::SetMatchSelections(PlayerSelections& s) {
     if (squad_search_) { SendAsync(std::move(spac)); return; }
 #endif
   }
+  // Gecko codes (gecko_session.h): the lock goes just before each selection, on the same ordered
+  // queue, so the opponent always has it by the time this selection can start a match.
+  const std::vector<uint8_t> lock = gecko_session::lock_message();
+  if (!lock.empty()) SendGecko(lock);
+  SendAsync(std::move(spac));
+}
+// The same selection again, with a fresh Gecko lock (codes were agreed after this side locked in).
+void NetplayClient::ResendSelections() {
+  auto spac = std::make_unique<Packet>();
+  {
+    std::lock_guard<std::mutex> lk(selection_mutex_);
+    WriteSelections(*spac, match_info_.local);
+  }
+  const std::vector<uint8_t> lock = gecko_session::lock_message();
+  if (!lock.empty()) SendGecko(lock);
   SendAsync(std::move(spac));
 }
 #if MU_SQUAD
@@ -2305,11 +2461,20 @@ std::string Matchmaking::openSlippiTicket(const UserInfo& me, const std::functio
   ENetAddress addr{};
   addr.port = 43113;
   bool resolved = false;
+  // Tests: a matchmaking stand-in instead of Slippi's server (mm_test_server).
+  std::string test_host;
+  int test_port = 0;
+  const bool test_mm = mm_test_server(&test_host, &test_port);
+  if (test_mm) {
+    addr.port = (enet_uint16)test_port;
+    host::log("slippi: matchmaking stand-in at %s:%d (test)", test_host.c_str(), test_port);
+  }
   native([&] {
-    resolved = enet_address_set_host(&addr, "mm.slippi.gg") == 0;
+    resolved = enet_address_set_host(&addr, test_mm ? test_host.c_str() : "mm.slippi.gg") == 0;
     if (!resolved) return;
     for (int retry = 0; !client_ && retry < 15; ++retry) {
-      host_port_ = yougame::search_policy::native_port((uint16_t)forced_port, (uint16_t)avoid, rng());
+      host_port_ = port_override_ ? port_override_
+                                  : yougame::search_policy::native_port((uint16_t)forced_port, (uint16_t)avoid, rng());
       ENetAddress addr; addr.host = ENET_HOST_ANY; addr.port = (enet_uint16)host_port_;
       client_ = enet_host_create(&addr, 1, 3, 0, 0);
     }
@@ -2378,7 +2543,7 @@ void Matchmaking::startYouGameMatchmaking(const char* status) {
   }
   display_provider_ = display::Provider::YouGame;
   static std::mt19937 rng((uint32_t)time_ms());
-  host_port_ = forced_port ? forced_port : 41000 + (int)(rng() % 10000);
+  host_port_ = port_override_ ? port_override_ : forced_port ? forced_port : 41000 + (int)(rng() % 10000);
   yougame::Search search;
   if (!youGameSearch(&search)) return;
   search.udp_port = (uint16_t)host_port_;

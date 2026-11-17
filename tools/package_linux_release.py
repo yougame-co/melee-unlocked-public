@@ -22,6 +22,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import build_content_release
 
 ROOT = Path(__file__).resolve().parents[1]
 EXE = 'melee_' + 'source'
@@ -283,12 +284,18 @@ def main():
         if catalog.get('version') != 1 or not catalog.get('models'):
             raise SystemExit(f'{args.pro_ai_dir}/catalog.json: no policies')
         (folder / 'ProAI').mkdir()
+        # As in the Windows zip: each pro's own policy ships, a matchup policy downloads the first
+        # time its pairing is played (Phillip's from Hugging Face, ours from the content release).
+        sources = ('https://huggingface.co/vladfi/phillip-models/resolve/', build_content_release.CONTENT_BASE)
         for model in catalog['models']:
             source = args.pro_ai_dir / model['file']
-            if not source.is_file():
-                if model['kind'] == 'imitation' or not model.get('source'):   # ours have nowhere to download from
-                    raise SystemExit(f'missing Fight a pro policy: {source}')
+            if model['kind'] != 'imitation':
+                if not str(model.get('source') or '').startswith(sources):
+                    raise SystemExit(f"Fight a pro policy {model['file']} has nowhere to download from: "
+                                     f"run tools/build_content_release.py and upload it to the content release")
                 continue
+            if not source.is_file():
+                raise SystemExit(f'missing Fight a pro policy: {source}')
             if hashlib.sha256(source.read_bytes()).hexdigest() != model['sha256']:
                 raise SystemExit(f'Fight a pro policy changed: {source}')
             shutil.copy2(source, folder / 'ProAI' / source.name)
@@ -452,6 +459,21 @@ def main():
             raise SystemExit(f'missing license text: {src}')
         shutil.copy2(src, licenses / dst)
     ship_vulkan_cache(ROOT / 'shadercache/vulkan-v1', folder / 'shadercache/vulkan-v1')
+    # The Lab view's fighter packs are their own download, as on Windows: MeleeUnlocked-Lab.zip on the
+    # content release, fetched the first time the Lab view is used. The same checks as
+    # tools/package_release.py: the packs here must be the ones in the zip the game names by hash.
+    lab_packs = sorted((ROOT / 'build/lab').glob('*.lab'))
+    if len(lab_packs) != 27:
+        raise SystemExit(f'Lab packs missing: {len(lab_packs)} of 27 in build/lab (run tools/build_lab_assets.py)')
+    lab_zip = ROOT / 'release/content-1/MeleeUnlocked-Lab.zip'
+    if not lab_zip.is_file() or hashlib.sha256(lab_zip.read_bytes()).hexdigest() != build_content_release.pinned_lab_sha():
+        raise SystemExit(f'{lab_zip} is missing or is not the zip the game checks for (tools/build_content_release.py)')
+    if not build_content_release.lab_zip_matches(lab_zip, ROOT / 'build/lab'):
+        raise SystemExit(f'the Lab packs in build/lab differ from {lab_zip}: publish them as a new content release')
+    (folder / 'Lab').mkdir(exist_ok=True)
+    (folder / 'Lab' / 'README.txt').write_text(
+        "The Lab view's fighters are a separate download (about 85 MB). The game fetches them the first\n"
+        'time the Lab view is turned on (F3) and keeps them here through updates.\n', encoding='utf-8')
     # Mod import tools: the system's 7-Zip and xdelta3, as the Windows release carries its own.
     tools = folder / 'tools'
     tools.mkdir()
@@ -482,7 +504,11 @@ def main():
     if archive.exists():
         archive.unlink()
     with tarfile.open(archive, 'w:gz', compresslevel=9) as tar:
-        tar.add(folder, arcname=name)
+        # The crash symbols stay in the unpacked folder (addr2line reads them there); the game never opens them.
+        tar.add(folder, arcname=name, filter=lambda item: None if item.name.endswith('.dbg') else item)
+    symbols = args.out / 'symbols' / f'{name}-linux'
+    symbols.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(folder / 'melee_game.dbg', symbols / 'melee_game.dbg')   # kept for crash reports (bugwatch release_check reads it)
     total = sum(p.stat().st_size for p in folder.rglob('*') if p.is_file())
     print(f'{archive} ({archive.stat().st_size / 1e6:.1f} MB packed, {total / 1e6:.1f} MB unpacked)')
 

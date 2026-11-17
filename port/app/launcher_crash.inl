@@ -172,11 +172,26 @@ LRESULT CALLBACK proc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
       HWND edit = make(L"EDIT", L"", WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_TABSTOP,
                        12, 32, 456, 120, ID_NOTE);
       SendMessageW(edit, EM_SETLIMITTEXT, 2000, 0);
-      make(L"STATIC", L"Sends your game logs (the last session and the one before), lobby log, this session's crash file and your marked online matches. "
-                      L"Names, accounts, addresses and folder names are removed before anything leaves your PC.",
-           0, 12, 160, 456, 34, 0);
-      make(L"BUTTON", L"Send", BS_DEFPUSHBUTTON | WS_TABSTOP, 296, 202, 82, 28, ID_SEND);
-      make(L"BUTTON", L"Cancel", WS_TABSTOP, 386, 202, 82, 28, ID_CANCEL);
+      // The line under the box wraps to as many rows as its words need at this PC's text size, and the
+      // buttons and the window follow it: at a fixed two rows its last words were cut off.
+      const wchar_t* about = L"Sends your game logs (the last session and the one before), lobby log, this session's crash file and your marked online matches. "
+                             L"Names, accounts, addresses and folder names are removed before anything leaves your PC.";
+      RECT measure{0, 0, 456, 0};
+      {
+        HDC dc = GetDC(w);
+        HGDIOBJ old = SelectObject(dc, font);
+        DrawTextW(dc, about, -1, &measure, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        SelectObject(dc, old);
+        ReleaseDC(w, dc);
+      }
+      const int about_h = std::max(34, (int)measure.bottom + 6);
+      make(L"STATIC", about, SS_NOPREFIX, 12, 160, 456, about_h, 0);
+      const int buttons_y = 160 + about_h + 8;
+      make(L"BUTTON", L"Send", BS_DEFPUSHBUTTON | WS_TABSTOP, 296, buttons_y, 82, 28, ID_SEND);
+      make(L"BUTTON", L"Cancel", WS_TABSTOP, 386, buttons_y, 82, 28, ID_CANCEL);
+      RECT want{0, 0, 480, buttons_y + 28 + 12};
+      AdjustWindowRectEx(&want, WS_CAPTION | WS_SYSMENU, FALSE, WS_EX_DLGMODALFRAME);
+      SetWindowPos(w, nullptr, 0, 0, want.right - want.left, want.bottom - want.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
       SetFocus(edit);
       return 0;
     }

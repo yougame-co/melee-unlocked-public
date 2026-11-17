@@ -260,7 +260,11 @@ void fetch_later(const Entry& e, bool retry = false) {
   // Never inside the YouGame app: its builds ship no catalog, and one dropped beside the game (a mod or
   // a pack) must not start downloads until the catalog is part of the verified build.
   if (yougame::active()) return;
-  if (off || e.sha256.size() != 64 || e.source.rfind("https://huggingface.co/vladfi/phillip-models/resolve/", 0) != 0) return;
+  // Two places only: Phillip's published models (a pinned Hugging Face commit) and this game's own
+  // content release, which holds the policies trained here.
+  const bool known_source = e.source.rfind("https://huggingface.co/vladfi/phillip-models/resolve/", 0) == 0 ||
+                            e.source.rfind(host::updater::kContentBase, 0) == 0;
+  if (off || e.sha256.size() != 64 || !known_source) return;
   std::lock_guard<std::mutex> lk(g_fetch_mutex);
   if (g_fetch_pending.count(e.file) || (!retry && g_fetch_tried.count(e.file))) return;
   g_fetch_tried.insert(e.file);

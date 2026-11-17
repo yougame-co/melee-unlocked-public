@@ -37,6 +37,7 @@ void mu_lcancel_view(MuLcancelView* out)
         out->have_common = 1;
         out->trigger_deadzone = p_ftCommonData->analog_shoulder_deadzone;
         out->lcancel_window = p_ftCommonData->xE4;
+        out->z_analog = p_ftCommonData->z_press_analog_value;
     }
     /* As the recompiled build: human slots 0-3, first one on each controller port. */
     for (slot = 0; slot < 4; ++slot) {
@@ -45,7 +46,7 @@ void mu_lcancel_view(MuLcancelView* out)
         int port;
         if (Player_GetPlayerSlotType(slot) != Gm_PKind_Human)
             continue;
-        port = (s8) Player_GetSubColor(slot);
+        port = (s8) Player_GetPadPort(slot);   /* pad_port (+0x48); +0x46 is the costume tint */
         if (port < 0 || port > 3)
             continue;
         /* In a network match every player reads the same controller value here, so the second

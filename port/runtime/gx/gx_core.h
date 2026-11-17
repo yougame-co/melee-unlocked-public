@@ -148,6 +148,10 @@ struct DrawCall {
   // particles, 0xFF for everything else. Display only: it feeds the per-player tint and the
   // particle tier of Visual effects, is not part of `identity` and never reaches a shader UID.
   uint8_t owner_player = 0xFF;
+  // The stage map gobj a draw came from (Source Port token 0xF7): its index (0..0x3F), 0x80 set when
+  // the game calls it scenery, 0x40 when its props stand close behind the floor (abi/mu_stage_scenery.h);
+  // 0xFF for anything else or unknown. Display only.
+  uint8_t stage_map = 0xFF;
   // Skinned (envelope) draw: the fighter's model. Its shadow and its effects are rigid draws, so
   // this is what tells the model apart from everything else the same player renders.
   bool skinned = false;
@@ -631,6 +635,9 @@ inline LightweightFilter lightweight_filter(const Frame& f, int level) {
 // (they have an owner or are skinned) never count, nor does anything off the world camera. With no
 // fighter in view (a cut-in, the results walk-off) nothing is skipped.
 inline bool lightweight_background(const LightweightFilter& e, const Frame& f, const DrawCall& d) {
+  // Scenery the game itself names (Whispy, Fountain of Dreams' trees, Yoshi's Story's clouds): off
+  // whatever its depth, which on those stages is the fighters' own.
+  if (e.backdrop_off && e.have_fighters && d.stage_map != 0xFF && (d.stage_map & 0x80) && lightweight_world_draw(e, d)) return true;
   if (!e.backdrop_off || !e.have_fighters || d.owner_player != 0xFF || d.skinned || !lightweight_world_draw(e, d)) return false;
   // The frame's own vertices: a stage piece is rigid, so the sub-frame solver never rewrites them.
   const Vertex* v = d.first_vertex + (size_t)d.vertex_count <= f.vertices.size() ? f.vertices.data() + d.first_vertex : nullptr;
@@ -642,18 +649,34 @@ inline bool lightweight_background(const LightweightFilter& e, const Frame& f, c
   // fighters (platforms, floors, walls, ledges). Scenery further back or in front (trees, poles, building fronts,
   // foreground props) goes too, so the lines stay readable and there are fewer draws.
   const bool band = e.level >= 5;
-  const float limit = e.fighter_far - (band ? 20.0f : kLightweightBackgroundDepth);
+  // A stage map the game marks as holding props close behind the floor (token 0xF7, bit 0x40): those
+  // props go from 8 units behind the fighters (Yoshi's Story's trees, Fountain of Dreams' tower).
+  const bool tight = d.stage_map != 0xFF && (d.stage_map & 0x40);
+  const float limit = e.fighter_far - (tight ? 8.0f : band ? 20.0f : kLightweightBackgroundDepth);
   const float front = e.fighter_far + 30.0f;
   bool seen = false;
   float lo[3] = {1e30f, 1e30f, 1e30f}, hi[3] = {-1e30f, -1e30f, -1e30f};
+  // The piece's extent first. A piece that surrounds the camera (Battlefield's sky sphere, about 1100
+  // units across with the camera inside it) is scenery whatever the depth of the point that happens
+  // to be in a corner of the view: its inner wall passes within the play plane's depth there, and as
+  // the camera moved the whole sky drew for a few frames at a time (a player's replay: 33 flashes of
+  // Battlefield's sky through the Arcade look's plain background in one game). No stage floor, wall
+  // or platform surrounds the camera.
   for (uint32_t i = 0; i < d.vertex_count; ++i) {
     const int row = (int)(v[i].posmtx & 0x3F);
     if (row + 2 >= 64) return false;
     const float* m = &d.posMatrices[row * 4];
+    for (int r = 0; r < 3; ++r) {
+      const float c = m[r * 4] * v[i].pos[0] + m[r * 4 + 1] * v[i].pos[1] + m[r * 4 + 2] * v[i].pos[2] + m[r * 4 + 3];
+      if (!std::isfinite(c)) return false;
+      lo[r] = std::min(lo[r], c); hi[r] = std::max(hi[r], c);
+    }
+  }
+  if (lo[0] < 0 && hi[0] > 0 && lo[1] < 0 && hi[1] > 0 && lo[2] < 0 && hi[2] > 0) return true;
+  for (uint32_t i = 0; i < d.vertex_count; ++i) {
+    const float* m = &d.posMatrices[(int)(v[i].posmtx & 0x3F) * 4];
     float p[3];
     for (int r = 0; r < 3; ++r) p[r] = m[r * 4] * v[i].pos[0] + m[r * 4 + 1] * v[i].pos[1] + m[r * 4 + 2] * v[i].pos[2] + m[r * 4 + 3];
-    if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) return false;
-    for (int r = 0; r < 3; ++r) { lo[r] = std::min(lo[r], p[r]); hi[r] = std::max(hi[r], p[r]); }
     const float z = p[2];
     if (z >= 0 || std::abs(p[0]) > -z * 1.5f || std::abs(p[1]) > -z * 1.5f) continue;   // out of view
     seen = true;
@@ -746,6 +769,12 @@ struct Backend {
   // display's own counts while frames come slower than the refresh: a fixed display still refreshes
   // at its full rate and repeats frames, a variable one refreshes once per frame. Render thread.
   virtual int variable_refresh() const { return -1; }
+  // Latency probe (MELEE_TRACE_LATENCY=1 with an input script): the id of the present just made,
+  // 0 when this renderer cannot tell when a present reached the screen; then, for that id, when it
+  // did on the now_seconds clock: 1 known (*seconds set), 0 not yet, -1 never. Only Vulkan with
+  // VK_GOOGLE_display_timing knows (Linux and macOS drivers); OpenGL and Direct3D say -1. Render thread.
+  virtual uint64_t probe_present_id() { return 0; }
+  virtual int probe_presented(uint64_t, double*) { return -1; }
   // NVIDIA frame generation running now with a fixed multiplier (2 to 6): the presentation loop
   // renders that many times fewer frames, and generation fills the rest up to the target rate.
   // 1 when it is off or in Dynamic mode (NVIDIA picks the multiplier itself).

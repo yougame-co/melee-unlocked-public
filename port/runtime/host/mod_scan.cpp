@@ -15,6 +15,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -389,6 +390,9 @@ const uint8_t kRetailDolSha1[20] = {0x08, 0xe0, 0xbf, 0x20, 0x13, 0x4d, 0xfc, 0x
 constexpr const char kVanillaMd5[] = "0e63d4223b01d9aba596259dc155a174";
 constexpr const char kMelee3dMd5[] = "7643d5ca759e83f7f23a96b10e5cfe5f";   // Melee 3D 1.0 applied to kVanillaMd5
 constexpr const char kRogueMeleeSha256[] = "518d02bc9a3c38551427a48af4d7e2ac4626b2cf5db4838e5b190b0877a82ed9";   // rogueMelee 3 (its README)
+// A disc with Melee's own title that changes at most this many of the player's disc's files (and adds
+// and removes none) is a copy of Melee, not a mod (Detected::copy).
+constexpr uint32_t kCopyChangedFiles = 3;
 struct KnownDisc { const char* hash; const char* name; const char* version; const char* id = ""; };
 const KnownDisc kHackPackMd5[] = {
   {"4e400c49b68bc3474dbe7970ad4df6d9", "20XX Hack Pack", "4.0 Beta02"},
@@ -1029,8 +1033,9 @@ Detected identify_disc(const fs::path& file, Detected d, const ScanOptions& opti
     return d;
   }
   // The retail game's code: a data-only mod, or the retail game in another layout.
+  LayerDiff diff;
   if (base) {
-    const LayerDiff diff = diff_against_base(in, info, *base);
+    diff = diff_against_base(in, info, *base);
     if (log) *log = std::to_string(diff.changed) + " files changed, " + std::to_string(diff.added) + " added, " +
                     std::to_string(diff.deleted) + " removed";
     if (diff.ok && !diff.changed && !diff.added && !diff.deleted && !diff.dol_runs) {
@@ -1053,6 +1058,19 @@ Detected identify_disc(const fs::path& file, Detected d, const ScanOptions& opti
   d.kind = Kind::AssetMod; d.name = title;
   set_support(d, Engine::Either, Support::Supported, true);
   d.message = "Detected: " + title + " (changes the game's files)";
+  // A copy of Melee rather than a mod: the disc keeps Melee's own title and changes only a few of the
+  // game's files (or there is no disc yet to compare it with). Players picked such a copy as their
+  // game disc; the launcher put it in Mods, where it turned on when first found and made their game a
+  // mod build online, so Direct refused their friends on the standard game (0.9.203 report). It is
+  // listed and can be switched on, but it never turns on by itself.
+  if (standard_title(info.title) &&
+      (!base || (diff.ok && diff.changed <= kCopyChangedFiles && !diff.added && !diff.deleted))) {
+    d.copy = true;
+    const std::string changed = !base ? std::string("changed files")
+                                      : std::to_string(diff.changed) + (diff.changed == 1 ? " changed file" : " changed files");
+    d.message = "A copy of Melee with " + changed + ", not a mod. It stays off unless you switch it on: while it is on, "
+                "online your game is a mod build and plays only with people on the same disc.";
+  }
   return d;
 }
 // A file is listed when it is a disc image or a card save (its message is never empty then); any
@@ -1090,7 +1108,7 @@ Detected identify(const fs::path& file, const ScanOptions& options, std::string*
 // The scan cache: Mods/.cache/scan.txt, one line per file keyed by path, size and time (and, for
 // discs, the retail disc they were compared with), so a boot never reads an unchanged disc again.
 namespace {
-constexpr const char kCacheHeader[] = "mu-scan 17";   // 17: Chaos Eternal plays on the Static Recomp; 16: unknown m-ex builds and code mods play on either engine; 15: Training Mode CE v1.4 d2 and v1.4.1 discs play natively; 14: retail content identity independent of disc padding
+constexpr const char kCacheHeader[] = "mu-scan 18";   // 18: copies of Melee (Detected::copy); 17: Chaos Eternal plays on the Static Recomp; 16: unknown m-ex builds and code mods play on either engine; 15: Training Mode CE v1.4 d2 and v1.4.1 discs play natively; 14: retail content identity independent of disc padding
 struct CacheEntry { std::string key, base; Detected d; };
 
 std::string cache_key(const fs::path& file) {
@@ -1121,13 +1139,14 @@ std::vector<CacheEntry> load_cache(const fs::path& file) {
     size_t start = 0;
     for (size_t tab; (tab = line.find('\t', start)) != std::string::npos; start = tab + 1) f.push_back(line.substr(start, tab - start));
     f.push_back(line.substr(start));
-    if (f.size() != 15) continue;
+    if (f.size() != 16) continue;
     CacheEntry e;
     e.key = f[0]; e.base = f[1];
     e.d.path = fs::u8path(f[2]);
     e.d.kind = kind_from(f[3]); e.d.name = f[4]; e.d.version = f[5]; e.d.hash = f[6]; e.d.key = f[7];
     e.d.needs = engine_from(f[8]); e.d.status = support_from(f[9]);
     e.d.can_enable = f[10] == "1"; e.d.card = f[11] == "1"; e.d.restart = f[12] == "1"; e.d.message = f[13]; e.d.catalog_id = f[14];
+    e.d.copy = f[15] == "1";
     out.push_back(std::move(e));
   }
   return out;
@@ -1145,7 +1164,8 @@ void save_cache(const fs::path& file, const std::vector<CacheEntry>& entries) {
       out << one_line(e.key) << '\t' << one_line(e.base) << '\t' << one_line(d.path.u8string()) << '\t' << kind_id(d.kind) << '\t'
           << one_line(d.name) << '\t' << one_line(d.version) << '\t' << d.hash << '\t' << one_line(d.key) << '\t'
           << engine_id(d.needs) << '\t' << support_id(d.status) << '\t' << (d.can_enable ? 1 : 0) << '\t' << (d.card ? 1 : 0)
-          << '\t' << (d.restart ? 1 : 0) << '\t' << one_line(d.message) << '\t' << one_line(d.catalog_id) << '\n';
+          << '\t' << (d.restart ? 1 : 0) << '\t' << one_line(d.message) << '\t' << one_line(d.catalog_id) << '\t'
+          << (d.copy ? 1 : 0) << '\n';
     }
   }
   fs::rename(temporary, file, ec);
@@ -1205,7 +1225,8 @@ std::string choice_lines(const std::map<std::string, int>& values) {
 // ================================================================================================
 // Scanning the Mods folder
 namespace {
-void apply_choices(ScanResult& result, std::map<std::string, int>* values) {
+// upgraded: the first scan by this version (the scan cache was an older version's).
+void apply_choices(ScanResult& result, std::map<std::string, int>* values, bool upgraded) {
   // One copy of 20XX TE and one Training Mode CE disc are used; further copies are listed only.
   std::map<std::string, const Detected*> first;
   for (auto& d : result.items) {
@@ -1230,14 +1251,21 @@ void apply_choices(ScanResult& result, std::map<std::string, int>* values) {
     if (!d.can_enable) continue;
     auto it = values->find(d.key);
     if (it == values->end()) {
-      const bool on = !(d.card && card_on);
+      const bool on = !(d.card && card_on) && !d.copy;
       (*values)[d.key] = on ? 1 : 0;
-      result.log.push_back(std::string(on ? "turned on " : "left off ") + d.name + " (found for the first time)");
-      if (!on)
+      result.log.push_back(std::string(on ? "turned on " : "left off ") + d.name + " (found for the first time" +
+                           (d.copy ? ": a copy of Melee)" : ")"));
+      if (!on && !d.copy)
         result.notes.push_back(d.name + " was found. Only one save mod can be on at a time: switch it on here to use it "
                                "instead of " + card_on->name + ".");
       if (on && d.card) card_on = &d;
       it = values->find(d.key);
+    } else if (upgraded && d.copy && it->second == 1) {
+      // Turned on by an earlier version when it was found: switched off once, after the update.
+      it->second = 0;
+      result.log.push_back("turned off " + d.name + " (a copy of Melee, once after the update)");
+      result.notes.push_back(d.name + " is a copy of Melee, not a mod, and was switched off: with it on, online your "
+                             "game was a mod build. Switch it on here if you meant to play with it.");
     }
     d.enabled = it->second == 1;
   }
@@ -1260,6 +1288,17 @@ ScanResult scan(const ScanOptions& options, std::map<std::string, int>* values) 
   const auto begin = std::chrono::steady_clock::now();
   const fs::path cache_file = options.mods_dir / ".cache" / "scan.txt";
   std::vector<CacheEntry> cache = options.use_cache ? load_cache(cache_file) : std::vector<CacheEntry>{};
+  // The first scan after an update finds an older version's cache (written by every earlier scan and
+  // rewritten by this one).
+  bool upgraded = false;
+  if (options.use_cache) {
+    std::ifstream old(cache_file);
+    std::string header;
+    if (old && std::getline(old, header) && header.rfind("mu-scan ", 0) == 0) {
+      const int version = std::atoi(header.c_str() + 8);
+      upgraded = version > 0 && version < std::atoi(kCacheHeader + 8);
+    }
+  }
   std::vector<CacheEntry> kept_cache;
   const std::shared_ptr<const BaseDisc> base = load_base(options.base_iso);
   const std::string base_id = base ? base->identity : std::string();
@@ -1337,7 +1376,10 @@ ScanResult scan(const ScanOptions& options, std::map<std::string, int>* values) 
     auto rank = [](const Detected& d) { return d.kind == Kind::Te ? 0 : d.kind == Kind::TmCe ? 1 : 2; };
     return rank(a) < rank(b);
   });
-  apply_choices(result, values);
+  // Switching an earlier copy off needs the game disc it was compared with: without one, Melee's own
+  // title alone marks a copy, and a mod built from the player's disc (Animelee keeps that title) would
+  // be taken for one.
+  apply_choices(result, values, upgraded && !base_id.empty());
   result.log.push_back("scanned " + options.mods_dir.u8string() + ": " + std::to_string(result.items.size()) + " items, " +
                        std::to_string(result.hashed) + " read, " + std::to_string(result.cached) + " from the cache, " +
                        std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1385,6 +1427,7 @@ bool write_detected_json(const fs::path& file, const ScanResult& result, bool so
         << ", \"needs_engine\": " << json_string(engine_id(d.needs))
         << ", \"status\": " << json_string(support_id(d.status))
         << ", \"card\": " << (d.card ? "true" : "false")
+        << ", \"copy\": " << (d.copy ? "true" : "false")
         << ", \"restart\": " << (d.restart ? "true" : "false")
         << ", \"message\": " << json_string(d.message) << "}";
   }
@@ -1733,7 +1776,8 @@ void import_async(const fs::path& picked) {
       const std::string where = display_path(target);
       const bool usable = d.can_enable && (d.status == Support::Supported || d.status == Support::Untested);
       message = (target == picked ? "Already in the Mods folder: " : "Copied into " + where + ". ") +
-                (usable ? std::string("Recognized: ") + d.name + (d.version.empty() ? "" : " " + d.version) + "."
+                (d.copy ? d.message
+                 : usable ? std::string("Recognized: ") + d.name + (d.version.empty() ? "" : " " + d.version) + "."
                         : "Not recognized as a mod this game can use: " + (d.message.empty() ? std::string("unknown file.") : d.message));
       const ScanResult result = scan_with_choices(options);
       publish(result, options);

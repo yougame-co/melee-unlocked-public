@@ -828,6 +828,60 @@ void set_native_functions(const NativeFunction* table, uint32_t count, DolRead d
   }
 }
 void suspend_function_patches() { if (!g_live.empty()) sync_functions(false); }
+
+namespace {
+NativeWrite g_agreed_write = nullptr;
+NativeRead g_agreed_read = nullptr;
+}  // namespace
+
+std::vector<Offerable> offerable() {
+  std::vector<Offerable> out;
+  if (!g_native_write || g_code_patches_allowed) return out;   // the Source Port only
+  for (const Code& c : g_codes)
+    if (c.enabled && c.supported && !c.plan.empty() && c.fn_patches.empty() && !c.patches_code)
+      out.push_back({c.name, c.lines});
+  return out;
+}
+
+void set_agreed_writer(NativeWrite write, NativeRead read) { g_agreed_write = write; g_agreed_read = read; }
+
+bool can_run(const std::vector<std::pair<uint32_t, uint32_t>>& lines, std::string* why) {
+  if (!g_agreed_write || g_code_patches_allowed) { if (why) *why = "this engine runs no codes online"; return false; }
+  Code c;
+  c.lines = lines;
+  classify(c);
+  const bool ok = c.supported && !c.plan.empty() && c.fn_patches.empty() && !c.patches_code;
+  if (!ok && why) *why = c.reason.empty() ? "it rewrites game code, which is not run online" : c.reason;
+  return ok;
+}
+
+void run_agreed(const std::vector<std::vector<std::pair<uint32_t, uint32_t>>>& codes) {
+  if (!g_agreed_write || codes.empty()) return;
+  // Each code checked and planned once, by its lines (classify, the same as the player's own).
+  static std::map<std::vector<std::pair<uint32_t, uint32_t>>, Code> planned;
+  const NativeWrite own_write = g_native_write;
+  const NativeRead own_read = g_native_read;
+  g_native_write = g_agreed_write;
+  g_native_read = g_agreed_read;
+  for (const auto& lines : codes) {
+    auto it = planned.find(lines);
+    if (it == planned.end()) {
+      Code c;
+      c.name = "agreed code";
+      c.lines = lines;
+      classify(c);
+      if (!c.supported || c.plan.empty() || !c.fn_patches.empty() || c.patches_code)
+        host::log("gecko online: an agreed code cannot run here (%s); it is skipped", c.reason.empty() ? "no plan" : c.reason.c_str());
+      it = planned.emplace(lines, std::move(c)).first;
+    }
+    const Code& c = it->second;
+    if (!c.supported || c.plan.empty() || !c.fn_patches.empty() || c.patches_code) continue;
+    uint32_t bad = 0;
+    run_plan(c, bad);
+  }
+  g_native_write = own_write;
+  g_native_read = own_read;
+}
 void set_static_runtime(StaticRunner run, StaticReserve reserve, StaticStart start) {
   g_static_run = run; g_static_reserve = reserve; g_static_start = start;
 }

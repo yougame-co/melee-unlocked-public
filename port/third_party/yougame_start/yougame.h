@@ -75,6 +75,13 @@ enum {
   YG_REASON_NOT_AVAILABLE = 8  /* no YouGame answered and no feedback page could open */
 };
 
+/* yg_set_game_state's state: what the game is doing now, for YouGame's button over it. */
+typedef enum yg_game_state {
+  YG_GAME_PLAYING = 1, /* in play: the button keeps out of the way */
+  YG_GAME_PAUSED = 2,  /* the game's own pause: the button shows (controllers, settings, friends) */
+  YG_GAME_MENU = 3     /* a main menu or another menu outside play: the button shows */
+} yg_game_state;
+
 /* yg_config.log's level. */
 enum { YG_LOG_INFO = 0, YG_LOG_WARN = 1 };
 
@@ -154,7 +161,7 @@ typedef struct yg_result {
     const char *player_message; /* words for the player, or "" */
   } feedback;
 
-  int menu_opened; /* openMenu: YouGame's play menu opened; else keep the game's own menu */
+  int menu_opened; /* openMenu/menuButton: YouGame's play menu opened; else keep the game's own menu */
 } yg_result;
 
 /* Every call's answer. Runs inside yg_update(), exactly once per call made after yg_init. */
@@ -212,6 +219,19 @@ long long yg_save_clear(yg_callback cb, void *user);
 /* kind YG_FEEDBACK_*; draft_text (UTF-8, may be NULL) is cut to 2,000 characters. */
 long long yg_open_feedback(int kind, const char *draft_text, yg_callback cb, void *user);
 long long yg_open_menu(yg_callback cb, void *user);
+/* Report the game's own input events, never poll input for the plugin. kind: keys, ps, pad, gc.
+ * Call set_input_kind on changes; menu_button once on the menu press (PS/Home, or GC chord).
+ * Best effort: older apps answer notYet; keep the game's own menu if result.opened is false. */
+long long yg_set_input_kind(const char *kind, yg_callback cb, void *user);
+long long yg_menu_button(const char *kind, yg_callback cb, void *user);
+/* Report each change of the game's state (not every frame): playing, paused or in a menu, so the
+ * app's overlay can keep YouGame's button out of play and show it on pause and in menus (an app
+ * that does not follow it yet keeps the button's usual fade). Fire-and-forget, no callback: the
+ * answer is ignored. Sent only when the state changed; called before YouGame answers (or while it
+ * is away), the latest state goes once hello is answered, and again on every new connection. Kept
+ * until yg_shutdown: after a new yg_init, say it again. 1 sent now, 0 kept for later or unchanged,
+ * -1 not a state or before yg_init. */
+int yg_set_game_state(yg_game_state state);
 /* Any other wire type in sdk.md "Native builds" (saveFileList, entitlements, ...). body_json is a
  * JSON object or NULL; timeout_seconds <= 0 means 15. */
 long long yg_call(const char *type, const char *body_json, double timeout_seconds, yg_callback cb,
@@ -330,9 +350,9 @@ extern "C" {
  * Limits, from the app's bridge and local channel (desktop/src bridge.ts, local-channel.ts). */
 
 #define YG__STDIO_LINE_MAX ((size_t)48 * 1024 * 1024) /* bridge.ts STDIO_LINE_LIMIT, both ways */
-#define YG__LOCAL_LINE_MAX ((size_t)68 * 1024)        /* contract section 3: longer closes the channel; a 64 KiB save fits */
+#define YG__LOCAL_LINE_MAX ((size_t)200 * 1024)        /* contract section 3: full escaped 32 KiB world message plus framing */
 #define YG__LOCAL_LINE_OLD ((size_t)64 * 1024)        /* an app whose hello names no lineMax (older): its limit */
-#define YG__LOCAL_READ_MAX ((size_t)1024 * 1024)      /* the longest line kept from the local host */
+#define YG__LOCAL_READ_MAX ((size_t)8 * 1024 * 1024)      /* a 1 MiB relay frame can take 6 MiB escaped */
 #define YG__INBOX_MAX ((size_t)64 * 1024 * 1024)      /* unread lines held for yg_update, in bytes */
 #define YG__OUTBOX_MAX ((size_t)64 * 1024 * 1024)     /* lines waiting to go out, in bytes */
 #define YG__ALLOC_SLACK 16                            /* what an allocation costs beyond its size */
@@ -340,6 +360,11 @@ extern "C" {
 #define YG__TIMEOUT 15.0
 #define YG__LOCAL_HELLO_TIMEOUT 6.0 /* contract section 1: no hello answer in 6 s is no host */
 #define YG__PROBE_COOLDOWN 5.0      /* contract section 1.3 */
+/* After the app ends a connection (an update restarting it, the player quitting and opening it
+ * again), the game looks again on its own, every 5 s for 5 minutes, so it reconnects without
+ * waiting for its next call. A game that never found the app keeps looking on calls only. */
+#define YG__RELOOK_EVERY 5.0
+#define YG__RELOOK_FOR 300.0
 /* Player pending (contract section 4; desktop/src/local-channel.ts "PLAYER PENDING"): after a hello
  * answered playerPending, hello is asked again about 2 s and about 6 s later, unless the player came
  * first (in an answer or the playerArrived push). */
@@ -363,6 +388,7 @@ static const char *yg__test_socket_root = NULL; /* replaces "/tmp" in the Mac so
 static int (*yg__test_open_url)(const char *url) = NULL;
 static double yg__test_local_hello_timeout = 0.0;
 static double yg__test_probe_cooldown = -1.0;
+static double yg__test_relook_every = -1.0; /* replaces YG__RELOOK_EVERY when set */
 static size_t yg__test_outbox_max = 0;
 static double yg__test_player_retry[2] = {0.0, 0.0}; /* replaces YG__PLAYER_RETRY_1 and _2 when set */
 #endif
@@ -1370,10 +1396,16 @@ static struct {
   long long next_id, local_gen;
   int local_state, hello_sent, hello_done, ready, closed, quit_requested, name_shared, feedback_unsupported;
   double last_probe_at;
+  /* Looking again on its own after the app ended a connection (YG__RELOOK_EVERY), until relook_until. */
+  int relook;
+  double relook_until;
   /* Who the player is (yg_player_status); on this connection: the game was told a player, how many
    * pending re-asks of hello went out, and when the first pending answer came. */
   int player_state, player_told, player_retries;
   double pending_at;
+  /* yg_set_game_state: the game's latest state (0: never said), and the one sent on this
+   * connection (0: none yet; every new hello starts again). */
+  int game_state, game_state_sent;
   char *player_id, *player_name, *game_id, *hello_json;
   /* The longest line this connection's app takes: YG__LOCAL_LINE_OLD until its hello names a
    * larger `lineMax` (never above YG__LOCAL_LINE_MAX); back to it on every new look. */
@@ -1952,6 +1984,11 @@ static int yg__peer_is_ours(int fd, uid_t uid) {
   socklen_t len = sizeof cred;
   if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0 || len != sizeof cred) return 0;
   return cred.uid == uid;
+#elif defined(__EMSCRIPTEN__)
+  /* A browser build has no local socket to check: refuse, so it never talks to one. */
+  (void)fd;
+  (void)uid;
+  return 0;
 #else
   uid_t peer = 0;
   gid_t group = 0;
@@ -2577,7 +2614,7 @@ static void yg__fill(yg__pool *pool, const yg__call *c, const yg__reply *r, int 
       out->feedback.retry_in_seconds = 0;
       out->feedback.player_message = "";
     }
-  } else if (!strcmp(c->type, "openMenu")) {
+  } else if (!strcmp(c->type, "openMenu") || !strcmp(c->type, "menuButton")) {
     out->menu_opened = answer && yg__f_bool(a, "opened", 0);
   }
 }
@@ -2659,7 +2696,7 @@ static void yg__send(long long id, char *line, size_t len) {
     /* The host ends a connection that sends a longer line, so it is never sent. */
     free(line);
     yg__post_reply(id, "tooLong", line_max > YG__LOCAL_LINE_OLD
-                                      ? "The request is longer than YouGame's local channel takes (68 KB)"
+                                      ? "The request is longer than YouGame's local channel takes (200 KB)"
                                       : "The request is longer than this YouGame app's local channel takes (64 KB): update YouGame");
     return;
   }
@@ -2789,6 +2826,7 @@ static long long yg__refuse(const char *type, const char *error, yg_callback cb,
 
 static void yg__send_hello(void);
 static void yg__complete(yg__call *c, const yg__reply *r, int browser);
+static int yg__game_state_flush(void);
 
 static void yg__flush_held(void) {
   yg__call *c;
@@ -2928,6 +2966,7 @@ static void yg__handle_hello(const yg__reply *r, long long gen) {
       yg__log(YG_LOG_INFO, "YouGame: the local channel did not answer hello (%s); running without YouGame",
               *r->code ? r->code : "no code");
       yg__g.local_state = YG__IDLE;
+      yg__g.relook = 0; /* an app that refuses this game: no more looks on its own */
       yg__g.hello_sent = yg__g.hello_done = 0;
       yg__lock();
       yg__g.drop_wanted = 1;
@@ -2937,6 +2976,7 @@ static void yg__handle_hello(const yg__reply *r, long long gen) {
       return;
     }
     yg__g.local_state = YG__CONNECTED;
+    yg__g.relook = 0;
     yg__log(YG_LOG_INFO, "YouGame: connected to the YouGame app (the game was started on its own)%s", NULL);
   }
   yg__g.hello_done = 1;
@@ -2962,6 +3002,8 @@ static void yg__handle_hello(const yg__reply *r, long long gen) {
     yg__g.ready = 1;
   }
   yg__flush_held();
+  yg__g.game_state_sent = 0; /* a new connection hears the latest state once */
+  yg__game_state_flush();
   if (yg__g.ready && r->ok && yg__g.cfg.on_ready) yg__g.cfg.on_ready(yg__g.cfg.user);
 }
 
@@ -3048,6 +3090,10 @@ static void yg__send_hello_line(int is_hello) {
     yg__buf_puts(&extra, ",\"version\":");
     yg__json_str(&extra, version, strlen(version));
     yg__buf_puts(&extra, ",\"channel\":1");
+#ifdef YOUGAME_TEST_BUILD
+    /* Presentation only: the standalone overlay keeps the purple YouGame button present. */
+    yg__buf_puts(&extra, ",\"testBuild\":true");
+#endif
     yg__call_start("hello", none, &extra, timeout, NULL, NULL, is_hello);
   } else {
     yg__call_start("hello", none, &extra, YG__TIMEOUT, NULL, NULL, is_hello);
@@ -3157,7 +3203,10 @@ static void yg__handle_event(yg__event *e) {
         yg__g.player_state = YG_PLAYER_UNKNOWN;
         yg__g.player_told = yg__g.player_retries = 0;
         if (was_connected) {
-          /* As stdio's end closing: what was asked fails; the next call looks again. */
+          /* As stdio's end closing: what was asked fails; the next call looks again, and so does
+           * yg_update on its own for a while (yg__relook_tick). */
+          yg__g.relook = 1;
+          yg__g.relook_until = yg__now() + YG__RELOOK_FOR;
           yg__log(YG_LOG_INFO, "YouGame: the YouGame app closed the local channel%s", NULL);
           yg__fail_with("noAnswer", "YouGame closed the channel", 1);
         } else {
@@ -3405,6 +3454,23 @@ void yg_shutdown(void) {
   yg__g.thread_up = 0;
 }
 
+/* Started on its own, and the app ended the connection: look again every YG__RELOOK_EVERY s until
+ * it answers or YG__RELOOK_FOR s have passed (then the next call looks, as before). */
+static void yg__relook_tick(void) {
+  double every = YG__RELOOK_EVERY, now;
+#ifdef YOUGAME_TESTING
+  if (yg__test_relook_every >= 0) every = yg__test_relook_every;
+#endif
+  if (!yg__g.relook || yg__g.transport != YG_TRANSPORT_LOCAL || yg__g.local_state != YG__IDLE || yg__g.closed)
+    return;
+  now = yg__now();
+  if (now > yg__g.relook_until) {
+    yg__g.relook = 0;
+    return;
+  }
+  if (now - yg__g.last_probe_at >= every) yg__start_probe();
+}
+
 void yg_update(void) {
   yg__event *head, *tail, *e, *next;
   long dropped;
@@ -3434,6 +3500,7 @@ void yg_update(void) {
   }
   if (!yg__g.shutdown_wanted) yg__expire();
   if (!yg__g.shutdown_wanted) yg__player_tick();
+  if (!yg__g.shutdown_wanted) yg__relook_tick();
   yg__g.in_update = 0;
   if (yg__g.shutdown_wanted) {
     yg__g.shutdown_wanted = 0;
@@ -3536,6 +3603,52 @@ long long yg_save_write(const char *data_json, yg_callback cb, void *user) {
 long long yg_save_load(yg_callback cb, void *user) { return yg__simple("saveLoad", cb, user); }
 long long yg_save_clear(yg_callback cb, void *user) { return yg__simple("saveClear", cb, user); }
 long long yg_open_menu(yg_callback cb, void *user) { return yg__simple("openMenu", cb, user); }
+
+static long long yg__input_event(const char *type, const char *kind, yg_callback cb, void *user) {
+  char body[32];
+  if (!kind || (strcmp(kind, "keys") && strcmp(kind, "ps") && strcmp(kind, "pad") && strcmp(kind, "gc")))
+    return yg__refuse(type, "Expected an input kind: keys, ps, pad or gc.", cb, user);
+  snprintf(body, sizeof body, "{\"kind\":\"%s\"}", kind);
+  return yg_call(type, body, 0, cb, user);
+}
+long long yg_set_input_kind(const char *kind, yg_callback cb, void *user) { return yg__input_event("inputKind", kind, cb, user); }
+long long yg_menu_button(const char *kind, yg_callback cb, void *user) { return yg__input_event("menuButton", kind, cb, user); }
+
+/* The latest game state to the app, when this connection has not heard it yet. Only once hello
+ * answered: a held line would be dropped with hello's failure, and the next hello sends it anyway. */
+static int yg__game_state_flush(void) {
+  yg__buf extra = {NULL, 0, 0, 0};
+  yg__span none = {NULL, 0};
+  int s = yg__g.game_state;
+  if (!s || s == yg__g.game_state_sent || !yg__g.hello_done || yg__g.closed) return 0;
+  if (yg__g.transport == YG_TRANSPORT_NONE) return 0;
+  if (yg__g.transport == YG_TRANSPORT_LOCAL && yg__g.local_state != YG__CONNECTED) return 0;
+  yg__buf_puts(&extra, s == YG_GAME_PAUSED ? ",\"state\":\"paused\"" : s == YG_GAME_MENU ? ",\"state\":\"menu\"" : ",\"state\":\"playing\"");
+  if (!yg__call_start("gameState", none, &extra, YG__TIMEOUT, NULL, NULL, 0)) {
+    yg__buf_free(&extra); /* out of memory: the next call or hello tries again */
+    return 0;
+  }
+  yg__buf_free(&extra);
+  yg__g.game_state_sent = s;
+  return 1;
+}
+
+int yg_set_game_state(yg_game_state state) {
+  int s = (int)state;
+  if (!yg__g.inited || (s != YG_GAME_PLAYING && s != YG_GAME_PAUSED && s != YG_GAME_MENU)) return -1;
+  yg__g.game_state = s;
+  if (yg__g.transport == YG_TRANSPORT_LOCAL && yg__g.local_state == YG__IDLE && !yg__g.closed) {
+    /* Started on its own and not connected: look again like any call (at most once every 5 s,
+     * contract section 1.3); the state goes after that look's hello. */
+    double cooldown = YG__PROBE_COOLDOWN;
+#ifdef YOUGAME_TESTING
+    if (yg__test_probe_cooldown >= 0) cooldown = yg__test_probe_cooldown;
+#endif
+    if (yg__now() - yg__g.last_probe_at >= cooldown) yg__start_probe();
+    return 0;
+  }
+  return yg__game_state_flush();
+}
 
 long long yg_open_feedback(int kind, const char *draft_text, yg_callback cb, void *user) {
   yg__buf draft = {NULL, 0, 0, 0}, extra = {NULL, 0, 0, 0};

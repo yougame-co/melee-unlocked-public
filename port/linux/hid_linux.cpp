@@ -336,7 +336,7 @@ NTSTATUS_HID HidP_GetButtonCaps(HIDP_REPORT_TYPE type, HIDP_BUTTON_CAPS* caps, U
 NTSTATUS_HID HidP_GetValueCaps(HIDP_REPORT_TYPE type, HIDP_VALUE_CAPS* caps, USHORT* length, PHIDP_PREPARSED_DATA data) {
   const Parsed* p = parsed_of(data);
   if (!p || !length) return HIDP_STATUS_INVALID_PREPARSED_DATA;
-  USHORT n = 0;
+  USHORT n = 0, index = 0;   // index: the data index, one per value in the report (HidP_GetData)
   for (int i = 0; i < p->field_count; ++i) {
     const Field& f = p->fields[i];
     if (f.type != type || is_button(f)) continue;
@@ -349,10 +349,16 @@ NTSTATUS_HID HidP_GetValueCaps(HIDP_REPORT_TYPE type, HIDP_VALUE_CAPS* caps, USH
         c.UsagePage = f.usage_page; c.ReportID = f.report_id; c.LinkCollection = f.collection; c.IsAbsolute = f.is_absolute;
         c.HasNull = f.has_null; c.BitSize = f.report_size; c.ReportCount = f.is_range ? f.report_count : 1;
         c.LogicalMin = f.logical_min; c.LogicalMax = f.logical_max; c.PhysicalMin = f.physical_min; c.PhysicalMax = f.physical_max;
-        if (f.is_range) { c.IsRange = 1; c.Range.UsageMin = f.usage_min; c.Range.UsageMax = f.usage_max; }
-        else c.NotRange.Usage = usage_at(f, u);
+        if (f.is_range) {
+          c.IsRange = 1; c.Range.UsageMin = f.usage_min; c.Range.UsageMax = f.usage_max;
+          c.Range.DataIndexMin = index; c.Range.DataIndexMax = (USHORT)(index + std::max<int>(1, f.report_count) - 1);
+        } else {
+          c.NotRange.Usage = usage_at(f, u);
+          c.NotRange.DataIndex = index;
+        }
       }
       ++n;
+      index = (USHORT)(index + (f.is_range ? std::max<int>(1, f.report_count) : 1));
     }
   }
   const bool fits = n <= *length;
@@ -450,6 +456,47 @@ NTSTATUS_HID HidP_GetUsageValue(HIDP_REPORT_TYPE type, USAGE page, USHORT, USAGE
     return HIDP_STATUS_SUCCESS;
   }
   return HIDP_STATUS_USAGE_NOT_FOUND;
+}
+
+ULONG HidP_MaxDataListLength(HIDP_REPORT_TYPE type, PHIDP_PREPARSED_DATA data) {
+  const Parsed* p = parsed_of(data);
+  if (!p) return 0;
+  ULONG n = 0;
+  for (int i = 0; i < p->field_count; ++i) {
+    const Field& f = p->fields[i];
+    if (f.type != type || is_button(f)) continue;
+    n += f.is_range ? (ULONG)std::max<int>(1, f.report_count) : (ULONG)std::max<int>(1, f.usage_count);
+  }
+  return n;
+}
+
+// The values only (the readers take buttons through HidP_GetUsagesEx), numbered as HidP_GetValueCaps
+// numbers them, raw and unsigned as Windows returns them.
+NTSTATUS_HID HidP_GetData(HIDP_REPORT_TYPE type, HIDP_DATA* list, ULONG* length, PHIDP_PREPARSED_DATA data,
+                          PCHAR report, ULONG report_length) {
+  const Parsed* p = parsed_of(data);
+  if (!p || !length) return HIDP_STATUS_INVALID_PREPARSED_DATA;
+  const auto* r = reinterpret_cast<const uint8_t*>(report);
+  if (!r) return HIDP_STATUS_INVALID_REPORT_LENGTH;
+  ULONG n = 0;
+  USHORT index = 0;
+  for (int i = 0; i < p->field_count; ++i) {
+    const Field& f = p->fields[i];
+    if (f.type != type || is_button(f)) continue;
+    const int entries = f.is_range ? std::max<int>(1, f.report_count) : std::max<int>(1, f.usage_count);
+    const bool here = report_matches(*p, f, r);
+    for (int k = 0; k < entries; ++k, ++index) {
+      if (!here || k >= f.report_count) continue;
+      if (n < *length && list) {
+        list[n].DataIndex = index; list[n].Reserved = 0;
+        list[n].RawValue = read_bits(r, report_length, f.bit_offset + k * f.report_size, f.report_size);
+      }
+      ++n;
+    }
+  }
+  const bool fits = n <= *length;
+  *length = std::min<ULONG>(n, *length);
+  return fits ? HIDP_STATUS_SUCCESS : HIDP_STATUS_BUFFER_TOO_SMALL;
 }
 
 BOOL HidD_GetPreparsedData(HANDLE file, PHIDP_PREPARSED_DATA* data) {

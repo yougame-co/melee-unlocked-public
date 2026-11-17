@@ -80,5 +80,34 @@ int main() {
           std::abs(sampled[3] - 10.f) < .0001f,
           "camera pan keeps moving when hit shake cancels its captured view step");
   }
+  // The Static Recomp's stage map tag (abi/mu_stage_scenery.h): the rendering GObj's map index read from
+  // guest memory, scenery and props-close-behind flagged as the Source Port's game flags them.
+  {
+    std::vector<uint8_t> memory(ppc::RAM_SIZE);
+    auto word = [&](uint32_t a, uint32_t v) {
+      auto* p = memory.data() + a - ppc::RAM_BASE;
+      p[0] = uint8_t(v >> 24); p[1] = uint8_t(v >> 16); p[2] = uint8_t(v >> 8); p[3] = uint8_t(v);
+    };
+    constexpr uint32_t gobj = 0x80005000, ground = 0x80006000, grkind = 0x8049E6C8 + 0x88;
+    word(0x804D7814, gobj);          // HSD_GObj_804D7814: the GObj being rendered
+    word(gobj, 3u << 16);            // classifier 3: a stage object
+    word(gobj + 4, 3);               // user data kind 3: Ground
+    word(gobj + 0x2C, ground);
+    gx::set_owner_tracking(true);
+    auto tag = [&](uint32_t stage, uint32_t map) {
+      word(grkind, stage); word(ground + 0x14, map);
+      gx::RenderObserver display(c, gx::Observe::DisplayJoint, memory.data());
+      return gx::observed_stage_map();
+    };
+    check(tag(0x1C, 5) == (0x80 | 5), "Dream Land map 5 (behind the play plane) is scenery");
+    check(tag(0x1C, 4) == 4, "Dream Land map 4 (the main stage) is not");
+    check(tag(0x0A, 3) == (0x40 | 3), "Yoshi's Story map 3 holds props close behind the floor");
+    check(tag(0x0A, 2) == 2, "Yoshi's Story map 2 (Randall) is a plain stage piece");
+    check(tag(0x24, 1) == 1, "Battlefield's maps are not in the table");
+    word(gobj, 6u << 16);            // an item: no stage tag
+    { gx::RenderObserver display(c, gx::Observe::DisplayJoint, memory.data());
+      check(gx::observed_stage_map() == 0xFF, "a non-stage object has no stage tag"); }
+    gx::set_owner_tracking(false);
+  }
   puts("joint generation, nested scope, guest isolation and hit-shake checks passed");
 }

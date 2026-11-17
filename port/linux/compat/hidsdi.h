@@ -52,6 +52,12 @@ NTSTATUS_HID HidP_GetUsages(HIDP_REPORT_TYPE type, USAGE page, USHORT collection
                             PHIDP_PREPARSED_DATA data, PCHAR report, ULONG report_length);
 NTSTATUS_HID HidP_GetUsageValue(HIDP_REPORT_TYPE type, USAGE page, USHORT collection, USAGE usage, ULONG* value,
                                 PHIDP_PREPARSED_DATA data, PCHAR report, ULONG report_length);
+// Every value field of a report with its data index (the numbering HidP_GetValueCaps gives them),
+// for devices that list the same usage twice (a Frame1's two trigger sliders).
+typedef struct _HIDP_DATA { USHORT DataIndex; USHORT Reserved; union { ULONG RawValue; BOOLEAN On; }; } HIDP_DATA;
+ULONG HidP_MaxDataListLength(HIDP_REPORT_TYPE type, PHIDP_PREPARSED_DATA data);
+NTSTATUS_HID HidP_GetData(HIDP_REPORT_TYPE type, HIDP_DATA* list, ULONG* length, PHIDP_PREPARSED_DATA data,
+                          PCHAR report, ULONG report_length);
 BOOL HidD_GetPreparsedData(HANDLE file, PHIDP_PREPARSED_DATA* data);
 BOOL HidD_FreePreparsedData(PHIDP_PREPARSED_DATA data);
 BOOL HidD_SetOutputReport(HANDLE file, LPVOID report, ULONG length);

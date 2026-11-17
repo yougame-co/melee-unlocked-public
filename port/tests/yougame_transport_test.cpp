@@ -429,9 +429,18 @@ static void kind_code_refusal() {
   how=2; CHECK(!s.open("test-ticket","abcdef",100) && !s.kind_refused());
   how=3; CHECK(s.open("test-ticket","abcdef",100) && !s.kind_refused());
 }
+static void seats_without_links() {
+  // Rooms' links:false (a standalone copy) moves the whole match to own UDP; no key means links.
+  CHECK(!any_seat_without_links(json::array()));
+  CHECK(!any_seat_without_links(json::array({{{"connectionId","a"}},{{"connectionId","b"},{"links",true}}})));
+  CHECK(any_seat_without_links(json::array({{{"connectionId","a"}},{{"connectionId","b"},{"links",false}}})));
+  CHECK(!any_seat_without_links(json::array({{{"connectionId","a"},{"links","false"}},{{"links",0}}})));
+  CHECK(!any_seat_without_links(json::object({{"links",false}})) && !any_seat_without_links(json()));
+  CHECK(seat_without_links(json{{"links",false}}) && !seat_without_links(json{{"links",nullptr}}) && !seat_without_links(json(false)));
+}
 int main() {
   mixed_version_reasons(); answer_after_deadline(); full_room_refusal(); kind_code_refusal();
   closed_during_event_wait(); closed_state_transitions();
-  mode_and_candidates(); broker_ordering(); unranked_recovery(); link_budget(); recovery_and_ranked(); leave_reasons(); lobby_match_links();
-  std::puts("yougame_transport: mode, candidates, broker ordering, link timeout/retry, leave reasons, lobby/match links, seat recovery and ranked resume passed");
+  mode_and_candidates(); broker_ordering(); unranked_recovery(); link_budget(); recovery_and_ranked(); leave_reasons(); lobby_match_links(); seats_without_links();
+  std::puts("yougame_transport: mode, candidates, broker ordering, link timeout/retry, leave reasons, lobby/match links, seats without links, seat recovery and ranked resume passed");
 }

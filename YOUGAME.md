@@ -1,0 +1,18 @@
+# Melee Unlocked: YouGame's version
+
+Source candidate for YouGame build 118, Melee Unlocked 0.9.205,
+row `0.9.205-online-test.118` (main configuration with Friends 4-seat, Doubles and Squad Strike; see BUILDING.md). This is a proposed build ("Not tested yet"), not the main listing build. Original project:
+https://github.com/Hero88go/melee-unlocked (GPL-3.0-or-later).
+Retain LICENSE, NOTICE and third-party notices.
+
+You need your own Melee NTSC 1.02 disc. Game-data containers and precompiled
+game payloads are omitted under YouGame's distribution policy. Any VCDIFF
+files present in an unstaged candidate require a separate provenance review
+and block publication until approved. The pinned decomp and aurora dependencies
+are gitlinks, without bundled submodule contents.
+
+See BUILDING.md for build-118 prerequisites, platform commands and limitations.
+Older CI documentation and patch-based recipes are historical and cannot be
+used unchanged for this revision. Both game and host use
+`YOUGAME_RANKED_BRANCH=ON`.
+The exact source of this build is downloadable from its page on YouGame.

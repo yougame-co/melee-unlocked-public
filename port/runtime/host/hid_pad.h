@@ -71,6 +71,53 @@ inline bool haybox_dinput_shape(const HidAxisRange (&axes)[8], unsigned button_m
 // Whether the device in a slot has that shape.
 bool hidpad_haybox_dinput(int slot);
 
+// A Frame1 on its own firmware in DInput mode (Mod Y held on plug-in) names itself "Frame1 Dinput".
+// It is not HayBox: its maker's public pico-rectangle firmware ("HID with triggers", which it grew
+// from) publishes X and Y for the control stick, Z and Rx for the C-stick, two Sliders for the
+// analog triggers, 16-bit each, and buttons 1-16 in the order A B X Y Start, -, -, -, D-pad left
+// right down up, Z R L. Each stick field is the GameCube byte moved into the top of the word
+// (((v - 128) << 8) + 127, Y negated), so it rests near 0, not mid-range. The generic reader scales
+// from the middle of the declared range, and a player's Frame1 read as full left and full up at
+// rest (log: stick -127,127 c-stick -127,0): stuck in the top-left corner.
+inline bool frame1_dinput_name(std::string lower) {
+  for (char& ch : lower) ch = (char)((ch >= 'A' && ch <= 'Z') ? ch - 'A' + 'a' : ch);
+  return lower.rfind("frame1", 0) == 0 || lower.find("pico-rectangle") != std::string::npos;
+}
+// The two ways a 16-bit field can carry that byte: two's complement around 0 (pico-rectangle) or
+// offset binary around the middle (HayBox and most pads). Decided per axis from the first report,
+// where a box's stick is at rest, by whichever reads nearer the centre.
+constexpr int8_t kFrame1Twos = 0, kFrame1Offset = 1;
+inline int frame1_field(unsigned long raw, int bits, int8_t encoding) {
+  if (bits < 8 || bits > 16) bits = 16;
+  const unsigned long mask = (1ul << bits) - 1, u = raw & mask;
+  const int shift = bits - 8;
+  if (encoding == kFrame1Offset) return (int)(u >> shift) - 128;
+  const long s = u >= (1ul << (bits - 1)) ? (long)u - (long)(1ul << bits) : (long)u;
+  return (int)(s >> shift);   // arithmetic: floors, so -20353 is -80 as the firmware meant
+}
+inline int8_t frame1_stick_encoding(unsigned long rest, int bits) {
+  const int twos = frame1_field(rest, bits, kFrame1Twos), offset = frame1_field(rest, bits, kFrame1Offset);
+  return (twos < 0 ? -twos : twos) <= (offset < 0 ? -offset : offset) ? kFrame1Twos : kFrame1Offset;
+}
+// A stick axis as the pad's signed value; flip for Y, which the firmware sends down-positive.
+inline int8_t frame1_stick(unsigned long raw, int bits, int8_t encoding, bool flip = false) {
+  int v = frame1_field(raw, bits, encoding);
+  if (flip) v = -v;
+  return (int8_t)(v > 127 ? 127 : v < -128 ? -128 : v);
+}
+// The analog triggers: pico-rectangle sends ((l - 128) << 8) + 128, other builds l << 8. A trigger
+// rests low, so the encoding that reads lower on the first report is the one in use.
+inline uint8_t frame1_trigger(unsigned long raw, int bits, int8_t encoding) {
+  const int v = encoding == kFrame1Twos ? frame1_field(raw, bits, kFrame1Twos) + 128
+                                        : frame1_field(raw, bits, kFrame1Offset) + 128;
+  return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+}
+inline int8_t frame1_trigger_encoding(unsigned long rest, int bits) {
+  return frame1_trigger(rest, bits, kFrame1Twos) <= frame1_trigger(rest, bits, kFrame1Offset) ? kFrame1Twos : kFrame1Offset;
+}
+// Whether the device in a slot is read as a Frame1 in DInput mode.
+bool hidpad_frame1_dinput(int slot);
+
 // What to call the device in a slot, for the Controls tab. Empty when the slot is unused.
 std::string hidpad_name(int slot);
 

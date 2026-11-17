@@ -46,6 +46,7 @@
 #include "early_input.h"
 #include "window.h"
 #include "cursor_idle.h"   // window_sdl.inl (Linux) hides the pointer after a rest
+#include "walter_egg.h"
 #include "replay_control.h"
 #include "input_bindings.h"
 #include "keyboard_ui_navigation.h"
@@ -103,6 +104,7 @@ std::atomic<bool> g_escape_press{false};
 std::atomic<bool> g_capturing{false};   // a control rebind is waiting for its key (input_begin_capture)
 MessageCallback g_on_message;
 std::atomic<bool> g_ui_capture{false};
+std::atomic<uint16_t> g_ui_withheld{0};
 std::mutex g_ui_pad_mutex;
 PadState g_ui_pad{};
 PadState g_ui_pads[4]{};
@@ -259,6 +261,12 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
     g_pointer_rested = false;
   }
   if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && g_pointer_rested) { SetCursor(nullptr); return TRUE; }
+  // MELEE_TEST_BIG_WINDOW=1 (hidden test runs): a --window larger than this PC's desktop is kept
+  // (1440p and ultrawide on a 1080p desktop); Windows otherwise caps it at the screen.
+  if (m == WM_GETMINMAXINFO) {
+    static const bool big = [] { const char* v = host::test_env::getenv("MELEE_TEST_BIG_WINDOW"); return v && *v == '1'; }();
+    if (big) { auto* mmi = reinterpret_cast<MINMAXINFO*>(l); mmi->ptMaxTrackSize = POINT{16384, 16384}; mmi->ptMaxSize = POINT{16384, 16384}; return 0; }
+  }
   // No mouse pointer over the game while it has focus and the settings panel is closed. The pointer
   // has nothing to do there, and after alt-tabbing back from a music player it sat in the middle of
   // the screen for the rest of the match. It comes back the moment the panel opens or focus leaves.
@@ -499,6 +507,15 @@ void* window_create(int w, int h, const wchar_t* title, bool visible, bool flip)
   // and caption, so the caption stays fixed, and the window stays hidden until it is adopted.
   const bool boxed = yougame::embedded();
   if (yougame::embed_toplevel()) r = {0, 0, w, h};
+  // A first size taller or wider than the desktop's work area put the picture's bottom edge (and the
+  // status line drawn on it) under the taskbar; cap it the way apply_client_size does for later sizes.
+  if (!boxed && !yougame::embed_toplevel()) {
+    RECT work{};
+    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) {
+      if (r.right - r.left > work.right - work.left) r.right = r.left + (work.right - work.left);
+      if (r.bottom - r.top > work.bottom - work.top) r.bottom = r.top + (work.bottom - work.top);
+    }
+  }
   // Adopted = a real parent (not the desktop) and WS_CHILD: the launcher sets WS_CHILD before SetParent,
   // and Windows can leave the window on the desktop, so any non-null parent is not proof.
   const auto boxAdopted = [] {
@@ -583,7 +600,14 @@ void* window_create(int w, int h, const wchar_t* title, bool visible, bool flip)
     if (!g_toplevel_rect) { g_client_w = w; g_client_h = h; }
     return g_hwnd;
   }
-  if (!boxed || !g_embed_view.has_view) { g_client_w = w; g_client_h = h; }
+  if (!boxed || !g_embed_view.has_view) {
+    // What the client area really is: the work-area cap above (or Windows' own cap) can make it smaller
+    // than asked, and the swapchain is sized from these.
+    RECT client{};
+    if (!boxed && GetClientRect(g_hwnd, &client) && client.right > 0 && client.bottom > 0) {
+      g_client_w = client.right; g_client_h = client.bottom;
+    } else { g_client_w = w; g_client_h = h; }
+  }
   if (visible && (!boxed || !g_embed_view.has_view || yg_embed_view_visible(&g_embed_view)))
     ShowWindow(g_hwnd, boxed && boxAdopted() ? SW_SHOWNA : SW_SHOW);
   return g_hwnd;
@@ -717,6 +741,7 @@ constexpr UINT kCursorRefresh = WM_APP + 7;
 void window_input_capture(bool capture) {
   if (g_ui_capture.exchange(capture) != capture && g_hwnd) PostMessageW(g_hwnd, kCursorRefresh, capture ? 1 : 0, 0);
 }
+void window_withhold_buttons(uint16_t mask) { g_ui_withheld.store(mask, std::memory_order_relaxed); }
 bool window_ui_gamecube_pad(PadState& pad) { std::lock_guard<std::mutex> lock(g_ui_pad_mutex); pad = g_ui_pad; return g_ui_gamecube; }
 bool window_ui_pads(PadState pads[4], PadState navigation_pads[4]) {
   std::lock_guard<std::mutex> lock(g_ui_pad_mutex);
@@ -1284,6 +1309,9 @@ void apply_known_box_layout(int idx) {
   if (lower.find("vjoy") != std::string::npos) {
     g_hid_bindings[idx] = vjoy_b0xx_bindings();
     host::log("hid pad %d: %s, using the B0XX (vJoy) layout", idx + 1, name.c_str());
+  } else if (hidpad_frame1_dinput(idx)) {
+    g_hid_bindings[idx] = frame1_dinput_bindings();
+    host::log("hid pad %d: %s, using the Frame1 DInput layout", idx + 1, name.c_str());
   } else if (lower.find("leonardo") != std::string::npos || lower.find("haybox") != std::string::npos ||
              hidpad_haybox_dinput(idx)) {
     // By name for the Arduino-based boxes; by descriptor for the Pico-based ones (a Frame1, say),
@@ -1451,7 +1479,54 @@ bool input_load_script(const char* path) {
 // MELEE_TEST_XINPUT_SLOW_MS=<n> (tests) makes every question about an empty slot take n ms;
 // MELEE_TEST_XINPUT_EVERY_READ=1 (tests) asks on the reading thread on every read, as before.
 static std::atomic<bool> g_xinput_present[4];
+// Per XInput slot: whether the pad sends a Frame1's grid (input_bindings.h, box_xinput_observe).
+// Advanced by the game's read only; the controls screen reads the copy.
+static BoxXInputDetect g_box_xinput[4];
+static std::atomic<int> g_box_xinput_state[4];
+// MELEE_TEST_XINPUT_SCRIPT=<file> (hidden tests): XInput slot 1 plays raw reports from the file
+// instead of asking Windows, so a pad's real XInput reports (a Frame1's grid values, an Xbox pad's
+// arbitrary ones) go through the real read path; slots 2 to 4 read as empty. Lines:
+//   <frame> <buttons hex> <LT> <RT> <LX> <LY> <RX> <RY>
+// frame in retraces from the input script's release (`@release N`), or from boot when the script
+// has no @release (or there is none), each report held until the next; before the first line the
+// pad rests at zero. '#' starts a comment.
+struct XInputFeedRow { uint32_t frame; XINPUT_GAMEPAD pad; };
+static const std::vector<XInputFeedRow>* xinput_feed() {
+  static const std::vector<XInputFeedRow>* feed = [] () -> const std::vector<XInputFeedRow>* {
+    const char* path = host::test_env::getenv("MELEE_TEST_XINPUT_SCRIPT");
+    if (!path || !*path) return nullptr;
+    auto* rows = new std::vector<XInputFeedRow>();
+    if (FILE* f = fopen(path, "r")) {
+      char line[256];
+      while (fgets(line, sizeof line, f)) {
+        if (line[0] == '#') continue;
+        unsigned fr = 0, buttons = 0; int lt = 0, rt = 0, lx = 0, ly = 0, rx = 0, ry = 0;
+        if (sscanf(line, "%u %x %d %d %d %d %d %d", &fr, &buttons, &lt, &rt, &lx, &ly, &rx, &ry) != 8) continue;
+        XInputFeedRow r{fr, {}};
+        r.pad.wButtons = (WORD)buttons; r.pad.bLeftTrigger = (BYTE)lt; r.pad.bRightTrigger = (BYTE)rt;
+        r.pad.sThumbLX = (short)lx; r.pad.sThumbLY = (short)ly; r.pad.sThumbRX = (short)rx; r.pad.sThumbRY = (short)ry;
+        rows->push_back(r);
+      }
+      fclose(f);
+    }
+    log("input: test XInput feed %s, %zu reports on slot 1", path, rows->size());
+    return rows;
+  }();
+  return feed;
+}
 static DWORD xinput_ask(int idx, XINPUT_STATE* state) {
+  if (const auto* feed = xinput_feed()) {
+    if (idx != 0) return ERROR_DEVICE_NOT_CONNECTED;
+    const uint32_t now = retrace_count();
+    const uint32_t start = g_script_release_after ? g_script_release_at : 1;
+    *state = {};
+    if (start && now >= start) {
+      const uint32_t rel = now - start;
+      for (const XInputFeedRow& r : *feed) { if (r.frame > rel) break; state->Gamepad = r.pad; }
+      state->dwPacketNumber = rel;
+    }
+    return ERROR_SUCCESS;
+  }
   // The app's provider owns the Xbox family once installed (xinput_state): no native question, and
   // no raw relay seat either, which would hand a PlayStation or Switch pad to the Xbox family too.
   if (controller_relay::active()) return ERROR_DEVICE_NOT_CONNECTED;
@@ -1534,6 +1609,27 @@ static bool agent_input_allowed(yougame::agent_test::InputKey key) {
       [](const char* line) { log("%s", line); });
 }
 #endif
+
+// Latency probe (MELEE_TRACE_LATENCY=1 with --script): each button the script turns on, on any
+// port, is a press. Numbered and stamped into this tick (tick_timing.h); the presentation thread
+// logs one "latency probe:" line per press (threaded_backend.cpp). Game thread only.
+static void note_script_presses(const PadState out[4]) {
+  constexpr uint16_t kButtons = PAD_LEFT | PAD_RIGHT | PAD_DOWN | PAD_UP | PAD_Z | PAD_R | PAD_L |
+                                PAD_A | PAD_B | PAD_X | PAD_Y | PAD_START;
+  static uint16_t held[4] = {};
+  static unsigned presses = 0;
+  bool pressed = false;
+  for (int port = 0; port < 4; ++port) {
+    const uint16_t now = out[port].err == 0 ? (uint16_t)(out[port].button & kButtons) : 0;
+    if (now & ~held[port]) pressed = true;
+    held[port] = now;
+  }
+  if (!pressed) return;
+  TickTiming& tick = tick_timing();
+  tick.probe = ++presses;
+  tick.probe_inject = tick.target > 0 ? tick.target : tick.wake > 0 ? tick.wake : tick.pad;
+  tick.probe_pad = tick.pad;
+}
 
 static void script_pads(uint32_t frame, bool update_state, PadState out[4]) {
 #ifdef YOUGAME_AGENT_TEST_HOOK
@@ -1658,12 +1754,21 @@ static void read_devices(PadState out[4], InputDebugSnapshot& debug, bool side_e
   for (int idx = 0; idx < 4; ++idx) {
     PadState& x = xin[idx]; x = {}; x.err = -1;
     XINPUT_STATE xs{};
-    if (!xinput_state(idx, &xs)) continue;
+    if (!xinput_state(idx, &xs)) { g_box_xinput[idx] = {}; g_box_xinput_state[idx].store(0, std::memory_order_relaxed); continue; }
     xin_connected[idx] = true;
     debug.xinput_connected[idx] = true;
     x.err = 0;
     auto& g = xs.Gamepad;
-    auto axis = [](SHORT v) { return (int)xinput_axis(v); };
+    // A Frame1 in XInput mode sends GameCube units on its own grid (box_xinput_observe).
+    const int16_t raw_axes[4] = {g.sThumbLX, g.sThumbLY, g.sThumbRX, g.sThumbRY};
+    const int8_t was_box = g_box_xinput[idx].state;
+    box_xinput_observe(g_box_xinput[idx], raw_axes);
+    const BoxXInputDetect det = g_box_xinput[idx];
+    g_box_xinput_state[idx].store((int)(uint8_t)det.state | ((int)(uint8_t)det.first << 8), std::memory_order_relaxed);
+    if (det.state > 0 && was_box <= 0)
+      host::log("xinput pad %d: a box in XInput mode (Frame1): its sticks and triggers read in GameCube units", idx);
+    if (det.state > 0) { g.bLeftTrigger = box_xinput_trigger(g.bLeftTrigger); g.bRightTrigger = box_xinput_trigger(g.bRightTrigger); }
+    auto axis = [&det](SHORT v) { return (int)box_xinput_axis(det, v); };
     // No deadzone and no trigger floor, as in Dolphin. These used Microsoft's recommended Xbox
     // deadzone, which zeroed both axes whenever both sat inside about 30 of Melee's 80 units: larger
     // than the game's own deadzone, and exactly where a box controller in XInput mode puts some of its
@@ -1904,6 +2009,7 @@ struct UiSnapshot {
         g_practice_toggle.store(true, std::memory_order_release);   // same as Tab
     }
     if (toggle_settings) g_settings_toggle.store(true, std::memory_order_release);
+    walter_egg::watch_pads(pads);   // the character select's easter egg: reads only
     g_ui_pad = pads[0];
     g_ui_gamecube = gamecube;
     g_ui_has_pad = false;
@@ -1911,6 +2017,9 @@ struct UiSnapshot {
       g_ui_pads[i] = pads[i];
       if (pads[i].err == 0) g_ui_has_pad = true;
     }
+    // Buttons the overlay holds from the game (window_withhold_buttons), after the overlay's copy.
+    if (const uint16_t withheld = g_ui_withheld.load(std::memory_order_relaxed))
+      for (int i = 0; i < 4; ++i) pads[i].button &= static_cast<uint16_t>(~withheld);
     if (!console && g_ui_capture.load()) {
       // UI capture is global, not player-one-only. Keeping ports 2-4 live made menu navigation
       // leak into Training and, during handoff, into the first online gameplay inputs.
@@ -1968,6 +2077,7 @@ void input_poll(PadState out[4]) {
   }
   if (input_script_active()) {
     script_pads(retrace_count(), true, out);
+    if (latency_trace_enabled()) note_script_presses(out);
     route_takeover(out);
     // Scripted runs took this return before the overlay's copy was made below, so the controller
     // overlay stayed blank whenever a script was driving. It is the only way to see the overlay
@@ -2232,7 +2342,10 @@ void input_debug_snapshot(InputDebugSnapshot& snapshot) {
     snapshot.xinput_connected[idx] = true;
     xin[idx].err = 0;
     auto& g = xs.Gamepad;
-    auto axis = [](SHORT v) { return (int)xinput_axis(v); };
+    const int packed = g_box_xinput_state[idx].load(std::memory_order_relaxed);
+    BoxXInputDetect det; det.state = (int8_t)(packed & 0xFF); det.first = (int8_t)(packed >> 8);
+    if (det.state > 0) { g.bLeftTrigger = box_xinput_trigger(g.bLeftTrigger); g.bRightTrigger = box_xinput_trigger(g.bRightTrigger); }
+    auto axis = [&det](SHORT v) { return (int)box_xinput_axis(det, v); };
     // Same reading as input_poll: no deadzone, no trigger floor.
     const int sx = axis(g.sThumbLX), sy = axis(g.sThumbLY), cx = axis(g.sThumbRX), cy = axis(g.sThumbRY);
     xin[idx].stick_x = (int8_t)sx; xin[idx].stick_y = (int8_t)sy; xin[idx].sub_x = (int8_t)cx; xin[idx].sub_y = (int8_t)cy;

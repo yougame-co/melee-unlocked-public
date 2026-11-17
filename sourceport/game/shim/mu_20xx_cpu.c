@@ -475,6 +475,15 @@ void mu_20xx_cpu_sdi(Fighter* fp, float* stick_x, float* stick_y)
  * mod's flash and its counters for the results screen are separate features (see the ledger). */
 int mu_20xx_cpu_lcancel(Fighter* fp)
 {
+    /* Hidden test runs only: every landing counts, the reference the automatic L-cancel's inputs
+     * are compared against. */
+    static int test_rule = -1;
+    if (test_rule < 0) {
+        test_rule = mu_test_getenv("MELEE_TEST_LCANCEL_RULE") != NULL;
+    }
+    if (test_rule && !mu_replay_abi_active()) {
+        return 1;
+    }
     if (!(cpu_word() & MU_CPU_LCANCEL)) {
         return 0;
     }

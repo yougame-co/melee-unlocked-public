@@ -63,6 +63,45 @@ static CSSData* online_css_data(void)
     return NULL;
 }
 
+int mu_online_abi_command(unsigned int command, const unsigned char* payload, unsigned int size,
+                          unsigned char* response, unsigned int capacity, unsigned int* response_size);
+#define CMD_ARENA_PICK 0xDC /* upstream 0xEE: MU_MAKER_COMMAND in this build */
+
+/* An arena room shows every player's portrait: the character and costume on this screen go to the
+ * host whenever they change (Slippi's external id, 0xFF for none; the costume; picked or not), the
+ * same values a lock-in sends. */
+void mu_slippi_sss_report_pick(int chosen)
+{
+    static int last = -1;
+    static unsigned char reply[4096];   /* the host's minimum response capacity */
+    unsigned char payload[3];
+    unsigned int got = 0;
+    CSSData* css = online_css_data();
+    u8 port = gm_801677F0();
+    int ext, color, pick;
+
+    if (css == NULL || port >= 4) {
+        return;
+    }
+    ext = css->vs.start.players[port].ckind;
+#ifdef MU_AKANEIA_FIGHTERS
+    {
+        const int mapped = mu_ak_mex_external(ext);
+        ext = mapped >= 0 ? mapped : 0xFF;
+    }
+#endif
+    color = css->vs.start.players[port].color;
+    pick = (chosen ? 1 : 0) << 16 | (ext & 0xFF) << 8 | (color & 0xFF);
+    if (pick == last) {
+        return;
+    }
+    last = pick;
+    payload[0] = (unsigned char) ext;
+    payload[1] = (unsigned char) color;
+    payload[2] = (unsigned char) (chosen ? 1 : 0);
+    mu_online_abi_command(CMD_ARENA_PICK, payload, sizeof payload, reply, sizeof reply, &got);
+}
+
 /* FN_TX_LOCK_IN. stage_behavior: -2 random, -1 unset (use the opponent's), 0+ that stage id.
  * Returns 1 once the selections went to the host, 0 when Squad Strike refused the lock-in (its
  * reason is on screen): then there is nothing to search with. -1: a friend room's lock-in held

@@ -46,3 +46,17 @@ typedef struct MuLookItems {
     int count;
     MuLookItem items[MU_LOOK_ITEMS];
 } MuLookItems;
+
+/* Separate optional export, what a Slippi replay's events carry beyond the geometry: the Slippi
+ * frame number (first frame -123), the match's time limit, the Fountain of Dreams platform heights,
+ * and per fighter the post-frame L-cancel (1 done, 2 missed) and hurtbox state (0 vulnerable) and
+ * the pre-frame processed stick and trigger. */
+typedef struct MuLookExtraFighter {
+    int lcancel, hurtbox;
+    float joy_x, joy_y, trigger;
+} MuLookExtraFighter;
+typedef struct MuLookExtras {
+    int frame, time_limit_seconds, timer_on;
+    float fod_left, fod_right;
+    MuLookExtraFighter fighters[4][2];
+} MuLookExtras;
