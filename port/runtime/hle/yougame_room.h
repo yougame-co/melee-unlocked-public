@@ -93,6 +93,14 @@ struct RoomIO {
   // When the pump stops: true hands the links on (the Friends lobby's next search adopts the room) instead
   // of closing them.
   std::function<bool()> keep_links = [] { return false; };
+  // Our own room socket (no app broker) dropped with neither the room nor us closing it: the pump
+  // rejoins on a fresh ticket instead of ending the room. A relay match has about 7 s before Slippi
+  // gives up on the peer, and Rooms hands a signed-in seat to its new socket at once.
+  std::function<bool()> own_drop = [] { return false; };
+  // Own socket mid-match: when it last heard anything / a relay frame (0 = never), and closing it as a drop.
+  std::function<uint64_t()> own_heard = [] { return uint64_t{0}; };
+  std::function<uint64_t()> own_relay_heard = [] { return uint64_t{0}; };
+  std::function<void()> own_abandon = [] {};
 };
 // A Doubles match room's one match is over: its result, or Rooms ending the room after the start.
 template<class Room> bool settles(const Room& r, const json& m) {
@@ -232,9 +240,37 @@ bool agent_drop_room_once_due(bool enabled, uint32_t css_frames, const Json& ros
 }
 #endif
 
+// Our own socket's way back into the room after a drop: the match's ticket is usually past its five
+// minutes by then, so a fresh one first, then the same socket reopened, all within 6 s.
+template<class Room> bool rejoin_own(Room& r, const RoomIO& io) {
+  const uint64_t start = io.clock(), until = start + 6000;
+  io.log("yougame: room socket dropped; rejoining the room");
+  bool renewed = false;
+  while (!r.stop && io.clock() < until) {
+    if (!renewed && !r.ticket_request.is_null()) {
+      const auto left = until - io.clock();
+      try {
+        renewed = renew_room_ticket(r.ticket, r.code, [&] {
+          return io.request(r.ticket_request, (int)std::min<uint64_t>(3000, left));
+        }, io.log);
+      } catch (...) {}
+    }
+    if (r.stop || io.clock() >= until) break;
+    std::string error;
+    if (r.socket->open_session(r.url, r.ticket, r.code, &error, (int)std::min<uint64_t>(2000, until - io.clock()))) {
+      io.log(("yougame: back in the room after " + std::to_string(io.clock() - start) + " ms").c_str());
+      return true;
+    }
+    if (io.clock() < until) io.pause((int)std::min<uint64_t>(250, until - io.clock()));
+  }
+  io.log("yougame: could not rejoin the room");
+  return false;
+}
+
 // A link ending does not end the room: ranked still owes reports and must hear its result.
 template<class Room> void pump_room(Room* r, std::mutex& mutex, const RoomIO& io) {
-  uint64_t last_ping = 0, reopen_at = 0;
+  uint64_t last_ping = 0, reopen_at = 0, probe_at = 0;
+  int own_rejoins = 0;
   bool rejoin_pending = false, awaiting_welcome = false, links_ended = false, room_closed = false, recovered_match_known = false;
   std::string recovered_match;
   const bool broker = r->socket->brokered();
@@ -247,11 +283,32 @@ template<class Room> void pump_room(Room* r, std::mutex& mutex, const RoomIO& io
     { std::lock_guard<std::mutex> lock(mutex); drop_room = agent_drop_room_due(*r, io, drop_room_seconds); }
     if (drop_room) r->socket->agent_test_drop_room();
 #endif
+    // Own socket, a match passing relay frames through it: 1 s of silence sends a ping; no answer in
+    // another 1 s means our connection died (TCP takes seconds to say so, and the other seat gives up
+    // after a 7 s stall). A pong means the socket is fine and the silence is the other seat's.
+    if (!broker && !r->socket->closed()) {
+      const uint64_t now = io.clock(), heard = io.own_heard(), relay = io.own_relay_heard();
+      const auto since = [now](uint64_t t) { return t >= now ? uint64_t{0} : now - t; };   // stamps from the reader thread
+      if (!relay || since(relay) >= 10000) probe_at = 0;
+      else if (probe_at && heard >= probe_at) probe_at = 0;
+      else if (!probe_at && since(heard) >= 1000) { r->socket->send({{"t", "ping"}}); probe_at = now; }
+      else if (probe_at && now - probe_at >= 1000) {
+        io.log("yougame: the room stopped answering mid-match; reopening the socket");
+        io.own_abandon(); probe_at = 0;
+      }
+    }
     json m;
     const bool got = r->socket->next(m, broker ? 100 : 250);
     if (!got && r->socket->closed()) {
       { std::lock_guard<std::mutex> lock(mutex); r->participants = json::array(); }
-      if (!broker || !r->recovery.dropped(io.clock(), r->socket->recoverable())) { room_closed = true; break; }
+      if (!broker) {
+        // Three rejoins per room at most: a room that keeps dropping us ends as before.
+        if (r->stop || own_rejoins >= 3 || !io.own_drop()) { room_closed = true; break; }
+        ++own_rejoins;
+        if (!rejoin_own(*r, io)) { room_closed = true; break; }
+        continue;
+      }
+      if (!r->recovery.dropped(io.clock(), r->socket->recoverable())) { room_closed = true; break; }
       awaiting_welcome = rejoin_pending = true;
       if (io.clock() >= reopen_at) {
         reopen_room(*r, io);

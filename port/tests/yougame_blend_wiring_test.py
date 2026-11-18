@@ -189,7 +189,8 @@ class BlendWiringTest(unittest.TestCase):
         self.assertIn("g_ticket_retry ? *g_ticket_retry : local_retry", bridge)
         self.assertIn('retry.delay(j)', bridge)
         self.assertIn("search_policy::wait(", bridge)
-        self.assertIn("site busy, retrying the ticket in %d s (try %d/3)", self.raw_link)
+        self.assertIn("yougame: %s, retrying the ticket in %d s (try %d/3)", self.raw_link)
+        self.assertIn('"the app has no page to ask yet" : "site busy"', self.raw_link)
         self.assertIn("search_policy::blend_port((uint16_t)forced_port, rng())", self.blend)
         self.assertNotIn("yg.result.wait();", self.blend.split("won_slippi = coord.matched", 1)[1])
 

@@ -823,7 +823,10 @@ json bridge(const json& body, int timeout_ms = 15000, const std::function<bool()
     // Inspect busy metadata before bridge converts a failure into display text.
     const int delay = body.value("type", "") == "mpTicket" ? retry.delay(j) : 0;
     if (!delay) break;
-    host::log("yougame: site busy, retrying the ticket in %d s (try %d/3)", delay, retry.tries());
+    // "notHere" is the local channel host's (the app has no page to ask yet), "busy" the site's.
+    host::log("yougame: %s, retrying the ticket in %d s (try %d/3)",
+              ranked::str(j, "code") == "notHere" ? "the app has no page to ask yet" : "site busy",
+              delay, retry.tries());
     if (!search_policy::wait(uint64_t(delay) * 1000, now_ms, [](int ms) { Sleep(ms); },
         [&] { return cancelled && cancelled(); })) throw std::runtime_error("Cancelled");
   }
@@ -937,6 +940,13 @@ class Socket {
   }
   int connection() const { return broker_ ? broker_->conn() : 0; }
   bool recoverable() const { return broker_ && broker_->close_code() == 1006; }
+  // Our own socket's connection died: no close frame from the room (code stays 1006) and not our close().
+  bool own_dropped() const { return !broker_ && !stopping_ && close_code_ == 1006; }
+  // Own socket: when it last heard anything, and last heard a relay frame (a match is passing through it).
+  uint64_t heard_at() const { return heard_at_.load(); }
+  uint64_t relay_heard_at() const { return relay_heard_at_.load(); }
+  // Own socket gone silent mid-match: close it as a drop, so the pump rejoins as after a 1006.
+  void abandon() { if (broker_) return; close(); close_code_ = 1006; stopping_ = false; }
   // Friends rooms also hold the seat after Rooms' silent-socket close (4002, rooms/src/room-rules.ts
   // SILENT_CLOSE): it is not final, so the console backend rejoins as it does after a 1006 drop.
   bool rejoinable() const { return recoverable() || (broker_ && broker_->close_code() == 4002); }
@@ -944,7 +954,7 @@ class Socket {
   bool kind_refused() const { return broker_ && broker_->kind_refused(); }   // another Teams protocol / Doubles profile
   bool busy() const { return broker_ && broker_->busy(); }
   bool room_full() const { return broker_ && broker_->full(); }
-  int close_code() const { return broker_ ? broker_->close_code() : 1006; }
+  int close_code() const { return broker_ ? broker_->close_code() : close_code_.load(); }
   bool brokered() const { return broker_ != nullptr; }
 #ifdef YOUGAME_AGENT_TEST_HOOK
   uint64_t agent_test_first_open_at() const { return broker_ ? broker_->agent_test_first_open_at() : 0; }
@@ -1005,6 +1015,7 @@ class Socket {
       queue_.clear();
       closed_ = false;
     }
+    close_code_ = 1006; stopping_ = false; heard_at_ = now_ms();
     reader_ = std::thread([this] { read_loop(); });
     return true;
   }
@@ -1043,6 +1054,7 @@ class Socket {
   bool closed() const { return broker_ ? broker_->closed() : closed_.load(); }
   void close(int code = 4000) {
     if (broker_) { broker_->close(1000, code); return; }
+    stopping_ = true;
     HINTERNET ws = nullptr;
     {
       std::lock_guard<std::mutex> lock(send_mutex_);
@@ -1069,15 +1081,32 @@ class Socket {
       if (!ws) break;
       DWORD got = 0;
       WINHTTP_WEB_SOCKET_BUFFER_TYPE type;
-      if (WinHttpWebSocketReceive(ws, buf.data(), (DWORD)buf.size(), &got, &type) != NO_ERROR) break;
-      if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) break;
+      const DWORD rc = WinHttpWebSocketReceive(ws, buf.data(), (DWORD)buf.size(), &got, &type);
+      if (rc == NO_ERROR) heard_at_ = now_ms();
+      if (rc != NO_ERROR) {
+        // Not a close the server sent: a dropped connection (or our own close from another thread).
+        if (!stopping_) host::log("yougame: room socket dropped (receive error %lu)", (unsigned long)rc);
+        break;
+      }
+      if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
+        // The room's own close: its code says why (4002 silent, 1008 too much, 4004 over, 4011 reset).
+        USHORT status = 0; DWORD reason_len = 0; char reason[124] = {};
+        if (WinHttpWebSocketQueryCloseStatus(ws, &status, reason, sizeof reason - 1, &reason_len) == NO_ERROR) {
+          close_code_ = status;
+          std::string why(reason, std::min<DWORD>(reason_len, sizeof reason - 1));
+          for (char& c : why) if (c < 0x20 || c > 0x7e) c = '?';
+          host::log("yougame: room socket closed by the room (code %u, %s)", (unsigned)status, why.empty() ? "no reason" : why.c_str());
+        }
+        break;
+      }
       if (type != WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE && type != WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE) continue;
       data.append(buf.data(), got);
-      if (data.size() > (1u << 20)) break;
+      if (data.size() > (1u << 20)) { host::log("yougame: room socket closed: a message over 1 MiB"); break; }
       if (type == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE) continue;
       json j = json::parse(data, nullptr, false);
       data.clear();
       if (j.is_discarded() || !j.is_object()) continue;
+      if (room_relay::is_frame(j)) relay_heard_at_ = now_ms();
       std::lock_guard<std::mutex> lock(mutex_);
       queue_.push_back(std::move(j));
       cv_.notify_all();
@@ -1087,6 +1116,9 @@ class Socket {
     cv_.notify_all();
   }
   std::unique_ptr<transport::Stream> broker_;
+  std::atomic<int> close_code_{1006};   // own socket: the room's close code, 1006 when the connection just dropped
+  std::atomic<bool> stopping_{false};   // our own close(): its receive error is not a drop
+  std::atomic<uint64_t> heard_at_{0}, relay_heard_at_{0};
   HINTERNET ws_ = nullptr;
   std::thread reader_;
   std::mutex mutex_, send_mutex_;
@@ -1515,6 +1547,10 @@ transport::RoomIO room_io(Room& r) {
     for (auto& f : r.lobby_session->due(now_ms())) out.push_back(std::move(f));
   };
   io.keep_links = [&r] { return r.keep_links.load(); };
+  io.own_drop = [&r] { return r.socket && r.socket->own_dropped(); };
+  io.own_heard = [&r] { return r.socket ? r.socket->heard_at() : 0; };
+  io.own_relay_heard = [&r] { return r.socket ? r.socket->relay_heard_at() : 0; };
+  io.own_abandon = [&r] { if (r.socket) r.socket->abandon(); };
   io.request = [&r](const json& q, int ms) {
     return bridge(q, ms, [&] { return q.value("type", "") == "mpTicket" && r.stop; });
   };

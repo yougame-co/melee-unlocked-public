@@ -2235,6 +2235,7 @@ static void setup_decide(GameModeState* state)
         last_match.connection_state != MU_SLP_MM_CONNECTION_SUCCESS ||
         mu_ranked_setup_model()->status != MU_SETUP_COMPLETE) {
         u8 end_mode = 1;
+        mu_online_abi_log("ranked setup: left before both seats finished it");
         mu_slippi_cmd(0xC2, &end_mode, 1, NULL, 0, NULL);
         gm_SetNextGameModeStateId(MU_SLP_STATE_CSS);
         return;

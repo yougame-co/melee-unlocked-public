@@ -435,10 +435,73 @@ static void quit_waiting_for_receipt_drains_concession() {
     stop_and_flush(f.r,f.mutex); CHECK(f.b.messages("finish")==1);
   }
 }
+// Our own socket (not the app's broker) drops with 1006: renew the ticket and reopen the room, at most 3 times.
+static void own_socket_rejoin() {
+  auto own = [](Fixture& f) {
+    f.r.socket->broker_mode=false;
+    f.io.own_drop=[&f]{return f.r.socket->stream.close_code()==1006;};
+  };
+  auto logged = [](const Fixture& f, const char* text) {
+    return std::any_of(f.logs.begin(),f.logs.end(),[&](const std::string& l){return l.find(text)!=std::string::npos;});
+  };
+  { // one drop, back in: the set plays on with the fresh ticket
+    Fixture f; own(f); f.ranked(); f.b.closed();
+    f.b.at(500,[&]{CHECK(f.b.count("netOpen")==2 && f.b.count("mpTicket")==1); f.tick();});
+    f.stop_at(600); f.run();
+    CHECK(!f.r.set.closed() && f.r.ticket=="ticket-new" && logged(f,"back in the room"));
+    for (const auto& q : f.b.requests) if (q["type"]=="netOpen" && &q!=&f.b.requests.front()) CHECK(q["ticket"]=="ticket-new");
+  }
+  { // a close the room sent (or ours) ends the room: no rejoin
+    Fixture f; own(f); f.ranked(); f.b.closed(1000); f.run();
+    CHECK(f.r.set.closed() && f.b.count("netOpen")==1 && f.b.count("mpTicket")==0);
+  }
+  { // every reopen fails: give up inside the 6 s budget
+    Fixture f; own(f); f.ranked(); f.b.on_open=[&](int){f.b.closed();}; f.b.closed(); f.run();
+    CHECK(f.r.set.closed() && f.b.now<=6101 && f.b.count("netOpen")>2 && logged(f,"could not rejoin"));
+  }
+  { // a fourth drop ends the room
+    Fixture f; own(f); f.ranked(); f.b.closed();
+    for (uint64_t t : {1000,2000,3000}) f.b.at(t,[&]{f.b.closed();});
+    f.run();
+    CHECK(f.r.set.closed() && f.b.count("netOpen")==4 && f.b.count("mpTicket")==3);
+  }
+}
+// Own socket mid-match: relay frames stop, a ping goes out, and no answer in 1 s reopens the socket.
+static void own_socket_silence_probe() {
+  auto logged = [](const Fixture& f, const char* text) {
+    return std::any_of(f.logs.begin(),f.logs.end(),[&](const std::string& l){return l.find(text)!=std::string::npos;});
+  };
+  auto probes = [](const Fixture& f) {
+    return (int)std::count_if(f.b.sent.begin(),f.b.sent.end(),[](const json& m){return str(m,"t")=="ping" && !m.count("at");});
+  };
+  struct Clocks { uint64_t heard = 1, relay = 1; };
+  auto own = [](Fixture& f, Clocks& c) {
+    f.r.socket->broker_mode=false;
+    f.io.own_drop=[&f]{return f.r.socket->stream.close_code()==1006;};
+    f.io.own_heard=[&c]{return c.heard;}; f.io.own_relay_heard=[&c]{return c.relay;};
+    f.io.own_abandon=[&f]{f.b.closed();};
+    f.b.on_open=[&f,&c](int id){c.heard=f.b.now; f.b.opened(id);};   // a fresh connection has just been heard
+  };
+  { // dead socket: probed, reopened, back in the room
+    Fixture f; Clocks c; own(f,c); f.ranked();
+    f.b.at(2600,[&]{CHECK(probes(f)==1 && f.b.count("netOpen")==2 && logged(f,"stopped answering") && logged(f,"back in the room")); f.tick();});
+    f.stop_at(2700); f.run(); CHECK(!f.r.set.closed());
+  }
+  { // live socket: the pong answers the probe, nothing reopens
+    Fixture f; Clocks c; own(f,c); f.ranked();
+    f.b.on_send=[&](const json& m){ if (str(m,"t")=="ping" && !m.count("at")) c.heard=f.b.now; };
+    f.stop_at(3000); f.run();
+    CHECK(probes(f)>=1 && f.b.count("netOpen")==1 && !logged(f,"stopped answering") && !f.r.set.closed());
+  }
+  { // no relay frames recently (menus, lobby): silence is normal, no probe
+    Fixture f; Clocks c; c.relay=0; own(f,c); f.ranked();
+    f.stop_at(3000); f.run(); CHECK(probes(f)==0 && f.b.count("netOpen")==1);
+  }
+}
 int main() {
   failed_send_is_loss();timeout_and_late_open();recovery_closes_and_expiry();lobby_start_links();
   departure_keeps_ranked_pump();missed_receipts();ticket_allowance();internet_unchanged();flush_joins_open();
   ticket_renewal_recovers();ticket_renewal_deadline();ticket_renewal_validation();
-  quit_waiting_for_receipt_drains_concession();late_doubles_begin_is_quiet();
-  std::puts("yougame_room: real pump send loss, late open, recovery expiry, lobby links, ranked drain, missed receipts, ticket budgets, internet compatibility and flush serialization passed");
+  quit_waiting_for_receipt_drains_concession();late_doubles_begin_is_quiet();own_socket_rejoin();own_socket_silence_probe();
+  std::puts("yougame_room: real pump send loss, late open, recovery expiry, lobby links, ranked drain, missed receipts, ticket budgets, internet compatibility and flush serialization and own-socket rejoin and silence probe passed");
 }

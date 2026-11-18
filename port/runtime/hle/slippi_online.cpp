@@ -3286,7 +3286,7 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
         return true;
       }
       if (payload[0] == 3) {
-        if (yougame::active()) yougame::ranked_screen_enter();
+        if (yougame::session()) yougame::ranked_screen_enter();
         return true;
       }
       if (payload[0] == 14) { // menu entry: did a Friends room open the CSS it came back from? (once)
@@ -3300,11 +3300,15 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
     case CMD_YOUGAME_DATA:
       switch (payload[0]) {
         case MU_YG_SUB_RANK:
-          q = yougame::active() ? yougame::rank_record_response() : yougame::ranked::rank_record_response({}, {}, {});
+          q = yougame::session() ? yougame::rank_record_response() : yougame::ranked::rank_record_response({}, {}, {});
           return true;
         case MU_YG_SUB_POLICY: {
           auto policy = use_ranked_rules(0) ? g_ranked_rules.policy : yougame::ranked_policy::slippi_v1();
-          policy.available = yougame::active() && !local_matchmaking_error(0);
+          // session(), not active(): a game the app started over the local channel has no bridge
+          // URL, so active() is false there and Ranked's setup would read "no rules" and quit.
+          const char* refusal = yougame::session() ? local_matchmaking_error(0) : "not in YouGame mode";
+          policy.available = refusal == nullptr;
+          if (refusal) host::log("yougame: Ranked rules unavailable to the game: %s", refusal);
           q = yougame::ranked_policy::encode(policy);
           return true;
         }

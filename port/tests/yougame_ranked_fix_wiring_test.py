@@ -34,6 +34,11 @@ class RankedFixWiringTest(unittest.TestCase):
         self.assertIn("case MU_YG_SUB_RANK:", handler)
         self.assertIn("case MU_YG_SUB_POLICY:", handler)
         self.assertIn("default: return false;", handler)
+        # A game the app started over the local channel is a session() but never active(): the
+        # rules reply must not refuse it, or Ranked's setup aborts the moment a match is found.
+        policy = handler.split("case MU_YG_SUB_POLICY:", 1)[1]
+        self.assertIn("yougame::session() ? local_matchmaking_error(0)", policy)
+        self.assertNotIn("yougame::active()", handler)
         wire = (ROOT / "port/runtime/abi/mu_ranked_wire.h").read_text()
         self.assertNotIn("0xFF", wire)
 
