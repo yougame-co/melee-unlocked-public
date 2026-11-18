@@ -13,6 +13,9 @@ class FriendsDisconnectTest(unittest.TestCase):
         backend = source[start:end]
         # The direct helper's attachment belongs to its existing tests; this fixture owns no ring.
         backend = backend.replace(body(backend,'attach'),' return true; ')
+        # So does the room relay (room_relay_wiring_test.py, yougame_room_relay_test.cpp).
+        backend = backend.replace(body(backend,'use_relay'),' (void)why; return false; ')
+        backend = backend.replace(body(backend,'relay_open'),' (void)me; (void)ports; return {}; ')
         menu.OnlineMenuTest().compile_fixture('39-room-worker', r'''
 #include "yougame_console_entry.h"
 #include <condition_variable>
@@ -30,6 +33,7 @@ std::atomic<int> drop_code{1006};
 namespace host {bool exit_requested(){return quitting;}void log(const char*,...) {}}
 using ENetSocket=int;constexpr int ENET_SOCKET_NULL=-1;
 void yg_enet_destroy(int) {} void yg_enet_enable(int) {}
+void relay_stop(const void*) {}
 namespace yougame {
 using json=nlohmann::json;
 namespace ranked {std::string str(const json& j,const char* key) {return friends::text(j,key,256);}}

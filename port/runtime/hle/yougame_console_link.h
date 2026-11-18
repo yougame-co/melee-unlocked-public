@@ -8,6 +8,8 @@
 #include "friends_handoff_join.h"
 #include "friends_handoff_transfer.h"
 #include "yougame_css_join.h"
+#include <map>
+#include <vector>
 
 namespace yougame::console {
 using Bytes = std::vector<uint8_t>;
@@ -48,6 +50,11 @@ struct SessionIO {
   std::function<int()> connection;
   std::function<bool(int)> attach;
   std::function<bool()> helper_missing = [] { return false; }; // the last attach was refused no_direct
+  // The room relay (yougame_room_relay.h): true once this session's datagrams go over the room instead of
+  // links (the app's helper refused or never answered the attach). relay_open(my port, every port) starts
+  // it and gives each other port its link; empty when it can't.
+  std::function<bool()> relay = [] { return false; };
+  std::function<std::map<int,unsigned>(int, const std::vector<int>&)> relay_open;
   std::function<int(unsigned)> state;
   std::function<std::string(unsigned)> route;
   std::function<std::vector<uint64_t>(unsigned)> rtt; // consume app path RTT samples

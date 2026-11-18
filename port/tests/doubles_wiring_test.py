@@ -451,7 +451,10 @@ int main(){
         has('io.helper_missing = [b] { return b->helper_missing.load(); };','yougame_link.cpp')
         has('return fail(i.helper_missing() ? kHelperMissing : "couldn\'t connect to your friend");','yougame_console_link.cpp')
         has('if (reason == kHelperMissing) return kHelperMissing;','yougame_console_notice.h')
-        has('if (helper_missing) return fail(console::kHelperMissing, false);','yougame_link.cpp')
+        # A matchmaking seat without the helper goes to the room relay (room_relay_wiring_test.py); the
+        # helper line stays for a relay that can't start.
+        has('if (helper_missing) {\n        no_helper_cooldown();','yougame_link.cpp')
+        has('host::log("yougame: the room relay could not start");\n      return fail(console::kHelperMissing, false);','yougame_link.cpp')
         # The notice is sticky over observe()'s status, and the lease is read from every home snapshot.
         has('ui.line=h.notice.empty()?h.status:h.notice;','yougame_doubles_runtime.inc')
         has('leased = (has_party && m["party"].value("playing",json())==true) ||','yougame_doubles.h')

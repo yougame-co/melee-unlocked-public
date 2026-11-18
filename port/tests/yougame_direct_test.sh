@@ -19,6 +19,12 @@ clang -std=c11 -O1 -Wall -Wextra -Wno-unused-parameter $san_flags -Iport/third_p
   port/third_party/enet/list.c port/third_party/enet/packet.c port/third_party/enet/peer.c \
   port/third_party/enet/protocol.c -o "$build_dir/enet"
 "$build_dir/enet"
+clang -std=c11 -O1 -Wall -Wextra -Wno-unused-parameter $san_flags -Iport/third_party/enet/include \
+  port/tests/yg_enet_relay_test.c port/third_party/enet/yg_enet_socket.c -o "$build_dir/relay" -lpthread
+"$build_dir/relay"
+clang++ -std=c++17 -O1 -Wno-deprecated-declarations $san_flags -Iport/runtime/hle -Iport/third_party \
+  port/tests/yougame_room_relay_test.cpp -o "$build_dir/room-relay"
+"$build_dir/room-relay"
 clang++ -std=c++20 -O1 -Wno-deprecated-declarations $san_flags -Iport/runtime/hle -Iport/third_party \
   port/tests/yougame_ranked_test.cpp -o "$build_dir/ranked"
 "$build_dir/ranked"

@@ -32,7 +32,8 @@ class LinksFalseWiring(unittest.TestCase):
         self.assertIn("sent_at.clear();", decide)
         self.assertIn('participants = m["participants"]; decide_transport(); }', LINK)
         # Decided before the lobby's first attach (an adopted lobby's roster) and before any address goes out.
-        self.assertLess(LINK.index("  decide_transport();\n"), LINK.index("if (links_mode && lobby_route) {"))
+        self.assertLess(LINK.index("  decide_transport();\n"),
+                        LINK.index('if (links_mode) probe_relay(lobby_route ? "before the lobby" : "before the match");'))
 
     def test_own_socket_opens_once_a_match_needs_it(self):
         gate = LINK.index("if (full && !links_mode && udp == INVALID_SOCKET) {")
@@ -57,7 +58,7 @@ class LinksFalseWiring(unittest.TestCase):
 
     def test_lobby_links_never_linger(self):
         self.assertIn("early.keep = links_mode;", LINK)
-        self.assertIn("if (links_mode) early.links.open<update::Required>", LINK)
+        self.assertIn("if (links_mode && !relay_self) early.links.open<update::Required>", LINK)
 
 
 if __name__ == "__main__":

@@ -1150,7 +1150,7 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
     i.log("console: start session " + c.session_id + " seed " + hex(c.seed) + " delay " + std::to_string(c.input_delay));
     // A relaunching seat can be absent for ~60 s. Rendezvous through Rooms before
     // starting the shared 20 s mesh budget; never send another begin for this session.
-    std::set<std::string> candidates; uint64_t candidate_at = 0;
+    std::set<std::string> candidates, relay_peers; uint64_t candidate_at = 0;   // relay_peers: seats whose candidate said they relay (no links helper)
     const auto restored_digest = c.card_digest;
     bool default_vote = c.default_card;
     // Rendezvous counters for the failure log: room ids only (8 chars), never tokens.
@@ -1174,6 +1174,8 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
       }
       if (str(d,"compat") != i.compatibility) return false;
       if ((sync_card || rejoin) && str(d,"cardDigest") != restored_digest) default_vote = true;
+      const auto relay_flag = d.find("relay");
+      if (relay_flag != d.end() && relay_flag->is_boolean() && *relay_flag == true) relay_peers.insert(str(m,"from"));
       candidates.insert(str(m,"from")); return true;
     };
     auto send_candidates = [&] {
@@ -1181,6 +1183,7 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
       for (const auto& p : link->frozen) if (str(p,"connectionId") != r.me) {
         auto d = transport::candidate(true,i.compatibility,"",c.session_id,"","","");
         if (sync_card || rejoin) d["cardDigest"] = restored_digest;
+        if (i.relay()) d["relay"] = true;   // this seat relays: every seat of the session does
         i.send_room({{"t","msg"},{"to",p["connectionId"]},{"d",d}}); ++cand_sent;
       }
       candidate_at = i.clock()+1000;
@@ -1225,13 +1228,43 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
       return reply;
     };
     // The app may take seconds to map the helper's ring (Friends waits 10 s); every step logs why it stopped.
+    // The room relay (yougame_room_relay.h): a seat without a links helper carries the session's datagrams
+    // over the room; one such seat moves every seat there. Ring links already open close.
+    bool relayed = false;
+    auto open_relay = [&](const char* why) {
+      int mine = 0; std::vector<int> ports;
+      for (const auto& p : link->frozen) {
+        const int port = p.value("port",0); ports.push_back(port);
+        if (str(p,"connectionId") == r.me) mine = port;
+      }
+      const auto links = i.relay_open ? i.relay_open(mine,ports) : std::map<int,unsigned>{};
+      if (links.empty()) { i.log("console: the room relay could not start"); return false; }
+      for (const auto& p : link->peers) { try { i.request({{"type","directClose"},{"link",p.link}},1000); } catch (...) {} }
+      link->peers.clear();
+      for (const auto& p : link->frozen) {
+        const auto conn = str(p,"connectionId"); if (conn == r.me) continue;
+        const auto it = links.find(p.value("port",0));
+        if (it == links.end()) { i.log("console: the room relay has no link for a seat"); return false; }
+        Peer peer{}; peer.port = it->first; peer.link = it->second; peer.connection = conn; peer.heard = i.clock(); peer.opened = i.clock();
+        peer.room_connection = i.connection(); link->peers.push_back(std::move(peer));
+      }
+      link->startup_work();
+      relayed = true;
+      i.log(std::string("console: the session's links go over the room relay (") + why + ")");
+      return true;
+    };
     step = "attach";
     if (!i.attach(std::min(10000,budget()))) {
       i.log("console: link helper attach failed");
       return fail(i.helper_missing() ? kHelperMissing : "couldn't connect to your friend");
     }
-    step = "open";
-    for (const auto& p : link->frozen) {
+    if (i.relay() || !relay_peers.empty()) {
+      step = "relay";
+      if (!open_relay(i.relay() ? "no links helper here" : "a friend has no links helper"))
+        return fail(i.helper_missing() ? kHelperMissing : "couldn't connect to your friend");
+    }
+    step = relayed ? "relay" : "open";
+    if (!relayed) for (const auto& p : link->frozen) {
       const auto conn = str(p,"connectionId"); if (conn == r.me) continue;
       if (!budget()) { i.log("console: no time left to open a link"); return fail("couldn't connect to your friend"); }
       const auto opened = i.clock();
@@ -1258,6 +1291,8 @@ std::unique_ptr<SessionLink> start_session(const json& input, SessionConfig& con
       }
       if (link->lost()) return fail(link->lost()->c_str());
       if (i.room_closed()) { i.log("console: room closed while links were opening"); return fail("couldn't connect to your friend"); }
+      // A friend's candidate says it relays: its seat has no links helper, so this seat's links never come up.
+      if (!relayed && !relay_peers.empty() && !open_relay("a friend has no links helper")) return fail("couldn't connect to your friend");
       bool up = candidates.size() == link->peers.size();
       for (auto& p : link->peers) {
         if (i.state(p.link) == 3) {

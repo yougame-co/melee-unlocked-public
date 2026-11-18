@@ -48,6 +48,18 @@ int yg_enet_get_address(ENetSocket socket, ENetAddress *address);
 int yg_enet_send(ENetSocket socket, const ENetAddress *address, const ENetBuffer *buffers, size_t count);
 int yg_enet_receive(ENetSocket socket, ENetAddress *address, ENetBuffer *buffers, size_t count);
 int yg_enet_wait(ENetSocket socket, enet_uint32 *condition, enet_uint32 timeout);
+/* Room relay: when no links helper exists, the same datagrams travel over the room's msg relay.
+ * Links YG_RELAY_LINK0..+n-1 keep the 10.255.x.x:7777 addresses. While relay is on, the virtual
+ * socket sends through the callback (called outside the lock, possibly after relay_end) and
+ * receives from a bounded queue that drops its oldest datagram when full. The ring is untouched. */
+enum { YG_RELAY_LINK0=0xFE00, YG_RELAY_MAX=64 };
+typedef void (*YGRelaySend)(unsigned link, const void *data, size_t len);
+void yg_enet_relay_callback(YGRelaySend send);
+int yg_enet_relay_begin(unsigned n_links);
+void yg_enet_relay_end(void);
+int yg_enet_relay_active(void);
+int yg_enet_relay_in(unsigned link, const void *data, size_t len);
+unsigned yg_enet_relay_dropped(void);
 #ifdef __cplusplus
 }
 #endif

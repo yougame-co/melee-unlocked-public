@@ -78,6 +78,9 @@ struct RoomIO {
   std::function<void(int)> pause = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
   std::function<int(unsigned)> link_state;
   std::function<void()> disable_links = [] {};
+  // The room relay (yougame_room_relay.h) carries this room's match instead of links: it ends wherever
+  // the links would, including when the room has no link ids at all.
+  std::function<void()> end_relay = [] {};
   std::function<void(const char*)> log = [](const char*) {};
   std::function<void(const json&)> result = [](const json&) {};
   std::function<void(const std::string&)> started = [](const std::string&) {};
@@ -160,6 +163,7 @@ inline std::string leave_id(const json& m, bool brokered) {
   return brokered && m.count("player") ? str(m["player"], "id") : str(m, "id");
 }
 template<class Room> void end_links(Room& r, const RoomIO& io) {
+  io.end_relay();
   if (r.links.ids.empty()) return;
   io.disable_links();
   close_links(r.links, io.request);

@@ -95,6 +95,94 @@ static int state(unsigned link) {
 static void address_for(unsigned link,ENetAddress *a) {
     a->host=ENET_HOST_TO_NET_32(0x0aff0000u|link); a->port=7777;
 }
+/* Room relay backend (header). Same mutex as the ring; every relay branch is taken only while
+ * relay_on, so the ring code below runs exactly as before when the relay is off. */
+static int relay_on, relay_woken;
+static unsigned relay_links, relay_head, relay_count, relay_drops;
+static ENetSocket relay_socket = ENET_SOCKET_NULL; /* created while the relay was on */
+static YGRelaySend relay_send;
+static struct { unsigned short link, len; unsigned char data[YG_DATAGRAM]; } relay_q[YG_SLOTS];
+#ifdef _WIN32
+static CONDITION_VARIABLE relay_cv = CONDITION_VARIABLE_INIT;
+static void relay_signal(void) { WakeAllConditionVariable(&relay_cv); }
+static void relay_sleep(uint64_t ms) { SleepConditionVariableSRW(&relay_cv,&mutex,(DWORD)(ms>100?100:ms),0); }
+#else
+static pthread_cond_t relay_cv = PTHREAD_COND_INITIALIZER;
+static void relay_signal(void) { pthread_cond_broadcast(&relay_cv); }
+/* CLOCK_REALTIME deadline in short slices; the caller re-checks its monotonic budget. */
+static void relay_sleep(uint64_t ms) {
+    struct timespec t;
+    if(ms>100) ms=100;
+    clock_gettime(CLOCK_REALTIME,&t);
+    t.tv_sec+=(time_t)(ms/1000); t.tv_nsec+=(long)(ms%1000)*1000000L;
+    if(t.tv_nsec>=1000000000L) { t.tv_sec++; t.tv_nsec-=1000000000L; }
+    pthread_cond_timedwait(&relay_cv,&mutex,&t);
+}
+#endif
+static int relay_link(unsigned link) { return relay_on && link>=YG_RELAY_LINK0 && link<YG_RELAY_LINK0+relay_links; }
+void yg_enet_relay_callback(YGRelaySend f) { LOCK(); relay_send=f; UNLOCK(); }
+int yg_enet_relay_begin(unsigned n) {
+    if(!n || n>YG_RELAY_MAX) return -1;
+    LOCK();
+    if(!relay_on) { relay_head=relay_count=0; relay_woken=0; relay_drops=0; }
+    relay_on=1; relay_links=n;
+    UNLOCK(); return 0;
+}
+void yg_enet_relay_end(void) {
+    LOCK();
+    if(relay_on) {
+        relay_on=0; relay_links=0; relay_head=relay_count=0; relay_woken=1;
+        /* A socket made for the relay never falls through to a ring that has no doorbells. */
+        if(relay_socket!=ENET_SOCKET_NULL && relay_socket==current) current=ENET_SOCKET_NULL;
+        relay_socket=ENET_SOCKET_NULL;
+        relay_signal();
+    }
+    UNLOCK();
+}
+int yg_enet_relay_active(void) { int n; LOCK(); n=relay_on; UNLOCK(); return n; }
+unsigned yg_enet_relay_dropped(void) { unsigned n; LOCK(); n=relay_drops; UNLOCK(); return n; }
+int yg_enet_relay_in(unsigned link,const void *data,size_t len) {
+    int ok=0; LOCK();
+    if(data && relay_link(link) && len && len<=YG_DATAGRAM) {
+        unsigned at;
+        if(relay_count==YG_SLOTS) { relay_head=(relay_head+1)%YG_SLOTS; relay_count--; relay_drops++; } /* oldest goes */
+        at=(relay_head+relay_count)%YG_SLOTS;
+        relay_q[at].link=(unsigned short)link; relay_q[at].len=(unsigned short)len;
+        memcpy(relay_q[at].data,data,len); relay_count++;
+        relay_signal(); ok=1;
+    }
+    UNLOCK(); return ok?0:-1;
+}
+/* Called locked; returns unlocked. The callback runs outside the lock. */
+static int relay_out(const ENetAddress *a,const ENetBuffer *buffers,size_t count,size_t total) {
+    unsigned char buf[YG_DATAGRAM]; size_t i,pos=0; unsigned link=0; YGRelaySend f=relay_send;
+    if(a && a->host==ENET_HOST_TO_NET_32(0x7f000001) && total==1 && count==1 &&
+       *(const unsigned char *)buffers[0].data==0) { relay_woken=1; relay_signal(); UNLOCK(); return 1; }
+    if(a && a->port==7777 && (ENET_NET_TO_HOST_32(a->host)&0xffff0000u)==0x0aff0000u)
+        link=ENET_NET_TO_HOST_32(a->host)&65535;
+    if(!enabled || !total || total>YG_DATAGRAM || !relay_link(link) || !f) { UNLOCK(); return (int)total; }
+    UNLOCK();
+    for(i=0;i<count;i++) { memcpy(buf+pos,buffers[i].data,buffers[i].dataLength); pos+=buffers[i].dataLength; }
+    f(link,buf,total);
+    return (int)total;
+}
+/* Called locked; returns unlocked. */
+static int relay_take(ENetSocket s,ENetAddress *a,ENetBuffer *buffers,size_t count) {
+    int result=0;
+    if(s!=current || !enabled) { UNLOCK(); return 0; }
+    while(relay_count && !result) {
+        unsigned len=relay_q[relay_head].len, link=relay_q[relay_head].link; size_t i,capacity=0,pos=0;
+        const unsigned char *data=relay_q[relay_head].data;
+        relay_head=(relay_head+1)%YG_SLOTS; relay_count--;
+        for(i=0;i<count;i++) { if(buffers[i].dataLength>YG_DATAGRAM) capacity=YG_DATAGRAM; else if(capacity<YG_DATAGRAM) capacity+=buffers[i].dataLength; }
+        if(len<=capacity && relay_link(link)) {
+            for(i=0;i<count && pos<len;i++) { size_t n=buffers[i].dataLength; if(n>len-pos)n=len-pos; memcpy(buffers[i].data,data+pos,n); pos+=n; }
+            if(a) address_for(link,a);
+            result=(int)len;
+        }
+    }
+    UNLOCK(); return result;
+}
 static int attach_locked(void *memory,size_t size,YGDoorbells b) {
     unsigned char *m=(unsigned char *)memory;
     int ok=0;
@@ -117,14 +205,15 @@ int yg_enet_channel_ready(void) { int n; LOCK(); n=live(); UNLOCK(); return n; }
 int yg_enet_enabled(void) {
     int n; LOCK(); n=enabled;
 #ifndef _WIN32
-    n=n && live();
+    n=n && (relay_on || live());
 #endif
     UNLOCK(); return n;
 }
-int yg_enet_link_state(unsigned link) { int n; LOCK(); n=state(link); UNLOCK(); return n; }
+int yg_enet_link_state(unsigned link) { int n; LOCK(); n=relay_link(link)?2:state(link); UNLOCK(); return n; }
 int yg_enet_link_address(unsigned link,ENetAddress *a) {
     int ok=0; unsigned i; LOCK();
-    if (a && state(link)==2) {
+    if (a && relay_link(link)) { address_for(link,a); ok=1; }
+    else if (a && state(link)==2) {
         for(i=0;i<3;i++) if(get16(mem+32+2*i)==link) {
             ENetAddress expected; address_for(link,&expected);
             /* Validate P2's header metadata, rather than using arbitrary destinations. */
@@ -140,12 +229,13 @@ int yg_enet_is_socket(ENetSocket s) { return s!=ENET_SOCKET_NULL && (uintptr_t)s
 unsigned yg_enet_mtu(ENetSocket s,unsigned ordinary) { return yg_enet_is_socket(s) ? (ordinary<YG_DATAGRAM?ordinary:YG_DATAGRAM) : ordinary; }
 ENetSocket yg_enet_create(void) {
     ENetSocket s=ENET_SOCKET_NULL; LOCK();
-    if(enabled && live() && current==ENET_SOCKET_NULL && serial<1048574) {
+    if(enabled && (relay_on || live()) && current==ENET_SOCKET_NULL && serial<1048574) {
         current=(ENetSocket)(-(intptr_t)(++serial+1)); local_port=7777; s=current;
+        if(relay_on) relay_socket=s;
     }
     UNLOCK(); return s;
 }
-void yg_enet_destroy(ENetSocket s) { LOCK(); if(s==current) current=ENET_SOCKET_NULL; UNLOCK(); }
+void yg_enet_destroy(ENetSocket s) { LOCK(); if(s==current) current=ENET_SOCKET_NULL; if(s==relay_socket) relay_socket=ENET_SOCKET_NULL; UNLOCK(); }
 int yg_enet_bind(ENetSocket s,const ENetAddress *a) { int ok; LOCK(); ok=s==current; if(ok && a) local_port=a->port; UNLOCK(); return ok?0:-1; }
 int yg_enet_get_address(ENetSocket s,ENetAddress *a) {
     int ok; LOCK(); ok=s==current && a;
@@ -157,6 +247,7 @@ int yg_enet_send(ENetSocket s,const ENetAddress *a,const ENetBuffer *buffers,siz
     for(i=0;i<count;i++) { if(buffers[i].dataLength>(size_t)INT_MAX-total) return -1; total+=buffers[i].dataLength; }
     LOCK();
     if(s!=current) { UNLOCK(); return (int)total; }
+    if(relay_on) return relay_out(a,buffers,count,total);
 #ifndef _WIN32
     if(!live()) { UNLOCK(); return -1; }
 #endif
@@ -186,6 +277,7 @@ int yg_enet_send(ENetSocket s,const ENetAddress *a,const ENetBuffer *buffers,siz
 }
 int yg_enet_receive(ENetSocket s,ENetAddress *a,ENetBuffer *buffers,size_t count) {
     unsigned budget; int result=0; LOCK();
+    if(relay_on) return relay_take(s,a,buffers,count);
 #ifndef _WIN32
     if(s==current && !live()) { UNLOCK(); return -1; }
 #endif
@@ -217,6 +309,15 @@ int yg_enet_wait(ENetSocket s,enet_uint32 *condition,enet_uint32 timeout) {
         int n; uint64_t now; YGDoorbells b;
         LOCK();
         if(s!=current) { UNLOCK(); return -1; }
+        if(relay_on) {
+            if((wanted&ENET_SOCKET_WAIT_RECEIVE) && enabled && relay_count) { *condition=ENET_SOCKET_WAIT_RECEIVE; UNLOCK(); return 0; }
+            if(wanted&ENET_SOCKET_WAIT_SEND) { *condition=ENET_SOCKET_WAIT_SEND; UNLOCK(); return 0; }
+            if(relay_woken) { relay_woken=0; UNLOCK(); return 0; } /* local wake: NONE, as on the ring */
+            now=clock_ms();
+            if(now>=until) { UNLOCK(); return 0; }
+            relay_sleep(until-now);
+            UNLOCK(); continue;
+        }
 #ifndef _WIN32
         if(!live()) { UNLOCK(); return -1; }
 #endif

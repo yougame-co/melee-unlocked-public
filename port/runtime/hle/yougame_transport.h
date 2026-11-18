@@ -200,7 +200,7 @@ class Stream {
     // replacing it could deliberately evict a seat which connected after the timeout.
     if (conn_ && !closed_) return ready_ || wait_open(until, cancelled);
     if (conn_) events_.retire(conn_);
-    conn_ = 0; pending_.clear(); ready_ = false; code_ = 1006; lobby_mismatch_ = false; kind_refused_ = false; busy_ = false; full_ = false;
+    conn_ = 0; live_conn_ = 0; pending_.clear(); ready_ = false; code_ = 1006; lobby_mismatch_ = false; kind_refused_ = false; busy_ = false; full_ = false;
     json q = {{"type", "netOpen"}, {"ticket", ticket}};
     if (!room.empty()) q["room"] = room;
     if (!session.empty()) q["session"] = session;
@@ -222,6 +222,16 @@ class Stream {
     try { request_({{"type", "netSend"}, {"conn", conn_}, {"data", m.dump()}}, 1000); return true; }
     catch (...) { return false; } // timeout/backpressure/rate limiting loses a message, not the stream
   }
+  // send() without mutex_: the room relay's sender never waits behind next()'s blocking event read.
+  // Uses the connection that last opened; a message raced by a close is lost, like any relayed datagram.
+  // `via` carries the request: the owner's request_ may read state its pump thread reassigns (an open's
+  // cancel), so the relay passes one of its own that reads nothing shared.
+  bool send_now(const json& m, const Request& via) {
+    const int id = live_conn_.load();
+    if (id <= 0 || closed_ || !via) return false;
+    try { via({{"type", "netSend"}, {"conn", id}, {"data", m.dump()}}, 1000); return true; }
+    catch (...) { return false; }
+  }
   bool next(json& m, int ms) {
     std::lock_guard<std::mutex> lock(mutex_);
     const uint64_t until = clock_() + ms;
@@ -230,9 +240,9 @@ class Stream {
       if (!pending_.empty() && ready_) { p = std::move(pending_.front()); pending_.pop_front(); }
       else if (!conn_ || closed_ || !events_.next(conn_, p, (int)std::max<int64_t>(0, (int64_t)until - clock_()))) return false;
       const auto event = str(p, "event");
-      if (event == "open") ready_ = true;
+      if (event == "open") { ready_ = true; live_conn_ = conn_; }
       if (event == "error") record_error(p);
-      if (event == "close") { closed_ = true; ready_ = false; record_close(p); return false; }
+      if (event == "close") { closed_ = true; ready_ = false; live_conn_ = 0; record_close(p); return false; }
       if (event == "message" && !ready_) { pending_.push_back(std::move(p)); continue; }
       if (event == "message" && p.count("data") && p["data"].is_string()) {
         m = json::parse(p["data"].get<std::string>(), nullptr, false);
@@ -243,7 +253,7 @@ class Stream {
   }
   void close(int timeout = 1000, int code = 1000) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const int id = conn_; conn_ = 0; ready_ = false; pending_.clear();
+    const int id = conn_; conn_ = 0; live_conn_ = 0; ready_ = false; pending_.clear();
     const bool reported_closed = closed_; closed_ = true;
     if (!id) return;
     events_.retire(id);
@@ -268,7 +278,7 @@ class Stream {
   void agent_test_drop_room() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (closed_ || !conn_) return;
-    const int id = conn_; conn_ = 0; ready_ = false; pending_.clear();
+    const int id = conn_; conn_ = 0; live_conn_ = 0; ready_ = false; pending_.clear();
     code_ = 1006; closed_ = true;
     events_.retire(id);
     // 1006 is local-only (reserved on the wire). Use the app's existing teardown request.
@@ -301,10 +311,10 @@ class Stream {
       if (!events_.next(conn_, p, slice)) { if (slice == 0) return false; continue; }
       if (cancelled && cancelled()) return false;
       const auto event = str(p, "event");
-      if (event == "open") { ready_ = true; return true; }
+      if (event == "open") { ready_ = true; live_conn_ = conn_; return true; }
       if (event == "message") pending_.push_back(std::move(p));
       if (event == "error") record_error(p);
-      if (event == "close") { record_close(p); closed_ = true; return false; }
+      if (event == "close") { record_close(p); closed_ = true; live_conn_ = 0; return false; }
     }
   }
   Events& events_;
@@ -312,6 +322,7 @@ class Stream {
   std::function<uint64_t()> clock_;
   mutable std::mutex mutex_;
   int conn_ = 0, code_ = 1006;
+  std::atomic<int> live_conn_{0};   // conn_ once open, for send_now
   std::atomic<bool> closed_{true};
   bool ready_ = false, lobby_mismatch_ = false, kind_refused_ = false, busy_ = false, full_ = false;
   std::deque<json> pending_;

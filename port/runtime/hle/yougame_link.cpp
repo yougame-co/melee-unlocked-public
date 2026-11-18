@@ -25,6 +25,7 @@
 #include "yougame_exit_reason.h"
 #include "yougame_ranked.h"
 #include "yougame_room.h"
+#include "yougame_room_relay.h"
 #include "yougame_lobby.h"
 #include "yougame_doubles_lobby.h"
 #include "yougame_console_link.h"
@@ -787,6 +788,11 @@ thread_local json g_ticket_out_of_date;
 // The local channel: the raw code of this thread's last refusal (letters only, <= 24, for the timing
 // lines), and accountSwitching's wait before asking again (0 for any other answer).
 thread_local std::string g_channel_code;
+// The app's raw answer, {ok:false, code} included, over whichever bridge this run has (stdio, the local
+// channel of a game the player started, or the launcher's HTTP). Throws only when nothing answers.
+json bridge_raw(const json& body, int timeout_ms) {
+  return g_stdio ? bridge_stdio(body, timeout_ms) : g_channel_allowed ? bridge_channel(body, timeout_ms) : bridge_http(body, timeout_ms);
+}
 thread_local uint64_t g_channel_retry_after = 0;
 json bridge(const json& body, int timeout_ms = 15000, const std::function<bool()>& cancelled = {}) {
   g_bridge_refusal.clear();
@@ -903,9 +909,12 @@ json tournament_bridge(const json& body, tourney::Deadline deadline, int answer_
 // ------------------------------------------------------------------ WebSocket (WinHTTP)
 // A reader thread queues each JSON message; next() waits on the queue, so the caller can poll its
 // cancel flag. Closing the handle from another thread ends the blocking receive.
+class Socket;
+bool relay_intercept(Socket* socket, const json& m);   // the room relay (below): true when m was its frame
+void relay_forget(Socket* socket);
 class Socket {
  public:
-  ~Socket() { close(); }
+  ~Socket() { relay_forget(this); close(); }
   bool open_session(const std::string& url, const std::string& ticket, const std::string& room, std::string* error, int timeout = 10000, const std::function<bool()>& cancelled = {}, const std::string& session = {}) {
     if (cancelled && cancelled()) return false;
     cancel_open_ = cancelled;
@@ -1006,8 +1015,23 @@ class Socket {
     std::string data = j.dump();
     return WinHttpWebSocketSend(ws_, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, data.data(), (DWORD)data.size()) == NO_ERROR;
   }
+  // The room relay's sender: never waits behind next()'s blocking read (transport::Stream::send_now).
+  // The relay's sends: no open's cancel (open_session reassigns cancel_open_ on the pump thread).
+  bool send_now(const json& j) {
+    return broker_ ? broker_->send_now(j, [](const json& q, int ms) { return bridge(q, ms); }) : send(j);
+  }
   // Up to timeout_ms for the next message; false on timeout or once the socket has closed and drained.
+  // Room relay frames (mu.relay) go to the relay here, so no caller ever sees one.
   bool next(json& out, int timeout_ms) {
+    const uint64_t until = now_ms() + (uint64_t)std::max(0, timeout_ms);
+    for (;;) {
+      const uint64_t now = now_ms();
+      if (!next_raw(out, now < until ? (int)(until - now) : 0)) return false;
+      if (!relay_intercept(this, out)) return true;
+      if (now_ms() >= until) return false;
+    }
+  }
+  bool next_raw(json& out, int timeout_ms) {
     if (broker_) return broker_->next(out, timeout_ms);
     std::unique_lock<std::mutex> lock(mutex_);
     cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this] { return !queue_.empty() || closed_; });
@@ -1070,6 +1094,110 @@ class Socket {
   std::deque<json> queue_;
   std::atomic<bool> closed_{false};
 };
+
+// ------------------------------------------------------------------ room relay (yougame_room_relay.h)
+// One relay at a time: the match (or console session) that started it owns it and stops it wherever its
+// links would close. Its sends go through the room socket it started on; a socket that goes away leaves
+// the relay idle until the next socket of the room hears a relay frame (a room reconnect).
+std::mutex g_relay_mutex;
+std::shared_ptr<room_relay::Relay> g_relay;     // g_relay_mutex
+const void* g_relay_owner = nullptr;            // g_relay_mutex
+Socket* g_relay_socket = nullptr;               // g_relay_mutex
+std::atomic<bool> g_relay_heard{false};         // a relay frame arrived while none ran: a peer relays
+// After an explicit no_direct (the app says its links helper is missing), searches skip the attach and
+// relay until this steady-clock time: a cooldown, so a helper the app starts again is used once it is
+// up. No answer or any other refusal relays only that search or session and leaves this alone; a later
+// attach that succeeds clears it.
+constexpr uint64_t kNoHelperCooldownMs = 60000;
+std::atomic<uint64_t> g_no_helper_until{0};
+uint64_t relay_clock() {
+  return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+void no_helper_cooldown() { g_no_helper_until = relay_clock() + kNoHelperCooldownMs; }
+bool no_helper_cooling() { return relay_clock() < g_no_helper_until.load(); }
+void helper_attached() { g_no_helper_until = 0; }
+void relay_datagram(unsigned link, const void* data, size_t n) {   // yg_enet_socket.c's callback
+  std::shared_ptr<room_relay::Relay> r;
+  { std::lock_guard<std::mutex> lock(g_relay_mutex); r = g_relay; }
+  if (r) r->queue(link, data, n);
+}
+room_relay::Relay::Send relay_sender(Socket* socket) {
+  return [socket](const json& m) { return socket->send_now(m); };
+}
+void relay_stop(const void* owner) {
+  std::shared_ptr<room_relay::Relay> r;
+  {
+    std::lock_guard<std::mutex> lock(g_relay_mutex);
+    if (!g_relay || (owner && g_relay_owner != owner)) return;
+    r = std::move(g_relay);
+    g_relay_owner = nullptr;
+    g_relay_socket = nullptr;
+  }
+  r->stop();
+  yg_enet_relay_end();
+  host::log("yougame: room relay ended (%llu sent, %llu received, %llu dropped)", (unsigned long long)r->sent(),
+            (unsigned long long)r->received(), (unsigned long long)(r->dropped() + yg_enet_relay_dropped()));
+}
+// Starts this seat's relay to the other seats (in-game ports). Link ids by port, or empty when it can't.
+std::map<int, unsigned> relay_start(const void* owner, Socket* socket, int me, const std::vector<int>& ports) {
+  auto links = room_relay::links_for(me, ports);
+  if (!socket || links.empty() || me < 1 || me > 4) return {};
+  relay_stop(nullptr);
+  auto r = std::make_shared<room_relay::Relay>(me, links, relay_sender(socket),
+      [](unsigned link, const std::string& bytes) { yg_enet_relay_in(link, bytes.data(), bytes.size()); });
+  yg_enet_relay_callback(relay_datagram);
+  if (yg_enet_relay_begin((unsigned)links.size())) return {};
+  {
+    std::lock_guard<std::mutex> lock(g_relay_mutex);
+    g_relay = r;
+    g_relay_owner = owner;
+    g_relay_socket = socket;
+    g_relay_heard = false;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_link_mutex);
+    for (const auto& kv : links) g_link_routes[kv.second] = "relay";
+  }
+  r->start();
+  host::log("yougame: room relay on: seat %d, %d peer%s", me, (int)links.size(), links.size() == 1 ? "" : "s");
+  return links;
+}
+bool relay_running(const void* owner = nullptr) {
+  std::lock_guard<std::mutex> lock(g_relay_mutex);
+  return g_relay && (!owner || g_relay_owner == owner);
+}
+bool relay_intercept(Socket* socket, const json& m) {
+  if (!room_relay::is_frame(m)) return false;
+  std::shared_ptr<room_relay::Relay> r;
+  {
+    std::lock_guard<std::mutex> lock(g_relay_mutex);
+    r = g_relay;
+    if (!r) { g_relay_heard = true; return true; }
+    if (!g_relay_socket) { g_relay_socket = socket; r->rebind(relay_sender(socket)); }
+  }
+  r->receive(m);
+  return true;
+}
+void relay_forget(Socket* socket) {
+  std::lock_guard<std::mutex> lock(g_relay_mutex);
+  if (!g_relay || g_relay_socket != socket) return;
+  g_relay_socket = nullptr;
+  g_relay->rebind({});
+}
+// The answer that sends this seat to the relay: the app's links helper is missing (no_direct) or the app
+// never answered the attach. Read right after the failed request (any later bridge call clears it).
+bool helper_refused() { return g_bridge_refusal == "no_direct"; }
+// Any refusal with a code (no_direct, ended, ...): the app answered and won't attach.
+bool attach_refused() { return !g_bridge_refusal.empty() && g_bridge_refusal != "update_required"; }
+// A relay still on from an earlier match (a parked room, or a room whose shutdown has not run yet)
+// would take every datagram of a match on links: stop it before links start.
+void relay_clear_stale() {
+  if (!yg_enet_relay_active()) return;
+  host::log("yougame: a room relay was still on from an earlier match: ending it before links");
+  relay_stop(nullptr);
+  if (yg_enet_relay_active()) yg_enet_relay_end();
+}
 
 // ------------------------------------------------------------------ addresses
 std::string addr_string(const sockaddr_in& a) {
@@ -1276,6 +1404,7 @@ struct Room : transport::RoomState<Socket> {
   bool doubles_match = false;
   std::string doubles_home;
   ~Room() {
+    relay_stop(this);   // before the socket goes: the relay sends through it
     // Also runs on cancelled/failed setup: no abandoned links occupy the three slots.
     transport::close_links(links, [](const json& q, int ms) { return bridge(q, ms); });
   }
@@ -1388,6 +1517,7 @@ transport::RoomIO room_io(Room& r) {
   };
   io.link_state = direct_state;
   io.disable_links = [] { yg_enet_enable(0); };
+  io.end_relay = [&r] { if (relay_running(&r)) { yg_enet_enable(0); relay_stop(&r); } };
   io.log = [](const char* message) { host::log("%s", message); };
   io.started = [](const std::string& id) { g_rank_results.pending(id); };
 #ifdef MELEE_DOUBLES
@@ -2193,21 +2323,52 @@ struct ConsoleBackend {
       return closed || (outgoing.empty() && sending == 0);
     }) && !closed;
   }
+  // The room relay (yougame_room_relay.h) instead of links: the app's links helper refused the attach
+  // (no_direct, or any other refusal) or never answered, and this session has a room to carry datagrams.
+  std::atomic<bool> relay{false};
+  bool relay_ready() const { return room && !room->closed(); }
+  bool use_relay(const char* why) {
+    if (!relay_ready()) return false;
+    relay = true;
+    host::log("%s (%s)", room_relay::kLog, why);
+    return true;
+  }
+  // Starts this seat's relay once the session knows its seats; each peer port's link, or empty.
+  std::map<int,unsigned> relay_open(int me, const std::vector<int>& ports) {
+    if (!relay_ready()) return {};
+    auto links = relay_start(this, room.get(), me, ports);
+    if (links.empty()) return {};
+    relay = true; helper_missing = false;
+    yg_enet_select(1); yg_enet_enable(1);
+    if (datagrams == ENET_SOCKET_NULL) datagrams = yg_enet_create();
+    if (datagrams == ENET_SOCKET_NULL) { relay_stop(this); return {}; }
+    return links;
+  }
   bool attach(int ms) {
     helper_missing = false; // only a no_direct refusal below sets it again
     if (retiring) return false; // a cancelled preparing entry must not wait on its own retire
     wait_console_retired([this] { return retiring.load(); }); // every console-session attach shares the process-global channel
     if (ms <= 0) return false;
     if (retiring) return false;
+    if (relay) return true;   // this session already relays (a peer asked, or an earlier attach)
     if (!yg_enet_channel_ready()) {
+      if (no_helper_cooling() && use_relay("the links helper refused a moment ago")) return true;
       // Like directOpen: a refused attach answers {ok:false, code} (no_direct when the links helper is
       // missing or won't start). Log the code (letters and _ only) instead of throwing it away.
-      json raw = g_stdio ? bridge_stdio({{"type","directAttach"}},ms) : bridge_http({{"type","directAttach"}},ms);
+      json raw;
+      try { raw = bridge_raw({{"type","directAttach"}},ms); }
+      catch (const BridgeNoAnswer&) {
+        host::log("console: link helper attach got no answer");
+        if (use_relay("no answer")) return true;
+        throw;
+      }
       if (!raw.value("ok",false)) {
         std::string code = ranked::str(raw,"code");
         if (code.empty() || code.size() > 24 || code.find_first_not_of("abcdefghijklmnopqrstuvwxyz_") != std::string::npos) code = "unknown";
         host::log("console: link helper attach refused (%s)", code.c_str());
         helper_missing = code == "no_direct";
+        if (helper_missing) no_helper_cooldown();   // only no_direct is remembered, and only for a while
+        if (use_relay(code.c_str())) return true;
         return false;
       }
       const auto h = raw.count("result") ? raw["result"] : json::object();
@@ -2218,7 +2379,9 @@ struct ConsoleBackend {
       transport::PosixAttachment p;
       if (!transport::posix_attachment(h,p) || yg_enet_attach_posix(p.section,p.wake,p.wait,p.size)) return false;
 #endif
+      helper_attached();
     }
+    relay_clear_stale();
     yg_enet_select(1); yg_enet_enable(1);
     datagrams = yg_enet_create(); // explicitly virtual: never falls back to an OS UDP socket
     return datagrams != ENET_SOCKET_NULL;
@@ -2229,6 +2392,7 @@ struct ConsoleBackend {
     cv.notify_all();
     if (worker.joinable()) worker.join();
     closed = true; cv.notify_all();
+    relay_stop(this); relay = false;   // before the room: the relay sends through its socket
     // A clean close preserves Rooms' relaunch hold. Never send an explicit leave.
     if (room) { room->close(1000); room.reset(); }
     if (datagrams != ENET_SOCKET_NULL) { yg_enet_destroy(datagrams); datagrams = ENET_SOCKET_NULL; yg_enet_enable(0); }
@@ -2299,6 +2463,10 @@ SessionIO console_io(const std::shared_ptr<ConsoleBackend>& b) {
   io.background_service = true;
   io.random = random64;
   io.request = [b](const json& q,int ms) {
+    // A room relay link is this game's own: nothing for the app to close.
+    if (ranked::str(q,"type") == "directClose" && q.count("link") && q["link"].is_number_unsigned() &&
+        q["link"].get<unsigned>() >= room_relay::kLink0 && q["link"].get<unsigned>() < room_relay::kLink0 + room_relay::kMaxLinks)
+      return json::object();
     if (ranked::str(q,"type") == "directClose" && b->retiring) {
       std::lock_guard<std::mutex> lock(b->mutex); b->retired_links.push_back(q);
       return json::object();
@@ -2306,7 +2474,7 @@ SessionIO console_io(const std::shared_ptr<ConsoleBackend>& b) {
     // A refused directOpen answers {ok:false, code} (no_direct, not_room, not_peer, exists, rate_links, ended).
     // bridge() would throw that away; hand the code (letters and _ only) to the link log instead.
     if (ranked::str(q,"type") == "directOpen") {
-      json j = g_stdio ? bridge_stdio(q,ms) : bridge_http(q,ms);
+      json j = bridge_raw(q,ms);
       if (j.value("ok",false)) return j.count("result") ? j["result"] : json::object();
       std::string code = ranked::str(j,"code");
       if (code.empty() || code.size() > 24 || code.find_first_not_of("abcdefghijklmnopqrstuvwxyz_") != std::string::npos) code = "unknown";
@@ -2348,6 +2516,8 @@ SessionIO console_io(const std::shared_ptr<ConsoleBackend>& b) {
   io.connection = [b] { return b->conn.load(); };
   io.attach = [b](int ms) { return b->attach(ms); };
   io.helper_missing = [b] { return b->helper_missing.load(); };
+  io.relay = [b] { return b->relay.load(); };
+  io.relay_open = [b](int me,const std::vector<int>& ports) { return b->relay_open(me,ports); };
   io.state = direct_state;
   io.route = [](unsigned id) { std::lock_guard<std::mutex> lock(g_link_mutex); return g_link_routes[id]; };
   io.rtt = [](unsigned id) {
@@ -4498,6 +4668,9 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   const bool adopted = parked != nullptr;
   std::map<std::string, unsigned> adopted_links;
   auto room = adopted ? std::move(parked) : std::make_unique<Room>();
+  // A parked room kept its links (keep_links: end_links never ran), and with them a relay it ran: the
+  // next match decides relay or links again, so this one ends here, outside g_mutex (it joins a thread).
+  if (adopted && relay_running(room.get())) { yg_enet_enable(0); relay_stop(room.get()); }
   if (adopted) {
     std::lock_guard<std::mutex> lock(g_mutex);
     room->games = transport::Games{};
@@ -4756,6 +4929,30 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
 #endif
     g_links_epoch = epoch;
   };
+  // The room relay (yougame_room_relay.h): this seat's app has no links helper (directAttach refused
+  // no_direct, or never answered). Known before the first candidate goes out, which says so (relay:true),
+  // so every seat of the match relays. No answer or another refusal relays this search only; no_direct
+  // also skips the attach for kNoHelperCooldownMs; an attach that succeeds clears that.
+  bool relay_self = false;
+  const auto probe_relay = [&](const char* when) {
+    if (!links_mode || relay_self) return;
+    const char* why = "the links helper refused a moment ago";
+    if (!no_helper_cooling()) {
+      try { attach_links(); helper_attached(); return; }
+      catch (const update::Required&) { throw; }
+      catch (const BridgeNoAnswer& e) { why = "the app did not answer the attach"; host::log("yougame: direct attach %s failed: %s", when, e.what()); }
+      catch (const std::exception& e) {
+        const bool no_direct = helper_refused();
+        if (!no_direct && !attach_refused()) { host::log("yougame: direct attach %s failed: %s", when, e.what()); return; }
+        if (no_direct) { no_helper_cooldown(); why = "no_direct"; }
+        else { why = "the app refused the attach"; host::log("yougame: direct attach %s refused: %s", when, e.what()); }
+      }
+      if (cancelled()) return;
+    }
+    relay_self = true;
+    host::log("%s (%s)", room_relay::kLog, why);
+  };
+  const auto relay_flag = [](const json& c) { return c.is_object() && c.count("relay") && c["relay"].is_boolean() && c["relay"].get<bool>(); };
   // The room's roster decides links or own UDP for every seat alike (links_hello seats only; a seat without
   // links never had a choice). A change restarts the address exchange in the new shape; a lobby back on
   // links attaches and opens its seated friends' links again.
@@ -4774,19 +4971,14 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     host::log("yougame: every seat has YouGame links again: back to direct links");
     if (lobby_route) {
       reopen_seated = true;
-      try { attach_links(); }
-      catch (const update::Required&) { throw; }
-      catch (const std::exception& e) { host::log("yougame: direct attach in the lobby failed: %s", e.what()); }
+      probe_relay("in the lobby");
     }
   };
   decide_transport();
   // A lobby opens each friend's link when they take a seat, so attach first: a game whose first online
   // mode this run is the lobby was refused no_direct there while a host already attached waited on it.
-  if (links_mode && lobby_route) {
-    try { attach_links(); }
-    catch (const update::Required&) { throw; }
-    catch (const std::exception& e) { host::log("yougame: direct attach before the lobby failed: %s", e.what()); }
-  }
+  // Every links search attaches here too, before its first candidate: a missing helper means the relay.
+  if (links_mode) probe_relay(lobby_route ? "before the lobby" : "before the match");
   // An invited room says welcome as soon as it opens: without one in kHelloMs the join ends on a line, never a
   // silent wait (the loop's hello_by check).
   if (invited && !adopted) hello_by = now_ms() + friends::kHelloMs;
@@ -4922,6 +5114,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
           // joined, and once we hold every address we stop sending.
           if (!cands.count(from)) sent_at.erase(from);
           cands[from] = links_mode ? transport::candidate(true, d.value("compat", ""), d.value("code", ""), d.value("match", ""), "", "", "") : d;
+          if (links_mode && relay_flag(d)) cands[from]["relay"] = true;   // that seat relays: so does the match
         }
       }
     } else if (room->socket->closed()) {
@@ -4996,8 +5189,8 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
         search.lobby_control->run(*lobby_session, lobby_link_info(*lobby_session, participants, early.links.by_peer), room_code);
       for (auto& f : lobby_session->due(now_ms())) room->socket->send(f);
       for (const auto& seated : lobby_session->take_seated())
-        if (links_mode) early.links.open<update::Required>(room->socket->connection(), connection_of(seated.id), request_app);
-      if (reopen_seated && links_mode && lobby_session->known()) {
+        if (links_mode && !relay_self) early.links.open<update::Required>(room->socket->connection(), connection_of(seated.id), request_app);
+      if (reopen_seated && links_mode && !relay_self && lobby_session->known()) {
         reopen_seated = false;
         for (const auto& seat : lobby_session->state().seats)
           if (seat.kind == lobby::Kind::Human && seat.id != lobby_me)
@@ -5174,9 +5367,10 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
         if (conn == room->me || p.value("localIndex", 0) != 0) continue;
         if (sent_at.count(conn) && now_ms() - sent_at[conn] < 1000) continue;
         if (!links_mode && !tokens.count(conn)) tokens[conn] = random64() | 1;
-        room->socket->send({{"t", "msg"}, {"to", conn},
-          {"d", transport::candidate(links_mode, compat, me.code, my_match_id, lan_addr, external,
-                                     links_mode ? "" : hex64(tokens[conn]))}});
+        json cand = transport::candidate(links_mode, compat, me.code, my_match_id, lan_addr, external,
+                                         links_mode ? "" : hex64(tokens[conn]));
+        if (links_mode && relay_self) cand["relay"] = true;
+        room->socket->send({{"t", "msg"}, {"to", conn}, {"d", std::move(cand)}});
         sent_at[conn] = now_ms();
       }
     }
@@ -5224,10 +5418,45 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     peers.push_back(peer);
   }
   const uint64_t connect_start = now_ms();   // linkReport's ms
-  if (links_mode) {
+  // Any seat without a links helper (its candidate said relay, or this one) moves the whole match onto
+  // the room relay: the same datagrams, carried by the room's msg relay.
+  bool relay_match = links_mode && relay_self;
+  if (links_mode) for (const auto& kv : cands) if (relay_flag(kv.second)) relay_match = true;
+  if (relay_match) {
+    if (!relay_self) host::log("yougame: a seat has no direct links helper: this match uses the room relay");
+    if (lobby_route) early.links.forget_all(close_app);   // no ring links wait for anyone
+    std::vector<int> ports;
+    for (const auto& peer : peers) ports.push_back(peer.port);
+    const auto links = relay_start(room.get(), room->socket.get(), my_seat + 1, ports);
+    if (links.empty()) {
+      host::log("yougame: the room relay could not start");
+      return fail(console::kHelperMissing, false);
+    }
+    for (auto& peer : peers) {
+      const auto it = links.find(peer.port);
+      if (it == links.end()) continue;
+      peer.chosen.sin_family = AF_INET;
+      peer.chosen.sin_addr.s_addr = htonl(0x0aff0000u | it->second);
+      peer.chosen.sin_port = htons(7777);
+    }
+    if (lobby_route) {
+      room->lobby_links.clear();
+      for (const auto& p : participants) {
+        const std::string conn = p.value("connectionId", "");
+        const auto it = links.find(p.value("slot", -1) + 1);
+        if (conn != room->me && it != links.end()) room->lobby_links[conn] = it->second;
+      }
+    }
+    { std::lock_guard<std::mutex> lock(g_mutex);
+      if (cancelled()) { relay_stop(room.get()); return fail("Cancelled"); }
+      yg_enet_enable(1);
+    }
+  } else if (links_mode) {
+    relay_clear_stale();
     try {
       // Idempotent once per run. Mapping stays alive across matches; only the host owns ring I/O.
       attach_links();
+      helper_attached();
       std::vector<std::string> remotes;
       for (const auto& p : participants) if (p.value("connectionId", "") != room->me) remotes.push_back(p.value("connectionId", ""));
       if (lobby_route) {
@@ -5266,14 +5495,18 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       }
     } catch (const update::Required&) { throw; }
     catch (...) {
-      // Read first: any later bridge call clears it. no_direct is this computer's own helper, so no
-      // other opponent can work: say why and stop, instead of searching again and bouncing each one.
-      const bool helper_missing = g_bridge_refusal == "no_direct";
+      // Read first: any later bridge call clears it. no_direct is this computer's own helper: the helper
+      // went away after this search attached. The other seats are already waiting on links, so this
+      // attempt fails as a link failure; the next search on this app goes straight to the room relay.
+      const bool helper_missing = helper_refused();
       try { throw; }
       catch (const std::exception& e) { host::log("yougame: direct links failed: %s", e.what()); }
       catch (...) { host::log("yougame: direct links failed"); }
       if (cancelled()) return fail("Cancelled");
-      if (helper_missing) return fail(console::kHelperMissing, false);
+      if (helper_missing) {
+        no_helper_cooldown();
+        host::log("yougame: the links helper refused (no_direct): the next search uses the room relay");
+      }
       // Count only peers whose link failed, never a teammate who connected.
       // Even a partial successful link resets the previous failure history.
       json failed_participants = json::array();
@@ -5331,14 +5564,15 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     // search or the session's end, whatever an identity refresh selects meanwhile.
     if (!cancelled() && links_hello && !links_mode) { g_own_udp_match = true; select_match_transport(g_slippi_match); }
   }
+  // The relay reports via links, path relay (rooms keeps any path it does not know as "bad").
   room->socket->send(transport::link_report(true, links_mode ? std::string("links")
       : peers.empty() ? std::string("none") : std::string(answered_via(peers.front(), peers.front().chosen)),
-      now_ms() - connect_start, !links_mode, links_mode ? transport::links_path(room->links.ids, [](unsigned id) {
+      now_ms() - connect_start, !links_mode, relay_match ? std::string("relay") : links_mode ? transport::links_path(room->links.ids, [](unsigned id) {
         std::lock_guard<std::mutex> lock(g_link_mutex);
         const auto it = g_link_routes.find(id);
         return it == g_link_routes.end() ? std::string() : it->second;
       }) : std::string()));
-  host::log("yougame: transport %s", links_mode ? "YouGame direct links"
+  host::log("yougame: transport %s", relay_match ? "the YouGame room relay" : links_mode ? "YouGame direct links"
             : links_hello ? "own UDP (a seat has no YouGame links)" : "own UDP");
   Match out;
   out.ok = true;
