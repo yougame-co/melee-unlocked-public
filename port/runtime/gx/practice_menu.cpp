@@ -1441,7 +1441,8 @@ void draw_intro(ImDrawList* dl, const Frame& f) {
   }
   // Then small at the top right: the buttons and what they open (dimmer after half a minute).
   const float u = gu * 0.8f, alpha = since < 30.0f ? 0.95f : 0.55f;
-  const char* spec = "S:+|D:Up  +|Z:Find a match, practice menu";
+  const char* spec = neural_ghosts() ? "S:+|D:Up  +|Z:Practice menu: Fight a pro, find a match"
+                                     : "S:+|D:Up  +|Z:Find a match, practice menu";
   const float hw = hints(dl, 0, 0, u, spec, alpha, false);
   hints(dl, f.game_x1 - hw - 8 * u, f.game_y0 + 30 * u, u, spec, alpha);
 }

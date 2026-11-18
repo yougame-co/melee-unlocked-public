@@ -4203,7 +4203,9 @@ static void draw_native_practice(SettingsState& state, RenderOptions& options,
   static bool counted_open = false;
   if (state.practice_open && !counted_open && options.practice_opens < 99) { ++options.practice_opens; state.dirty = true; }
   counted_open = state.practice_open;
-  const bool show_hint = options.matchmaking_hint && options.practice_opens < 3;
+  // The corner hint stays in every Training match (owner 11-17: players must see how to open it for
+  // Fight a pro); the setting still hides it. The big banner is still for the first opens only.
+  const bool show_hint = options.matchmaking_hint;
 
   // The Practice menu's looks (practice_menu.cpp). The window further down is the "Window" look, and
   // what "All settings" opens until the menu is closed again.
