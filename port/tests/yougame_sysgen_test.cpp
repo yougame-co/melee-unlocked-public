@@ -1,6 +1,7 @@
 // Synthetic fixtures and shipped manifest. No disc, game process, network or external delta encoder.
 #include "sysgen.h"
 #include "vcdiff.h"
+#include <map>
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
@@ -150,8 +151,16 @@ static void shipped_manifest_tests() {
     check(fs::file_size(delta) > 0, "shipped delta is nonempty: " + delta.string());
   }
   std::sort(targets.begin(), targets.end());
-  check(targets == std::vector<std::string>{"GameSetup_gui.dat", "slpCSS.dat"},
-        "shipped manifest contains exactly the two required targets");
+  check(targets == std::vector<std::string>{"GameSetup_gui.dat", "SlippiCSS_gui.dat", "slpCSS.dat"},
+        "shipped manifest contains exactly the three required targets");
+  // Pinned to upstream v0.9.207 (Slippi 3.7.0, e6478b848): a new upstream Sys file needs new deltas
+  // (make_sys_deltas.py --targets-rev <tag>), never a stale rebuild of the old one.
+  const std::map<std::string, std::string> upstream = {
+      {"GameSetup_gui.dat", "cb78574af8b6ceede7890d4a6a74d61afefdd8df"},
+      {"slpCSS.dat", "c70c600663ded2fefe11aeb439f3e61125273651"},
+      {"SlippiCSS_gui.dat", "c613efa143e9efb6effeb98aa6f8650243f88977"}};
+  for (const auto& file : files)
+    check(upstream.count(file.target) && upstream.at(file.target) == file.sha1, "shipped target is upstream 3.7.0's: " + file.target);
 }
 static void applier_tests(const fs::path& root) {
   const Bytes target = bytes("hello"), source = bytes("disc"), second_source = bytes("extra");
@@ -191,6 +200,7 @@ static void applier_tests(const fs::path& root) {
   for (const auto* folder : {"Sys", "SysPlayback", "slippi_sys_general"}) {
     write(build / folder / "GameFiles/GALE01/GameSetup_gui.dat", target);
     write(build / folder / "GameFiles/GALE01/slpCSS.dat", bytes("staging"));
+    write(build / folder / "GameFiles/GALE01/SlippiCSS_gui.dat", bytes("staging"));
   }
   check(assets.prepare(config, disc, error), "staging without manifest: " + error);
   check(assets.status_message().empty(), "no manifest produces no status message");

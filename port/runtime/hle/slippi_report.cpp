@@ -24,7 +24,7 @@
 namespace slippi::report {
 namespace {
 using json = nlohmann::json;
-const wchar_t* USER_AGENT = L"SlippiDolphin (b: ishiiruka) (v: 3.6.4) (o: windows)";
+const wchar_t* USER_AGENT = L"SlippiDolphin (b: ishiiruka) (v: 3.7.0) (o: windows)";
 const char* ENDPOINT = "https://internal.slippi.gg/graphql";
 constexpr int MAX_ATTEMPTS = 5;
 

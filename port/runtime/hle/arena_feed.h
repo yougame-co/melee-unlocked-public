@@ -24,9 +24,9 @@
 
 namespace slippi::arena_feed {
 
-constexpr uint8_t kVersion = 1;
+constexpr uint8_t kVersion = 2;   // 2: Slippi 3.7.0's 92-byte post-frame event
 // The recording's event sizes this build writes (native_replay_stream.cpp begin_slippi).
-constexpr uint16_t kFrameStartSize = 12, kPreFrameSize = 66, kPostFrameSize = 84, kGameEndSize = 6;
+constexpr uint16_t kFrameStartSize = 12, kPreFrameSize = 66, kPostFrameSize = 92, kGameEndSize = 6;
 constexpr int32_t kFirstFrame = -123;
 
 enum Kind : uint8_t { kStart = 1, kFrame = 2, kEnd = 3 };

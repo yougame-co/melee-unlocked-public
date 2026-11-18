@@ -15,6 +15,10 @@ namespace host::early_input {
 // The transport's send: called on the sampler thread, so it must only queue (every transport here
 // hands packets to its own network thread). `target` is the pad frame the change first appears in.
 using SendFn = void (*)(int32_t target, const uint8_t pad[kPadBytes]);
+// Slippi 3.7.0 input suggestions for Slippi players (hle/slippi_input_suggestions.h): the same
+// watching, judged by Slippi's own rule for which changes are worth sending, each with a sequence
+// number. Also called on the sampler thread or the game thread: it must only queue.
+using SuggestFn = void (*)(int32_t target, uint32_t seq, const uint8_t pad[kPadBytes]);
 
 // The player's setting (Online tab, "Early inputs"), with the MELEE_EARLY_INPUTS=0|1 test override
 // applied. Off: nothing is sent, nothing is announced to the other player, and received early pads
@@ -24,7 +28,7 @@ void set_enabled(bool on);
 
 // A match began: watch the controller and send through `send`. Does nothing while disabled or
 // already running. stop() ends the thread and must run before the transport goes away.
-void start(SendFn send);
+void start(SendFn send, SuggestFn suggest = nullptr);
 void stop();
 bool running();
 
@@ -32,6 +36,11 @@ bool running();
 // judges changes against, and the first non-neutral one identifies which controller the local
 // player is holding.
 void note_sent_pad(int32_t frame, const uint8_t pad[kPadBytes]);
+// The host finished a frame's online command, after note_sent_pad or note_skipped. `skipped`: the
+// polled pad was not sent and the same frame is polled again (`pad` is that unsent pad).
+// `advancing`: the game runs the next frame on this poll too, so the next poll is a frame later.
+// A change seen while the poll was being handled is released here, now that its frame is known.
+void note_frame_done(bool skipped, bool advancing, const uint8_t pad[kPadBytes]);
 
 // The pad in wire form (buttons big-endian, sticks, triggers), as hle_pad writes it for the game.
 void pad_to_wire(const PadState& pad, uint8_t out[kPadBytes]);
@@ -44,6 +53,7 @@ struct Stats {
   uint64_t resent_after_skip = 0;   // pads sent again after a skipped poll
   uint64_t follow_ups = 0;          // byte changes sent after a line crossing, before its poll
   uint64_t received = 0;  // early pads received from the other players (counted by the transports)
+  uint64_t suggestions = 0;   // Slippi input suggestions handed to the transport
   int local_port = -1;    // the controller port the local player was found on (-1: not yet)
 };
 Stats stats();

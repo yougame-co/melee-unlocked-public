@@ -47,6 +47,7 @@ constexpr int ENET_EVENT_TYPE_RECEIVE=1, ENET_EVENT_TYPE_DISCONNECT=2, ENET_EVEN
 int yg_enet_is_socket(int) { return 0; } bool yg_enet_enabled() { return true; }
 void enet_packet_destroy(ENetPacket*) {}
 void enet_peer_reset(ENetPeer*) { ++resets; }
+void disable_packet_throttle_drops(ENetPeer*) {}   // Slippi 3.7.0: every connected peer
 ENetPeer* enet_host_connect(ENetHost*,const ENetAddress* a,int,int) {
  ++connects;fallback_at=clock_ms; CHECK(a->host==public_host() && a->port==42000); return &pub;
 }

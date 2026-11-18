@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
     live.set_event_sink([&](const uint8_t* data, uint32_t size) { sent.insert(sent.end(), data, data + size); ++calls; });
     std::vector<uint8_t> slippi_start(0x2F8, 1);
     CHECK(live.begin_slippi(slippi_start, std::vector<uint8_t>(600, 0xCD), 1700000000));
-    std::vector<uint8_t> pre(66, 2), post(84, 3), book(8, 4), game_end(6, 5);
+    std::vector<uint8_t> pre(66, 2), post(92, 3), book(8, 4), game_end(6, 5);
     CHECK(live.append(0x37, pre.data(), (uint32_t)pre.size()));
     CHECK(live.append(0x38, post.data(), (uint32_t)post.size()));
     CHECK(live.append(0x3C, book.data(), (uint32_t)book.size()));

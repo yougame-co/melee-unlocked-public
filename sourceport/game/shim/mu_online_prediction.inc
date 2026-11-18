@@ -1,9 +1,12 @@
 /* Shared native predictor, included by mu_online.c and the window-free rollback harness.
  * Slippi policy stays on its original branches; console compares every controller field. */
-static int load_opponent_inputs(PADStatus* stat, int frame, int predicting_allowed)
+/* Section 10. *predicted_players gets a bit per remote index whose pad for this frame was kept as a
+ * prediction (REG_PREDICTED_PLAYERS, for section 11). */
+static int load_opponent_inputs(PADStatus* stat, int frame, int predicting_allowed, unsigned int* predicted_players)
 {
     int count, remote_port = 0, have_all = 1;
     u8* rxb = mu_online.rxb;
+    *predicted_players = 0;
     for (count = 0; count < REMOTES; count++, remote_port++) {
         int latest;
         const u8* slots = rxb + RXB_OPNT_INPUTS + count * RXB_INPUTS_COUNT * PAD_SIZE;
@@ -17,17 +20,27 @@ static int load_opponent_inputs(PADStatus* stat, int frame, int predicting_allow
         } else if (predicting_allowed && (mu_online.console_active || frame >= START_SYNC_FRAME - mu_online.delay) &&
                    !mu_online.game_over)
         {
-            /* Predicting: the newest confirmed pad, or an early pad the other player sent for a
-             * frame up to this one. Kept for comparison once the real input arrives. */
+            /* Predicting (Slippi 3.7.0): the host's pad for this frame among the frames after the
+             * latest one (the latest input, or a newer input suggestion from that player), the
+             * latest input past those, or an early pad the other player sent for a frame up to this
+             * one. The pad kept for the comparison is the one the game gets, so a wrong prediction
+             * always rolls back. The copy also clears the kept pad's PAD_RNG_ROLLBACK_MARKER: that
+             * byte of a remote pad is always zero. */
+            unsigned int ahead = (unsigned int) (frame - latest - 1);
             u8 w = mu_online.predicted_write[count];
             const u8* early = early_pad(count, frame, latest);
             have_all = 0;
+            /* Console rollback fills no host predictions: it keeps predicting the latest pad. */
+            if (!mu_online.console_active && ahead < RXB_INPUTS_COUNT) {
+                src = rxb + RXB_OPNT_PREDICTED_INPUTS + count * RXB_INPUTS_COUNT * PAD_SIZE + ahead * PAD_SIZE;
+            }
             if (early != NULL) {
                 src = early;
                 mu_online.early_used++;
             }
             memcpy(mu_online.predicted[count][w], src, PAD_SIZE);
             mu_online.predicted_early[count][w] = (u8) (early != NULL);
+            *predicted_players |= 1u << count;
             mu_online.predicted_write[count] = (u8) ((w + 1) % PREDICTED_INPUTS_COUNT);
             if (!mu_online.player_predicting[count]) {
                 mu_online.player_savestate_frame[count] = frame;
@@ -41,12 +54,102 @@ static int load_opponent_inputs(PADStatus* stat, int frame, int predicting_allow
         }
         if (remote_port < 4) {
             wire_to_pad(&stat[remote_port], src);
+            /* A slot with no player has no pad to load, and on the oldest frame of the longest
+             * rollback the index above runs past its inputs. Section 11 reads every slot's RNG
+             * bits, so these stay zero. Console rollback has no RNG bits: its analog A is real. */
+            if (!mu_online.console_active && count >= rxb[RXB_OPNT_COUNT]) {
+                stat[remote_port].analogA = 0;
+            }
         }
     }
     if (have_all) {
         mu_online.finalized = frame;
     }
     return have_all;
+}
+
+/* TriggerSendInput section 11 (Slippi 3.7.0): this frame's RNG bits, and the pad bits taken out of
+ * the inputs. A player could hold an input until a seed they like comes up to choose the result of
+ * a random special (turnip, hammer, misfire). So on the frame a player newly presses B with the
+ * stick toward one of those, the bits that came with the other players' pads of that frame (every
+ * player's, when several do it on the same frame) go into the top byte of that frame's seed
+ * (sync_rng_proc). Runs for every frame the game is given, re-simulated ones included, and keeps
+ * the result by frame. predicted_players: the remote indices whose pad here is a kept prediction. */
+static void prepare_rng_bits(PADStatus* stat, int frame, unsigned int predicted_players)
+{
+    unsigned int prev_b_held =
+        mu_online.b_held_history[(unsigned int) (frame - 1) & (RNG_HISTORY_COUNT - 1)];
+    unsigned int b_held = 0, rolling = 0, ports_used, seed_bits = 0;
+    u32 pad_bits = 0;   /* 8 bits per port, port 1 at the bottom */
+    int port, count;
+
+    for (port = 0; port < 4; port++) {
+        PADStatus* pad = &stat[port];
+        int x;
+        pad_bits |= (u32) pad->analogA << (8 * port);
+        pad->analogA = 0;
+        if (!(pad->button & 0x200)) {
+            continue;
+        }
+        b_held |= 1u << port;
+        if (prev_b_held & (1u << port)) {
+            continue;   /* not a fresh B press */
+        }
+        /* Whether this character rolls something with B and the stick selects that special. The
+         * game takes side-B at |x| >= 0.6 and down-B at y <= -0.55 after dividing by 80. These
+         * are raw values and its clamp can only shrink them, so a press that passes might not
+         * roll but one that fails never does. */
+        switch ((int) Player_GetPlayerCharacter(port)) {   /* PlayerBlock_LoadExternalCharID */
+        case CKind_Peach:
+            if (pad->stickY <= DOWN_B_MAX_STICK_Y) {
+                rolling |= 1u << port;
+            }
+            break;
+        case CKind_GameWatch:
+        case CKind_Luigi:
+            x = pad->stickX < 0 ? -pad->stickX : pad->stickX;
+            if (x >= SIDE_B_MIN_STICK_X) {
+                rolling |= 1u << port;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    mu_online.b_held_history[(unsigned int) frame & (RNG_HISTORY_COUNT - 1)] = (u8) b_held;
+
+    if (rolling != 0) {
+        /* Everyone's bits but the rolling player's, or everyone's when several roll. With one
+         * player rolling, that player's opponent always has the bits this needs even when
+         * predicting a press, so a correctly predicted press needs no rollback. */
+        ports_used = 0xF;
+        if (((rolling - 1) & rolling) == 0) {
+            ports_used &= ~rolling;
+        }
+        for (port = 0; port < 4; port++) {
+            if (ports_used & (1u << port)) {
+                seed_bits ^= (pad_bits >> (8 * port)) & 0xFF;
+            }
+        }
+        mu_online.rng_bit_frames++;
+        /* A predicted player whose bits were just used had no real bits for this frame, and
+         * section 9 only compares inputs: mark the kept prediction so that it forces a rollback.
+         * The write index is one past the prediction kept for this frame. */
+        for (count = 0; count < REMOTES; count++) {
+            int p = count < mu_online.local_index ? count : count + 1;
+            int idx;
+            if (!(predicted_players & (1u << count)) || !(ports_used & (1u << p))) {
+                continue;
+            }
+            idx = mu_online.predicted_write[count] - 1;
+            if (idx < 0) {
+                idx += PREDICTED_INPUTS_COUNT;
+            }
+            mu_online.predicted[count][idx][PAD_RNG_ROLLBACK_MARKER] = 1;
+        }
+    }
+    /* For sync_rng_proc when the engine processes this frame. */
+    mu_online.rng_seed_bits_history[(unsigned int) frame & (RNG_HISTORY_COUNT - 1)] = (u8) seed_bits;
 }
 
 static int used_slot(int frame)
@@ -210,6 +313,13 @@ static int check_predictions(int frame)
             }
             actual = rxb + RXB_OPNT_INPUTS + count * RXB_INPUTS_COUNT * PAD_SIZE + offset * PAD_SIZE;
             predicted = mu_online.predicted[count][mu_online.predicted_read[count]];
+            /* Slippi 3.7.0: section 11 marks a prediction when that frame's RNG used this player's
+             * bits before they arrived. The frame is redone with them, even if the inputs match. */
+            if (!mu_online.console_active && predicted[PAD_RNG_ROLLBACK_MARKER] != 0) {
+                mu_online.rng_rollbacks++;
+                rollback_required = 1;
+                break;
+            }
             if ((actual[0] & 0x1F) != (predicted[0] & 0x1F) ||
                 (actual[1] & 0x7F) != (predicted[1] & 0x7F) ||
                 memcmp(actual + 2, predicted + 2, 4) != 0)

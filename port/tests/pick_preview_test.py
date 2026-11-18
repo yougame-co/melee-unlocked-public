@@ -253,8 +253,8 @@ class PickPreviewWiring(unittest.TestCase):
         self.assertIn('mu_slippi_cmd(MU_PICK_PREVIEW_COMMAND, b, sizeof b', function(menu, 'mu_pick_preview_send'))
         native = read(GAME / 'include/mu_native.h')
         state = native[native.index('typedef struct MuMatchState {'):native.index('} MuMatchState;')]
-        # After the 962-byte MSRB copy: the MSRB itself is unchanged.
-        self.assertLess(state.index('unsigned char raw[962];'), state.index('MuOpponentPick opp_picks[3];'))
+        # After the MSRB copy (Slippi 3.7.0's 1030 bytes): the MSRB itself is unchanged.
+        self.assertLess(state.index('unsigned char raw[1030];'), state.index('MuOpponentPick opp_picks[3];'))
         pick = native[native.index('typedef struct MuOpponentPick {'):native.index('} MuOpponentPick;')]
         for field in ['valid, port', 'char_id', 'color', 'team_id', 'squad_count', 'kinds[3]', 'colors[3]', 'locked']:
             self.assertIn(field, pick)

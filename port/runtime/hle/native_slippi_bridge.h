@@ -80,7 +80,9 @@ inline bool command_payload_valid(uint8_t cmd, const uint8_t* payload, uint32_t 
     return payload_len == 0 || (payload_len == 1 && payload && (payload[0] == 1 || payload[0] == 2));
   uint32_t expected = 0;
   switch (cmd) {
-    case CMD_ONLINE_INPUTS: return payload && (payload_len == 25 || payload_len == 33); // native local partner appends eight pad bytes
+    // Slippi 3.7.0: + the input source port and the leaving flag (27); the native local partner
+    // appends its nine pad bytes (PAD_WIRE_SIZE: inputs and RNG bits).
+    case CMD_ONLINE_INPUTS: return payload && (payload_len == 27 || payload_len == 36);
     case CMD_CAPTURE_SAVESTATE: case CMD_LOAD_SAVESTATE: expected = 32; break;
     case CMD_FIND_OPPONENT: expected = 19; break;
     case CMD_SET_MATCH_SELECTIONS: expected = 9; break;

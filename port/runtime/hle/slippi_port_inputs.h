@@ -7,7 +7,10 @@
 
 namespace slippi {
 inline constexpr uint8_t kMachinePadMessage = 0xE5;
-inline constexpr uint8_t kMachinePadVersion = 1;
+// 2: Slippi 3.7.0's pads, PAD_WIRE_SIZE bytes each (the inputs and the RNG bits byte). A version 1
+// sender (8-byte pads) is refused, as it plays a different simulation anyway.
+inline constexpr uint8_t kMachinePadVersion = 2;
+inline constexpr size_t kDropHistoryMax = 64;   // SLIPPI_DROP_REPORT_INPUT_COUNT
 
 struct PortInputs {
   int main = 0, humans = 2;
@@ -66,12 +69,12 @@ struct PortInputs {
     size_t copied = 0;
     for (const auto& pad : main_pads) {
       if (copied++ == count) break;
-      out.insert(out.end(),pad->buf,pad->buf + PAD_DATA_SIZE);
+      out.insert(out.end(),pad->buf,pad->buf + PAD_WIRE_SIZE);
       if (second >= 0) {
         const auto& q = partner_send;
         const auto it = std::find_if(q.begin(),q.end(),[&](const auto& p) { return p->frame == pad->frame; });
         if (it == q.end()) return {}; // never send a main frame without its partner
-        out.insert(out.end(),(*it)->buf,(*it)->buf + PAD_DATA_SIZE);
+        out.insert(out.end(),(*it)->buf,(*it)->buf + PAD_WIRE_SIZE);
       }
     }
     return out;
@@ -80,13 +83,14 @@ struct PortInputs {
     while (!partner_send.empty() && partner_send.back()->frame < oldest) partner_send.pop_back();
   }
   struct Received { bool ok = false; int32_t frame = 0, checksum_frame = 0; uint32_t checksum = 0; };
-  Received receive(const uint8_t* b, size_t n, int sender) {
+  // history (by port, may be null) also gets every pad taken, newest first, for player drop reports.
+  Received receive(const uint8_t* b, size_t n, int sender, std::deque<Pad>* history = nullptr) {
     if (n < 20 || b[0] != kMachinePadMessage || b[1] != 'M' || b[2] != 'U' || b[3] != 'L' ||
         b[4] != kMachinePadVersion || sender < 0 || sender >= humans || owner[sender] != sender || sender == main || b[5] != sender)
       return {};
     const int second = partner(sender);
     if (b[6] != (second < 0 ? 255 : second)) return {};
-    const int count = b[19], stride = PAD_DATA_SIZE * (second < 0 ? 1 : 2);
+    const int count = b[19], stride = PAD_WIRE_SIZE * (second < 0 ? 1 : 2);
     if (!count || count > 128 || n != size_t(20 + count * stride)) return {};
     const int32_t frame = int32_t(u32(b+7));
     if (frame < count || frame <= 0) return {};
@@ -99,8 +103,15 @@ struct PortInputs {
     for (int which = 0; which < (second < 0 ? 1 : 2); ++which) {
       auto& q = pads[which ? second : sender];
       const int head = q.empty() ? 0 : q.front()->frame;
-      for (int64_t f = std::max<int64_t>(int64_t(head) + 1, int64_t(frame) - count + 1); f <= frame; ++f)
-        q.push_front(std::make_unique<Pad>(int32_t(f),b+20+(frame-f)*stride+which*PAD_DATA_SIZE));
+      const int p = which ? second : sender;
+      for (int64_t f = std::max<int64_t>(int64_t(head) + 1, int64_t(frame) - count + 1); f <= frame; ++f) {
+        const uint8_t* pad = b+20+(frame-f)*stride+which*PAD_WIRE_SIZE;
+        q.push_front(std::make_unique<Pad>(int32_t(f),pad));
+        if (history) {
+          history[p].emplace_front(int32_t(f),pad);
+          if (history[p].size() > kDropHistoryMax) history[p].pop_back();
+        }
+      }
     }
     return {true,frame,int32_t(u32(b+11)),u32(b+15)};
   }

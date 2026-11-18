@@ -1,21 +1,24 @@
 # Slippi Sys deltas
 
-These two VCDIFF patches reconstruct `GameSetup_gui.dat` and `slpCSS.dat` using
-files from the player's own GALE01 revision 2 retail disc. The compliance ruling
+These three VCDIFF patches reconstruct `GameSetup_gui.dat`, `slpCSS.dat` and
+`SlippiCSS_gui.dat` (Slippi 3.7.0, upstream v0.9.207) using files from the player's
+own GALE01 revision 2 retail disc. The compliance ruling
 prohibits shipping these Nintendo-derived whole files from YouGame in production.
 The four other whole `.dat` files remain eligible to ship. This spike leaves all
-Sys files untouched; packaging must exclude the two prohibited originals later.
+Sys files untouched; packaging must exclude the prohibited originals later.
 
 Python 3.9 (stdlib only) and `/opt/homebrew/bin/xdelta3` version 3.2.1 are required.
 From the repository root:
 
 ```sh
-python3 port/sys_deltas/make_sys_deltas.py /path/to/GALE01r2.iso
+python3 port/sys_deltas/make_sys_deltas.py /path/to/GALE01r2.iso --targets-rev e6478b848
 python3 port/sys_deltas/check_sys_deltas.py /path/to/GALE01r2.iso
 python3 port/sys_deltas/make_sys_deltas.py /path/to/GALE01r2.iso --compliance-only
 python3 -m unittest discover port/sys_deltas
 ```
 
+The whole targets never stay in this tree: `--targets-rev` reads the three Sys copies
+from a git revision that has them (the upstream release tag) instead of the working tree.
 Use `--out directory` on the generator and `--dir directory` on the checker to
 override the default `port/sys_deltas`. For a determinism check, generate twice
 into separate directories and compare both patches and `manifest.json` byte for

@@ -61,6 +61,7 @@ int snprintf(char* buffer, __SIZE_TYPE__ size, const char* format, ...);
 void mu_replay_apply_game_info(StartMeleeData* data, const unsigned char* info);
 struct gm_80479D58_t* mu_gm_engine_state(void);
 void mu_gmvs_request_online_end(int pauser);
+void mu_gmvs_online_end_time(int frames);
 void mu_alarms_hold(void);
 void mu_alarms_release(void);
 void mu_replay_game_info_block(unsigned char* out, const StartMeleeData* data);
@@ -95,6 +96,26 @@ enum {
     CMD_SELFTEST_KEEP = 0xF0,     /* native test only: keep the state as a reference */
     CMD_SELFTEST_COMPARE = 0xF1,   /* native test only: compare the state with the reference */
     RESPONSE_CAPACITY = 4096,
+    /* Slippi 3.7.0 (Online.s): the frame-indexed RNG history (a power of 2 reaching further back
+     * than the longest rollback) and the two extra bytes of a pad report. Byte 8 goes over the
+     * network with the inputs and the game never sees it; byte 11 marks a kept prediction only. */
+    RNG_HISTORY_COUNT = 16,
+    PAD_RNG_BITS = 8,
+    PAD_RNG_ROLLBACK_MARKER = 11,
+    SIDE_B_MIN_STICK_X = 48,
+    DOWN_B_MAX_STICK_Y = -44,
+    /* The inputs command payload (Slippi's TXB without its command byte), byte offsets. */
+    TXB_FRAME = 0,
+    TXB_FINALIZED_FRAME = 4,
+    TXB_FINALIZED_FRAME_CHECKSUM = 8,
+    TXB_DELAY = 12,
+    TXB_PAD = 13,
+    TXB_INPUT_SOURCE_INDEX = TXB_PAD + PAD_SIZE,   /* controller port the local inputs come from */
+    TXB_IS_LEAVING = TXB_INPUT_SOURCE_INDEX + 1,    /* the local player chose to leave the game */
+    TXB_SIZE = TXB_IS_LEAVING + 1,                  /* 27 */
+    /* YouGame local partners: the partner's pad after Slippi's payload (8 input bytes and a zero RNG
+     * bits byte, the host's PAD_WIRE_SIZE); always sent, zero without a partner. */
+    TXB_PARTNER_PAD_SIZE = PAD_RNG_BITS + 1,
     /* The match state response (Slippi's MSRB), byte offsets. */
     MSRB_CONNECTION_STATE = 0,
     MSRB_LOCAL_READY = 1,
@@ -105,7 +126,16 @@ enum {
     MSRB_DELAY_FRAMES = 9,
     MSRB_ERROR_MSG = 357,
     MSRB_GAME_INFO_BLOCK = 598,
-    MSRB_SIZE = 962,
+    MSRB_ALT_STAGE_MODE = 961,
+    /* Slippi 3.7.0: per port the ranked info (rating f32, update count u32, global and regional
+     * placement u16, mmr f32; RPI_SIZE bytes, recorded as is) and then a bot flag per port. */
+    MSRB_RANKED_PLAYER_INFO = MSRB_ALT_STAGE_MODE + 1,
+    RPI_SIZE = 16,
+    MSRB_IS_BOT = MSRB_RANKED_PLAYER_INFO + RPI_SIZE * 4,
+    MSRB_SIZE = MSRB_IS_BOT + 4,   /* 1030 */
+    /* The 3.6.4 reply ends where the ranked info starts. The peer-to-peer host still answers that
+     * one; the fields past it only go into the recording, which then gets zeroes. */
+    MSRB_MIN_SIZE = MSRB_RANKED_PLAYER_INFO,
     MM_CONNECTION_SUCCESS = 4,
     MM_ERROR_ENCOUNTERED = 5,
     /* The inputs response (Slippi's RXB), byte offsets. */
@@ -115,8 +145,13 @@ enum {
     RXB_OPNT_FRAME_NUMS = RXB_OPNT_DESYNC + 8 * REMOTES,
     RXB_SMALLEST_LATEST = RXB_OPNT_FRAME_NUMS + 4 * REMOTES,
     RXB_OPNT_INPUTS = RXB_SMALLEST_LATEST + 4,
-    RXB_SHOULD_DESPAWN = RXB_OPNT_INPUTS + PAD_SIZE * RXB_INPUTS_COUNT * REMOTES,
-    RXB_SIZE = RXB_SHOULD_DESPAWN + REMOTES,
+    /* Slippi 3.7.0: per remote player the frame its fighter despawns on (s32, 0 if it does not),
+     * then per remote player the pads to predict each of the RXB_INPUTS_COUNT frames after its
+     * latest frame with (entry 0 is latest + 1), then the random bits to send with the next pad. */
+    RXB_DESPAWN_FRAMES = RXB_OPNT_INPUTS + PAD_SIZE * RXB_INPUTS_COUNT * REMOTES,
+    RXB_OPNT_PREDICTED_INPUTS = RXB_DESPAWN_FRAMES + 4 * REMOTES,
+    RXB_NEXT_PAD_RNG_BITS = RXB_OPNT_PREDICTED_INPUTS + PAD_SIZE * RXB_INPUTS_COUNT * REMOTES,
+    RXB_SIZE = RXB_NEXT_PAD_RNG_BITS + 1,   /* 559 */
     /* Early inputs, after Slippi's reply (the host appends them for this engine only): per remote
      * a count, then entries of a target pad frame (big-endian) and a 12-byte pad. Each is a
      * controller change the other player sent the moment it happened, before the pad of the frame
@@ -140,11 +175,16 @@ enum {
     MATCH_STRUCT_LEN = 0x138,
     RGB_SIZE = RGB_GAME_INFO_BLOCK + MATCH_STRUCT_LEN,   /* 368, the bridge's CMD_REPORT_GAME size */
     ONLINE_MODE_RANKED = 0,
+    ONLINE_MODE_PARTY = 4,
     LGL_LIMIT = 45,   /* ledge grabs past this lose a timeout */
     END_TIME = 1,
     END_GAME = 2,
     END_LRAS = 7,
+    LEAVING_GAME_END_FRAMES = 0x1E,   /* StartEngineLoop: GAME! for someone who chose to leave */
 };
+
+/* Slippi 3.7.0's sizes (Output/Netplay InitOnlinePlay: TXB 0x1C with the command byte, RXB 0x22F). */
+_Static_assert(TXB_SIZE == 27 && RXB_SIZE == 559 && MSRB_SIZE == 1030, "Slippi 3.7.0 buffer layouts");
 
 enum { ENGINE_CONTINUE = 0, ENGINE_RESIM = 1, ENGINE_ROLLBACK_DONE = 2 };
 
@@ -198,6 +238,12 @@ typedef struct MuOnlineState {
     u8 recovery_stocks[4];
     u16 recovery_percent[4];
     StartMeleeData* start_data;   /* the match's game info (0x80480530), for the game report */
+    /* Slippi 3.7.0, indexed by frame & (RNG_HISTORY_COUNT - 1): the ports holding B on each frame
+     * (ODB_B_HELD_HISTORY) and the bits sync_rng_proc mixes into that frame's seed
+     * (ODB_RNG_SEED_BITS_HISTORY). Kept through rollbacks, like the rest of this block. */
+    u8 b_held_history[RNG_HISTORY_COUNT];
+    u8 rng_seed_bits_history[RNG_HISTORY_COUNT];
+    u8 is_leaving;            /* ODB_IS_LEAVING: the local player left a Party match (InitPause) */
     unsigned int tx_checksum; /* the checksum field of the last pad sent (Slippi reuses its buffer) */
     int direct_renew;         /* depth of pad renews the rollback logic called itself */
     int resim;                /* re-simulating after a rollback load */
@@ -218,6 +264,9 @@ typedef struct MuOnlineState {
      * the ones that came from an early pad (early_used counts frames predicted from one). */
     unsigned int predictions, mispredictions, early_used, early_right, early_wrong;
     unsigned int early_rollbacks;   /* rollbacks started by an early pad, before the confirmed one */
+    /* Frames whose seed took players' RNG bits, and rollbacks a prediction marked for them forced. */
+    unsigned int rng_bit_frames, rng_rollbacks;
+    unsigned int despawns;    /* remote fighters removed after a disconnect */
     /* Correction size: fighter positions when a rollback loaded, compared with the re-simulated
      * state at the same frame (the visible snap). */
     float corr_pos[4][2];
@@ -289,6 +338,26 @@ int mu_online_resim_active(void)
     return mu_online.resim;
 }
 
+/* ODB_IS_DISCONNECTED, for InitPause's client pause (gmvs.c). */
+int mu_online_disconnected(void)
+{
+    return mu_online.disconnected;
+}
+
+/* ODB_IS_LEAVING (Slippi 3.7.0): set by InitPause when the local player LRA-Starts out of a Party
+ * match, sent with every pad from then on (the host then disconnects from everyone), and read by
+ * StartEngineLoop and VSSceneDecide. Kept through rollbacks, so it is set once. It outlives the match
+ * until the next one is armed, as the console's ODB does until InitOnlinePlay replaces it. */
+int mu_online_is_leaving(void)
+{
+    return mu_online.is_leaving;
+}
+
+void mu_online_leave(void)
+{
+    mu_online.is_leaving = 1;
+}
+
 /* Slippi Dolphin always runs its Required code sections (General Codes, Recording, Online), so an
  * online match plays with every gameplay code in them, whatever this game was booted with. */
 unsigned int mu_online_codes(void)
@@ -303,7 +372,7 @@ unsigned int mu_online_codes(void)
     return MU_RC_INIT_STAGE_DATA | MU_RC_INIT_PLAYER_DATA | MU_RC_OFFSCREEN_DAMAGE | MU_RC_DEAD_UP_FALL |
            MU_RC_FD_BG_SEED | MU_RC_PS_ZERO_BUFFER | MU_RC_PS_IS_VALID | MU_RC_PS_FROZEN_CHECK |
            MU_RC_PS_FILE_LOAD | MU_RC_WHISPY_FIX | MU_RC_NANA_DETERMINISM | MU_RC_PS_MONITOR |
-           MU_RC_PREVENT_WOBBLING;
+           MU_RC_PREVENT_WOBBLING | MU_RC_CASTLE_WIND_RESET | MU_RC_KONGO_LOG_RESET;
 }
 
 /* The patches' short-circuit: an online match is running and the scene is not being left. */
@@ -849,7 +918,7 @@ static void clamp_stick_at_rest(PADStatus* pad)
 int mu_online_pad_renew(PADStatus* stat)
 {
     int frame, i;
-    u8 tx[33];
+    u8 tx[TXB_SIZE + TXB_PARTNER_PAD_SIZE];
     u8 local[PAD_SIZE];
     unsigned int got = 0;
     PADStatus* source;
@@ -895,18 +964,21 @@ int mu_online_pad_renew(PADStatus* stat)
         }
         memset(stat, 0, 4 * sizeof *stat);
         if (mu_online.selftest_rollback && known) {
-            /* Self-test: exactly the pads this frame used the first time. */
+            /* Self-test: exactly the pads this frame used the first time (kept with their RNG
+             * bits, so section 11 gives the frame the same seed bits again). */
             for (p = 0; p < 4; p++) {
                 wire_to_pad(&stat[p], mu_online.used_pads[slot][p]);
             }
+            prepare_rng_bits(stat, frame, 0);
         } else {
             int confirmed;
+            unsigned int predicted_players;
             idx = mu_online.local_inputs_idx - (mu_online.rollback_end_frame - frame + 1);
             if (idx < 0) {
                 idx += LOCAL_INPUTS_COUNT;
             }
             wire_to_pad(&stat[mu_online.local_index], mu_online.local_inputs[idx]);
-            confirmed = load_opponent_inputs(stat, frame, 1);
+            confirmed = load_opponent_inputs(stat, frame, 1, &predicted_players);
             if (known && mu_online.used_confirmed[slot]) {
                 /* Every pad of this frame was confirmed the first time: they must not change. */
                 u8 wire[PAD_SIZE];
@@ -921,7 +993,8 @@ int mu_online_pad_renew(PADStatus* stat)
                     }
                 }
             }
-            record_used_pads(stat, frame, confirmed);
+            record_used_pads(stat, frame, confirmed);   /* with the RNG bits, as sent */
+            prepare_rng_bits(stat, frame, predicted_players);
             trace_pads_line(stat, frame, "resim", confirmed);
         }
         mu_online.frame = frame + 1;
@@ -952,8 +1025,8 @@ int mu_online_pad_renew(PADStatus* stat)
               global_frame());
     }
     /* Section 4: send this frame's pad. */
-    put32(tx, (u32) frame);
-    put32(tx + 4, (u32) mu_online.stable_finalized);
+    put32(tx + TXB_FRAME, (u32) frame);
+    put32(tx + TXB_FINALIZED_FRAME, (u32) mu_online.stable_finalized);
     /* The finalized frame's checksum; when it is not in the ring the previous value goes out
      * again, as the console's reused transfer buffer does. A zero would read as a desync. */
     for (i = 0; i < DESYNC_ENTRIES; i++) {
@@ -962,10 +1035,19 @@ int mu_online_pad_renew(PADStatus* stat)
             break;
         }
     }
-    put32(tx + 8, mu_online.tx_checksum);
-    tx[12] = mu_online.delay;
-    memcpy(tx + 13, mu_online.last_local, PAD_SIZE);
-    memset(tx + 25, 0, 8);
+    put32(tx + TXB_FINALIZED_FRAME_CHECKSUM, mu_online.tx_checksum);
+    tx[TXB_DELAY] = mu_online.delay;
+    /* Slippi 3.7.0: the controller port the local inputs come from (the host watches it for input
+     * suggestions) and whether the local player chose to leave (the host then disconnects). */
+    tx[TXB_INPUT_SOURCE_INDEX] = mu_online.input_source;
+    tx[TXB_IS_LEAVING] = mu_online.is_leaving;
+    memcpy(tx + TXB_PAD, mu_online.last_local, PAD_SIZE);
+    /* Slippi 3.7.0: the random bits the last reply gave go out with this pad. They reach the delay
+     * buffer with it (section 8) and section 11 takes them out again before the game sees them. */
+    tx[TXB_PAD + PAD_RNG_BITS] = mu_online.rxb[RXB_NEXT_PAD_RNG_BITS];
+    /* A local partner's pad follows Slippi's payload: its inputs and an RNG bits byte that is always
+     * zero (one machine's random bits go out once, with the main pad). */
+    memset(tx + TXB_SIZE, 0, TXB_PARTNER_PAD_SIZE);
     {
         const int partner_source = mu_lobby_partner_source();
         if (partner_source >= 0 && partner_source < 4) {
@@ -973,7 +1055,7 @@ int mu_online_pad_renew(PADStatus* stat)
             clamp_stick_at_rest(second);
             if (second->err == -3) wire_to_pad(second, mu_online.last_partner);
             pad_to_wire(mu_online.last_partner, second);
-            memcpy(tx + 25, mu_online.last_partner, 8);
+            memcpy(tx + TXB_SIZE, mu_online.last_partner, PAD_RNG_BITS);
         }
     }
     /* The second pad is sampled only on a new frame. Its delayed confirmed queue comes back as
@@ -1042,7 +1124,7 @@ int mu_online_pad_renew(PADStatus* stat)
            PAD_SIZE);
     mu_online.local_inputs_idx = (u8) ((mu_online.local_inputs_idx + 1) % LOCAL_INPUTS_COUNT);
     /* Section 8: this frame's pad goes into the delay buffer. */
-    memcpy(mu_online.delay_buffer[mu_online.delay_index], tx + 13, PAD_SIZE);
+    memcpy(mu_online.delay_buffer[mu_online.delay_index], tx + TXB_PAD, PAD_SIZE);
     mu_online.delay_index = (u8) ((mu_online.delay_index + 1) % mu_online.delay);
 
     /* Section 9: rollback decision. */
@@ -1080,8 +1162,11 @@ int mu_online_pad_renew(PADStatus* stat)
     }
     /* Section 10: remote pads for this frame, predicted where they have not arrived. */
     {
-        int confirmed = load_opponent_inputs(stat, frame, 1);
-        record_used_pads(stat, frame, confirmed);
+        unsigned int predicted_players;
+        int confirmed = load_opponent_inputs(stat, frame, 1, &predicted_players);
+        record_used_pads(stat, frame, confirmed);   /* with the RNG bits, as sent */
+        /* Section 11: this frame's RNG bits. */
+        prepare_rng_bits(stat, frame, predicted_players);
         trace_pads_line(stat, frame, "run", confirmed);
     }
     mu_online.frame = frame + 1;
@@ -1278,9 +1363,16 @@ void mu_online_frame_begin(void)
 
     if (!mu_online.disconnect_displayed && mu_online.disconnected && !mu_online.game_over) {
         mu_online.disconnect_displayed = 1;
-        logf_("online: disconnected at frame %d", frame, 0, 0);
-        hud_message(9.0F, -162.0F, 0.7F, 0xFF0000FFu, "DISCONNECTED");
+        logf_("online: disconnected at frame %d%s", frame, mu_online.is_leaving ? " (the local player left)" : "", 0);
+        /* No message when the local player chose to leave (Slippi 3.7.0). */
+        if (!mu_online.is_leaving) {
+            hud_message(9.0F, -162.0F, 0.7F, 0xFF0000FFu, "DISCONNECTED");
+        }
         end_game();
+        /* Someone who chose to leave is not kept around as long (Slippi 3.7.0). */
+        if (mu_online.is_leaving) {
+            mu_gmvs_online_end_time(LEAVING_GAME_END_FRAMES);
+        }
     }
 
     if (mu_online.stable_rollback_active) {
@@ -1404,6 +1496,34 @@ desync_done:
         capture_state(frame);
     }
 
+    /* Despawn disconnected remote fighters (Slippi 3.7.0). The reply gives, per remote index, the
+     * frame that player's fighter despawns on (0: it does not). It is compared with the frame being
+     * processed rather than taken as an order, since the reply is not refreshed during a rollback
+     * and these frames can be replayed. Remote index to port as section 10 maps it. The removal
+     * itself only acts once (fn_8016EF98 does nothing without a fighter). */
+    {
+        int remote, port = 0;
+        for (remote = 0; remote < REMOTES; remote++, port++) {
+            int despawn_frame;
+            if (port == mu_online.local_index) {
+                port++;
+            }
+            despawn_frame = (int) be32(rxb + RXB_DESPAWN_FRAMES + 4 * remote);
+            if (despawn_frame == 0 || frame < despawn_frame) {
+                continue;
+            }
+            /* In Party mode someone already eliminated stays, so they still show on the results
+             * screen. They have no fighter, and without teams no stock to come back with. */
+            if (mu_online.mode == ONLINE_MODE_PARTY && Player_GetStocks(port) == 0) {
+                continue;
+            }
+            if (fn_8016EF98(port)) {
+                mu_online.despawns++;
+                logf_("online: despawned port %d (remote %d) at frame %d", port, remote, frame);
+            }
+        }
+    }
+
     /* The match is over once it has stayed over past the rollback window. */
     if (!mu_online.game_over) {
         if (gmVs_GetSceneState()->match_result == 0) {
@@ -1516,12 +1636,24 @@ int mu_online_frame_end(void)
 /* ---- the match (InitOnlinePlay, 8016E748) ---- */
 
 /* Slippi's SyncRNG: every frame the seed is the frame number (halves swapped) plus the match's
- * offset, so both games draw the same numbers whatever happened before. */
+ * offset, so both games draw the same numbers whatever happened before.
+ * Slippi 3.7.0 then hashes it (murmur3 finalizer): Melee's RNG turns a seed that steps by a fixed
+ * amount each frame into rolls that also step by a fixed amount, and this makes each frame's rolls
+ * unrelated to the last's. Last, the frame's RNG bits from section 11 (zero on most frames) go into
+ * the top byte, after the hash: the top bits of each roll then land evenly spaced for the 256
+ * values. The global frame here is the frame section 11 stored them under. */
 static void sync_rng_proc(HSD_GObj* gobj)
 {
     u32 f = (u32) global_frame();
+    u32 seed = ((f << 16) | (f >> 16)) + mu_online.rng_offset;
     (void) gobj;
-    *HSD_RandSeedPtr = ((f << 16) | (f >> 16)) + mu_online.rng_offset;
+    seed ^= seed >> 16;
+    seed *= 0x85EBCA6Bu;
+    seed ^= seed >> 13;
+    seed *= 0xC2B2AE35u;
+    seed ^= seed >> 16;
+    seed ^= (u32) mu_online.rng_seed_bits_history[f & (RNG_HISTORY_COUNT - 1)] << 24;
+    *HSD_RandSeedPtr = seed;
 }
 
 static int fetch_match_state(unsigned int* size)
@@ -1645,7 +1777,7 @@ int mu_online_test_wait(void)
         unsigned int now = mu_online_abi_retrace_count();
         if (now != last) {
             last = now;
-            if (fetch_match_state(&size) != 0 || size < MSRB_SIZE) {
+            if (fetch_match_state(&size) != 0 || size < MSRB_MIN_SIZE) {
                 return 0;
             }
             if (mu_online.match_state[MSRB_CONNECTION_STATE] == MM_ERROR_ENCOUNTERED) {
@@ -1706,9 +1838,14 @@ void mu_online_start_melee(StartMeleeData* data)
 #endif
         online_game_index++;
     /* FN_LoadMatchState: the match as the host negotiated it. */
-    if (fetch_match_state(&size) != 0 || size < MSRB_SIZE) {
+    if (fetch_match_state(&size) != 0 || size < MSRB_MIN_SIZE) {
         mu_online_abi_log("online: no match state at match start; playing offline");
         return;
+    }
+    /* A 3.6.4-sized reply (the peer-to-peer host's) has no ranked info or bot flags: the recording
+     * gets zeroes there, not what an earlier reply left in this buffer. */
+    if (size < MSRB_SIZE) {
+        memset(mu_online.match_state + size, 0, MSRB_SIZE - size);
     }
     mu_online.frame = 1;
     for (i = 0; i < USED_PADS_COUNT; i++) {
@@ -1762,9 +1899,9 @@ void mu_online_start_melee(StartMeleeData* data)
     }
     gobj = GObj_Create(4, 7, 0);
     HSD_GObj_SetupProc(gobj, sync_rng_proc, 0);
-    /* Per-match rules the online codes read: mode, the frozen Stadium choice (last match state
-     * byte), teams, the local port. */
-    mu_online_rules_set(mu_online.mode, mu_online.match_state[MSRB_SIZE - 1], data->rules.is_teams,
+    /* Per-match rules the online codes read: mode, the frozen Stadium choice (the match state's
+     * alt stage mode byte; 3.7.0 appends ranked info and bot flags after it), teams, the local port. */
+    mu_online_rules_set(mu_online.mode, mu_online.match_state[MSRB_ALT_STAGE_MODE], data->rules.is_teams,
                         mu_online.local_index);
     mu_online.active = 1;
     mu_online_audio_match_start(mu_online.local_index, mu_online.input_source);
@@ -1831,6 +1968,8 @@ void mu_online_match_exit(void)
           (int) mu_online.resim_input_mismatches, 0, 0);
     logf_("online: %d pad alarms gated during rollbacks, %d forced renews", (int) mu_online.gated_alarms,
           (int) mu_online.forced_renews, 0);
+    logf_("online: %d frames seeded with RNG bits, %d rollbacks for RNG bits, %d despawns",
+          (int) mu_online.rng_bit_frames, (int) mu_online.rng_rollbacks, (int) mu_online.despawns);
     if (mu_online.resim) {
         mu_online.resim = 0;
         mu_online_abi_resim_phase(0);

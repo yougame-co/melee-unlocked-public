@@ -128,7 +128,7 @@ later; a zip is enough for the first Reddit post.
   with the Slippi Launcher's `user.json` (fallback added in `slippi_online.cpp` `init()`).
 - Repo hygiene stays: the public repo carries the recompiler and runtime, never the ISO, DOL or
   `port/generated/`. A clone rebuilds `port/generated/` from the user's own ISO.
-- Online status for the release notes: wire-compatible with Slippi 3.6.4 (matchmaking ticket
+- Online status for the release notes: wire-compatible with Slippi 3.7.0 (matchmaking ticket
   accepted by mm.slippi.gg, port-vs-port matches complete with identical replays). Port-vs-Dolphin
   determinism is unproven: label online play "experimental, direct codes with a partner first".
 

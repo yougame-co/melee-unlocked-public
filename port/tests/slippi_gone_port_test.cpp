@@ -136,12 +136,12 @@ std::string source(const char* path) {
 void the_game_calls_them() {
   const std::string online = source(SLIPPI_ONLINE_CPP), net = source(SLIPPI_NET_CPP);
   check(!online.empty() && !net.empty(), "sources readable");
-  check(online.find("slippi::PortReply(gone, have_connected_opponent, g_gone_own_frames, g_gone_last_frame[i],") != std::string::npos,
-        "the reply is built by PortReply with the match's own latches");
-  check(online.find("g_gone_own_frames = slippi::LatchGoneRead(g_gone_own_frames, g_netplay->EveryRemoteReadsGoneOwnFrames())") != std::string::npos,
-        "the latch reads the opponents' builds");
-  check(online.find("int32_t threshold = slippi::GoneLatestFrame(g_gone_own_frames, g_gone_last_frame[i], results[i]->latest_frame) + 2 * ROLLBACK_MAX_FRAMES + 2;") != std::string::npos,
-        "the despawn timer uses the latched last frame");
+  // Build 122 (Slippi 3.7.0): the player drop protocol replaced the gone-port remap in the reply. A
+  // dropped port's inputs are settled with the other players and repeat from a shared despawn frame;
+  // the helpers above stay tested for the builds that still read this way.
+  check(online.find("slippi::PortReply(") == std::string::npos, "the reply no longer remaps a gone port");
+  check(online.find("g_netplay->FillDroppedPlayerInputs(frame);") != std::string::npos, "dropped ports repeat their settled input");
+  check(online.find("(uint32_t)results[i]->despawn_frame") != std::string::npos, "the game gets each port's despawn frame");
   check(online.find("g_gone_own_frames = -1;\n    std::fill(std::begin(g_gone_last_frame), std::end(g_gone_last_frame), slippi::kNoFrame);") != std::string::npos,
         "a new match forgets the last match's latches");
   check(net.find("slippi::EveryPeerReadsGoneOwnFrames(") != std::string::npos, "the client uses the tested gate");

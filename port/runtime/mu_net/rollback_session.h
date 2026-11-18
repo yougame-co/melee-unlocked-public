@@ -14,9 +14,9 @@
 namespace mu_net {
 
 // Sizes of the two replies the game reads (its own contract, big-endian inside).
-constexpr size_t kInputsReplySize = 297;
+constexpr size_t kInputsReplySize = 559;   // the game's 3.7.0 layout: + despawn frames, predicted pads, RNG bits
 constexpr size_t kMatchStateReplySize = 962;
-constexpr size_t kInputsPayloadSize = 25;
+constexpr size_t kInputsPayloadSize = 27;
 // First byte of the inputs reply.
 enum InputsResult : uint8_t { kInputsNormal = 1, kInputsSkip = 2, kInputsDisconnected = 3, kInputsAdvance = 4 };
 

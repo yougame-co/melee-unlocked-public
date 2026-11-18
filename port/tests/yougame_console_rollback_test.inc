@@ -13,7 +13,15 @@ struct PADStatus {
 enum {
   ROLLBACK_MAX = 7, PREDICTED_INPUTS_COUNT = 14, RXB_INPUTS_COUNT = 7, REMOTES = 3,
   PAD_SIZE = 12, USED_PADS_COUNT = 16, START_SYNC_FRAME = 78,
-  RXB_OPNT_FRAME_NUMS = 26, RXB_SMALLEST_LATEST = 38, RXB_OPNT_INPUTS = 42, RXB_SIZE = 297,
+  // Slippi 3.7.0's RXB (mu_online.c): despawn frames, predicted inputs and the next pad's RNG bits follow the inputs.
+  RXB_OPNT_COUNT = 1, RXB_OPNT_FRAME_NUMS = 26, RXB_SMALLEST_LATEST = 38, RXB_OPNT_INPUTS = 42,
+  RXB_DESPAWN_FRAMES = RXB_OPNT_INPUTS + PAD_SIZE * RXB_INPUTS_COUNT * REMOTES,
+  RXB_OPNT_PREDICTED_INPUTS = RXB_DESPAWN_FRAMES + 4 * REMOTES,
+  RXB_NEXT_PAD_RNG_BITS = RXB_OPNT_PREDICTED_INPUTS + PAD_SIZE * RXB_INPUTS_COUNT * REMOTES,
+  RXB_SIZE = RXB_NEXT_PAD_RNG_BITS + 1,
+  RNG_HISTORY_COUNT = 16, PAD_RNG_BITS = 8, PAD_RNG_ROLLBACK_MARKER = 11,
+  SIDE_B_MIN_STICK_X = 48, DOWN_B_MAX_STICK_Y = -44,
+  CKind_GameWatch = 3, CKind_Luigi = 7, CKind_Peach = 12,
   ENGINE_CONTINUE = 0, ENGINE_RESIM, ENGINE_ROLLBACK_DONE,
   CONSOLE_QUERY = 0, CONSOLE_MATCH_BEGIN, CONSOLE_FORWARD, CONSOLE_INPUTS,
   CONSOLE_REPLAY, CONSOLE_MATCH_END, CONSOLE_FAIL,
@@ -40,6 +48,8 @@ struct Bookkeeping {
   unsigned early_scored[3], early_missed[3]; u8 early_distrusted[3];
   int selftest_rollback; unsigned long long rollback_start_ticks;
   unsigned rollbacks, max_depth, loads, captures, resim_frames;
+  u8 b_held_history[RNG_HISTORY_COUNT], rng_seed_bits_history[RNG_HISTORY_COUNT];
+  unsigned rng_bit_frames, rng_rollbacks;
 };
 struct State {
   gm_80479D58_t engine;
@@ -199,6 +209,7 @@ void pad_to_wire(u8* a, const PADStatus* p) {
   a[10] = p->err; a[11] = 0;
 }
 u32 be32(const u8* p) { return u32(p[0]) << 24 | u32(p[1]) << 16 | u32(p[2]) << 8 | p[3]; }
+int Player_GetPlayerCharacter(int) { return 0; }   // no character rolls with B here
 #include "../../sourceport/game/shim/mu_online_prediction.inc"
 void camera_tasks() { ++current->cameras; }
 // Audio production execution is added below; these declarations match the game header.

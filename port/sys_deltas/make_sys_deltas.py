@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 
@@ -16,10 +17,20 @@ DEFAULT_OUT = Path(__file__).resolve().parent
 PORT = DEFAULT_OUT.parent
 
 
-def targets():
+def read_target(folder, name, rev=None):
+    path = Path("port") / folder / "GameFiles" / "GALE01" / name
+    if rev is None:
+        return (PORT.parent / path).read_bytes()
+    # The whole files never stay in the tree (they are disc derived): read them from the commit that has
+    # them, e.g. the upstream release tag, straight from git's objects.
+    return subprocess.run(["git", "-C", str(PORT.parent), "show", "{}:{}".format(rev, path.as_posix())],
+                          check=True, stdout=subprocess.PIPE).stdout
+
+
+def targets(rev=None):
     result = {}
     for name in TARGETS:
-        copies = [(PORT / folder / "GameFiles" / "GALE01" / name).read_bytes() for folder in SYS]
+        copies = [read_target(folder, name, rev) for folder in SYS]
         if any(copy != copies[0] for copy in copies[1:]):
             raise ValueError("Sys copies differ: " + name)
         result[name] = copies[0]
@@ -127,11 +138,11 @@ def close_sources(disc, target_data, selected, temporary):
     raise AssertionError("unreachable closure round")
 
 
-def generate(disc, out):
+def generate(disc, out, rev=None):
     require_xdelta()
     identity = {"format": FORMAT, "disc": {"id": "GALE01", "revision": 2}, "files": []}
     check_disc(disc, identity)
-    target_data = targets()
+    target_data = targets(rev)
     selected = select_sources(disc, target_data)
     # All retail concatenations, interim deltas and decoded targets stay in temp.
     with tempfile.TemporaryDirectory(prefix="sys-deltas-") as temporary:
@@ -149,6 +160,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("disc", type=Path)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    parser.add_argument("--targets-rev", help="read the Sys targets from this git revision (e.g. the upstream tag)")
     parser.add_argument("--compliance-only", action="store_true", help="require zero full-disc matches at any delta offset")
     args = parser.parse_args(argv)
     try:
@@ -157,9 +169,9 @@ def main(argv=None):
             manifest = load_manifest(args.out)
             check_disc(disc, manifest)
             return 0 if compliance(disc, manifest["files"], args.out) else 1
-        generate(disc, args.out)
+        generate(disc, args.out, args.targets_rev)
         return 0
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
         print("FAIL: " + str(error), file=sys.stderr)
         return 1
 

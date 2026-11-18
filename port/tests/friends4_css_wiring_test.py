@@ -796,19 +796,21 @@ int main() {
 #include <cstdint>
 #include "slippi_port_inputs.h"
 using u8 = uint8_t;
-constexpr int REMOTES = 3, PAD_SIZE = 12, RXB_INPUTS_COUNT = 7, RXB_OPNT_FRAME_NUMS = 26, RXB_OPNT_INPUTS = 42;
+constexpr int REMOTES = 3, PAD_SIZE = 12, RXB_INPUTS_COUNT = 7, RXB_OPNT_COUNT = 1, RXB_OPNT_FRAME_NUMS = 26, RXB_OPNT_INPUTS = 42;
+// Slippi 3.7.0: the host's predicted inputs follow the inputs and the despawn frames.
+constexpr int RXB_OPNT_PREDICTED_INPUTS = RXB_OPNT_INPUTS + PAD_SIZE * RXB_INPUTS_COUNT * REMOTES + 4 * REMOTES;
 constexpr int START_SYNC_FRAME = 123, PREDICTED_INPUTS_COUNT = 10;
-struct PADStatus { u8 wire[12]{}; };
+struct PADStatus { u8 wire[12]{}; u8 analogA = 0; };
 struct {
-    u8 rxb[512]{}, predicted_write[3]{}, predicted_read[3]{}, predicted_early[3][10]{}, predicted[3][10][12]{};
+    u8 rxb[600]{}, predicted_write[3]{}, predicted_read[3]{}, predicted_early[3][10]{}, predicted[3][10][12]{};
     int local_index = 0, console_active = 0, delay = 2, game_over = 0, early_used = 0;
     int player_predicting[3]{}, player_savestate_frame[3]{}, savestate_predicting = 0, savestate_frame = 0, finalized = 0;
 } mu_online;
 uint32_t be32(const u8* p) { return slippi::PortInputs::u32(p); }
 int early_calls[3]{};
 const u8* early_pad(int port, int, int) { ++early_calls[port]; return nullptr; }
-void wire_to_pad(PADStatus* p, const u8* b) { std::memcpy(p->wire,b,12); }
-static int load_opponent_inputs(PADStatus* stat, int frame, int predicting_allowed) PREDICTOR
+void wire_to_pad(PADStatus* p, const u8* b) { std::memcpy(p->wire,b,12); p->analogA = b[8]; }
+static int load_opponent_inputs(PADStatus* stat, int frame, int predicting_allowed, unsigned int* predicted_players) PREDICTOR
 void put32(u8* p, int n) { for (int i=0;i<4;++i) p[i]=u8(uint32_t(n)>>(24-8*i)); }
 int main() {
     slippi::PortInputs bank; bank.main = 0; bank.humans = 4; bank.owner = {{0,0,2,3}};
@@ -820,15 +822,16 @@ int main() {
             if (remote == 0) std::memcpy(out,bank.pads[1][k]->buf,12);
         }
     }
-    PADStatus pads[4];
-    assert(!load_opponent_inputs(pads,125,1)); // other machines still need prediction
+    mu_online.rxb[RXB_OPNT_COUNT] = 3;
+    PADStatus pads[4]; unsigned int predicted = 0;
+    assert(!load_opponent_inputs(pads,125,1,&predicted)); // other machines still need prediction
     assert(!mu_online.player_predicting[0] && !early_calls[0]);
     assert(mu_online.player_predicting[1] && early_calls[1]);
     assert(pads[1].wire[0] == 125 && pads[1].wire[1] == 77);
     // Rollback re-reads exactly the saved partner bytes; no hardware or early-ring sample is used.
     for (int frame=120;frame<=126;++frame) {
-        load_opponent_inputs(pads,frame,1);
-        assert(pads[1].wire[0] == frame && pads[1].wire[1] == 77);
+        load_opponent_inputs(pads,frame,1,&predicted);
+        assert(!(predicted & 1) && pads[1].wire[0] == frame && pads[1].wire[1] == 77);
         assert(!mu_online.player_predicting[0] && !early_calls[0]);
     }
 }
@@ -850,10 +853,12 @@ int main() {
         self.assertIn('mu_f4_p2_claim("tab");', body(inc, 'static int mu_friends4_partner_cycle(u8 door)'))
         self.assertIn('strcpy(p->line[2], "Partner: Player 2");', body(inc, 'static void mu_f4_panel_text('))
         self.assertIn('const int partner_source = mu_lobby_partner_source();', online)
-        self.assertIn('memcpy(tx + 25, mu_online.last_partner, 8);', online)
+        # Slippi 3.7.0: after the 27-byte TXB, the partner's inputs; its RNG bits byte stays zero.
+        self.assertIn('memcpy(tx + TXB_SIZE, mu_online.last_partner, PAD_RNG_BITS);', online)
+        self.assertIn('memset(tx + TXB_SIZE, 0, TXB_PARTNER_PAD_SIZE);', online)
         net = read('port/runtime/hle/slippi_net.cpp')
         self.assertIn('port_inputs_->local_partner(*partner);', net)
-        self.assertIn('port_inputs_->receive(packet.data(),packet.size(),sender)', net)
+        self.assertIn('port_inputs_->receive(packet.data(),packet.size(),sender,remote_pad_history_)', net)
         self.assertIn('port_inputs_->packet(local_pad_queue_)', net)
         self.assertIn('out->checksum_primary = port == owner;', net)
         self.assertIn('port_inputs_->local_output(index,frame,max_frame_count)', net)

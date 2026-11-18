@@ -39,7 +39,10 @@ enum {
   kMsStateIdle = 0, kMsStateConnecting = 3, kMsStateConnected = 4, kMsStateError = 5,
 };
 // The inputs reply: byte offsets.
-enum { kRxResult = 0, kRxRemoteCount = 1, kRxChecksums = 2, kRxLatest = 26, kRxSmallestLatest = 38, kRxInputs = 42, kRxInputFrames = 7 };
+enum { kRxResult = 0, kRxRemoteCount = 1, kRxChecksums = 2, kRxLatest = 26, kRxSmallestLatest = 38, kRxInputs = 42, kRxInputFrames = 7,
+       // After three players' pads (3 x 7 x 12): the frame each remote fighter despawns on (none here),
+       // the pads to predict each remote's next seven frames with, one byte of RNG bits for the next pad.
+       kRxDespawnFrames = 294, kRxPredictedInputs = 306, kRxNextPadRngBits = 558 };
 
 void put32(uint8_t* p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
 
@@ -811,6 +814,11 @@ struct RollbackSession::Impl {
       transport.remote_pad(f, pad);
       std::memcpy(b + kRxInputs + k * kPadGameSize, pad, kPadWireSize);
     }
+    // Predictions repeat the latest pad (the game puts an early input over them when it has one). No
+    // fighter despawns in a two-player session, and no RNG bits travel with these pads: zero on both
+    // sides, so both games mix the same seed.
+    for (int k = 0; k < kRxInputFrames; ++k)
+      std::memcpy(b + kRxPredictedInputs + k * kPadGameSize, b + kRxInputs, kPadGameSize);
     counters.local_frame = transport.local_latest();
     counters.remote_frame = transport.remote_latest();
   }

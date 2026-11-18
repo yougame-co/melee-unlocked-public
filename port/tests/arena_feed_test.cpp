@@ -55,7 +55,7 @@ struct Fighter {
     const uint8_t item[44] = {};
     CHECK(recording.append(0x3B, item, sizeof item));   // an item: never sent
     for (int slot = 0; slot < fighters; ++slot) {
-      uint8_t post[84] = {};
+      uint8_t post[92] = {};
       put32(post, uint32_t(f)); post[4] = uint8_t(slot); post[6] = uint8_t(slot ? 0x13 : 0x02);
       CHECK(recording.append(0x38, post, sizeof post));
     }

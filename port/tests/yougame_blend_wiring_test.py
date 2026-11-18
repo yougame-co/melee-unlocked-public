@@ -166,8 +166,11 @@ class BlendWiringTest(unittest.TestCase):
         self.assertIn("after 30 s; searching again", self.raw_link)
 
     def test_resolution_stays_inside_native_scope_and_failure_stops_only_slippi(self):
-        native = self.ticket.split("native([&] {", 1)[1].split("});", 1)[0]
+        # Slippi 3.7.0 resolves the STUN servers too: every lookup stays inside a native() scope.
+        native = "".join(block.split("});", 1)[0] for block in self.ticket.split("native([&] {")[1:])
         self.assertIn('enet_address_set_host(&addr,', native)
+        self.assertIn('enet_address_set_host(&a, server.first)', native)
+        self.assertEqual(native.count('enet_address_set_host('), self.ticket.count('enet_address_set_host('))
         self.assertIn("ENetAddress addr{};", self.ticket)
         self.assertIn('could not resolve the Slippi server', self.raw_net)
         self.assertIn("if (!resolved) return", self.ticket)

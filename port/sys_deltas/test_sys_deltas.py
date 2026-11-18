@@ -152,21 +152,21 @@ class SyntheticTests(unittest.TestCase):
                 result = select_sources(self.disc, {"example": self.one})
         self.assertEqual([s["disc"] for s in result["example"]], ["MnOne.dat"])
 
-    def test_valid_manifest_and_two_real_decodes(self):
+    def test_valid_manifest_and_every_target_real_decodes(self):
         self.assertEqual(load_manifest(self.root), self.manifest)
         result, output = self.run_check()
         self.assertEqual(result, 0, output)
-        self.assertEqual(output.count(": PASS"), 2)
+        self.assertEqual(output.count(": PASS"), len(TARGETS))
 
     def test_wrong_source_sha1_fails_closed_without_decoder(self):
-        self.manifest["files"][0]["sources"][0]["sha1"] = "0" * 40
-        self.manifest["files"][1]["sources"][0]["sha1"] = "0" * 40
+        for entry in self.manifest["files"]:
+            entry["sources"][0]["sha1"] = "0" * 40
         with mock.patch("check_sys_deltas.require_xdelta"), mock.patch(
                 "sys_delta_common.run_xdelta", side_effect=AssertionError("decoder must not run")):
             result, output = self.run_check()
         self.assertEqual(result, 1)
         self.assertIn("source SHA-1 mismatch: MnOne.dat", output)
-        self.assertEqual(output.count(": FAIL"), 2)
+        self.assertEqual(output.count(": FAIL"), len(TARGETS))
 
     def test_wrong_source_size_and_missing_source(self):
         for field, value, message in [("size", 1, "source size mismatch"), ("disc", "missing.dat", "missing source")]:

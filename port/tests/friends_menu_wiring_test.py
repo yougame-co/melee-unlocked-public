@@ -199,7 +199,7 @@ class FriendsMenuWiringTest(unittest.TestCase):
         mirror = net.index("yg_enet_mirror_service(")
         self.assertGreater(mirror, match_loop)
         self.assertLess(mirror, net.index("enet_host_service(client_, &ev, service_wait)", match_loop))
-        self.assertLess(mirror, net.index("enet_host_service(client_, &ev, held.empty() ? 250 : 1)", match_loop))
+        self.assertLess(mirror, net.index("enet_host_service(client_, &ev, !held.empty() ? 1 : waiting_on_drop ? 10 : 250)", match_loop))
 
     def test_version_refusal_and_notice_are_handled_before_generic_error(self):
         link = source("port/runtime/hle/yougame_link.cpp")

@@ -6,6 +6,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "test_env.h"
 #include "early_input.h"
+#include "../hle/slippi_input_suggestions.h"
 #include "host.h"
 #include "tick_timing.h"
 #include <atomic>
@@ -22,6 +23,16 @@ std::atomic<bool> g_setting{true};
 std::atomic<bool> g_running{false};
 std::thread g_thread;
 SendFn g_send = nullptr;
+// Slippi suggestions (under g_mutex): the newest input the Slippi players know of from this side, as
+// a real pad or a suggestion; a change seen while a poll was being handled, kept until that poll's
+// frame is known; the sequence number.
+SuggestFn g_suggest = nullptr;
+uint8_t g_sl_known[kPadBytes] = {};
+bool g_sl_has_known = false;
+uint8_t g_sl_pending[kPadBytes] = {};
+bool g_sl_has_pending = false;
+uint32_t g_sl_seq = 0;
+std::atomic<bool> g_advancing{false};       // the game runs the next frame on the last poll too
 std::mutex g_mutex;                        // g_known, g_stats
 uint8_t g_known[kPadBytes] = {};            // the newest pad the other side has, sent or early
 std::atomic<int32_t> g_last_sent_frame{0};
@@ -94,6 +105,46 @@ double test_lead_seconds() {
 // The pad frame a change seen now first appears in.
 int32_t target_frame() {
   return g_last_sent_frame.load(std::memory_order_acquire) + (g_poll_pending.load(std::memory_order_acquire) ? 2 : 1);
+}
+
+// Slippi's rule, g_mutex held: `pad` goes out as a suggestion for `target` if it says something the
+// Slippi players do not know yet. Returns the sequence number to send it with, 0 for nothing.
+uint32_t suggest_locked(const uint8_t pad[kPadBytes], int32_t target) {
+  if (!g_suggest || !g_sl_has_known) return 0;
+  if (target < slippi::suggestions::kStartSyncFrame) return 0;   // the game zeroes inputs polled before it
+  if (!slippi::suggestions::is_meaningful_change(g_sl_known, pad)) return 0;
+  std::memcpy(g_sl_known, pad, kPadBytes);
+  ++g_stats.suggestions;
+  return ++g_sl_seq;
+}
+// The pad frame the next poll is sent as.
+int32_t next_poll_target() {
+  return g_last_sent_frame.load(std::memory_order_acquire) + 1 + (g_advancing.load(std::memory_order_acquire) ? 1 : 0);
+}
+// A controller read between polls, for the Slippi players.
+void emit_suggestion(const uint8_t now[kPadBytes]) {
+  SuggestFn fn = nullptr;
+  uint32_t seq = 0;
+  int32_t target = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_suggest) return;
+    if (g_poll_pending.load(std::memory_order_acquire)) {
+      // The game polled and that poll is not handled yet: this read is for the frame after it, which
+      // is only known once the poll is handled (note_frame_done). The newest such read is kept.
+      std::memcpy(g_sl_pending, now, kPadBytes);
+      g_sl_has_pending = true;
+      return;
+    }
+    target = next_poll_target();
+    seq = suggest_locked(now, target);
+    fn = g_suggest;
+  }
+  if (seq && trace_line())
+    log("suggest send: target %d seq %u last %d %02x%02x %d,%d %d,%d %d %d at %.2f ms after the poll", target, seq,
+        g_last_sent_frame.load(), now[0], now[1], (int8_t)now[2], (int8_t)now[3], (int8_t)now[4], (int8_t)now[5], now[6], now[7],
+        (now_seconds() - tick_timing().pad) * 1000.0);
+  if (seq && fn) fn(target, seq, now);
 }
 
 // `force`: after a skipped poll, any byte difference from what the other side has is sent again.
@@ -172,6 +223,7 @@ void loop() {
     pad_to_wire(pads[port], now);
     clamp_rest(now);
     emit(now, g_skipped.exchange(false, std::memory_order_acq_rel));
+    emit_suggestion(now);
   }
 }
 
@@ -183,11 +235,14 @@ bool enabled() {
 }
 void set_enabled(bool on) { g_setting.store(on, std::memory_order_relaxed); }
 
-void start(SendFn send) {
+void start(SendFn send, SuggestFn suggest) {
   if (!enabled() || !send || g_running.load(std::memory_order_acquire)) return;
   stop();
   {
     std::lock_guard<std::mutex> lock(g_mutex);
+    g_suggest = suggest;
+    g_sl_has_known = g_sl_has_pending = false;
+    g_sl_seq = 0;
     std::memset(g_known, 0, sizeof g_known);
     g_crossed_target = 0;
     g_last_follow_up = 0;
@@ -196,6 +251,7 @@ void start(SendFn send) {
   g_local_port.store(-1, std::memory_order_release);
   g_skipped.store(false, std::memory_order_release);
   g_poll_pending.store(false, std::memory_order_release);
+  g_advancing.store(false, std::memory_order_release);
   g_send = send;
   g_running.store(true, std::memory_order_release);
   g_thread = std::thread(loop);
@@ -207,6 +263,7 @@ void stop() {
   g_running.store(false, std::memory_order_release);
   if (g_thread.joinable()) g_thread.join();
   g_send = nullptr;
+  { std::lock_guard<std::mutex> lock(g_mutex); g_suggest = nullptr; }
 }
 
 bool running() { return g_running.load(std::memory_order_acquire); }
@@ -219,6 +276,8 @@ void note_sent_pad(int32_t frame, const uint8_t pad[kPadBytes]) {
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     std::memcpy(g_known, sent, kPadBytes);
+    std::memcpy(g_sl_known, sent, kPadBytes);   // the real pad: what the Slippi players know now
+    g_sl_has_known = true;
   }
   g_last_sent_frame.store(frame, std::memory_order_release);
   g_poll_pending.store(false, std::memory_order_release);
@@ -262,6 +321,33 @@ void note_skipped() {
   g_poll_pending.store(false, std::memory_order_release);
   if (g_running.load(std::memory_order_acquire) && trace_line()) log("early skip: last %d", g_last_sent_frame.load());
   if (g_running.load(std::memory_order_acquire)) g_skipped.store(true, std::memory_order_release);
+}
+void note_frame_done(bool skipped, bool advancing, const uint8_t pad[kPadBytes]) {
+  if (!g_running.load(std::memory_order_acquire)) return;
+  // A skipped frame is polled again; an advanced frame runs on this poll too, so the next poll is
+  // for the frame after it.
+  g_advancing.store(!skipped && advancing, std::memory_order_release);
+  SuggestFn fn = nullptr;
+  uint32_t seq = 0;
+  int32_t target = 0;
+  uint8_t candidate[kPadBytes];
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_suggest) return;
+    bool have = false;
+    // A read stored after this frame's poll, now that the frame of that poll is known.
+    if (g_sl_has_pending) { std::memcpy(candidate, g_sl_pending, kPadBytes); g_sl_has_pending = false; have = true; }
+    // The skipped frame's input was never sent, so it is news if it differs from what was.
+    if (!have && skipped && pad) { std::memcpy(candidate, pad, kPadBytes); clamp_rest(candidate); have = true; }
+    if (!have) return;
+    target = next_poll_target();
+    seq = suggest_locked(candidate, target);
+    fn = g_suggest;
+  }
+  if (seq && trace_line())
+    log("suggest send (released at frame done, %s): target %d seq %u last %d %02x%02x %d,%d", skipped ? "skipped" : advancing ? "advancing" : "sent",
+        target, seq, g_last_sent_frame.load(), candidate[0], candidate[1], (int8_t)candidate[2], (int8_t)candidate[3]);
+  if (seq && fn) fn(target, seq, candidate);
 }
 void note_poll() { if (g_running.load(std::memory_order_acquire)) g_poll_pending.store(true, std::memory_order_release); }
 void note_packet() { std::lock_guard<std::mutex> lock(g_mutex); ++g_stats.packets; }

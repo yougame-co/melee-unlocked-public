@@ -56,7 +56,7 @@ if(MELEE_NO_SLIPPI)
   list(REMOVE_ITEM RUNTIME_NS_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppc/leaf_stencils.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppc/leaf_translator.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/runtime/ppc/ram_translator.cpp")
   foreach(ns_removed
-      runtime/hle/exi_slippi.cpp runtime/hle/slippi_net.cpp runtime/hle/slippi_online.cpp runtime/hle/slippi_spectate.cpp
+      runtime/hle/exi_slippi.cpp runtime/hle/slippi_net.cpp runtime/hle/slippi_mm_service.cpp runtime/hle/slippi_online.cpp runtime/hle/slippi_spectate.cpp
       runtime/hle/slippi_report.cpp runtime/hle/slippi_playback.cpp runtime/hle/native_practice.cpp
       runtime/hle/native_practice_model.cpp runtime/hle/native_replay_stream.cpp runtime/hle/jukebox.cpp
       runtime/hle/slippi_arena.cpp runtime/hle/arena_feed.cpp runtime/gx/arena_panel.cpp   # arena rooms ride on Slippi Direct
@@ -661,6 +661,18 @@ target_include_directories(port_early_input_test PRIVATE runtime/host)
 target_compile_features(port_early_input_test PRIVATE cxx_std_17)
 target_compile_options(port_early_input_test PRIVATE /EHsc)
 add_test(NAME port_early_input COMMAND port_early_input_test)
+add_executable(port_slippi_input_suggestions_test tests/slippi_input_suggestions_test.cpp)
+target_include_directories(port_slippi_input_suggestions_test PRIVATE runtime/hle)
+target_compile_features(port_slippi_input_suggestions_test PRIVATE cxx_std_17)
+target_compile_options(port_slippi_input_suggestions_test PRIVATE /EHsc)
+add_test(NAME port_slippi_input_suggestions COMMAND port_slippi_input_suggestions_test)
+# Slippi 3.7.0 game-file asset links (hle/slippi_hsd_links.cpp): Slippi's own tests on synthetic archives.
+# By hand, --local <GameFiles dir> <extracted disc dir or disc image> [--ref <dir>] resolves the real files.
+add_executable(port_slippi_hsd_links_test tests/slippi_hsd_links_test.cpp runtime/hle/slippi_hsd_links.cpp)
+target_include_directories(port_slippi_hsd_links_test PRIVATE runtime/hle)
+target_compile_features(port_slippi_hsd_links_test PRIVATE cxx_std_17)
+target_compile_options(port_slippi_hsd_links_test PRIVATE /EHsc)
+add_test(NAME port_slippi_hsd_links COMMAND port_slippi_hsd_links_test)
 
 add_executable(port_pack_skin_rule_test tests/pack_skin_rule_test.cpp runtime/host/pack_skin_rule.cpp)
 target_include_directories(port_pack_skin_rule_test PRIVATE runtime/host)
@@ -1045,6 +1057,16 @@ target_link_libraries(port_slippi_login_test PRIVATE runtime guest)
 target_compile_options(port_slippi_login_test PRIVATE /EHsc)
 target_compile_definitions(port_slippi_login_test PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
 add_test(NAME port_slippi_login COMMAND port_slippi_login_test)
+# Slippi's matchmaking service client (hle/slippi_mm_service.cpp, in runtime through the glob above):
+# the join message, STUN, the NAT type, and whole sessions against a fake service on loopback.
+add_executable(port_slippi_mm_service_test tests/slippi_mm_service_test.cpp runtime/hle/slippi_mm_service.cpp)
+target_include_directories(port_slippi_mm_service_test PRIVATE runtime/hle runtime/host third_party)
+target_compile_features(port_slippi_mm_service_test PRIVATE cxx_std_17)
+target_compile_options(port_slippi_mm_service_test PRIVATE /EHsc)
+target_compile_definitions(port_slippi_mm_service_test PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
+target_link_libraries(port_slippi_mm_service_test PRIVATE ws2_32 secur32)
+add_test(NAME port_slippi_mm_service COMMAND port_slippi_mm_service_test)
+set_tests_properties(port_slippi_mm_service PROPERTIES TIMEOUT 90)
 add_executable(port_settings_load_test tests/settings_load_test.cpp)
 target_link_libraries(port_settings_load_test PRIVATE runtime guest)
 target_include_directories(port_settings_load_test PRIVATE runtime)

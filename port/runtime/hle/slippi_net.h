@@ -5,6 +5,7 @@
 #pragma once
 #include "slippi_game_prep.h"
 #include "opponent_display.h"
+#include "slippi_mm_service.h"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -44,13 +45,21 @@ constexpr int ONLINE_LOCKSTEP_INTERVAL = 30;
 constexpr int REMOTE_PLAYER_MAX = 3;
 constexpr int PLAYER_COUNT_MAX = REMOTE_PLAYER_MAX + 1;
 constexpr int PAD_FULL_SIZE = 0xC;
-constexpr int PAD_DATA_SIZE = 0x8;
+constexpr int PAD_DATA_SIZE = 0x8;   // buttons, sticks and triggers
+// What goes over the network for each frame (Slippi 3.7.0): the inputs and one byte of RNG bits.
+constexpr int PAD_WIRE_SIZE = PAD_DATA_SIZE + 1;
+// Player drops (Slippi 3.7.0): how long the other players' reports about a dropped player are awaited,
+// and how many frames after the dropped player's last input the fighter despawns (2 * 7 + 2).
+constexpr uint64_t DROP_REPORT_WAIT_MS = 300;
+constexpr int32_t DROP_DESPAWN_FRAMES = 16;
 constexpr uint8_t CHAT_MSG_CHAT_DISABLED = 0x10;
 extern const char* const SLIPPI_SEMVER;   // netplay version this port speaks
 
 enum NetMsg : uint8_t {
   NP_MSG_SLIPPI_PAD = 0x80, NP_MSG_SLIPPI_PAD_ACK = 0x81, NP_MSG_SLIPPI_MATCH_SELECTIONS = 0x82, NP_MSG_SLIPPI_CONN_SELECTED = 0x83,
   NP_MSG_SLIPPI_CHAT_MESSAGE = 0x84, NP_MSG_SLIPPI_COMPLETE_STEP = 0x85, NP_MSG_SLIPPI_SYNCED_STATE = 0x86,
+  // Slippi 3.7.0: a mid-frame input hint (unreliable), and what a client has of a dropped player's inputs.
+  NP_MSG_SLIPPI_PAD_SUGGESTION = 0x87, NP_MSG_SLIPPI_PLAYER_DROP = 0x88,
   // Melee Unlocked only: the sender's build (retail or a mod's identity). Slippi Dolphin logs an
   // unknown id and ignores it, so it is safe to send to anyone.
   NP_MSG_MU_BUILD = 0xE0,
@@ -118,7 +127,7 @@ struct Pad {
   uint32_t checksum = 0;
   uint8_t buf[PAD_FULL_SIZE] = {};
   explicit Pad(int32_t f) : frame(f) {}
-  Pad(int32_t f, const uint8_t* data) : frame(f) { for (int i = 0; i < PAD_DATA_SIZE; ++i) buf[i] = data[i]; }
+  Pad(int32_t f, const uint8_t* data) : frame(f) { for (int i = 0; i < PAD_WIRE_SIZE; ++i) buf[i] = data[i]; }
   Pad(int32_t f, int32_t cf, uint32_t c, const uint8_t* data) : Pad(f, data) { checksum_frame = cf; checksum = c; }
 };
 
@@ -128,6 +137,7 @@ struct RemotePadOutput {
   uint8_t player_idx = 0;
   bool is_disconnected = false;
   bool checksum_primary = true; // compare once per machine, though every port carries the checksum
+  int32_t despawn_frame = 0;   // the frame a dropped player's fighter despawns on, 0 until settled
   std::vector<uint8_t> data;
 };
 
@@ -160,6 +170,9 @@ struct UserInfo {
   int port = 0;
   std::vector<std::string> chat_messages;
   bool is_bot = false;
+  // What the matchmaking service says of the player's rank (Slippi 3.7.0 records it in the replay).
+  float ranked_rating = 0, ranked_mmr = 0;
+  int ranked_update_count = 0, ranked_global_placement = 0, ranked_regional_placement = 0;
 };
 
 // The user record written by the Slippi Launcher (user.json in the Slippi user folder).
@@ -298,6 +311,8 @@ class NetplayClient {
   uint8_t GetSlippiRemoteSentChatMessage(bool chat_enabled);
   int32_t CalcTimeOffsetUs();
   double GetAndResetAvgPingMs();
+  // Once a dropped player's last input is settled it repeats up to `frame` (Slippi 3.7.0).
+  void FillDroppedPlayerInputs(int32_t frame);
   int LastPingMs() const { return (int)(last_ping_ms_.load(std::memory_order_relaxed)); }
   // Each remote machine's last ping (Teams has up to three), and how many there are. UI thread safe.
   int RemotePingMs(int index) const {
@@ -338,6 +353,9 @@ class NetplayClient {
   // EarlyPads gives remote `index`'s early pads for frames after `latest` (its confirmed pads reach
   // `latest`; older entries are dropped), for the game's prediction.
   void SendEarlyPad(int32_t target, const uint8_t pad[host::early_input::kPadBytes]);
+  // Slippi 3.7.0 input suggestion: this side's newest input between frames, for the players that do
+  // not take this build's early pads (Slippi Dolphin, and the Static Recomp). Any thread: it only queues.
+  void SendSlippiPadSuggestion(int32_t target_frame, uint32_t seq, const uint8_t pad[host::early_input::kPadBytes]);
   void EarlyPads(int index, int32_t latest, std::vector<host::early_input::Entry>& out);
   // Live pick previews (display only). SendPickPreview: the game thread, every CSS frame; sends
   // to the peers that take them, only while CONNECTED, only on change, at most one per
@@ -372,6 +390,11 @@ class NetplayClient {
   void Disconnect();
   void ThreadFunc();
   bool AreAllPeersDisconnectedForKey(const std::string& key);
+  // Player drops (Slippi 3.7.0), network thread: the others are told which inputs this side has of a
+  // dropped player, and after a short wait everyone settles on the same last input and despawn frame.
+  bool ProcessPlayerDrops();
+  void SendPlayerDropReport(uint8_t port);
+  void AddPlayerDropReportInputs(uint8_t port, int32_t last_frame, uint8_t count, const uint8_t* inputs);
   bool AreAllConnectionsDisconnected();
   void WriteSelections(Packet& p, const PlayerSelections& s);
   std::unique_ptr<PlayerSelections> ReadSelections(Packet& p);
@@ -420,6 +443,11 @@ class NetplayClient {
   std::deque<std::unique_ptr<Pad>> local_pad_queue_;
   std::unique_ptr<PortInputs> port_inputs_;
   bool machine_pad_format_ = false;
+  // Each remote port's latest inputs, newest first: what another client may be missing if the
+  // player drops (Slippi 3.7.0). By port, like port_inputs_->pads; under pad_mutex_.
+  std::deque<Pad> remote_pad_history_[PLAYER_COUNT_MAX];
+  std::atomic<int32_t> despawn_frames_[PLAYER_COUNT_MAX] = {};   // by port, 0 until settled
+  uint64_t player_drop_times_ms_[PLAYER_COUNT_MAX] = {};         // network thread only
   struct ChecksumEntry { int32_t frame = 0; uint32_t value = 0; } remote_checksums_[REMOTE_PLAYER_MAX];
   uint64_t ping_us_[REMOTE_PLAYER_MAX] = {};
   std::atomic<uint64_t> ping_sample_sum_us_{0}, ping_sample_count_{0};
@@ -599,6 +627,17 @@ class Matchmaking {
   _ENetHost* client_ = nullptr;
   _ENetPeer* server_ = nullptr;
   bool is_mm_connected_ = false;
+  // Slippi 3.7.0: the search runs on the WebSocket matchmaking service (slippi_mm_service.h). client_
+  // is then only the socket bound to the netplay port: STUN servers are asked through it for its
+  // public address, and one of them is sent a packet now and then so the NAT mapping the opponent
+  // will use does not expire while queued.
+  std::unique_ptr<mm_service::Session> mm_session_;
+  uint32_t stun_host_ = 0;        // the STUN server the keepalives go to, network byte order
+  uint16_t stun_port_ = 0;
+  bool has_stun_addr_ = false;
+  uint64_t last_keepalive_ms_ = 0;
+  bool stunBindingRequest(uint32_t host, uint16_t port, mm_service::StunObservation* result);
+  void sendStunKeepalive();
   std::atomic<bool> is_mm_terminated_{false};
   std::thread thread_;
   MatchSearchSettings search_settings_;

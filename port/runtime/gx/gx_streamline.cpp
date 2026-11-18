@@ -62,6 +62,7 @@ bool ray_reconstruction_available() { return false; }
 long create_dxgi_factory2(uint32_t flags, const void* riid, void** out) { return CreateDXGIFactory2(flags, *(const IID*)riid, out); }
 long d3d12_create_device(void* adapter, int fl, const void* riid, void** out) { return D3D12CreateDevice((IUnknown*)adapter, (D3D_FEATURE_LEVEL)fl, *(const IID*)riid, out); }
 bool device_faulted() { return false; }
+bool restart_without_streamline() { return false; }
 void set_device(ID3D12Device*) {}
 void* native_interface(void* proxy) { return proxy; }
 bool dlss_supported(IDXGIAdapter*) { return false; }
@@ -210,8 +211,40 @@ static bool has_nvidia_adapter() {
   return found;
 }
 
+// The note that Streamline faulted on this PC, beside the game: it holds the game version it happened
+// on, and a start of that version leaves Streamline out. A new version tries it again.
+static std::wstring g_fault_note;
+static bool fault_noted() {
+  FILE* f = _wfopen(g_fault_note.c_str(), L"rb");
+  if (!f) return false;
+  char text[64] = {};
+  const size_t n = std::fread(text, 1, sizeof text - 1, f);
+  std::fclose(f);
+  return std::string(text, n).rfind(MELEE_PORT_VERSION, 0) == 0;
+}
+bool restart_without_streamline() {
+  if (g_fault_note.empty()) return false;
+  if (FILE* f = _wfopen(g_fault_note.c_str(), L"wb")) {
+    std::fputs(MELEE_PORT_VERSION, f);
+    std::fputc('\n', f);
+    std::fputs("Streamline faulted while taking the graphics device on this PC; this version starts without it.", f);
+    std::fputc('\n', f);
+    std::fclose(f);
+  }
+  if (!fault_noted()) { host::log("dlss: could not write the Streamline fault note"); return false; }
+  host::log("dlss: starting the game again without Streamline");
+  host::request_restart();
+  if (!host::exit_requested()) return false;   // the new process did not start
+  host::end_process(0);
+}
+
 bool init(const std::wstring& exe_dir, bool load_frame_generation) {
   const char* force_fault = std::getenv("MELEE_SL_TEST_DEVICE_FAULT");   // tests the fallback below
+  g_fault_note = exe_dir + L"/streamline-faulted.txt";
+  if (fault_noted()) {
+    host::log("dlss: Streamline faulted on this PC with this version; not loaded (DLSS, Reflex and frame generation unavailable; delete streamline-faulted.txt to try again)");
+    return false;
+  }
   if (!has_nvidia_adapter() && !(force_fault && *force_fault == '1')) {
     host::log("dlss: no NVIDIA GPU, Streamline not loaded (DLSS, Reflex and frame generation unavailable)");
     return false;

@@ -101,7 +101,7 @@ enum Command : uint8_t {
   kReportGame = 0xBD,      // payload 368: the finished game
 };
 enum : int32_t { kCommandOk = 0, kCommandUnknown = -1, kCommandBounds = -2, kCommandNeedsRollback = -3 };
-constexpr uint32_t kMatchStateSize = 962;      // the game's match state block (mu_online.c MSRB_SIZE)
+constexpr uint32_t kMatchStateSize = 1030;     // the game's match state block (mu_online.c MSRB_SIZE)
 constexpr uint32_t kMatchStateError = 357;     // offset of its error text
 constexpr uint8_t kStateError = 5;             // connection state: no match can be made
 constexpr uint8_t kInputsDisconnected = 3;     // kInputs result: the match is gone

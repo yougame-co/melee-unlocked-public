@@ -12,13 +12,13 @@
         "SysPlayback",
         "slippi_sys_general"
       ],
-      "target_sha1": "f611b333de3324a11c0d084910e04283c5e364a5",
-      "target_size": 1031905,
+      "target_sha1": "cb78574af8b6ceede7890d4a6a74d61afefdd8df",
+      "target_size": 788239,
       "sources": [
         {
-          "disc": "GmTou1p.dat",
-          "sha1": "775afe828685ea695daf16af0d2b9539689098cd",
-          "size": 126193
+          "disc": "GrOt.dat",
+          "sha1": "695d679a41b92b77d9146a117b491fa53665f769",
+          "size": 1145019
         },
         {
           "disc": "MnSlChr.dat",
@@ -26,49 +26,9 @@
           "size": 3812581
         },
         {
-          "disc": "GrOt.dat",
-          "sha1": "695d679a41b92b77d9146a117b491fa53665f769",
-          "size": 1145019
-        },
-        {
-          "disc": "MnSlMap.dat",
-          "sha1": "ea559c0bb9c494d9338529ac01f3d30d49e20414",
-          "size": 681443
-        },
-        {
-          "disc": "GmTou1p.usd",
-          "sha1": "87f2032ecba32616eea42c1d9fc5f316a3b29a77",
-          "size": 126193
-        },
-        {
           "disc": "TyMew.dat",
           "sha1": "9a4424dec3c0e2fb0e8b4a824d18be73fd898745",
           "size": 58435
-        },
-        {
-          "disc": "MnMaAll.usd",
-          "sha1": "46215adc465f2cba610991dab179930437cc28ab",
-          "size": 2155311
-        },
-        {
-          "disc": "TyMcR1Ds.dat",
-          "sha1": "07f83449cb994b89f6427259d91400e745eadfbd",
-          "size": 362154
-        },
-        {
-          "disc": "GmTou2p.dat",
-          "sha1": "9ed40e6a6cb0c8bfcd14e965fb846d7bd1b68619",
-          "size": 132333
-        },
-        {
-          "disc": "TyKamex.dat",
-          "sha1": "e56ca3fdaa5b92ba50663ed453b03c578d53940c",
-          "size": 465921
-        },
-        {
-          "disc": "TySeriA.dat",
-          "sha1": "a85723fdaf689d69d4bd8b4f35d192988b5f639a",
-          "size": 204532
         },
         {
           "disc": "EfCoData.dat",
@@ -76,14 +36,39 @@
           "size": 1334111
         },
         {
-          "disc": "TyMarumi.dat",
-          "sha1": "baf2ecb1cdde01514c2713873f6d4cafde835026",
-          "size": 51916
+          "disc": "TyMcR1Ds.dat",
+          "sha1": "07f83449cb994b89f6427259d91400e745eadfbd",
+          "size": 362154
+        },
+        {
+          "disc": "GmTou1p.dat",
+          "sha1": "775afe828685ea695daf16af0d2b9539689098cd",
+          "size": 126193
+        },
+        {
+          "disc": "TySeriA.dat",
+          "sha1": "a85723fdaf689d69d4bd8b4f35d192988b5f639a",
+          "size": 204532
         },
         {
           "disc": "ItCo.dat",
           "sha1": "20e5cb7e88b5ebbe0ad5886bdd4a4bda648c4523",
           "size": 2949760
+        },
+        {
+          "disc": "TyKamex.dat",
+          "sha1": "e56ca3fdaa5b92ba50663ed453b03c578d53940c",
+          "size": 465921
+        },
+        {
+          "disc": "TyMarumi.dat",
+          "sha1": "baf2ecb1cdde01514c2713873f6d4cafde835026",
+          "size": 51916
+        },
+        {
+          "disc": "MnExtAll.usd",
+          "sha1": "6b0f2d64038e4093d88b652ad510c896fbdc07e2",
+          "size": 1315321
         },
         {
           "disc": "GmStRoll.dat",
@@ -106,9 +91,9 @@
           "size": 295166
         },
         {
-          "disc": "TyCerebi.dat",
-          "sha1": "4c7a5d306b3345f56d7db844f809f0061433645c",
-          "size": 300974
+          "disc": "GmTou2p.dat",
+          "sha1": "9ed40e6a6cb0c8bfcd14e965fb846d7bd1b68619",
+          "size": 132333
         },
         {
           "disc": "GmTou3p.dat",
@@ -116,19 +101,14 @@
           "size": 489373
         },
         {
-          "disc": "TyFzero.dat",
-          "sha1": "d0e2a0a43900f6db23fdf2ce823be1f3b874a002",
-          "size": 353329
-        },
-        {
-          "disc": "TyStdiam.dat",
-          "sha1": "ded8162f37166a736bc1c6c2ebfb092186668b7c",
-          "size": 495527
+          "disc": "GrZe.dat",
+          "sha1": "0ed9df087832df418eac020e4415bdc6fa5664cd",
+          "size": 856428
         }
       ],
       "delta": "GameSetup_gui.dat.vcdiff",
-      "delta_sha1": "3028a7dccbe78a7aca41fc196758c584515ffc94",
-      "delta_size": 189688
+      "delta_sha1": "e9732ba6be69a26240a5c3a9b368ace11d17ae1a",
+      "delta_size": 104099
     },
     {
       "target": "slpCSS.dat",
@@ -189,6 +169,71 @@
       "delta": "slpCSS.dat.vcdiff",
       "delta_sha1": "675b8d05267b954474799a09def766f48728520b",
       "delta_size": 57663
+    },
+    {
+      "target": "SlippiCSS_gui.dat",
+      "sys": [
+        "Sys",
+        "SysPlayback",
+        "slippi_sys_general"
+      ],
+      "target_sha1": "c613efa143e9efb6effeb98aa6f8650243f88977",
+      "target_size": 237571,
+      "sources": [
+        {
+          "disc": "TyJugemu.dat",
+          "sha1": "281c382043eefcd18db9a1b5049722feff6cef93",
+          "size": 149034
+        },
+        {
+          "disc": "MnSlChr.dat",
+          "sha1": "2972c888ea07ec39f1129c9a2ccc945bd43edd59",
+          "size": 3812581
+        },
+        {
+          "disc": "MnExtAll.dat",
+          "sha1": "e3cb546c310183c9eb4fff331f2ee71eab99a353",
+          "size": 1309449
+        },
+        {
+          "disc": "TyFood.dat",
+          "sha1": "c08ece46999845bf6321040501ba6d6da0d3e696",
+          "size": 193528
+        },
+        {
+          "disc": "EfCoData.dat",
+          "sha1": "e5ab7d3a3935536a62c335f1901e7f830b128dfa",
+          "size": 1334111
+        },
+        {
+          "disc": "GmTou3p.usd",
+          "sha1": "c8f2122acc958262a34cae7e626fe144510c611f",
+          "size": 400813
+        },
+        {
+          "disc": "GrRc.dat",
+          "sha1": "ca2e92256a4e02c05f9d118a79958ffcd0d8c761",
+          "size": 961722
+        },
+        {
+          "disc": "MnExtAll.usd",
+          "sha1": "6b0f2d64038e4093d88b652ad510c896fbdc07e2",
+          "size": 1315321
+        },
+        {
+          "disc": "MnSlMap.dat",
+          "sha1": "ea559c0bb9c494d9338529ac01f3d30d49e20414",
+          "size": 681443
+        },
+        {
+          "disc": "PlGlNr.dat",
+          "sha1": "a92b1b29e61f1136fbe9cb8f75705a32055f85aa",
+          "size": 84444
+        }
+      ],
+      "delta": "SlippiCSS_gui.dat.vcdiff",
+      "delta_sha1": "19f19508da11f890e81c8eb92de681a00ade1d3c",
+      "delta_size": 58007
     }
   ]
 }

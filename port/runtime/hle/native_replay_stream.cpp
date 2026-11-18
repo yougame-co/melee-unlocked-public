@@ -72,7 +72,7 @@ bool NativeReplayStream::begin_slippi(const std::vector<uint8_t>& start,
   start_time_ = start_time;
   last_frame_ = -123;   // Dolphin's value until the first post-frame event
   // SendGameInfo's command table (Recording/SendGameInfo.asm), in the order it writes it.
-  table_ = {{0x36, uint16_t(start.size())}, {0x37, 66}, {0x38, 84}, {0x39, 6}, {0x3A, 12},
+  table_ = {{0x36, uint16_t(start.size())}, {0x37, 66}, {0x38, 92}, {0x39, 6}, {0x3A, 12},
             {0x3B, 44}, {0x3C, 8}, {0x3D, uint16_t(codes.size())}, {0x10, 516}, {0x3F, 9},
             {0x40, 5}, {0x41, 8}};
   for (const auto& entry : table_) sizes_[entry.first] = entry.second;

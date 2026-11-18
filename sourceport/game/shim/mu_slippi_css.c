@@ -191,11 +191,17 @@ void mu_slippi_css_enter(CSSData** css, u8* chosen, s8* port, u8* request, s8* n
         dt.team_idx = st->team_idx;
     }
 
-    /* slpCSS.dat, symbol slpCSS. The host's system-file layer serves it; without it the mode title
-     * keeps the CSS's own texture instead of taking the game down. */
-    if (DVDConvertPathToEntrynum("slpCSS.dat") >= 0) {
-        HSD_Archive* ar = lbArchive_LoadArchive("slpCSS.dat");
-        dt.slpcss = ar != NULL ? HSD_ArchiveGetPublicAddress(ar, "slpCSS") : NULL;
+    /* SlippiCSS_gui.dat (Slippi 3.7.0's name for slpCSS.dat), symbol slpCSS. The host's
+     * system-file layer serves it; a host that still serves only the old name gets that file. Without
+     * either the mode title keeps the CSS's own texture instead of taking the game down. */
+    {
+        const char* name = DVDConvertPathToEntrynum("SlippiCSS_gui.dat") >= 0 ? "SlippiCSS_gui.dat"
+                           : DVDConvertPathToEntrynum("slpCSS.dat") >= 0    ? "slpCSS.dat"
+                                                                            : NULL;
+        if (name != NULL) {
+            HSD_Archive* ar = lbArchive_LoadArchive(name);
+            dt.slpcss = ar != NULL ? HSD_ArchiveGetPublicAddress(ar, "slpCSS") : NULL;
+        }
     }
     mu_slippi_sss_set_slpcss(dt.slpcss);   /* name entry's connect help */
 }

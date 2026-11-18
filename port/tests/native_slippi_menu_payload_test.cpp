@@ -82,11 +82,11 @@ int main() {
   CHECK(st.app_state == 1 && st.name == "Tester" && st.code == "TEST\x81\x94" "001");
   CHECK(call(online::CMD_GET_ONLINE_STATUS, b5, 1, out) == online::NATIVE_COMMAND_BOUNDS);
 
-  // B3 reply (MSRB, 962 bytes) at the design's offsets.
-  static_assert(menu::MSRB_SIZE == 962, "MSRB size");
+  // B3 reply (MSRB, 1030 bytes) at the design's offsets.
+  static_assert(menu::MSRB_SIZE == 1030, "MSRB size");
   static_assert(menu::MSRB_GAME_INFO + menu::GAME_INFO_LEN == menu::MSRB_MATCH_ID, "game info");
   static_assert(menu::MSRB_ERROR + menu::ERROR_LEN == menu::MSRB_GAME_INFO, "error");
-  g_reply.assign(962, 0);
+  g_reply.assign(1030, 0);
   g_reply[0] = 4; g_reply[1] = 1; g_reply[2] = 0; g_reply[3] = 1; g_reply[4] = 0;
   g_reply[5] = 0xDE; g_reply[6] = 0xAD; g_reply[7] = 0xBE; g_reply[8] = 0xEF; g_reply[9] = 2;
   g_reply[10] = 0x11; g_reply[11] = 0x22; g_reply[12] = 1;
@@ -107,7 +107,7 @@ int main() {
   CHECK(m.local_name == "Local" && m.names[1] == "Remote" && m.names[0].empty() && m.opp_name == "Remote");
   CHECK(m.codes[1] == "PEER\x81\x94" "002" && m.uids[0] == "uid0" && m.error == "err");
   CHECK(m.game_info[0] == 0x32 && m.game_info[311] == 0x7A && m.match_id == "mode.direct-1" && m.alt_stage == 1);
-  CHECK(!menu::parse_match_state(out.data(), 961, &m));
+  CHECK(!menu::parse_match_state(out.data(), 1029, &m));
 
   // BC reply: 4-byte seed; BA, B9 and B3 take no payload.
   g_reply = {0x12, 0x34, 0x56, 0x78};

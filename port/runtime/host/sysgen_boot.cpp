@@ -6,7 +6,7 @@
 namespace host {
 namespace { sysgen::Assets assets; }
 bool required_sys_asset(const std::string& name) {
-  return name == "GameSetup_gui.dat" || name == "slpCSS.dat";
+  return name == "GameSetup_gui.dat" || name == "slpCSS.dat" || name == "SlippiCSS_gui.dat";
 }
 void prepare_sys_assets(const std::string& user_dir, const std::string& data_dir) {
 #ifdef MELEE_NO_SLIPPI

@@ -63,7 +63,7 @@ enum {
     MSRB_LOCAL_NAME = 15,
     MSRB_P1_NAME = 46,
     MSRB_NAME_LEN = 31,
-    MSRB_SIZE = 962,
+    MSRB_SIZE = 1030,   /* MuMatchState.raw: Slippi 3.7.0's MSRB */
     MM_CONNECTION_SUCCESS = 4,
 };
 

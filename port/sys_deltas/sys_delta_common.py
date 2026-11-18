@@ -12,7 +12,8 @@ FORMAT = "vcdiff-xdelta3-3.2.1-nosecondary"
 # the manifest lists: the host applier, port/runtime/host/sysgen.cpp, accepts only these names).
 SYS = ["slippi_sys", "slippi_sys_general", "slippi_sys_playback"]
 BUILD_SYS = ["Sys", "SysPlayback", "slippi_sys_general"]
-TARGETS = ["GameSetup_gui.dat", "slpCSS.dat"]
+# Slippi 3.7.0 (upstream v0.9.207) adds SlippiCSS_gui.dat, its linked copy of slpCSS.dat.
+TARGETS = ["GameSetup_gui.dat", "slpCSS.dat", "SlippiCSS_gui.dat"]
 XDELTA = "/opt/homebrew/bin/xdelta3"
 
 
@@ -139,8 +140,8 @@ def validate_manifest(manifest):
     if manifest["format"] != FORMAT or manifest["disc"] != {"id": "GALE01", "revision": 2}:
         raise ValueError("unsupported manifest format/disc")
     files = manifest["files"]
-    if not isinstance(files, list) or len(files) != 2:
-        raise ValueError("manifest must describe exactly two targets")
+    if not isinstance(files, list) or len(files) != len(TARGETS):
+        raise ValueError("manifest must describe exactly {} targets".format(len(TARGETS)))
     seen = set()
     for entry in files:
         if not isinstance(entry, dict) or set(entry) != {"target", "sys", "target_sha1", "target_size", "sources", "delta", "delta_sha1", "delta_size"}:

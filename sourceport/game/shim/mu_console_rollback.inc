@@ -50,10 +50,11 @@ static int console_inputs(int operation, int frame)
 static int console_pad_renew(PADStatus* stat)
 {
     int confirmed, frame = mu_online.frame;
+    unsigned int predicted_players; /* Slippi's section 11 RNG bits are online only */
     if (!mu_online.console_injecting) return 1; /* alarms never issue session frames */
     memset(stat, 0, 4 * sizeof *stat);
     wire_to_pad(&stat[mu_online.local_index], mu_online.last_local);
-    confirmed = load_opponent_inputs(stat, frame, 1);
+    confirmed = load_opponent_inputs(stat, frame, 1, &predicted_players);
     record_used_pads(stat, frame, confirmed);
     mu_online.frame = frame + 1;
     return 0;

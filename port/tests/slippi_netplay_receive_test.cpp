@@ -20,13 +20,13 @@ PlayerSelections selection() {
 }
 
 // SendSlippiPad retains the ACK frame and trims all older frames. This models
-// the sender's newest-first wire payload; all eight bytes identify their frame.
+// the sender's newest-first wire payload; all nine bytes identify their frame.
 std::vector<uint8_t> pad_packet(int32_t frame, int32_t ack) {
   std::vector<uint8_t> packet(14, 0);
   packet[0] = NP_MSG_SLIPPI_PAD;
   for (int i = 0; i < 4; ++i) packet[1 + i] = (uint8_t)((uint32_t)frame >> (24 - 8 * i));
   for (int32_t f = frame; f >= std::max(ack, 1); --f)
-    packet.insert(packet.end(), PAD_DATA_SIZE, (uint8_t)f);
+    packet.insert(packet.end(), PAD_WIRE_SIZE, (uint8_t)f);
   return packet;
 }
 
@@ -87,10 +87,10 @@ void legacy_failure_proof() {
   // The former unconditional selection reset loses acknowledged frames 1 and 2.
   r.pads.clear();
   const auto first = r.pad(3), later = r.pad(12);
-  check(pad_packet(3, r.sender_ack).size() == 22 && 14 + first.inputs * PAD_DATA_SIZE == 38,
-        "old reset: frame 3 has 22 bytes but receiver requires 38");
-  check(pad_packet(12, r.sender_ack).size() == 94 && 14 + later.inputs * PAD_DATA_SIZE == 110,
-        "old reset: frame 12 has 94 bytes but receiver requires 110");
+  check(pad_packet(3, r.sender_ack).size() == 23 && 14 + first.inputs * PAD_WIRE_SIZE == 41,
+        "old reset: frame 3 has 23 bytes but receiver requires 41");
+  check(pad_packet(12, r.sender_ack).size() == 104 && 14 + later.inputs * PAD_WIRE_SIZE == 122,
+        "old reset: frame 12 has 104 bytes but receiver requires 122");
   check(first.error == receive::PadError::TooSmall && later.error == receive::PadError::TooSmall &&
         r.sender_ack == 3 && r.pads.empty(), "old reset: refusal persists and ACK cannot advance");
 }

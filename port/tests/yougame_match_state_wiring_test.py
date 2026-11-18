@@ -17,7 +17,9 @@ class MatchStateWiring(unittest.TestCase):
             # 120: yougame_start.h verbatim from YouGame v2 4b69a7a28 (o.ask: LATER at launch, ON_USE at the press; Play offline).
             # 120: then YouGame claude/c3-window-d258 063f1abcf (the drawn C3 window, o.name).
             # 121: then YouGame claude/v2 efdafa604 (PR 2413: /desktop?from=game&game=<slug>, long names wrap).
-            'yougame_start.h': '4fc1fa941a9875b4d9b76cf0de86bbbed441e7d4c38a59b8d25f1af497a86a9e',
+            # 122: then YouGame claude/start-dpi-b7d2 b2b8a304e (buttons placed while per-monitor aware, scaled screens).
+            # 122: then YouGame claude/start-get-c91e 0544f1538 (Get YouGame installs YouGame in the start window, PR 2454).
+            'yougame_start.h': 'a819834fc298c04877a41364207e77f43f510608949bfaad983107c0151fbf24',
             'yougame.h': 'f0796dd3ab37c6cc6ae96c554458f6638cadeff7268962d99da54baf9b9839de',
         }.items():
             self.assertEqual(hashlib.sha256((ROOT / 'port/third_party/yougame_start' / name).read_bytes()).hexdigest(), digest)

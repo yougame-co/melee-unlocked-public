@@ -32,14 +32,19 @@ struct PadResult { int64_t inputs; PadError error; };
 // Preserve the receive path's size checks and frame ordering. Header parsing, checksums,
 // timing and ACK emission remain in NetplayClient::OnData.
 inline PadResult PadInputs(int32_t frame, const uint8_t* data, size_t size,
-    std::deque<std::unique_ptr<Pad>>& pads) {
+    std::deque<std::unique_ptr<Pad>>& pads, std::deque<Pad>* history = nullptr) {
   constexpr int offset = 14;
   const int32_t head = pads.empty() ? 0 : pads.front()->frame;
   const int64_t count = (int64_t)frame - head;
-  if (offset + count * PAD_DATA_SIZE > (int64_t)size) return {count, PadError::TooSmall};
+  if (offset + count * PAD_WIRE_SIZE > (int64_t)size) return {count, PadError::TooSmall};
   if (count > 128) return {count, PadError::TooMany};
-  for (int64_t i = count - 1; i >= 0; --i)
-    pads.push_front(std::make_unique<Pad>((int32_t)(frame - i), &data[offset + i * PAD_DATA_SIZE]));
+  for (int64_t i = count - 1; i >= 0; --i) {
+    pads.push_front(std::make_unique<Pad>((int32_t)(frame - i), &data[offset + i * PAD_WIRE_SIZE]));
+    if (history) {
+      history->emplace_front((int32_t)(frame - i), &data[offset + i * PAD_WIRE_SIZE]);
+      if (history->size() > 64) history->pop_back();   // SLIPPI_DROP_REPORT_INPUT_COUNT
+    }
+  }
   return {count, PadError::None};
 }
 

@@ -5,6 +5,7 @@
  */
 #include "slippi_netplay_receive.h"
 #include "slippi_port_inputs.h"
+#include "slippi_input_suggestions.h"
 #include "native_slippi_bridge.h"
 // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
 #include "yougame_net_test.h"
@@ -97,6 +98,7 @@ class Capture {
   MatchInfo match_info_;
   NetplayClient::RemoteBuild remote_build_[REMOTE_PLAYER_MAX];
   std::unique_ptr<PortInputs> port_inputs_ = std::make_unique<PortInputs>();
+  std::deque<Pad> remote_pad_history_[PLAYER_COUNT_MAX]; // Slippi 3.7.0 player drop reports
   host::early_input::Buffer early_pads_[REMOTE_PLAYER_MAX];
   struct Connection { uint8_t player_idx; bool is_disconnected; };
   _ENetPeer* peer = reinterpret_cast<_ENetPeer*>(1);

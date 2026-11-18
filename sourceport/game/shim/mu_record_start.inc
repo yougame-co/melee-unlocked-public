@@ -49,18 +49,24 @@ static void record_player(u8* g, const PlayerInitData* p)
 enum {
     MSRB_P1_NAME = 46, MSRB_P1_CONNECT_CODE = 201, MSRB_P1_SLIPPI_UID = 241,
     MSRB_MATCH_ID = 910, MSRB_ALT_STAGE_MODE = 961,
+    MSRB_RANKED_PLAYER_INFO = 962,   /* Slippi 3.7.0: RPI_SIZE (16) per port, then 4 bot flags */
     GS_NAMETAG = 0x161, GS_PAL = 0x1A1, GS_FROZEN_PS = 0x1A2, GS_MINOR = 0x1A3, GS_MAJOR = 0x1A4,
     GS_NAME = 0x1A5, GS_CODE = 0x221, GS_UID = 0x249, GS_LANGUAGE = 0x2BD, GS_MATCH_ID = 0x2BE,
     GS_GAME_NUMBER = 0x2F1, GS_TIEBREAK = 0x2F5,
+    /* Replay 3.20.0 (Slippi 3.7.0): each port's ranked info (rating, update count, global and
+     * regional placement, mmr) and then its bot flag, both as the MSRB keeps them. */
+    GS_RANKED_PLAYER_INFO = 0x2F9, GS_RANKED_PLAYER_INFO_LENGTH = 16 * 4,
+    GS_IS_BOT = GS_RANKED_PLAYER_INFO + GS_RANKED_PLAYER_INFO_LENGTH, GS_IS_BOT_LENGTH = 4,
+    GS_SIZE = GS_IS_BOT + GS_IS_BOT_LENGTH,   /* 0x33D: the command byte and 828 payload bytes */
 };
 int mu_ps_frozen_toggle(void);
 
 static void emit_game_start(const StartMeleeData* data, const u8* msrb)
 {
-    u8 b[0x2F9];
+    u8 b[GS_SIZE];
     int i;
     memset(b, 0, sizeof b);
-    b[1] = 3; b[2] = 19; b[3] = 1;
+    b[1] = 3; b[2] = 20; b[3] = 0;   /* replay version 3.20.0 */
     record_rules(b + 5, &data->rules);
     for (i = 0; i < 6; ++i) record_player(b + 5 + 0x60 + 0x24 * i, &data->players[i]);
     /* The recorded copy only: a human Zelda holding A starts as Sheik, and a costume the character
@@ -114,6 +120,10 @@ static void emit_game_start(const StartMeleeData* data, const u8* msrb)
         memcpy(b + GS_MATCH_ID, msrb + MSRB_MATCH_ID, 51);
         /* The game number within this search (and the tiebreak number, ranked only) is kept by
          * the host, which sees the searches; it fills GS_GAME_NUMBER in. */
+        /* Ranked info and bot flags, every online mode, copied together (the MSRB keeps them in
+         * this order); a local game writes zeroes. */
+        memcpy(b + GS_RANKED_PLAYER_INFO, msrb + MSRB_RANKED_PLAYER_INFO,
+               GS_RANKED_PLAYER_INFO_LENGTH + GS_IS_BOT_LENGTH);
     }
 #ifdef MU_AKANEIA_FIGHTERS
     /* Convert the final serialized copy only. Costume and Zelda checks above use native kinds;

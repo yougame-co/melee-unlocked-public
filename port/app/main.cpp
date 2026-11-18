@@ -2402,8 +2402,10 @@ static int melee_main(int argc, char** argv) {
   if (slippi::Matchmaking::local_peer.test_stage >= 0) {
     const int stage = slippi::Matchmaking::local_peer.test_stage;
     // A mod disc (--mod-base-iso) has its own stages: any id, so a mod's stage can be tested.
+    // Peach's Castle (4) and Kongo Jungle (5) too: Direct and Teams players can pick them, and Slippi
+    // 3.7.0 resets a state of each at stage init.
     const bool legal = stage == 0x2 || stage == 0x3 || stage == 0x8 || stage == 0x1C || stage == 0x1F || stage == 0x20 ||
-                       !o.mod_base_iso.empty();
+                       stage == 0x4 || stage == 0x5 || !o.mod_base_iso.empty();
     if (!slippi::Matchmaking::local_peer.enabled || !legal) {
       std::fprintf(stderr, "--test-stage requires --local-peer and a legal tournament stage id (2, 3, 8, 28, 31, or 32; any on a mod disc)\n");
       return 2;

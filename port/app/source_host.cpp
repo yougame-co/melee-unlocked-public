@@ -1127,7 +1127,7 @@ bool read_cosmetic(uint32_t offset, void* dst, uint32_t size, bool* ok) {
 
 // ---- Slippi system files (--slippi-menus) ----
 // The online menus read Slippi's patched menu files (online rows, descriptions, frozen Stadium name,
-// connect-code text) and slpCSS.dat. The static recomp gets them over EXI (D1/D2, exi_slippi.cpp);
+// connect-code text) and its CSS file. The static recomp gets them over EXI (D1/D2, exi_slippi.cpp);
 // the native game asks for them through the ordinary disc path, so they are registered in the
 // filesystem table here, built once at boot with the same code. Own offset range, never counted as
 // mod assets. Any failure turns the menus off for the run instead of mixing vanilla and patched.
@@ -1154,7 +1154,12 @@ static_assert(kSystemFileBase >= 0x58000000u && kSystemFileBase + 0x10000000u <=
 const char* const kSystemFileNames[] = {
   "MnMaAll.usd", "MnMaAll.dat", "SdMenu.usd", "SdMenu.dat", "MnSlMap.usd", "MnSlMap.dat",
   "SdSlChr.usd", "SdSlChr.dat", "MnExtAll.usd", "MnExtAll.dat", "slpCSS.dat", "GameSetup_gui.dat",
+  "SlippiCSS_gui.dat",
 };
+// Slippi 3.7.0's name for slpCSS.dat, built from links into the player's disc (exi_slippi.cpp). The
+// native CSS asks for it first and falls back to slpCSS.dat, so when it cannot be built (a disc that
+// lacks what it links to) it is left out rather than turning the menus off.
+bool optional_system_file(const char* name) { return std::strcmp(name, "SlippiCSS_gui.dat") == 0; }
 
 uint32_t fnv1a(const uint8_t* p, size_t n) {
   uint32_t h = 2166136261u;
@@ -1193,6 +1198,7 @@ void load_system_files(const char* forced_off_by) {
     // offer stages whose code the native game does not have, so Slippi's is used in both views.
     if (modded) host::log("slippi menus: Slippi's %s replaces the pack's copy", name);
     std::vector<uint8_t> data = slippi::system_game_file(name);
+    if (data.empty() && optional_system_file(name)) { host::log("slippi menus: %s left out (cannot build it)", name); continue; }
     if (data.empty()) { host::log("slippi menus: off (cannot build %s)", name); return; }
     // The GitHub build's online menu: YouGame Ranked and YouGame Direct above Slippi's rows. The
     // YouGame app keeps Slippi's labels (its rows are all YouGame). A file that is not the expected
@@ -4888,6 +4894,9 @@ uint32_t replay_codes(const Slippi::GameSettings& s, uint8_t* ps_frozen_toggle) 
       {0x801D4724, MU_REPLAY_CODE_PS_PRELOAD, "Stadium preload: skip normal load"},
       {0x801D4F14, MU_REPLAY_CODE_PS_PRELOAD, "Stadium preload: reset isLoaded"},
       {0x800165AC, MU_REPLAY_CODE_PS_FILE_LOAD, "Stadium StadiumFileLoad"},
+      // Slippi 3.7.0: two stage states that carried over from the last game are reset at stage init.
+      {0x801CD37C, MU_REPLAY_CODE_CASTLE_WIND_RESET, "Reset Castle Wind"},
+      {0x801D69B0, MU_REPLAY_CODE_KONGO_LOG_RESET, "Reset Kongo Log Bridge"},
       {0x8008653C, MU_REPLAY_CODE_WHISPY_FIX, "WhispyBlowDirFix"},
       {0x800AC5B8, MU_REPLAY_CODE_NANA_DETERMINISM, "NanaDeterminism"},
       {0x801D24FC, MU_REPLAY_CODE_PS_MONITOR, "PSCameraIndependentMonitor"},

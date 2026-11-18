@@ -1,8 +1,8 @@
 /* Slippi online menus: VS splash, in-game name tags and the online results screen, native.
  * Covers GALE01r2.ini codes InitVsSplash (4913) + CheckAltStageName (5658) + FG_CreateSubtext
  * (5844, plain mode), PlayOpponentCharAnnouncer (5033), HideAllJObjs (5055), HideLetterJObjs
- * (5076), SkipStageNumberShow (5093), InitInGame (4039), ParseNumbersBetter (4230),
- * ControlAllPanels (4231), GrayPanelsForRemotePlayers (4245). Every entry point is inert unless
+ * (5076), SkipStageNumberShow (5093), InitInGame (4039), ParseNumbersBetter (4230, removed in
+ * Slippi 3.7.0), ControlAllPanels (4231), GrayPanelsForRemotePlayers (4245). Every entry point is inert unless
  * the menus flag is on and the matching online scene is current. Console struct offsets from the
  * asm are translated to decomp field names; MSRB game info stays console layout (raw bytes). */
 #include <string.h>
@@ -434,11 +434,11 @@ void mu_slippi_ingame_hud_init(void)
     }
 }
 
-/* ParseNumbersBetter (global in Slippi): no kerning-start bytes before digits, only inside the
- * online major here (decision D3). */
+/* ParseNumbersBetter: Slippi 3.7.0 removed it to restore the vanilla monospaced numbers, so digits
+ * keep their kerning-start bytes everywhere again. The hook stays for the caller in hsd_3A64.c. */
 int mu_slippi_digits_no_kerning(void)
 {
-    return mu_slippi_menus_enabled() && mu_slippi_in_online_mode();
+    return 0;
 }
 
 /* ---------------------------------------------------------------- results (8:3, Party) */

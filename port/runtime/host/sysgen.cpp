@@ -19,7 +19,8 @@
 namespace host::sysgen {
 namespace {
 constexpr size_t max_asset = 256u * 1024 * 1024;
-const std::array<std::string, 2> required = {"GameSetup_gui.dat", "slpCSS.dat"};
+// SlippiCSS_gui.dat: Slippi 3.7.0's linked copy of slpCSS.dat (upstream v0.9.207).
+const std::array<std::string, 3> required = {"GameSetup_gui.dat", "slpCSS.dat", "SlippiCSS_gui.dat"};
 bool fail(std::string& error, const std::string& message) { error = message; return false; }
 bool component(const std::string& s) {
   return !s.empty() && s != "." && s != ".." &&

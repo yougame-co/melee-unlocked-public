@@ -15,7 +15,9 @@ enum : uint32_t {
   MSRB_REMOTE_INDEX = 4, MSRB_RNG_OFFSET = 5, MSRB_DELAY = 9, MSRB_USER_CHAT = 10, MSRB_OPP_CHAT = 11,
   MSRB_CHAT_PLAYER = 12, MSRB_USER_RANK = 13, MSRB_OPP_RANK = 14, MSRB_LOCAL_NAME = 15,
   MSRB_PLAYER_NAMES = 46, MSRB_OPP_NAME = 170, MSRB_CONNECT_CODES = 201, MSRB_UIDS = 241,
-  MSRB_ERROR = 357, MSRB_GAME_INFO = 598, MSRB_MATCH_ID = 910, MSRB_ALT_STAGE = 961, MSRB_SIZE = 962,
+  MSRB_ERROR = 357, MSRB_GAME_INFO = 598, MSRB_MATCH_ID = 910, MSRB_ALT_STAGE = 961,
+  // Slippi 3.7.0: each player's ranked info (16 bytes, by port), then whether each is a bot account.
+  MSRB_RANKED_PLAYER_INFO = 962, MSRB_IS_BOT = 1026, MSRB_SIZE = 1030,
   NAME_LEN = 31, CODE_LEN = 10, UID_LEN = 29, ERROR_LEN = 241, GAME_INFO_LEN = 312, MATCH_ID_LEN = 51,
 };
 // B9 online status reply, B5 selections, B4 find opponent, BB chat, BE suggestion (request, reply).

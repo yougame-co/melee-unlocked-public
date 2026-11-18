@@ -402,6 +402,26 @@ BASE = 'eb04f3c'
 # The Ranked merge (yg-ranked-port) changed these Slippi routines; they are pinned to its tip instead.
 RANKED_BASE = '9152358'
 RANKED_ROUTINES = ('mu_online_start_melee', 'report_game')
+# Upstream v0.9.207 (Slippi 3.7.0) changed these Slippi routines; they are pinned to its tag.
+UPSTREAM_BASE = 'e6478b848'
+UPSTREAM_ROUTINES = ('mu_online_codes', 'mu_online_match_exit', 'mu_online_test_wait', 'sync_rng_proc')
+# v0.9.207's edits to mu_online_start_melee, applied over the Ranked pin.
+UPSTREAM_START_MELEE = (
+    ('    if (fetch_match_state(&size) != 0 || size < MSRB_SIZE) {\n'
+     '        mu_online_abi_log("online: no match state at match start; playing offline");\n'
+     '        return;\n    }\n',
+     '    if (fetch_match_state(&size) != 0 || size < MSRB_MIN_SIZE) {\n'
+     '        mu_online_abi_log("online: no match state at match start; playing offline");\n'
+     '        return;\n    }\n    /* A 3.6.4-sized reply (the peer-to-peer host\'s) has no ranked info or bot flags: the recording\n'
+     '     * gets zeroes there, not what an earlier reply left in this buffer. */\n'
+     '    if (size < MSRB_SIZE) {\n        memset(mu_online.match_state + size, 0, MSRB_SIZE - size);\n    }\n'),
+    ('    /* Per-match rules the online codes read: mode, the frozen Stadium choice (last match state\n'
+     '     * byte), teams, the local port. */\n'
+     '    mu_online_rules_set(mu_online.mode, mu_online.match_state[MSRB_SIZE - 1],',
+     '    /* Per-match rules the online codes read: mode, the frozen Stadium choice (the match state\'s\n'
+     '     * alt stage mode byte; 3.7.0 appends ranked info and bot flags after it), teams, the local port. */\n'
+     '    mu_online_rules_set(mu_online.mode, mu_online.match_state[MSRB_ALT_STAGE_MODE],'),
+)
 
 
 def baseline(path, base=BASE):
@@ -621,8 +641,14 @@ int mu_native_rtx_semantics(void)
         ).split()
         self.assertEqual(len(names), 61)
         ranked = baseline(path, RANKED_BASE)
+        upstream = baseline(path, UPSTREAM_BASE)
         for name in names:
-            self.assertEqual(body(new, name), body(ranked if name in RANKED_ROUTINES else old, name))
+            want = body(upstream if name in UPSTREAM_ROUTINES else ranked if name in RANKED_ROUTINES else old, name)
+            if name == 'mu_online_start_melee':
+                for before, after in UPSTREAM_START_MELEE:
+                    self.assertEqual(want.count(before), 1, before)
+                    want = want.replace(before, after)
+            self.assertEqual(body(new, name), want)
 
     def test_frontier_and_rumble_ordering_and_alarm_guard(self):
         console = read('sourceport/game/shim/mu_console_rollback.inc')

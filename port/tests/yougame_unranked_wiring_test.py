@@ -95,6 +95,7 @@ int mu_ranked_setup_finish_game(int,unsigned) { return finish_result; }
 struct VsData { struct { struct { unsigned stkind=8; } rules; } start; } vs_data;
 VsData* gmVsMelee_GetVsData() { return &vs_data; }
 int mu_ranked_practice() { return cpu; }
+int mu_online_is_leaving() { return 0; } // Slippi 3.7.0's Party leave; never set in these cases
 const MuRankedSet* mu_ranked_set() { return &set; }
 void mu_ranked_practice_control(int a) { practice_action=a; }
 void mu_slippi_cmd(int,const u8* p,int,void*,int,void*) { end_mode=*p; }

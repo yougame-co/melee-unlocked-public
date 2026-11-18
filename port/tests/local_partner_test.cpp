@@ -12,7 +12,8 @@ using namespace slippi;
 
 static Pad sample(int frame, int port) {
   Pad p(frame); p.checksum_frame = frame - 2; p.checksum = uint32_t(frame * 771);
-  for (int i = 0; i < PAD_DATA_SIZE; ++i) p.buf[i] = frame <= 2 ? 0 : uint8_t(frame * 17 + port * 31 + i);
+  // Slippi 3.7.0's wire pad: the inputs and the RNG bits byte, both carried for every port.
+  for (int i = 0; i < PAD_WIRE_SIZE; ++i) p.buf[i] = frame <= 2 ? 0 : uint8_t(frame * 17 + port * 31 + i);
   return p;
 }
 static void simulation(std::array<int,4> owners, std::vector<int> machines, int humans) {
@@ -55,7 +56,7 @@ static void simulation(std::array<int,4> owners, std::vector<int> machines, int 
       for (int frame = 1; frame <= 180; ++frame) {
         const auto expected = sample(frame,port);
         CHECK(q[180-frame]->frame == frame);
-        CHECK(!std::memcmp(q[180-frame]->buf,expected.buf,PAD_DATA_SIZE));
+        CHECK(!std::memcmp(q[180-frame]->buf,expected.buf,PAD_WIRE_SIZE));
       }
     }
   }
@@ -95,9 +96,11 @@ int main() {
   simulation({{0,0,2,3}},{0,2},3);   // pair + solo, CPU on the last port
   CHECK(mu_local_partner_capable(MU_BUILD_CAPS2_FRIENDS_LOBBY | MU_BUILD_CAPS2_LOCAL_PARTNER));
   CHECK(!mu_local_partner_capable(MU_BUILD_CAPS2_FRIENDS_LOBBY)); // old build refused
-  uint8_t payload[33] = {};
-  CHECK(slippi::online::command_payload_valid(slippi::online::CMD_ONLINE_INPUTS,payload,33));
-  CHECK(!slippi::online::command_payload_valid(slippi::online::CMD_ONLINE_INPUTS,payload,32));
+  // Slippi 3.7.0's 27-byte TXB, plus the local partner's nine-byte pad.
+  uint8_t payload[36] = {};
+  CHECK(slippi::online::command_payload_valid(slippi::online::CMD_ONLINE_INPUTS,payload,27));
+  CHECK(slippi::online::command_payload_valid(slippi::online::CMD_ONLINE_INPUTS,payload,36));
+  for (uint32_t old : {25u,33u,35u}) CHECK(!slippi::online::command_payload_valid(slippi::online::CMD_ONLINE_INPUTS,payload,old));
   for (int machines : {1,2}) {
     const auto ticket = yougame::friends::doubles_queue_ticket("doubles-lobby-1:mu","abcdefghjkmn","generation",machines);
     CHECK(ticket["local_partner"] == yougame::friends::kLocalPartnerCapability && ticket["queue"] == "casual");

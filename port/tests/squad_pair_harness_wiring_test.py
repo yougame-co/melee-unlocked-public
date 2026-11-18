@@ -196,7 +196,7 @@ int main() {
         window = read(ROOT / 'port/runtime/host/window.cpp')
         self.assertIn('script_pads(retrace_count(), true, out)', function(window, 'input_poll'))
         game = read(ROOT / 'sourceport/game/shim/mu_online.c')
-        for code in ('source = &stat[mu_online.input_source]', 'memcpy(tx + 13, mu_online.last_local, PAD_SIZE)',
+        for code in ('source = &stat[mu_online.input_source]', 'memcpy(tx + TXB_PAD, mu_online.last_local, PAD_SIZE)',
                      'command(CMD_ONLINE_INPUTS, tx, sizeof tx', 'mu_online.delay_buffer[mu_online.delay_index]'):
             self.assertIn(code, game)
         online = read(ROOT / 'port/runtime/hle/slippi_online.cpp')

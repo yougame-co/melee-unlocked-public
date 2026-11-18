@@ -47,6 +47,11 @@ long d3d12_create_device(void* adapter, int feature_level, const void* riid, voi
 // is then off for the run and the renderer makes a plain device instead.
 bool device_faulted();
 void set_device(ID3D12Device* device);
+// Streamline faulted while taking the device: its process-wide hooks stay broken for the rest of the
+// run (the next DXGI call through them stopped the game with "device or resource busy"). Remembers
+// that for this version of the game, so later starts leave Streamline out, starts this game again
+// and ends this process. False when the restart could not be started (the caller goes on as before).
+bool restart_without_streamline();
 // The driver's own interface behind a Streamline proxy (device, command list), for code that talks
 // to NVIDIA NGX directly. Returns the argument unchanged when Streamline is not in use. Borrowed: the
 // proxy keeps it alive.

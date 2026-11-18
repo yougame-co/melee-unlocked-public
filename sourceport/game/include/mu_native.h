@@ -540,6 +540,10 @@ int mu_ucf_enabled(void);   /* General Codes on, and the replay (if any) carries
 #define MU_RC_PREVENT_WOBBLING 0x00008000u
 #define MU_RC_UCF08 0x00020000u
 #define MU_RC_PS_PRELOAD 0x00040000u
+/* Slippi 3.7.0's Initialize Stage Data resets (Reset Castle Wind 801CD37C, Reset Kongo Log Bridge
+ * 801D69B0). The host's MU_REPLAY_CODE_* for them must use the same bits. */
+#define MU_RC_CASTLE_WIND_RESET 0x00080000u
+#define MU_RC_KONGO_LOG_RESET 0x00100000u
 struct StartMeleeData;
 int mu_replay_on(void);
 int mu_replay_code(unsigned int code);     /* playback and the replay carries the code */
@@ -621,6 +625,9 @@ void mu_online_start_melee(struct StartMeleeData* data);   /* InitOnlinePlay */
 void mu_online_match_exit(void);
 void mu_online_scene_loop_exit(void);              /* the scene loop left, maybe mid rollback */
 void mu_online_reset_game_index(void);             /* a new opponent search: game reports count from 1 */
+int mu_online_disconnected(void);                  /* ODB_IS_DISCONNECTED (InitPause) */
+int mu_online_is_leaving(void);                    /* ODB_IS_LEAVING: left a Party match (Slippi 3.7.0) */
+void mu_online_leave(void);                        /* InitPause: the local player LRA-Started out of Party */
 
 /* Rollback-safe audio and rumble for online play, shim/mu_online_audio.c: sounds a re-executed
  * frame starts again adopt the voices its previous execution started; music and rumble requests
@@ -723,7 +730,7 @@ typedef struct MuMatchState {
     unsigned char game_info[312];
     char match_id[51];
     unsigned char alt_stage_mode;
-    unsigned char raw[962];
+    unsigned char raw[1030];   /* Slippi 3.7.0's MSRB: 3.6.4's 962 bytes, ranked info and bot flags */
     MuOpponentPick opp_picks[3]; /* not part of the MSRB: filled from the 0xED read beside it */
 } MuMatchState;
 

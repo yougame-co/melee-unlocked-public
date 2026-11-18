@@ -1248,6 +1248,8 @@ void D3D12Backend::init() {
       const bool faulted_before = streamline::device_faulted();
       streamline::set_device(device_.Get());
       if (!faulted_before && streamline::device_faulted()) {
+        // Its hooks stay broken in this process: a fresh start without it is the only sound way on.
+        streamline::restart_without_streamline();
         // Streamline faulted taking the device: drop its proxy device (a throw from its broken locks
         // only leaks it) and make a plain one on the next attempt.
         try { device_.Reset(); } catch (const std::system_error&) {}

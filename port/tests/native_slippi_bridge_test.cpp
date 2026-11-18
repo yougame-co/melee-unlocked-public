@@ -27,10 +27,10 @@ int32_t call(uint8_t cmd, const uint8_t* payload, uint32_t size, uint8_t* respon
 int main() {
   std::vector<uint8_t> response(CAPACITY, 0xEE);
   uint32_t size = 123;
-  uint8_t inputs[25] = {};
+  uint8_t inputs[27] = {};
 
   // A missing size pointer is a bounds error before anything else happens.
-  CHECK(call(CMD_ONLINE_INPUTS, inputs, 25, response.data(), CAPACITY, nullptr) == NATIVE_COMMAND_BOUNDS);
+  CHECK(call(CMD_ONLINE_INPUTS, inputs, 27, response.data(), CAPACITY, nullptr) == NATIVE_COMMAND_BOUNDS);
 
   // Savestates are refused without native support, even with a well-formed payload.
   uint8_t savestate[32] = {};
@@ -46,19 +46,19 @@ int main() {
   CHECK(handler_calls == 2);
 
   // Response buffer checks.
-  CHECK(call(CMD_ONLINE_INPUTS, inputs, 25, nullptr, CAPACITY, &size) == NATIVE_COMMAND_BOUNDS);
-  CHECK(call(CMD_ONLINE_INPUTS, inputs, 25, response.data(), CAPACITY - 1, &size) == NATIVE_COMMAND_BOUNDS);
-  CHECK(call(CMD_ONLINE_INPUTS, nullptr, 25, response.data(), CAPACITY, &size) == NATIVE_COMMAND_BOUNDS);
+  CHECK(call(CMD_ONLINE_INPUTS, inputs, 27, nullptr, CAPACITY, &size) == NATIVE_COMMAND_BOUNDS);
+  CHECK(call(CMD_ONLINE_INPUTS, inputs, 27, response.data(), CAPACITY - 1, &size) == NATIVE_COMMAND_BOUNDS);
+  CHECK(call(CMD_ONLINE_INPUTS, nullptr, 27, response.data(), CAPACITY, &size) == NATIVE_COMMAND_BOUNDS);
 
   // Fixed payload sizes.
-  CHECK(call(CMD_ONLINE_INPUTS, inputs, 24, response.data(), CAPACITY, &size) == NATIVE_COMMAND_BOUNDS);
+  CHECK(call(CMD_ONLINE_INPUTS, inputs, 26, response.data(), CAPACITY, &size) == NATIVE_COMMAND_BOUNDS);
   CHECK(call(CMD_GET_MATCH_STATE, inputs, 1, response.data(), CAPACITY, &size) == NATIVE_COMMAND_BOUNDS);
   CHECK(handler_calls == 2);
 
   // A valid call copies the handler's reply and reports its size.
   next_reply = {1, 2, 3, 4, 5};
   size = 99;
-  CHECK(call(CMD_ONLINE_INPUTS, inputs, 25, response.data(), CAPACITY, &size) == NATIVE_COMMAND_OK);
+  CHECK(call(CMD_ONLINE_INPUTS, inputs, 27, response.data(), CAPACITY, &size) == NATIVE_COMMAND_OK);
   CHECK(size == 5 && response[0] == 1 && response[4] == 5 && response[5] == 0xEE);
   next_reply.clear();
   CHECK(call(CMD_GET_MATCH_STATE, nullptr, 0, response.data(), CAPACITY, &size) == NATIVE_COMMAND_OK);
@@ -72,7 +72,7 @@ int main() {
   // A reply larger than the caller's buffer is a bounds error and copies nothing.
   next_reply.assign(CAPACITY + 1, 7);
   response.assign(CAPACITY + 1, 0xEE);
-  CHECK(call(CMD_ONLINE_INPUTS, inputs, 25, response.data(), CAPACITY, &size) == NATIVE_COMMAND_BOUNDS);
+  CHECK(call(CMD_ONLINE_INPUTS, inputs, 27, response.data(), CAPACITY, &size) == NATIVE_COMMAND_BOUNDS);
   CHECK(size == 0 && response[0] == 0xEE);
 
   // The load preserve list must end with a zero address inside the payload.

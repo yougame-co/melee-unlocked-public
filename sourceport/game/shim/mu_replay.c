@@ -643,9 +643,123 @@ void mu_replay_fighter_flags(const Fighter* fp, unsigned char out[5])
 
 void mu_ghost_post_frame(Fighter* fp);   /* mu_practice_cpu.c: the pro AI's end-of-frame view */
 
+/* Replay 3.20.0 (Slippi 3.7.0, SendGamePostFrame): the state a character keeps from one move to the
+ * next. 0x55 stored charge, 0x56 spent bitflags (what can only be done once until the game resets
+ * it, usually on landing: 0x01 air neutral-B, 0x02 air side-B, 0x04 air down-B, 0x08 Peach's float,
+ * 0x10 aerial tether, 0x20 air item catch), 0x57 wall jumps since grounded, 0x58 a character byte,
+ * 0x59 a character value (word). Slippi reads each entry of its table as a word from the
+ * character's vars (fp+222C on) on the console; here the same fields are read by name, since the
+ * native layout of those vars differs. A charge takes the word's low byte, a spent bit its low bit
+ * (bools the game only sets to 0 or 1), a character value the whole word. Kirby's copy of an
+ * ability is keyed by 0x80 | the ability's internal character id. */
+enum { SPENT_AIR_NEUTRAL_B = 0, SPENT_AIR_SIDE_B = 1, SPENT_AIR_DOWN_B = 2 };
+
+static void stored_state_entries(const Fighter* fp, int key, u8* b, u32* spent)
+{
+#define SPENT(bit, value) (*spent |= ((u32) (value) & 1) << (bit))
+#define CHARGE(value) (b[0x55] = (u8) (value))
+    switch (key) {
+    case Ft_Kind_Mario:
+    case Ft_Kind_DrMario:
+        SPENT(SPENT_AIR_SIDE_B, fp->u.mr.x2238_isCapeBoost);     /* Cape */
+        SPENT(SPENT_AIR_DOWN_B, fp->u.mr.x2234_tornadoCharge);   /* Tornado */
+        break;
+    case Ft_Kind_Donkey:
+        CHARGE(fp->u.dk.x222C);   /* Giant Punch charge */
+        break;
+    case Ft_Kind_Seak:
+        CHARGE(fp->u.sk.x0);   /* needles held */
+        break;
+    case Ft_Kind_Samus:
+        CHARGE(fp->u.ss.x2230);   /* Charge Shot charge */
+        break;
+    case Ft_Kind_Mewtwo:
+        CHARGE(fp->u.mt.x2234_shadowBallCharge);
+        SPENT(SPENT_AIR_SIDE_B, fp->u.mt.x223C_isConfusionBoost);
+        break;
+    case Ft_Kind_Luigi:
+        /* Cyclone: landing does not reset it, a grounded Cyclone does. */
+        SPENT(SPENT_AIR_DOWN_B, fp->u.lg.x222C_cycloneCharge);
+        break;
+    case Ft_Kind_Mars:     /* Dancing Blade */
+    case Ft_Kind_Emblem:   /* Double-Edge Dance */
+        SPENT(SPENT_AIR_SIDE_B, fp->u.ms.x222C);
+        break;
+    case Ft_Kind_Peach:
+        SPENT(SPENT_AIR_NEUTRAL_B, fp->u.pe.specialairn_used);   /* Toad */
+        putf(b, 0x59, fp->u.pe.x4);                              /* float frames left */
+        break;
+    case Ft_Kind_Popo:
+        SPENT(SPENT_AIR_NEUTRAL_B, fp->u.pp.x224C);   /* Ice Shot */
+        break;
+    case Ft_Kind_Nana:
+        SPENT(SPENT_AIR_NEUTRAL_B, fp->u.nn.x224C);   /* her own event, her own flag */
+        break;
+    case Ft_Kind_Koopa:
+        putf(b, 0x59, fp->u.kp.x222C);   /* Fire Breath fuel */
+        break;
+    case Ft_Kind_GameWatch:
+        CHARGE(fp->u.gw.x2238_panicCharge);                  /* Oil Panic shots absorbed */
+        put32(b, 0x59, (u32) fp->u.gw.x223C_panicDamage);    /* Oil Panic absorbed damage */
+        break;
+    case Ft_Kind_Kirby:
+        SPENT(SPENT_AIR_SIDE_B, fp->u.kb.x64);   /* Hammer */
+        break;
+    case 0x80 | Ft_Kind_Donkey:
+        CHARGE(fp->u.kb.xBC);
+        break;
+    case 0x80 | Ft_Kind_Seak:
+        CHARGE(fp->u.kb.xB4);
+        break;
+    case 0x80 | Ft_Kind_Samus:
+        CHARGE(fp->u.kb.xA8);
+        break;
+    case 0x80 | Ft_Kind_Mewtwo:
+        CHARGE(fp->u.kb.x9C);
+        break;
+    case 0x80 | Ft_Kind_Peach:
+        SPENT(SPENT_AIR_NEUTRAL_B, fp->u.kb.xCC);
+        break;
+    case 0x80 | Ft_Kind_Popo:
+    case 0x80 | Ft_Kind_Nana:
+        SPENT(SPENT_AIR_NEUTRAL_B, fp->u.kb.xC4);
+        break;
+    case 0x80 | Ft_Kind_Koopa:
+        putf(b, 0x59, fp->u.kb.x84);
+        break;
+    default:
+        break;
+    }
+#undef CHARGE
+#undef SPENT
+}
+
+static void record_stored_state(const Fighter* fp, u8* b)
+{
+    int key = (int) fp->kind;
+    /* 0x10 aerial tether used (0x02 of fp+2228), 0x20 air item catch used (0x40 of fp+2224: no
+     * item can be caught in the air until an action change on the ground). */
+    u32 spent = (fp->used_tether ? 0x10u : 0) | (fp->x2224_b1 ? 0x20u : 0);
+    b[0x57] = fp->x1969_walljumpUsed;
+    stored_state_entries(fp, key, b, &spent);
+    if (key == Ft_Kind_Kirby) {
+        /* The hammer is his own, everything else belongs to the copied ability (4 = none). */
+        int ability = (int) fp->u.kb.hat.kind;
+        b[0x58] = (u8) ability;
+        stored_state_entries(fp, ability | 0x80, b, &spent);
+    } else if (key == Ft_Kind_Peach) {
+        /* has_float is 1 while she can float, so 0x08 (float used) is its inverse. */
+        spent |= (((u32) fp->u.pe.has_float & 1) ^ 1) << 3;
+    } else if (key == Ft_Kind_GameWatch) {
+        /* The last Judge number in the low nibble, the one before it in the high nibble. */
+        b[0x58] = (u8) (((u32) fp->u.gw.x222C_judgeVar1 & 0x0F) | (((u32) fp->u.gw.x2230_judgeVar2 & 0x0F) << 4));
+    }
+    b[0x56] = (u8) spent;
+}
+
 void mu_replay_post_frame(Fighter* fp)
 {
-    u8 b[0x55];
+    u8 b[0x5D];   /* the command byte and 92 payload bytes (replay 3.20.0) */
     u32 misc;
 
     mu_ghost_post_frame(fp);
@@ -695,6 +809,7 @@ void mu_replay_post_frame(Fighter* fp)
     put32(b, 0x4D, (u32) fp->anim_id);
     put16(b, 0x51, fp->dmg.x18ec_instancehitby);
     put16(b, 0x53, fp->x2074.x2088);
+    record_stored_state(fp, b);   /* 0x55..0x5C, zero for characters without any */
     mu_replay_abi_event(0x38, b + 1, sizeof b - 1);
 }
 

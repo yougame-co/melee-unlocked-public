@@ -13,6 +13,7 @@
 #include "unlock_code_policy.h"
 #include "offline_results_code_policy.h"
 #include "host.h"
+#include "slippi_hsd_links.h"
 #include "vcdiff.h"
 #include "sysgen_boot.h"
 #include "mod_scan.h"
@@ -78,7 +79,7 @@ enum Cmd : uint8_t {
 // Fixed payload sizes (bytes after the command byte), from CEXISlippi::payloadSizes.
 std::unordered_map<uint8_t, uint32_t> g_payload_sizes = {
     {CMD_RECEIVE_COMMANDS, 1}, {CMD_PREPARE_REPLAY, 0xFFFF}, {CMD_READ_FRAME, 4}, {CMD_IS_STOCK_STEAL, 5}, {CMD_GET_LOCATION, 6},
-    {CMD_IS_FILE_READY, 0}, {CMD_GET_GECKO_CODES, 0}, {CMD_ONLINE_INPUTS, 25}, {CMD_CAPTURE_SAVESTATE, 32}, {CMD_LOAD_SAVESTATE, 32},
+    {CMD_IS_FILE_READY, 0}, {CMD_GET_GECKO_CODES, 0}, {CMD_ONLINE_INPUTS, 27}, {CMD_CAPTURE_SAVESTATE, 32}, {CMD_LOAD_SAVESTATE, 32},
     {CMD_GET_MATCH_STATE, 0}, {CMD_FIND_OPPONENT, 19}, {CMD_SET_MATCH_SELECTIONS, 9}, {CMD_SEND_CHAT_MESSAGE, 2}, {CMD_OPEN_LOGIN, 0},
     {CMD_LOGOUT, 0}, {CMD_UPDATE, 0}, {CMD_GET_ONLINE_STATUS, 0}, {CMD_CLEANUP_CONNECTION, 0}, {CMD_GET_NEW_SEED, 0},
     {CMD_REPORT_GAME, 368}, {CMD_FETCH_CODE_SUGGESTION, 31}, {CMD_OVERWRITE_SELECTIONS, 2 + 12},
@@ -699,7 +700,7 @@ bool game_file_name_allowed(const std::string& name) {
 
 // Reads and patches one file. Runs without the cache lock held: the preload worker must never
 // make the simulation thread wait behind a multi-megabyte read plus VCDIFF.
-std::vector<uint8_t> build_game_file(const std::string& name) {
+std::vector<uint8_t> build_game_file_contents(const std::string& name) {
   std::vector<uint8_t> out;
   if (!game_file_name_allowed(name)) return out;
   std::string base = host::sys_game_file_path(name);
@@ -736,6 +737,50 @@ std::vector<uint8_t> build_game_file(const std::string& name) {
   }
   host::log("slippi: game file %s not found in %s", name.c_str(), host::options.sys_dir.c_str());
   return out;
+}
+
+// One file of the player's disc by name, for the asset links below (Slippi Dolphin reads it with
+// FileMon::ReadFileWithName). The retail base when a mod disc runs on one, as for the .diff files
+// above; else, or when the base lacks it, the mounted disc.
+bool read_disc_file_by_name(const std::string& name, std::vector<uint8_t>* out) {
+  out->clear();
+  if (!host::options.mod_base_iso.empty() &&
+      source_port::mods::read_disc_file(std::filesystem::u8path(host::options.mod_base_iso), ("/" + name).c_str(), out) &&
+      !out->empty())
+    return true;
+  uint32_t off = 0, size = 0;
+  if (!host::disc_find_file(name, &off, &size) || !size) return false;
+  out->resize(size);
+  if (!host::disc_read(off, out->data(), size)) { out->clear(); return false; }
+  return true;
+}
+
+// Slippi 3.7.0 ships GameSetup_gui.dat and SlippiCSS_gui.dat with Nintendo's assets replaced by
+// links into the player's disc; they are copied in here (Slippi's SlippiGameFileLoader::resolveLinks,
+// slippi_hsd_links.h). A file with links is resolved once per session and kept, so the Legacy cache
+// and the Source Port's system-file layer share the work. One that cannot be resolved is served as
+// nothing, as Slippi does, rather than with dangling links.
+std::map<std::string, std::vector<uint8_t>> g_linked_files;
+std::mutex g_linked_files_mutex;
+
+std::vector<uint8_t> build_game_file(const std::string& name) {
+  {
+    std::lock_guard<std::mutex> lock(g_linked_files_mutex);
+    const auto it = g_linked_files.find(name);
+    if (it != g_linked_files.end()) return it->second;
+  }
+  std::vector<uint8_t> out = build_game_file_contents(name);
+  if (out.empty()) return out;
+  std::string error;
+  const hsd::Status status = hsd::resolve_links(name, out, read_disc_file_by_name, &error,
+      [](const std::string& line) { host::log("slippi: %s", line.c_str()); });
+  if (status == hsd::Status::NoLinks) return out;
+  if (status == hsd::Status::Failed) {
+    host::log("slippi: could not load %s: %s", name.c_str(), error.c_str());
+    out.clear();
+  }
+  std::lock_guard<std::mutex> lock(g_linked_files_mutex);
+  return g_linked_files.emplace(name, std::move(out)).first->second;   // a racing build already stored it: that copy
 }
 
 const std::vector<uint8_t>& load_game_file(const std::string& name) {
