@@ -52,8 +52,8 @@
  * right there: the button turns into a progress bar while it downloads the site's Windows installer
  * over HTTPS, checks it is whole and signed by Fluo Inc. (the same check as the installed program),
  * runs it silently (per-user, never elevated, no wizard, no browser), then starts YouGame in the tray
- * as above (YG_START_OPENED). The X or Esc closes it at any point as Play offline (YG_START_DECLINED):
- * a download ends, an install already running finishes by itself. If any step fails, and on macOS and Linux, "Get YouGame" opens YouGame's download page in the browser
+ * as above (YG_START_OPENED). The X or Esc closes it at any point (YG_START_DECLINED, not
+ * remembered as Play offline): a download ends, an install already running finishes by itself. If any step fails, and on macOS and Linux, "Get YouGame" opens YouGame's download page in the browser
  * (YG_START_OFFERED). "Play offline" or closing it returns YG_START_DECLINED. It waits for an
  * answer. Every answer and every failure returns, so the game starts as usual.
  *
@@ -1927,7 +1927,7 @@ static yg__start_ui yg__start_u;
    silently ("/S": the one-click per-user installer, never elevated, no wizard, no browser; it writes
    the link type, so the tray start works right after). The window then closes with
    YG__START_ANSWER_INSTALLED and yg_start starts YouGame in the tray as Open YouGame does. The X or
-   Esc is Play offline at any point: a download ends at once, an install already running finishes by
+   Esc closes it at any point, not remembered as Play offline: a download ends at once, an install already running finishes by
    itself, and the game is never held up waiting for either. A failure falls back to the download
    page, as before; an install still running after 5 minutes does not (no second installer). A game can turn it off: #define YG__START_GET_INSTALL 0. */
 #ifndef YG__START_GET_INSTALL
@@ -1948,23 +1948,16 @@ typedef void *yg__start_net;
 typedef BOOL (WINAPI *yg__start_net_close_fn)(yg__start_net);
 
 /* The worker's state. `running` is set until the worker has ended (a worker the window stopped
-   waiting for may outlive it); the window itself goes by yg__start_u.getting. `req` is the open
-   request, which whichever thread takes it first closes: the window closes it to end a download at
-   once (WinHttpCloseHandle ends a pending call on another thread). */
+   waiting for may outlive it, and a later window starts no second one); the window itself goes by
+   yg__start_u.getting. Only the worker touches its WinHTTP handles: a stopped download ends at the
+   next read or timeout, out of sight, since the window never waits for it. */
 typedef struct yg__start_get {
   volatile LONG stage, pct, stop, running;
-  void *volatile req;
-  yg__start_net_close_fn net_close;
   HANDLE thread;
   HWND w;
   int staging;
 } yg__start_get;
 static yg__start_get yg__start_g;
-
-static void yg__start_get_abort(void) {
-  void *r = InterlockedExchangePointer((PVOID volatile *)&yg__start_g.req, NULL);
-  if (r && yg__start_g.net_close) yg__start_g.net_close(r);
-}
 typedef yg__start_net (WINAPI *yg__start_net_open_fn)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
 typedef yg__start_net (WINAPI *yg__start_net_connect_fn)(yg__start_net, LPCWSTR, WORD, DWORD);
 typedef yg__start_net (WINAPI *yg__start_net_request_fn)(yg__start_net, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR,
@@ -2055,12 +2048,7 @@ static int yg__start_get_download(const wchar_t *path, int staging) {
   c = net_connect(s, staging ? L"staging.yougame.co" : L"yougame.co", 443, 0);
   if (c) r = net_request(c, L"GET", L"/api/desktop/download?file=YouGame-windows-x64.exe", NULL, NULL, NULL,
                          0x00800000 /* WINHTTP_FLAG_SECURE */);
-  if (r) {
-    yg__start_g.net_close = net_close;
-    InterlockedExchangePointer((PVOID volatile *)&yg__start_g.req, r);
-    if (yg__start_g.stop) goto done; /* stopped before the request was there to close */
-  }
-  if (!r || !net_send(r, NULL, 0, NULL, 0, 0, 0) || !net_receive(r, NULL)) goto done;
+  if (!r || yg__start_g.stop || !net_send(r, NULL, 0, NULL, 0, 0, 0) || !net_receive(r, NULL)) goto done;
   len = sizeof status;
   if (!net_query(r, 19 | 0x20000000 /* STATUS_CODE | FLAG_NUMBER */, NULL, &status, &len, NULL) || status != 200)
     goto done;
@@ -2092,7 +2080,7 @@ done:
     CloseHandle(f);
     if (!ok) DeleteFileW(path);
   }
-  if (r) yg__start_get_abort(); /* unless the window closed it already */
+  if (r) net_close(r);
   if (c) net_close(c);
   if (s) net_close(s);
   /* winhttp.dll stays loaded: it may still finish closing in the background, and a worker the window
@@ -2130,7 +2118,7 @@ static int yg__start_get_install(const wchar_t *path) {
   }
   memcpy(dir, path, cut * sizeof(wchar_t));
   dir[cut] = 0;
-  for (attempt = 0; attempt < 2 && !started; ++attempt) {
+  for (attempt = 0; attempt < 2 && !started && !yg__start_g.stop; ++attempt) { /* Play offline: never started */
     line[0] = L'"';
     memcpy(line + 1, path, n * sizeof(wchar_t));
     wcscpy(line + n + 1, L"\" /S");
@@ -2167,7 +2155,7 @@ static DWORD WINAPI yg__start_get_run(LPVOID unused) {
       if (yg__start_g.stop) {
         end = YG__START_GET_STOPPED;
       } else {
-        yg__start_get_note(YG__START_GET_INSTALLING);
+        yg__start_get_note(YG__START_GET_INSTALLING); /* the check and the start can take a moment */
         /* Came up meanwhile (installed some other way): nothing to install, the tray step sees it. */
         got = yg__start_running(yg__start_g.staging) ? 1 : yg__start_get_install(path);
         end = got > 0 ? YG__START_GET_DONE : got < 0 ? YG__START_GET_SLOW : YG__START_GET_FAILED;
@@ -2187,13 +2175,15 @@ static int yg__start_get_begin(HWND w) {
   HWND later = GetDlgItem(w, YG__START_ID_LATER), mainb = GetDlgItem(w, YG__START_ID_MAIN);
   DWORD id;
   /* Only a first install: an installed YouGame (even an old one) is never reinstalled from here, since
-     the installer ends a running copy of it; the page handles those. */
-  if (yg__start_g.running || yg__start_installed(yg__start_g.staging) || yg__start_running(yg__start_g.staging))
+     the installer ends a running copy of it (its CHECK_APP_RUNNING step); the page handles those. */
+  /* Never from a game run as administrator (or SYSTEM): the installer would run raised from a folder
+     the user can write to, or install into the wrong profile. The download page handles that. */
+  if (yg__start_g.running || yg__start_raised() || yg__start_installed(yg__start_g.staging) ||
+      yg__start_running(yg__start_g.staging))
     return 0;
   yg__start_g.w = w;
   yg__start_g.pct = 0;
   yg__start_g.stop = 0;
-  yg__start_g.req = NULL;
   yg__start_g.stage = YG__START_GET_DOWNLOAD;
   yg__start_g.running = 1;
   yg__start_g.thread = CreateThread(NULL, 0, yg__start_get_run, NULL, 0, &id);
@@ -2203,7 +2193,10 @@ static int yg__start_get_begin(HWND w) {
     return 0;
   }
   yg__start_u.getting = 1;
-  if (later) ShowWindow(later, SW_HIDE);
+  if (later) {
+    ShowWindow(later, SW_HIDE);
+    EnableWindow(later, FALSE); /* no focus for it: Left then Enter must not read as Play offline */
+  }
   if (mainb) InvalidateRect(mainb, NULL, FALSE);
   return 1;
 }
@@ -2570,8 +2563,21 @@ static void yg__start_ui_button(yg__start_ui *u, int id, HDC target, const RECT 
       yg__start_fill_rrect(bits, bw, bh, g, g, pw, ph, ph * .5f, YG__START_C_LATER);
       if (fw > 0) yg__start_fill_rrect(bits, bw, bh, g, g, fw < ph ? ph : fw, ph, ph * .5f, YG__START_C_FOCUS);
       GdiFlush();
-      if (st == YG__START_GET_DOWNLOAD) sprintf(label, "Downloading YouGame  %ld%%", (long)pct);
-      else strcpy(label, "Installing YouGame...");
+      /* The pill is sized for "Get YouGame": the longest label that fits inside it, never clipped. */
+      {
+        static const char *const down[3] = {"Downloading %ld%%", "Getting %ld%%", "%ld%%"};
+        static const char *const inst[3] = {"Installing...", "Installing", "..."};
+        HGDIOBJ was = SelectObject(dc, u->f_button);
+        int k;
+        for (k = 0; k < 3; ++k) {
+          SIZE ext;
+          if (st == YG__START_GET_DOWNLOAD) sprintf(label, down[k], (long)pct);
+          else strcpy(label, inst[k]);
+          if (k == 2 || (GetTextExtentPoint32A(dc, label, (int)strlen(label), &ext) && ext.cx <= (LONG)(pw - ph * .5f)))
+            break;
+        }
+        SelectObject(dc, was);
+      }
       SetRect(&t, 0, 0, bw, bh);
       yg__start_text(dc, u->f_button, label, &t, YG__START_C_WHITE, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
     } else {
@@ -2640,13 +2646,13 @@ static HICON yg__start_logo_icon(int size) {
    chose not to go online. */
 static void yg__start_pick(HWND w, int id) {
   if (yg__start_u.getting) {
-    /* Getting YouGame: the main button is a progress bar; X or Esc is Play offline at once. A download
+    /* Getting YouGame: the main button is a progress bar; X or Esc closes it at once. A download
        ends now; an install already running finishes by itself, out of sight. */
     if (id == YG__START_ID_MAIN) return;
     InterlockedExchange(&yg__start_g.stop, 1);
-    yg__start_get_abort();
     yg__start_u.getting = 0;
-    yg__start_u.choice = YG__START_ANSWER_LATER;
+    /* No choice made: they had asked for YouGame, so the window is offered again next start. */
+    yg__start_u.choice = YG__START_ANSWER_NONE;
     DestroyWindow(w);
     return;
   }
@@ -2661,7 +2667,7 @@ static void yg__start_pick(HWND w, int id) {
 /* Moves focus between the two buttons and shows the focus ring (keyboard or controller). */
 static void yg__start_focus(HWND w, int id) {
   HWND b = GetDlgItem(w, id);
-  if (!b) return;
+  if (!b || (yg__start_u.getting && id != YG__START_ID_MAIN)) return;
   SendMessageW(w, WM_CHANGEUISTATE, MAKEWPARAM(UIS_CLEAR, UISF_HIDEFOCUS), 0);
   SetFocus(b);
   InvalidateRect(GetDlgItem(w, YG__START_ID_MAIN), NULL, FALSE);
@@ -2829,7 +2835,8 @@ static LRESULT CALLBACK yg__start_wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) 
           st == YG__START_GET_SLOW) {
         /* A slow install is still going: never the download page beside it (no second installer). */
         u->choice = st == YG__START_GET_DONE ? YG__START_ANSWER_INSTALLED
-                  : st == YG__START_GET_FAILED ? YG__START_ANSWER_GET : YG__START_ANSWER_LATER;
+                  : st == YG__START_GET_FAILED ? YG__START_ANSWER_GET
+                  : YG__START_ANSWER_NONE; /* slow or stopped: not a remembered Play offline */
         u->getting = 0;
         DestroyWindow(w);
       } else if (GetDlgItem(w, YG__START_ID_MAIN)) {
@@ -3032,8 +3039,7 @@ static int yg__start_offer_window(const yg__start_win *win) {
        itself. The worker gets a moment to end, then runs on alone until it does (it starts nothing
        once stopped). No choice is made up here. */
     InterlockedExchange(&yg__start_g.stop, 1);
-    yg__start_get_abort();
-    (void)WaitForSingleObject(yg__start_g.thread, 2000);
+    (void)WaitForSingleObject(yg__start_g.thread, yg__start_g.stage == YG__START_GET_DOWNLOAD ? 200 : 0);
     CloseHandle(yg__start_g.thread);
     yg__start_g.thread = NULL;
     u->getting = 0;
@@ -3819,6 +3825,10 @@ yg_start_result yg_start(const yg_start_options *o) {
   }
 #endif
   if (answer != YG__START_ANSWER_GET) return YG_START_DECLINED;
+#if defined(_WIN32) && !defined(YOUGAME_START_TESTING)
+  /* An earlier window's install is still going: no download page (and no second installer) beside it. */
+  if (yg__start_g.running) return YG_START_DECLINED;
+#endif
   /* Which game sent the player (o->game is a checked plain slug), so the download page can name it. */
   {
     char url[160];

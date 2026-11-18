@@ -235,10 +235,15 @@ bool Assets::prepare(const Config& config, const Disc& disc, std::string& error)
       if (needed.empty()) continue;
       std::vector<uint8_t> output;
       bool rebuild = false;
+      // A generated file that no longer matches the manifest is stale (an older build's Sys asset, e.g. the
+      // Slippi 3.6 GameSetup_gui.dat left by build 121 under 3.7.0's build 122): rebuild and replace it.
+      std::set<std::filesystem::path> stale;
       for (const auto& item : needed) {
         if (std::filesystem::exists(item.second)) {
-          if (!read(item.second, file.size, output) || !matches(output, file.size, file.sha1))
-            return fail(error, file.target + ": generated file size/SHA-1 mismatch");
+          if (!read(item.second, file.size, output) || !matches(output, file.size, file.sha1)) {
+            stale.insert(item.second);
+            rebuild = true;
+          }
         } else rebuild = true;
       }
       if (rebuild) {
@@ -260,7 +265,7 @@ bool Assets::prepare(const Config& config, const Disc& disc, std::string& error)
         if (sha1(output) != file.sha1) return fail(error, file.target + ": rebuilt target size/SHA-1 mismatch");
         bool built = false;
         for (const auto& item : needed) {
-          if (std::filesystem::exists(item.second)) continue;
+          if (std::filesystem::exists(item.second) && !stale.count(item.second)) continue;
           if (!atomic_write(item.second, output))
             return fail(error, file.target + ": cannot atomically write generated file");
           built = true;

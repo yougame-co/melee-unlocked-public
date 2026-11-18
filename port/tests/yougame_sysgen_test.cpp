@@ -17,6 +17,10 @@ static void check(bool ok, const std::string& message) {
   if (!ok) { std::cerr << "FAIL: " << message << '\n'; std::exit(1); }
 }
 static Bytes bytes(const std::string& s) { return Bytes(s.begin(), s.end()); }
+static Bytes read_all(const fs::path& p) {
+  std::ifstream f(p, std::ios::binary);
+  return Bytes(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
 static void append(Bytes& a, const Bytes& b) { a.insert(a.end(), b.begin(), b.end()); }
 static void integer(Bytes& out, size_t n) {
   if (n >= 128) integer(out, n >> 7);
@@ -223,10 +227,11 @@ static void applier_tests(const fs::path& root) {
   cached_message(3);
   check(assets.lookup(sys / "", "GameSetup_gui.dat") == data / "SysGenerated/Sys/GameSetup_gui.dat",
         "trailing slash lookup redirects");
+  // A stale cache (an older build's generated file, or a damaged one) is rebuilt from the disc and replaced.
   write(data / "SysGenerated/Sys/GameSetup_gui.dat", bytes("wrong"));
-  check(!assets.prepare(config, disc, error) && error.find("generated file") != std::string::npos, "modified cache fails closed");
-  check(assets.generated_names(sys).empty(), "failure publishes no redirects");
-  check(assets.status_message().empty(), "failure publishes no success message");
+  check(assets.prepare(config, disc, error) && reads == 2, "stale cache rebuilt from the disc: " + error);
+  check(read_all(data / "SysGenerated/Sys/GameSetup_gui.dat") == target, "stale cache replaced with the target");
+  check(assets.lookup(sys, "GameSetup_gui.dat") == data / "SysGenerated/Sys/GameSetup_gui.dat", "rebuilt cache redirect");
   clean_generated(); disc_bytes = bytes("oops");
   check(!assets.prepare(config, disc, error) && error.find("disc source size/SHA-1") != std::string::npos, "modified disc fails closed");
   disc_bytes = source; readable = false;
