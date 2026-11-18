@@ -7,6 +7,7 @@
 #endif
 #include "pc_settings.h"
 #include "pc_settings_shared.h"
+#include "coming_soon_overlay.h"
 #include "host.h"
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
@@ -268,6 +269,12 @@ bool PcSettingsUID3D11::begin(RenderOptions& options) {
 void PcSettingsUID3D11::draw() {
   if (!impl_->ready) return;
   render_draw_data(impl_->renderer, ImGui::GetDrawData());
+}
+
+void PcSettingsUID3D11::draw_picture_overlay(uint32_t w, uint32_t h) {
+  if (!impl_->ready || !ImGui::GetCurrentContext()) return;
+  ImDrawData data;
+  if (coming_soon_overlay::picture_draw_data(&data, (float)w, (float)h)) render_draw_data(impl_->renderer, &data);
 }
 
 }  // namespace gx

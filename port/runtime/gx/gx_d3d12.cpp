@@ -85,6 +85,7 @@ static_assert(MU_RTX_PASS_PARTICLES == 1, "remix_effect_draw (gx_core.h) tests t
 #include "gecko_data.h"
 #ifdef GX_PC_SETTINGS
 #include "pc_settings.h"
+#include "coming_soon_overlay.h"
 #include "lab_view.h"
 #endif
 
@@ -2572,6 +2573,10 @@ void D3D12Backend::pso_worker() {
       job = pso_jobs_.front(); pso_jobs_.pop_front();
     }
     PsoResult r; r.key = job.key; r.recipe = job.recipe;
+    // MELEE_TEST_PSO_DELAY_MS=<ms> (tests only): each pipeline takes that much longer, as a slow
+    // driver compile does after an update, so the frames drawn while it is pending can be seen.
+    static const int test_delay_ms = [] { const char* v = host::test_env::getenv("MELEE_TEST_PSO_DELAY_MS"); return v ? std::atoi(v) : 0; }();
+    if (test_delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(test_delay_ms));
     r.pso = build_pso(job.key, job.vsu, job.psu, job.topo, r.vs, r.ps);
     { std::lock_guard<std::mutex> lk(pso_mutex_); pso_done_.push_back(std::move(r)); }
     pso_done_cv_.notify_all();
@@ -4889,6 +4894,11 @@ void D3D12Backend::present_pass(const EfbCopy& c, bool upscaled, ID3D12Resource*
   // It is scaled to cover the window and cropped evenly where the shapes differ.
   video_bg::set_border(opts_.border_art);
   bool art_reversed = false;
+  // Kept for the shader preset path: a RetroArch preset's passes clear the whole window (the
+  // built-in CRT filter does not), so the art is painted again in the bars after the preset.
+  bool art_drawn = false;
+  D3D12_GPU_DESCRIPTOR_HANDLE art_gpu_kept{};
+  float art_rect_kept[28] = {}, art_hdr_kept[4] = {};
   if (const auto art = video_bg::border_frame(&art_reversed)) {
     if (ID3D12Resource* texture = update_video_texture(art, video_bg::kBorderSlot)) {
       const uint32_t art_slot = reserve_srvs(4);
@@ -4923,6 +4933,10 @@ void D3D12Backend::present_pass(const EfbCopy& c, bool upscaled, ID3D12Resource*
       list_->SetGraphicsRoot32BitConstants(1, 4, hdr_lane, 28);
       list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
       list_->DrawInstanced(3, 1, 0, 0);
+      art_drawn = true;
+      art_gpu_kept = art_gpu;
+      std::memcpy(art_rect_kept, art_rect, sizeof art_rect_kept);
+      std::memcpy(art_hdr_kept, hdr_lane, sizeof art_hdr_kept);
       // Root constants stay set: the draws after this one set only the first twenty, and must not
       // inherit the shadow.
       const float no_frame[8] = {};
@@ -5071,6 +5085,16 @@ void D3D12Backend::present_pass(const EfbCopy& c, bool upscaled, ID3D12Resource*
       list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     }
   }
+#ifdef GX_PC_SETTINGS
+  {   // The Coming soon stickers go into the picture under a preset (same target format as the overlay's pipeline)
+    const bool soon_in_picture = shader_on && settings_ui_ && backbuffer_format_ == DXGI_FORMAT_R8G8B8A8_UNORM;
+    coming_soon_overlay::set_in_picture(soon_in_picture);
+    if (soon_in_picture) {
+      list_->OMSetRenderTargets(1, &shader_rtv, FALSE, nullptr);
+      settings_ui_->draw_picture_overlay(list_.Get(), shader_w, shader_h);
+    }
+  }
+#endif
   if (shader_on) {
     D3D12_RESOURCE_BARRIER to_source{};
     to_source.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -5085,6 +5109,26 @@ void D3D12Backend::present_pass(const EfbCopy& c, bool upscaled, ID3D12Resource*
     list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     D3D12_VIEWPORT whole{0, 0, (float)client_w_, (float)client_h_, 0, 1};
     list_->RSSetViewports(1, &whole);
+    if (art_drawn) {
+      // The bars around the picture (pillarbox and letterbox), each its own scissor.
+      const LONG px0 = (LONG)std::floor(vp.TopLeftX), py0 = (LONG)std::floor(vp.TopLeftY);
+      const LONG px1 = (LONG)std::ceil(vp.TopLeftX + vp.Width), py1 = (LONG)std::ceil(vp.TopLeftY + vp.Height);
+      const D3D12_RECT bars[4] = {{0, 0, px0, client_h_}, {px1, 0, client_w_, client_h_},
+                                  {px0, 0, px1, py0}, {px0, py1, px1, client_h_}};
+      list_->SetPipelineState(hdr_active_ && blit_hdr_pso_ ? blit_hdr_pso_.Get() : blit_pso_.Get());
+      list_->SetGraphicsRootSignature(blit_root_.Get());
+      list_->SetGraphicsRootDescriptorTable(0, art_gpu_kept);
+      list_->SetGraphicsRoot32BitConstants(1, 28, art_rect_kept, 0);
+      list_->SetGraphicsRoot32BitConstants(1, 4, art_hdr_kept, 28);
+      list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      for (const D3D12_RECT& bar : bars) {
+        if (bar.right <= bar.left || bar.bottom <= bar.top) continue;
+        list_->RSSetScissorRects(1, &bar);
+        list_->DrawInstanced(3, 1, 0, 0);
+      }
+      const float no_frame[8] = {};
+      list_->SetGraphicsRoot32BitConstants(1, 8, no_frame, 20);
+    }
     list_->RSSetScissorRects(1, &sc);
   }
   std::swap(depth_barrier.Transition.StateBefore, depth_barrier.Transition.StateAfter);
@@ -5256,7 +5300,13 @@ void D3D12Backend::update_hdr() {
         if (desc.MaxLuminance > 100.0f) hdr_display_peak_ = desc.MaxLuminance;
       }
     }
-    g_hdr_display.store(display_hdr, std::memory_order_relaxed);
+    // Windows HDR on with the game's HDR output off: Windows maps the game's SDR picture itself,
+    // which on some screens looks washed out. Logged on every change so a colour report shows it.
+    static bool hdr_state_logged = false;
+    if (g_hdr_display.exchange(display_hdr, std::memory_order_relaxed) != display_hdr || !hdr_state_logged)
+      host::log("display: Windows HDR %s for this screen%s", display_hdr ? "on" : "off",
+                display_hdr && !opts_.hdr_output ? "; the game's HDR output is off, so Windows maps its SDR picture" : "");
+    hdr_state_logged = true;
   }
   // A RetroArch shader preset draws SDR into the swap chain itself: HDR waits until it is off.
   const bool want = opts_.hdr_output && hdr_display_available() && blit_hdr_pso_ && opts_.shader_preset.empty();

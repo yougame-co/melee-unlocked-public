@@ -1373,17 +1373,17 @@ int build_verdict(uint8_t remote_count, std::string* why) {
         // An opponent on the standard game: say it is this player's own mod disc that differs, and
         // where it is switched off. A copy of Melee with one changed file left in Mods\Discs read as
         // "a different mod build" to a player whose ISOs were the same (0.9.203 report).
+        // Short enough for the character select's four-line error box (the longer wording was cut off).
         if (!rb.mod_view)
-          *why = "Your mod disc " + (g_local_build.name.empty() ? std::string("") : g_local_build.name + " ") +
-                 "is on and Player " + std::to_string(port) +
-                 " plays the standard game. Turn it off in the launcher's Mods, or both use the same disc";
+          *why = "Your mods are on" + (g_local_build.name.empty() ? std::string("") : ": " + g_local_build.name) +
+                 ". Player " + std::to_string(port) + " has none. Turn yours off in Mods, or use the same";
         else
-          *why = "Player " + std::to_string(port) + " has a different mod build. Everyone needs the same ISO and game version";
+          *why = "Player " + std::to_string(port) + " has different mods. Everyone needs the same ones";
         return -1;
       }
     } else if (rb.mod_view) {
-      *why = "Your opponent has the mod disc " + (rb.name.empty() ? std::string("a mod build") : rb.name) +
-             " on. They can turn it off in the launcher's Mods, or you both use the same disc";
+      *why = "Opponent has mods on" + (rb.name.empty() ? std::string("") : ": " + rb.name) +
+             ". Turn them off in Mods, or use the same";
       return -1;
     }
   }

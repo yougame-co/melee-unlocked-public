@@ -239,6 +239,15 @@ static struct {
     float cam[13];         /* eye before, eye, interest, up, vertical field of view (degrees) */
 } mu_menu_cam;
 
+/* The menu camera's eye before the C-stick turned it this frame (mu_menu_camera above). */
+int mu_menu_camera_neutral_eye(float out[3])
+{
+    out[0] = mu_menu_cam.cam[0];
+    out[1] = mu_menu_cam.cam[1];
+    out[2] = mu_menu_cam.cam[2];
+    return out[0] != 0.0f || out[1] != 0.0f || out[2] != 0.0f;
+}
+
 void mu_menu_camera(HSD_CObj* cobj, int tilted)
 {
     Vec3 v;

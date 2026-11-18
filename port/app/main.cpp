@@ -2794,6 +2794,13 @@ static int melee_main(int argc, char** argv) {
               gfx.efb_scale ? ("x" + std::to_string(gfx.efb_scale)).c_str() : "auto", gfx.dlss_mode,
               gfx.vsync ? "on" : "off", gfx.exclusive_fullscreen ? "exclusive fullscreen" : "windowed or borderless",
               host::startup_mark().c_str());
+    // The picture's colour and filtering settings, so a report about colours (11-17: menu outlines
+    // looking white instead of gold) says what was set.
+    host::log("settings: picture brightness %.2f, contrast %.2f, vibrance %.2f, sharpening %d%%, MSAA %d, SSAA %d, "
+              "anisotropy %d, HDR output %s, shader preset %s, CRT filter %s",
+              gfx.brightness, gfx.contrast, gfx.vibrance, (int)(gfx.sharpness * 100.0f + 0.5f), gfx.msaa, gfx.ssaa,
+              gfx.anisotropy, gfx.hdr_output ? "on" : "off", gfx.shader_preset.empty() ? "none" : gfx.shader_preset.c_str(),
+              gfx.crt_filter ? "on" : "off");
   }
 
   // The Lossless adapter's lag test (Settings > Advanced, or --lag-test): the native game and the

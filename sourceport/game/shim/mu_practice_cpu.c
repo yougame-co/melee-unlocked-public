@@ -628,13 +628,36 @@ MU_EXCLUSIONS(practice_cpu,
  * full-width text, else NULL. The game then shows it on the CPU's own grey tag in place of "CP". */
 const char* mu_pro_tag_text(int slot)
 {
-    static const char* const names[] = {"Mang0", "Zain", "", "Cody", "aMSa"};
+    /* Capitals, as Melee's own name tags are (name entry has no lower case). */
+    static const char* const names[] = {"MANG0", "ZAIN", "", "CODY", "AMSA"};
     static char sjis[5][16];
     const MuPcConfig* c;
     HSD_GObj* g;
     int pro;
-    /* Off until the owner approves its look (the CP tag's letters); MELEE_TEST_PRO_TAG shows it in tests. */
-    if (mu_test_getenv("MELEE_TEST_PRO_TAG") == NULL) return NULL;
+    /* MELEE_TEST_TAG_NAMES=<p1>,<p2>,<p3>,<p4> (tests only): those ports show that name on their tag
+     * through the game's own name-tag path, human or CPU (empty: none), to compare the looks. */
+    {
+        static char test_sjis[4][24];
+        const char* v = mu_test_getenv("MELEE_TEST_TAG_NAMES");
+        if (v != NULL && slot >= 0 && slot <= 3) {
+            int port = 0, n = 0;
+            for (; *v && port < slot; v++) if (*v == ',') port++;
+            if (port == slot && *v && *v != ',') {
+                for (; *v && *v != ',' && n < 20; v++) {
+                    unsigned code = *v >= 'A' && *v <= 'Z' ? 0x8260u + (unsigned) (*v - 'A')
+                                  : *v >= 'a' && *v <= 'z' ? 0x8281u + (unsigned) (*v - 'a')
+                                  : *v >= '0' && *v <= '9' ? 0x824Fu + (unsigned) (*v - '0') : 0x8140u;
+                    test_sjis[slot][n++] = (char) (code >> 8);
+                    test_sjis[slot][n++] = (char) code;
+                }
+                test_sjis[slot][n] = 0;
+                return test_sjis[slot];
+            }
+            return NULL;
+        }
+    }
+    /* The pro's name as a real name tag (owner 11-17): white letters on the tag's dark box and the
+     * port's coloured arrow (mu_pro_tag_port_plate). */
     if (slot < 0 || slot > 3 || Player_GetPlayerSlotType(slot) != Gm_PKind_Cpu || !pc_allowed()) return NULL;
     c = pc_settings();
     if (!c->enabled) return NULL;
@@ -661,4 +684,10 @@ const char* mu_pro_tag_text(int slot)
         sjis[pro][n] = 0;
     }
     return sjis[pro];
+}
+
+int mu_pro_tag_port_plate(int slot)
+{
+    /* A pro AI's name shows the way a human's saved name does: on the port's coloured tag. */
+    return slot >= 0 && slot <= 3 && Player_GetPlayerSlotType(slot) == Gm_PKind_Cpu && mu_pro_tag_text(slot) != NULL;
 }

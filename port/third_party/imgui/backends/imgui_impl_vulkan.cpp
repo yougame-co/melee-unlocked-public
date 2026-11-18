@@ -1248,6 +1248,16 @@ void ImGui_ImplVulkan_CreateMainPipeline(const ImGui_ImplVulkan_PipelineInfo* pi
     bd->Pipeline = ImGui_ImplVulkan_CreatePipeline(v->Device, v->Allocator, v->PipelineCache, pipeline_info);
 }
 
+// Melee Unlocked: one more pipeline like the main one for another target (a shader preset's picture
+// texture, whose format differs from the swap chain's), for ImGui_ImplVulkan_RenderDrawData's pipeline
+// argument. The caller destroys it with vkDestroyPipeline before ImGui_ImplVulkan_Shutdown.
+VkPipeline ImGui_ImplVulkan_CreateExtraPipeline(const ImGui_ImplVulkan_PipelineInfo* info)
+{
+    ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();
+    ImGui_ImplVulkan_InitInfo* v = &bd->VulkanInitInfo;
+    return ImGui_ImplVulkan_CreatePipeline(v->Device, v->Allocator, v->PipelineCache, info);
+}
+
 void    ImGui_ImplVulkan_DestroyDeviceObjects()
 {
     ImGui_ImplVulkan_Data* bd = ImGui_ImplVulkan_GetBackendData();

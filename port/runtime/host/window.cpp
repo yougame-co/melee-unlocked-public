@@ -118,6 +118,7 @@ yougame::parity::OverlayPad g_overlay_pad = [] {   // input/simulation thread on
   pad.standalone_menu = pad_menu_chord;
   return pad;
 }();
+int g_ui_start_waited[4]{};   // settings_shortcut::hold_lone_start, per port
 #ifdef YOUGAME_AGENT_TEST_HOOK
 int g_ui_agent_step = -1;   // protected by g_ui_pad_mutex, alongside the snapshot it identifies
 #endif
@@ -1984,6 +1985,9 @@ struct UiSnapshot {
     const uint64_t menu_now = static_cast<uint64_t>(now_seconds() * 1000.0);
     yougame::parity::signals.emit(g_overlay_pad.tick(menu_now));
     bool toggle_settings = false;
+    uint32_t scene_major = 0, scene_minor = 0, scene_frame = 0;
+    current_scene(&scene_major, &scene_minor, &scene_frame);
+    const bool training = scene_major == 0x1C;   // Training, where a lone Start opens its pause menu
     const bool home_input = g_background_input || (g_hwnd && window_focused(g_hwnd));
     for (int i = 0; i < 4; ++i) {
       // Only ImGui receives the filtered keyboard copy. All chord/console/friends readers
@@ -2026,6 +2030,10 @@ struct UiSnapshot {
       if (opened_here) g_settings_controller_port.store(i, std::memory_order_release);
       if (settings_shortcut::poll_practice(pads[i].err == 0, pads[i].button, g_ui_practice_chord_held[i]))
         g_practice_toggle.store(true, std::memory_order_release);   // same as Tab
+      const bool start_taken = g_ui_settings_chord_held[i] || g_ui_practice_chord_held[i] ||
+                               ((raw_buttons & 0x1000) && !(menu_buttons & 0x1000));
+      settings_shortcut::hold_lone_start(training && pads[i].err == 0, start_taken, raw_buttons,
+                                         pads[i].button, g_ui_start_waited[i]);
     }
     if (toggle_settings) g_settings_toggle.store(true, std::memory_order_release);
     walter_egg::watch_pads(pads);   // the character select's easter egg: reads only

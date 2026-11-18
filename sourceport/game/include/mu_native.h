@@ -830,7 +830,9 @@ void mu_slippi_main_menu_loaded(void);                    /* end of mnMain_Scene
 void mu_slippi_switch_to_online_menu(void);               /* 1P menu, row 2 */
 int mu_slippi_menu_clear_check(int menus_differ);         /* fn_8022AFEC */
 void mu_slippi_online_menu_think(struct HSD_GObj* gp);
-void mu_slippi_menu_soon(int canvas, int idle);            /* mnmain: each frame; canvas -1 = new scene */
+void mu_slippi_menu_soon(int canvas, int idle);
+struct HSD_JObj;
+void mu_slippi_menu_rows(struct HSD_JObj** rows, int count, void* cobj);   /* mnmain fn_8022AFEC */            /* mnmain: each frame; canvas -1 = new scene */
 int mu_slippi_css_text_heap(void);                        /* preloadState: 0 = vanilla size */
 void mu_slippi_log_online_rows(void);
 void mu_mnmain_install_online_menu(void);                 /* mn/mnmain.c */

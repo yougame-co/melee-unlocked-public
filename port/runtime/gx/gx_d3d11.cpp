@@ -74,6 +74,7 @@
 #include "gecko_data.h"
 #ifdef GX_PC_SETTINGS
 #include "pc_settings.h"
+#include "coming_soon_overlay.h"
 #include "lab_view.h"
 #endif
 
@@ -1788,6 +1789,10 @@ void D3D11Backend::present_efb(const EfbCopy& c) {
   // Border art fills the window first; the picture is drawn over it (see the D3D12 backend).
   video_bg::set_border(opts_.border_art);
   bool art_reversed = false;
+  // Kept for the shader preset path, which clears the whole window: the art is painted again in
+  // the bars after the preset (see the D3D12 backend).
+  ID3D11ShaderResourceView* art_srv_kept = nullptr;
+  float art_rect_kept[16] = {}, art_frame_kept[8] = {};
   if (const auto art = video_bg::border_frame(&art_reversed)) {
     if (TextureEntry* texture = update_video_texture(art, video_bg::kBorderSlot)) {
       const float window = (float)client_w_ / std::max((float)client_h_, 1.0f), shape = (float)art->width / std::max((float)art->height, 1.0f);
@@ -1806,6 +1811,9 @@ void D3D11Backend::present_efb(const EfbCopy& c) {
       const float art_frame[8] = {art_px, art_py, art_px + art_pw, art_py + art_ph,
                                   std::clamp(std::max(art_px, art_py) * 0.6f, 12.0f, 160.0f), 0, 0, opts_.border_edge ? 1.0f : 0.0f};
       blit(texture->srv.Get(), art_rect, nullptr, art_frame, true);
+      art_srv_kept = texture->srv.Get();
+      std::memcpy(art_rect_kept, art_rect, sizeof art_rect_kept);
+      std::memcpy(art_frame_kept, art_frame, sizeof art_frame_kept);
       context_->OMSetRenderTargets(1, &rtv, nullptr);
     }
   }
@@ -1867,6 +1875,15 @@ void D3D11Backend::present_efb(const EfbCopy& c) {
     rect[9] = (float)std::clamp((int)std::lround((double)c.src_h * scale_ / shader_h), 1, 4);
   }
   blit(efb_srv_.Get(), rect, efb_depth_srv_.Get(), crt_on ? crt : nullptr);
+#ifdef GX_PC_SETTINGS
+  // The Coming soon stickers go into the picture under a preset, so its lines and curve cover them.
+  coming_soon_overlay::set_in_picture(shader_on && settings_ui_);
+  if (shader_on && settings_ui_) {
+    settings_ui_->draw_picture_overlay(shader_w, shader_h);
+    reset_bound();
+    context_->IASetInputLayout(layout_.Get());
+  }
+#endif
   if (shader_on) {
     context_->OMSetRenderTargets(1, &rtv, nullptr);
     const user_shader::Target where{vp.TopLeftX, vp.TopLeftY, (uint32_t)std::max(vw, 1.0f), (uint32_t)std::max(vh, 1.0f)};
@@ -1877,6 +1894,22 @@ void D3D11Backend::present_efb(const EfbCopy& c) {
     context_->OMSetRenderTargets(1, &rtv, nullptr);
     D3D11_VIEWPORT whole{0, 0, (float)client_w_, (float)client_h_, 0, 1};
     context_->RSSetViewports(1, &whole);
+    if (art_srv_kept) {
+      // The preset cleared the bars: the border art goes back there, one scissor per bar.
+      const LONG px0 = (LONG)std::floor(vp.TopLeftX), py0 = (LONG)std::floor(vp.TopLeftY);
+      const LONG px1 = (LONG)std::ceil(vp.TopLeftX + vp.Width), py1 = (LONG)std::ceil(vp.TopLeftY + vp.Height);
+      const D3D11_RECT bars[4] = {{0, 0, px0, client_h_}, {px1, 0, client_w_, client_h_},
+                                  {px0, 0, px1, py0}, {px0, py1, px1, client_h_}};
+      for (const D3D11_RECT& bar : bars) {
+        if (bar.right <= bar.left || bar.bottom <= bar.top) continue;
+        context_->RSSetScissorRects(1, &bar);
+        blit(art_srv_kept, art_rect_kept, nullptr, art_frame_kept, true);
+      }
+      reset_bound();
+      context_->IASetInputLayout(layout_.Get());
+      context_->OMSetRenderTargets(1, &rtv, nullptr);
+      context_->RSSetViewports(1, &whole);
+    }
     context_->RSSetScissorRects(1, &sc);
   }
 #ifdef GX_PC_SETTINGS

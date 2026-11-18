@@ -28,6 +28,7 @@ int64_t now_ms() {
 
 std::atomic<int64_t> g_last_show{0};    // the last frame the page was showing
 std::atomic<int64_t> g_since{0};        // when it started showing (the pop-in runs from here)
+std::atomic<float> g_offset[6];          // each row's offset from its untilted place (set_offsets)
 
 // Where each YouGame row's name ends on the menu's first page, and the row's middle, in the game's
 // 640x480 picture (measured on the menu: the rows step left as they go down). A sticker starts just
@@ -127,8 +128,9 @@ void sticker(ImDrawList* dl, ImVec2 left, float u, float t, const char* text) {
     const ImVec2 o(c.x + (i % 2 ? 1 : -1) * (w * 0.5f - (i < 2 ? 2 : 14) * u), c.y + (i < 2 ? -1 : 1) * (h * 0.5f + 1 * u));
     sparkle(dl, o, (4 + 3 * k) * u * k, rgba(255, 255, 210));
   }
-  const float wobble = std::sin(t * 2.6f) * 2.0f, pulse = 1.0f + 0.035f * std::sin(t * 5.2f);
-  turn(dl, start, c, -10.0f + wobble, pop * pulse);
+  // Level with its row (owner 11-17: "more in line"): a slight sway instead of the old 10 degree tilt.
+  const float wobble = std::sin(t * 2.6f) * 0.6f, pulse = 1.0f + 0.035f * std::sin(t * 5.2f);
+  turn(dl, start, c, wobble, pop * pulse);
 }
 
 }  // namespace
@@ -137,21 +139,72 @@ void first_row_text(const char* text) { if (text) g_first_text = text; }
 
 void showing() {
   const int64_t now = now_ms();
-  if (now - g_last_show.load() > 400) g_since = now;   // a new visit to the page: pop in again
+  if (now - g_last_show.load() > 400) {   // a new visit to the page: pop in again, untilted until told
+    g_since = now;
+    for (auto& o : g_offset) o.store(0.0f);
+  }
   g_last_show = now;
+}
+
+void set_offsets(const float offsets[6]) {
+  for (int i = 0; i < 6; ++i) {
+    const float v = offsets[i];
+    g_offset[i].store(std::isfinite(v) ? std::clamp(v, -320.0f, 320.0f) : 0.0f);
+  }
+}
+
+// With a shader preset the renderer draws the game picture into a texture and the preset's passes
+// draw that to the window. The stickers then go into a list of their own, drawn into that picture
+// before the preset (picture_draw_data), so its scanlines and curve cover them as the menu.
+namespace {
+bool g_in_picture = false;
+ImDrawList* g_picture_list = nullptr;
+bool g_picture_ready = false;
+ImVec2 g_picture_pos, g_picture_size;
+}  // namespace
+
+void set_in_picture(bool on) { g_in_picture = on; }
+
+bool picture_draw_data(ImDrawData* out, float target_w, float target_h) {
+  if (!g_picture_ready || !g_picture_list || g_picture_list->VtxBuffer.Size == 0 || g_picture_size.x <= 0 || g_picture_size.y <= 0)
+    return false;
+  out->Clear();
+  out->Valid = true;
+  out->AddDrawList(g_picture_list);
+  out->DisplayPos = g_picture_pos;
+  out->DisplaySize = g_picture_size;
+  out->FramebufferScale = ImVec2(target_w / g_picture_size.x, target_h / g_picture_size.y);
+  out->Textures = &ImGui::GetPlatformIO().Textures;   // the font atlas, should it change this frame
+  return true;
 }
 
 void draw(float x0, float y0, float x1, float y1) {
   const int64_t now = now_ms();
+  g_picture_ready = false;
   if (now - g_last_show.load() > 120) return;   // the page is not on screen
   const float u = (y1 - y0) / 480.0f, cx = (x0 + x1) * 0.5f;
   // The game picture is below ImGui. Keep its badges below settings windows,
   // modal dimming and confirmations even when draw() is called after a popup.
   ImDrawList* dl = ImGui::GetBackgroundDrawList();
+  if (g_in_picture) {   // into the picture, under the preset (see picture_draw_data)
+    if (!g_picture_list) g_picture_list = IM_NEW(ImDrawList)(ImGui::GetDrawListSharedData());
+    dl = g_picture_list;
+    dl->_ResetForNewFrame();
+    dl->PushTexture(ImGui::GetIO().Fonts->TexRef);
+    dl->PushClipRect(ImVec2(x0, y0), ImVec2(x1, y1));
+    g_picture_pos = ImVec2(x0, y0);
+    g_picture_size = ImVec2(x1 - x0, y1 - y0);
+  }
   const float since = float(now - g_since.load()) / 1000.0f;
   for (int i = 0; i < 3; ++i) {
     const float t = since - 0.35f - 0.09f * float(i);   // after the rows settle, one after another
-    sticker(dl, ImVec2(cx + (kRows[i].name_end + 6 - 320) * u, y0 + (kRows[i].centre - 9) * u), u, t, i == 0 ? g_first_text.load() : kText);
+    const float dx = g_offset[2 * i].load(), dy = g_offset[2 * i + 1].load();
+    // On the row's middle line, just after its name (it sat 9 pixels above the middle, tilted).
+    sticker(dl, ImVec2(cx + (kRows[i].name_end + 6 - 320 + dx) * u, y0 + (kRows[i].centre + dy) * u), u, t, i == 0 ? g_first_text.load() : kText);
+  }
+  if (dl == g_picture_list) {
+    dl->_PopUnusedDrawCmd();
+    g_picture_ready = true;
   }
 }
 

@@ -53,6 +53,9 @@ public:
   ~PcSettingsUI();
   bool begin(RenderOptions& options); // returns true when render configuration changed
   void draw(ID3D12GraphicsCommandList* list);
+  // The Coming soon stickers into the game picture texture the caller has bound (w x h), under a
+  // shader preset (coming_soon_overlay::picture_draw_data). Leaves ImGui's state on the list.
+  void draw_picture_overlay(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t h);
   // The panel, the Esc menu or the Practice menu is up (RTX Remix's window steps aside for them).
   bool overlay_visible() const;
 };
@@ -65,6 +68,8 @@ public:
   ~PcSettingsUID3D11();
   bool begin(RenderOptions& options);
   void draw();   // into whatever render target the caller has bound
+  // The Coming soon stickers into the bound game picture texture (w x h) under a shader preset.
+  void draw_picture_overlay(uint32_t w, uint32_t h);
 };
 #ifndef _WIN32
 // Linux: the same panel drawn with OpenGL into the default framebuffer (pc_settings_gl.cpp).

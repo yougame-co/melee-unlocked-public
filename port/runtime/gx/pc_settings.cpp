@@ -3679,7 +3679,7 @@ PcSettingsUI::PcSettingsUI(void* window, ID3D12Device* device, ID3D12CommandQueu
   desc.NumDescriptors = (UINT)state.used.size(); desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   if (FAILED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&state.heap)))) host::die("PC settings descriptor heap creation failed");
   state.stride = device->GetDescriptorHandleIncrementSize(desc.Type);
-  ImGui_ImplDX12_InitInfo info{}; info.Device = device; info.CommandQueue = queue; info.NumFramesInFlight = 6;   // FSR frame generation draws the overlay twice per frame (two presents)
+  ImGui_ImplDX12_InitInfo info{}; info.Device = device; info.CommandQueue = queue; info.NumFramesInFlight = 9;   // FSR frame generation draws the overlay twice per frame (two presents), and the Coming soon stickers under a shader preset once more
   info.RTVFormat = (DXGI_FORMAT)rtv_format; info.DSVFormat = DXGI_FORMAT_UNKNOWN;
   info.SrvDescriptorHeap = state.heap.Get(); info.UserData = &state;
   info.SrvDescriptorAllocFn = [](ImGui_ImplDX12_InitInfo* i, D3D12_CPU_DESCRIPTOR_HANDLE* cpu, D3D12_GPU_DESCRIPTOR_HANDLE* gpu) {
@@ -11905,6 +11905,13 @@ void PcSettingsUI::draw(ID3D12GraphicsCommandList* list) {
   if (!data) return;
   ID3D12DescriptorHeap* heap = impl_->heap.Get(); list->SetDescriptorHeaps(1, &heap);
   ImGui_ImplDX12_RenderDrawData(data, list);
+}
+void PcSettingsUI::draw_picture_overlay(ID3D12GraphicsCommandList* list, uint32_t w, uint32_t h) {
+  if (!ImGui::GetCurrentContext()) return;
+  ImDrawData data;
+  if (!coming_soon_overlay::picture_draw_data(&data, (float)w, (float)h)) return;
+  ID3D12DescriptorHeap* heap = impl_->heap.Get(); list->SetDescriptorHeaps(1, &heap);
+  ImGui_ImplDX12_RenderDrawData(&data, list);
 }
 #endif
 #ifndef _WIN32

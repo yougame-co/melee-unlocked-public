@@ -105,7 +105,7 @@ class GameStateWiring(unittest.TestCase):
         self.assertIn("yougame::game_state::overlay_menu_open.store(state.open || state.menu_open || state.practice_open ||", settings)
 
     def test_build_number(self):
-        self.assertEqual(source("YOUGAME_BUILD").strip(), "0.9.211-online-test.122.8")
+        self.assertEqual(source("YOUGAME_BUILD").strip(), "0.9.212-online-test.122.9")
 
     def test_worker_semantics(self):
         cxx = compiler()
