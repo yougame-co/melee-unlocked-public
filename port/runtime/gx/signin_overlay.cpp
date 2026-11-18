@@ -34,6 +34,7 @@ const char* label(Button b) {
     case Button::Update: return words::kUpdate;
     case Button::Cancel: return words::kCancel;
     case Button::Restart: return words::kRestartNow;
+    case Button::Feedback: return words::kFeedback;
     case Button::None: break;
   }
   return "";
@@ -181,7 +182,8 @@ void draw(float x0, float y0, float x1, float y1) {
       case Screen::UpdateNotAppCopy:
       case Screen::UpdateOldApp:
       case Screen::UpdateLatest:
-      case Screen::UpdateNoCheck: wrapped_text(v.message, 13.0f * u, kText); break;
+      case Screen::UpdateNoCheck:
+      case Screen::Home: wrapped_text(v.message, 13.0f * u, kText); break;
       case Screen::Closed: break;
     }
 

@@ -3524,6 +3524,40 @@ void blend_over(uint64_t epoch) {
   if (g_search_generation.current(epoch)) update_open(refusal, epoch);
 }
 
+namespace {
+std::mutex g_home_mutex;
+signin::Home g_home;   // g_home_mutex
+bool home_showing() { std::lock_guard<std::mutex> lock(g_home_mutex); return g_home.is_open(); }
+bool home_view(signin::View& out) {
+  std::lock_guard<std::mutex> lock(g_home_mutex);
+  if (!g_home.is_open()) return false;
+  out = g_home.view();
+  return true;
+}
+void home_press(signin::Button button) {
+  if (button == signin::Button::Feedback) {
+    host::log("yougame: home box, Send feedback");
+    std::thread([] {
+      bool ok = false;
+      try { ok = bridge_channel({{"type", "openFeedback"}}, 3000).value("ok", false); } catch (...) {}
+      host::log("yougame: openFeedback %s", ok ? "answered" : "not answered");
+      if (ok) { std::lock_guard<std::mutex> lock(g_home_mutex); g_home.feedback_sent(); }
+    }).detach();
+    return;
+  }
+  if (button == signin::Button::Back) {
+    host::log("yougame: home box, Back");
+    std::lock_guard<std::mutex> lock(g_home_mutex);
+    g_home.close();
+  }
+}
+}  // namespace
+void home_open() {
+  std::string name;
+  { std::lock_guard<std::mutex> lock(g_mutex); if (g_identity.ok) name = g_identity.name; }
+  { std::lock_guard<std::mutex> lock(g_home_mutex); g_home.open(name); }
+  host::log("yougame: home box opened");
+}
 bool sign_in_needed() {
   if (g_stdio || !g_channel_allowed || !g_channel_up.load() || !g_channel_signed_out.load()) return false;
   std::lock_guard<std::mutex> lock(g_mutex);
@@ -3536,12 +3570,12 @@ void sign_in_open() {
   sign_in_send(ask);
 }
 bool sign_in_showing() {
-  if (reach_showing() || update_showing()) return true;
+  if (reach_showing() || update_showing() || home_showing()) return true;
   std::lock_guard<std::mutex> lock(g_signin_mutex);
   return g_signin.is_open();
 }
 void sign_in_view(signin::View& out) {
-  if (reach_view(out) || update_view(out)) return;
+  if (reach_view(out) || update_view(out) || home_view(out)) return;
   Identity id;
   { std::lock_guard<std::mutex> lock(g_mutex); id = g_identity; }
   signin::Ask ask;
@@ -3557,6 +3591,7 @@ void sign_in_view(signin::View& out) {
 void sign_in_press(signin::Button button) {
   if (reach_showing()) { reach_press(button); return; }
   if (update_showing()) { update_press(button); return; }
+  if (home_showing()) { home_press(button); return; }
   signin::Ask ask;
   { std::lock_guard<std::mutex> lock(g_signin_mutex); ask = g_signin.press(button, now_ms()); }
   if (button == signin::Button::Back) host::log("yougame sign-in: Back");
@@ -3734,24 +3769,71 @@ void relay_key(const char* key) {
   if (g_stdio) write_line(std::string("yg {\"key\":\"") + key + "\"}");
 }
 
-bool channel_menu_key() {
+void input_kind(const char* kind) {
+  static std::mutex m;
+  static std::string last, sent;            // m: the latest kind seen; the latest kind sent
+  static uint64_t sent_epoch = 0;           // m
+  static bool sending = false;              // m: one sender thread at a time, always the latest value
+  if (g_stdio || !g_channel_allowed || !g_channel_up.load() || !kind) return;
+  const uint64_t epoch = g_channel_epoch.load();
+  {
+    std::lock_guard<std::mutex> lock(m);
+    if (last == kind && sent == kind && sent_epoch == epoch) return;   // once per change, once per connection
+    last = kind;
+    if (sending) return;                    // the running sender picks the latest up
+    sending = true;
+  }
+  std::thread([] {
+    for (;;) {
+      std::string k;
+      uint64_t e;
+      {
+        std::lock_guard<std::mutex> lock(m);
+        e = g_channel_epoch.load();
+        if (last == sent && sent_epoch == e) { sending = false; return; }
+        k = last;
+        sent = k;
+        sent_epoch = e;
+      }
+      try { (void)bridge_channel({{"type", "inputKind"}, {"kind", k}}, 2000); } catch (...) {}
+    }
+  }).detach();
+}
+bool channel_menu_key(const char* kind) {
   if (g_stdio || !g_channel_allowed) return false;
+  const bool pad = kind && std::string(kind) != "keys";
+  // Start with Down held stays the game's (a crouch pause) when no YouGame is there to ask.
+  if (pad && !g_channel_up.load()) return false;
   static std::atomic<int64_t> last{0};
   const int64_t now = (int64_t)now_ms();
   if (now - last.load() < 300) return true;   // the channel takes one menuButton every 300 ms
   last = now;
-  // No YouGame connected: the same ask as a YouGame row picked first (Get / Open YouGame / offline).
+  // Pressed again with one of the game's YouGame boxes up: closes it (Back).
+  if (sign_in_showing()) { sign_in_press(signin::Button::Back); return true; }
+  // No YouGame connected (Shift+Tab only): the same ask as a YouGame row picked first.
   if (!g_channel_up.load()) { host::log("yougame: Shift+Tab, no YouGame connected"); first_row_picked(); return true; }
   if (sign_in_needed()) { host::log("yougame: Shift+Tab, signed out"); sign_in_open(); return true; }
-  std::thread([] {
-    bool opened = false;
+  const std::string device = kind ? kind : "keys";
+  input_kind(device.c_str());
+  std::thread([device] {
+    bool opened = false, fallback = false;
+    std::string code = "no answer";
     try {
-      const json j = bridge_channel({{"type", "menuButton"}, {"kind", "keys"}}, 2000);
-      opened = j.value("opened", false) || (j.count("result") && j["result"].is_object() && j["result"].value("opened", false));
+      const json j = bridge_channel({{"type", "menuButton"}, {"kind", device}}, 2000);
+      const json r = j.count("result") && j["result"].is_object() ? j["result"] : j;
+      if (j.value("ok", false)) {
+        opened = r.value("opened", false);
+        code = opened ? "opened" : "not opened";
+        fallback = !opened;   // an app with no overlay of its own (the small start app)
+      } else {
+        code = j.value("code", std::string("refused"));
+        // busy (300 ms / rate limit), notYet (still connecting) and closed mean try later: nothing
+        // opens. Anything else is an app that doesn't know menuButton: the game's box.
+        fallback = code != "busy" && code != "notYet" && code != "closed";
+      }
     } catch (...) {}
-    host::log("yougame: Shift+Tab, app menu %s", opened ? "opened" : "not opened");
-    // An app with no overlay (the small start app): the game's own YouGame box when there is one to show.
-    if (!opened && sign_in_needed()) sign_in_open();
+    host::log("yougame: Shift+Tab, app menu: %s", code.c_str());
+    if (fallback) { if (sign_in_needed()) sign_in_open(); else home_open(); }
   }).detach();
   return true;
 }

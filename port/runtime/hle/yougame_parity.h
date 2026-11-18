@@ -202,8 +202,14 @@ class OverlayPad {
     const bool held = connected && (buttons & start);
     const bool pressed = held && !was_start_[port];
     was_start_[port] = held;
-    if (!stdio) return nullptr;
     if (!held) claimed_[port] = false;
+    if (!stdio) {
+      // A game started on its own: the same chord asks the local channel's app (standalone_menu).
+      if (pressed && (buttons & down) && !(buttons & z) && !legacy_settings && standalone_menu && standalone_menu())
+        claimed_[port] = true;
+      if (claimed_[port]) buttons &= static_cast<uint16_t>(~start);
+      return nullptr;
+    }
     const bool chord = pressed && (buttons & down) && !(buttons & z) && !legacy_settings;
     if (chord) claimed_[port] = true;
     // Keep Start suppressed until its release, including when Down is released first.
@@ -213,6 +219,7 @@ class OverlayPad {
     release_at_ = now_ms + 100;
     return key_.tab(true, true, true, false).line;
   }
+  bool (*standalone_menu)() = nullptr;   // true when it took the press (yougame::channel_menu_key)
  private:
   OverlayKey key_;
   bool was_start_[4]{}, claimed_[4]{};

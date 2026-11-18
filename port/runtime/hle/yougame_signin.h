@@ -46,6 +46,10 @@ constexpr const char* kWait = "YouGame is busy. Trying again in";   // "... in 1
 constexpr const char* kNotYet = "Sign in with a code works only in a game YouGame checked. Sign in with your browser instead.";
 // "Play online with YouGame" (Reach below): a YouGame row picked with no YouGame to reach.
 constexpr const char* kReachTitle = "Play online with YouGame";
+constexpr const char* kHomeTitle = "YouGame";
+constexpr const char* kFeedback = "Send feedback";
+constexpr const char* kHomeOnline = "Ranked, Unranked and Friends are in Online Play, on the main menu.";
+constexpr const char* kFeedbackOpened = "The feedback page is open in your browser.";
 constexpr const char* kLooking = "Looking for YouGame...";
 constexpr const char* kAppClosed = "YouGame isn't running. Open YouGame to play online.";
 constexpr const char* kNoApp = "Online play needs the YouGame app.";
@@ -140,10 +144,12 @@ enum class Screen {
   UpdateOldApp,       // an app that answers updateGame with notYet: today's "Open YouGame to update it"
   UpdateLatest,       // You have the latest. Try again.: Back
   UpdateNoCheck,      // YouGame couldn't check for updates. Try again.: Try again, Play offline
+  // Home: Shift+Tab, signed in, and the app drew no menu of its own (the small start app)
+  Home,               // Signed in as Ada. Online Play is in the main menu.: Feedback, Back
 };
 enum class Ask { None, Code, Browser };
 // What the panel offers, in order. The first is where the cursor starts.
-enum class Button { None, NewCode, TryAgain, Browser, Back, OpenApp, GetApp, Offline, Update, Cancel, Restart };
+enum class Button { None, NewCode, TryAgain, Browser, Back, OpenApp, GetApp, Offline, Update, Cancel, Restart, Feedback };
 
 struct View {
   Screen screen = Screen::Closed;
@@ -194,6 +200,7 @@ class Model {
       case Button::Update:
       case Button::Cancel:
       case Button::Restart:
+      case Button::Feedback:
       case Button::None: break;
     }
     return Ask::None;
@@ -340,6 +347,7 @@ class Model {
       case Screen::UpdateOldApp:
       case Screen::UpdateLatest:
       case Screen::UpdateNoCheck:
+      case Screen::Home:
       case Screen::Closed: break;
     }
     return v;
@@ -427,6 +435,30 @@ class Reach {
   Screen screen_ = Screen::Closed;
   std::string note_;
   bool page_ = false, failed_ = false;
+};
+
+// The YouGame box for Shift+Tab when the player is signed in and the app drew no menu over the game
+// (the small start app has no overlay): who is signed in, where online play starts, Send feedback
+// (the app opens the game's feedback page) and Back. Pure; yougame_link.cpp holds the lock.
+class Home {
+ public:
+  bool is_open() const { return open_; }
+  void open(const std::string& name) { open_ = true; name_ = name; sent_ = false; }
+  void feedback_sent() { sent_ = true; }
+  void close() { open_ = false; }
+  View view() const {
+    View v;
+    if (!open_) return v;
+    v.screen = Screen::Home;
+    v.title = kHomeTitle;
+    v.message = (name_.empty() ? std::string("Signed in to YouGame.") : "Signed in as " + name_ + ".") + "\n" + kHomeOnline;
+    if (sent_) v.message += std::string("\n\n") + kFeedbackOpened;
+    v.buttons[0] = Button::Feedback; v.buttons[1] = Button::Back;
+    return v;
+  }
+ private:
+  bool open_ = false, sent_ = false;
+  std::string name_;
 };
 
 // "Update to play online": a copy of Melee started on its own, connected to YouGame over the local channel,

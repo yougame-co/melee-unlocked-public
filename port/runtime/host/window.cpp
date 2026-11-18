@@ -112,7 +112,12 @@ PadState g_ui_navigation_pads[4]{};
 bool g_ui_has_pad = false;
 bool g_ui_gamecube = false;
 bool g_ui_settings_chord_held[4]{};
-yougame::parity::OverlayPad g_overlay_pad;   // input/simulation thread only
+bool pad_menu_chord();
+yougame::parity::OverlayPad g_overlay_pad = [] {   // input/simulation thread only
+  yougame::parity::OverlayPad pad;
+  pad.standalone_menu = pad_menu_chord;
+  return pad;
+}();
 #ifdef YOUGAME_AGENT_TEST_HOOK
 int g_ui_agent_step = -1;   // protected by g_ui_pad_mutex, alongside the snapshot it identifies
 #endif
@@ -308,6 +313,7 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
   }
   // Reserve Tab before ImGui or the game's keyboard bindings see it. The edge reaches the practice
   // UI whether a text field is active or the overlay is closed.
+  if ((m == WM_KEYDOWN || m == WM_SYSKEYDOWN) && !(l & (1 << 30))) yougame::input_kind("keys");
   if (m == WM_KEYDOWN && w == VK_TAB) {
     // Shift+Tab in a game started on its own opens the connected app's menu instead.
     if (!(l & (1 << 30)) && !((GetKeyState(VK_SHIFT) & 0x8000) && yougame::channel_menu_key()))
@@ -469,6 +475,16 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 // The SDL window feeds its focus events to the Linux compatibility layer.
 bool window_focused(HWND) { return linux_compat::window_focused(); }
 #endif
+// Start with D-pad Down held, in a game started on its own: YouGame's menu, as Shift+Tab, only with
+// the game window in front (a pad read in the background never opens the game's box behind the app).
+bool pad_menu_chord() {
+#ifdef _WIN32
+  if (!window_focused(g_hwnd)) return false;
+#else
+  if (!window_focused(nullptr)) return false;
+#endif
+  return yougame::channel_menu_key("pad");
+}
 }  // namespace
 
 #ifdef _WIN32
@@ -1978,6 +1994,7 @@ struct UiSnapshot {
           settings_shortcut::poll_z_start(pads[i].err == 0, pads[i].button,
                                           g_ui_settings_chord_held[i]);
       uint16_t menu_buttons = raw_buttons;
+      if (pads[i].err == 0 && raw_buttons && !keyboard_ports[i]) yougame::input_kind("pad");
       yougame::parity::signals.emit(g_overlay_pad.poll(yougame::stdio_bridge(), i,
           pads[i].err == 0, menu_buttons, menu_now, g_ui_settings_chord_held[i]));
       if (!console && yougame::active() && !opened_here && !g_ui_capture.load()) {

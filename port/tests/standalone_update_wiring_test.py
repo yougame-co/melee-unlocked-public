@@ -269,8 +269,8 @@ class StandaloneUpdate(unittest.TestCase):
     def test_pushes_and_panel_routing(self):
         link = source("port/runtime/hle/yougame_link.cpp")
         self.assertIn("if (!g_stdio && g_channel_allowed) { sign_in_push(push); update_push(push); }", link)
-        self.assertIn("if (reach_showing() || update_showing()) return true;", body(link, "bool sign_in_showing() {"))
-        self.assertIn("if (reach_view(out) || update_view(out)) return;", body(link, "void sign_in_view(signin::View& out) {"))
+        self.assertIn("if (reach_showing() || update_showing() || home_showing()) return true;", body(link, "bool sign_in_showing() {"))
+        self.assertIn("if (reach_view(out) || update_view(out) || home_view(out)) return;", body(link, "void sign_in_view(signin::View& out) {"))
         self.assertIn("if (update_showing()) { update_press(button); return; }", body(link, "void sign_in_press(signin::Button button) {"))
 
     def test_asks_off_the_frame_and_clean_exit(self):
@@ -284,7 +284,7 @@ class StandaloneUpdate(unittest.TestCase):
     def test_overlay_words(self):
         overlay = source("port/runtime/gx/signin_overlay.cpp")
         for line in ("case Button::Update: return words::kUpdate;", "case Button::Cancel: return words::kCancel;",
-                     "case Button::Restart: return words::kRestartNow;", "case Screen::UpdateNoCheck: wrapped_text(v.message"):
+                     "case Button::Restart: return words::kRestartNow;", "case Screen::UpdateNoCheck:\n      case Screen::Home: wrapped_text(v.message"):
             self.assertIn(line, overlay)
         words = source("port/runtime/hle/yougame_signin.h")
         for line in ('kUpdate = "Update"', 'kCancel = "Cancel"', 'kRestartNow = "Restart now"',

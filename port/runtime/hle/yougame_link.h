@@ -177,12 +177,18 @@ void tournament_drain();
 // Plain "escape" is also sent for older apps. Sent as `yg {"key":"shift-escape"}`.
 void relay_key(const char* key);
 
-// Shift+Tab in a game started on its own (local channel): {"type":"menuButton","kind":"keys"}, as the
+// Shift+Tab (or the pad's Start with D-pad Down) in a game started on its own (local channel):
+// {"type":"menuButton","kind":"keys"|"pad"}, as the
 // SDK's yg_menu_button. The full app answers opened:true with its menu over the game; otherwise the
 // game shows its own YouGame box (sign in), and with no app the Get / Open YouGame ask. False only
 // under the stdio bridge (the shortcut keys carry it there) or with YouGame turned off, so the key
 // stays the practice toggle.
-bool channel_menu_key();
+bool channel_menu_key(const char* kind = "keys");
+// The device the player last used, for the app's button pictures: {"type":"inputKind","kind":"keys"|"pad"}
+// over the local channel, once per change and once per connection. Any thread; never waits.
+void input_kind(const char* kind);
+// The signed-in YouGame box (yougame_signin.h Home) over the game; Shift+Tab with no app menu.
+void home_open();
 
 // The page pause's state for the page (yougame_ux.h PagePause::Result), sent over the stdio bridge as
 // `yg {"event":{"type":"pause","pausable":B,"paused":P,"reason":R}}` (reason left out when null).

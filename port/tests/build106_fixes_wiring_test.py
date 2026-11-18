@@ -114,8 +114,8 @@ class Build106Fixes(unittest.TestCase):
         # Get YouGame goes to production's page unless the build is the staging-only start build.
         get = body(link, "void open_get_page() {")
         self.assertIn('kStartStaging ? "https://staging.yougame.co/desktop" : "https://yougame.co/desktop"', get)
-        self.assertIn("if (reach_showing() || update_showing()) return true;", body(link, "bool sign_in_showing() {"))
-        self.assertIn("if (reach_view(out) || update_view(out)) return;", body(link, "void sign_in_view(signin::View& out) {"))
+        self.assertIn("if (reach_showing() || update_showing() || home_showing()) return true;", body(link, "bool sign_in_showing() {"))
+        self.assertIn("if (reach_view(out) || update_view(out) || home_view(out)) return;", body(link, "void sign_in_view(signin::View& out) {"))
         self.assertIn("if (reach_showing()) { reach_press(button); return; }", body(link, "void sign_in_press(signin::Button button) {"))
         overlay = source("port/runtime/gx/signin_overlay.cpp")
         self.assertIn("case Button::OpenApp: return words::kOpenApp;", overlay)
@@ -133,7 +133,9 @@ class Build106Fixes(unittest.TestCase):
         self.assertIn('#define YG__START_OPEN "Open YouGame"', start)
         self.assertIn('#define YG__START_LATER "Play offline"', start)   # the C3 window (YouGame 55e1965c6)
         # v2 a678bb7b: a tray start waits for YouGame to come up; a slow one is DECLINED, never the download page.
-        self.assertIn("if (yg__start_tray(staging, any, have) == YG__START_TRAY_STARTED) {", start)
+        # 122.6 (YouGame 3c9a9d020): a refused tray start falls back to the mini app, then the same wait.
+        self.assertIn("tray = yg__start_tray(staging, any, have);", start)
+        self.assertIn("if (tray == YG__START_TRAY_STARTED) {", start)
         self.assertIn("return up >= 0 ? (yg_start_result)up : YG_START_DECLINED;", start)
         self.assertIn("if (installed && YG__START_UPDATE_SYSTEM && yg__start_raised()) text = YG__START_TEXT_RAISED;", start)
 
