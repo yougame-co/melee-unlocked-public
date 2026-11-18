@@ -294,6 +294,13 @@ static void Pole_ChangeState(GOBJ *pole_gobj, int state) {
 void Event_Init(GOBJ *gobj) {
     // use wavedash pole as slalom pole
     assets = Archive_GetPublicAddress(event_vars->event_archive, "wavedash");
+#ifdef MU_NATIVE
+    /* The console loads the event fresh each time; here the last run's poles would stay "active"
+       (freed with the old scene), so no new pole was ever placed. */
+    active_pole_gobj = 0;
+    next_pole_gobj = 0;
+    pole_counter = 0;
+#endif
 
     int canvas = Text_CreateCanvas(2, 0, 0, 0, 0, GXLINK_HUD, 81, 19);
 

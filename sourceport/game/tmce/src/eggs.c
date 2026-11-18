@@ -179,6 +179,8 @@ void Event_Init(GOBJ *gobj)
     /* Every exercise owns a new egg, even if the old scene reused a GObj address. */
     egg_gobj = 0;
     accumulated_damage = 0;
+    /* The console loads the event fresh each time; here the count would carry over. */
+    egg_counter = 0;
 #endif
     // initialize egg camera subject
     cam = CameraSubject_Alloc();
