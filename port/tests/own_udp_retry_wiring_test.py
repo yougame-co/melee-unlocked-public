@@ -16,8 +16,23 @@ class OwnUdpRetryWiring(unittest.TestCase):
         self.assertIn('kOwnUdpRetry = "We couldn\'t connect you two. Looking for another opponent...\\n"', self.search)
         self.assertIn('"Allow Melee Unlocked through your firewall."', self.search)
 
+    def test_failed_own_udp_moves_onto_the_room_relay_when_every_seat_agrees(self):
+        start = self.link.index('const auto own_udp_relay = [&]() -> bool {')
+        body = self.link[start:self.link.index('\n  };\n', start)]
+        self.assertIn('{"kind", "mu-relay-ok"}, {"v", 1}, {"compat", compat}', body)
+        self.assertIn('while (agreed.size() < want.size() && now_ms() < until && !cancelled())', body)
+        self.assertIn('if (cancelled() || agreed.size() < want.size())', body)   # all seats or nobody relays
+        self.assertIn('relay_start(room.get(), room->socket.get(), my_seat + 1, ports)', body)
+        self.assertIn('g_relay_own = true;', body)
+        self.assertIn('relay_match = true;', body)
+        # The relay's ENet takes YouGame sockets even on a copy with no links; the match binds no own port.
+        self.assertIn('((g_direct && !g_own_udp_match) || g_relay_own)', self.link)
+        self.assertIn('out.udp_port = links_mode || relay_match ? 0 : bound_port;', self.link)
+        self.assertIn('links_hello && !links_mode && !relay_match) { g_own_udp_match = true;', self.link)
+        self.assertEqual(self.link.count('g_relay_own = false;'), 4)   # its definition and every g_own_udp_match reset
+
     def test_second_own_udp_failure_feeds_the_counter_and_sets_the_hint(self):
-        start = self.link.index('} else if (!punch(udp, my_seat + 1, peers, ingress, cancelled)) {')
+        start = self.link.index('} else if (!punch(udp, my_seat + 1, peers, ingress, cancelled) && !own_udp_relay()) {')
         block = self.link[start:self.link.index('if (cancelled()) return fail("Cancelled");\n  { std::lock_guard', start)]
         self.assertIn('repeated = g_direct_link_failures.failed(unreached, room->me);', block)
         self.assertIn('!(peer.found && peer.acked)) unreached.push_back(p);', block)

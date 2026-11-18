@@ -98,6 +98,8 @@ class GameStateWiring(unittest.TestCase):
         self.assertIn("int32_t a[5] = {-1, 0, 0, 0, 0};", report)   # a query: never pauses or resumes
         self.assertIn("match = a[4] != 0; paused = a[0] > 0 || a[3] != 0;", report)
         self.assertIn("overlay_menu_open.load(", report)
+        # Static Recomp has no bridge: it reads gm_GetDbPauseFlag's byte itself, or it never says paused.
+        self.assertIn("(host::rd8(0x80479D68u) & 0x7) != 0", report)
         shim = source("sourceport/game/shim/mu_yougame_pause.h")
         self.assertIn("a[3] = gm_GetDbPauseFlag(1) || gm_GetDbPauseFlag(2);", shim)
         self.assertIn("if (n >= 5) {", shim)
@@ -105,7 +107,7 @@ class GameStateWiring(unittest.TestCase):
         self.assertIn("yougame::game_state::overlay_menu_open.store(state.open || state.menu_open || state.practice_open ||", settings)
 
     def test_build_number(self):
-        self.assertEqual(source("YOUGAME_BUILD").strip(), "0.9.212-online-test.122.9")
+        self.assertEqual(source("YOUGAME_BUILD").strip(), "0.9.212-online-test.122.10")
 
     def test_worker_semantics(self):
         cxx = compiler()

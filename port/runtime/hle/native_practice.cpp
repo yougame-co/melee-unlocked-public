@@ -686,9 +686,12 @@ static void report_game_state() {
     int32_t a[5] = {-1, 0, 0, 0, 0};
     if (g_bridge(OP_PAGE_PAUSE, a, 5) == 0) { match = a[4] != 0; paused = a[0] > 0 || a[3] != 0; }
   } else {
-    const uint32_t info = host::rd32(0x804D6720u);   // Static Recomp: the scene kind only
+    const uint32_t info = host::rd32(0x804D6720u);   // Static Recomp: the scene kind and the pause bits
     const int kind = info && host::try_ptr(info, 1) ? host::rd8(info) : -1;
     match = kind == 2 || kind == 3 || kind == 4 || kind == 0x2C;
+    // gm_80479D58.unk_10.x0 (gm_GetDbPauseFlag): bit 0 the scene freeze, bits 1 and 2 Start's pause. The source
+    // port's answer counts the same three bits (mu_yougame_pause.h).
+    paused = match && host::try_ptr(0x80479D68u, 1) && (host::rd8(0x80479D68u) & 0x7) != 0;
   }
   yougame::report_game_state(yougame::game_state::classify(
       match, paused, yougame::game_state::overlay_menu_open.load(std::memory_order_relaxed)));

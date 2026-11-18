@@ -1419,13 +1419,16 @@ bool g_slippi_match = false;  // g_mutex; identity refresh must not switch a liv
 // a standalone copy). Set when such a match is found, cleared when a search starts or the session ends, so
 // an identity refresh mid-match never moves its ENet back onto links.
 bool g_own_udp_match = false;
+// g_mutex; this match's own UDP failed and every seat agreed to the room relay (mu-relay-ok): its ENet takes
+// YouGame sockets carried by the room, also on a copy with no links. Cleared with g_own_udp_match.
+bool g_relay_own = false;
 
 void select_match_transport(bool slippi) {
   g_slippi_match = slippi;
 #ifdef _WIN32
-  yg_enet_select(!slippi && g_direct && !g_own_udp_match);
+  yg_enet_select(!slippi && ((g_direct && !g_own_udp_match) || g_relay_own));
 #else
-  yg_enet_select(!slippi && g_broker && !g_own_udp_match);
+  yg_enet_select(!slippi && ((g_broker && !g_own_udp_match) || g_relay_own));
 #endif
 }
 #ifdef YOUGAME_AGENT_TEST_HOOK
@@ -4240,6 +4243,7 @@ bool prepare_slippi_match(const std::function<bool()>& cancelled, uint64_t epoch
   std::lock_guard<std::mutex> lock(g_mutex);
   if (!g_search_generation.current(epoch) || cancelled()) return false;
   g_own_udp_match = false;
+  g_relay_own = false;
   select_match_transport(true);
   yg_enet_enable(0);
 #ifdef YOUGAME_AGENT_TEST_HOOK
@@ -4338,6 +4342,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   { std::lock_guard<std::mutex> lock(g_mutex);
     if (cancelled()) { Match out; out.error = "Cancelled"; return out; }
     g_own_udp_match = false;
+    g_relay_own = false;
     select_match_transport(false);
   }
 #ifndef _WIN32
@@ -5422,6 +5427,54 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   // the room relay: the same datagrams, carried by the room's msg relay.
   bool relay_match = links_mode && relay_self;
   if (links_mode) for (const auto& kv : cands) if (relay_flag(kv.second)) relay_match = true;
+  // Own UDP found no way through (both seats behind NAT, a firewall): before giving up on this opponent, each
+  // seat says so to the room (mu-relay-ok) and waits a few seconds for every other seat's word. Only when all
+  // agree does the match move onto the room relay, slower but playable; a copy without this never sends the
+  // word, so a mixed room fails as before. A seat whose punch worked never waits, and the others time out.
+  constexpr int kRelayAgreeMs = 5000;
+  const auto own_udp_relay = [&]() -> bool {
+    host::log("yougame: connect failed (own UDP): my STUN %s, my LAN %s", external.empty() ? "none" : "ok", lan_addr.empty() ? "none" : "ok");
+    if (cancelled() || peers.empty() || !room->socket || room->socket->closed()) return false;
+    room->socket->send({{"t", "msg"}, {"d", {{"kind", "mu-relay-ok"}, {"v", 1}, {"compat", compat}}}});
+    std::set<std::string> want, agreed;
+    for (const auto& p : participants) if (p.value("connectionId", "") != room->me) want.insert(p.value("connectionId", ""));
+    const uint64_t until = now_ms() + kRelayAgreeMs;
+    while (agreed.size() < want.size() && now_ms() < until && !cancelled()) {
+      json m;
+      if (!room->socket->next(m, 100)) { if (room->socket->closed()) return false; continue; }
+      const std::string t = m.value("t", "");
+      if ((t == "leave" || t == "away") && want.count(transport::leave_id(m, room->socket->brokered()))) return false;
+      if (t != "msg" || !m.count("d") || !m["d"].is_object()) continue;
+      const json& d = m["d"];
+      const std::string from = m.value("from", "");
+      if (d.value("kind", "") == "mu-relay-ok" && d.value("v", 0) == 1 && d.value("compat", "") == compat && want.count(from))
+        agreed.insert(from);
+    }
+    if (cancelled() || agreed.size() < want.size()) {
+      host::log("yougame: room relay not agreed (%d of %d seats)", (int)agreed.size(), (int)want.size());
+      return false;
+    }
+    std::vector<int> ports;
+    for (const auto& peer : peers) ports.push_back(peer.port);
+    const auto links = relay_start(room.get(), room->socket.get(), my_seat + 1, ports);
+    if (links.empty()) { host::log("yougame: the room relay could not start"); return false; }
+    for (auto& peer : peers) {
+      const auto it = links.find(peer.port);
+      if (it == links.end()) continue;
+      peer.chosen.sin_family = AF_INET;
+      peer.chosen.sin_addr.s_addr = htonl(0x0aff0000u | it->second);
+      peer.chosen.sin_port = htons(7777);
+    }
+    { std::lock_guard<std::mutex> lock(g_mutex);
+      if (cancelled()) { relay_stop(room.get()); return false; }
+      g_relay_own = true;
+      select_match_transport(g_slippi_match);
+      yg_enet_enable(1);
+    }
+    relay_match = true;
+    host::log("yougame: own UDP failed: every seat agreed, this match uses the room relay");
+    return true;
+  };
   if (relay_match) {
     if (!relay_self) host::log("yougame: a seat has no direct links helper: this match uses the room relay");
     if (lobby_route) early.links.forget_all(close_app);   // no ring links wait for anyone
@@ -5532,9 +5585,8 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       return fail(repeated && !lobby_match ? search_policy::kLinkRetry : search_policy::kLinkFailed,
                   transport::retry_link_failure(search.mode));
     }
-  } else if (!punch(udp, my_seat + 1, peers, ingress, cancelled)) {
+  } else if (!punch(udp, my_seat + 1, peers, ingress, cancelled) && !own_udp_relay()) {
     if (cancelled()) return fail("Cancelled");
-    host::log("yougame: connect failed (own UDP): my STUN %s, my LAN %s", external.empty() ? "none" : "ok", lan_addr.empty() ? "none" : "ok");
     // Unranked searches again, as Slippi does when a found opponent cannot be reached. The second failure in
     // a row with the same opponent says so on screen, with what to try (own UDP has no relay to fall back on).
     bool repeated;
@@ -5552,7 +5604,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       if (repeated) g_own_udp_blocked = true;
     }
     room->socket->send(transport::link_report(false, "none", now_ms() - connect_start, true));
-    if (repeated) host::log("yougame: own UDP failed twice with this opponent: showing the firewall line");
+    if (repeated) host::log("yougame: own UDP failed twice with this opponent, no room relay: showing the firewall line");
     return fail(repeated && !direct && !lobby_match ? search_policy::kLinkRetry : search_policy::kLinkFailed, !direct);
   }
 
@@ -5562,7 +5614,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     if (!cancelled()) g_own_udp_blocked = false;
     // The match's ENet takes native sockets (slippi_net: own_udp is !yg_enet_selected()) until the next
     // search or the session's end, whatever an identity refresh selects meanwhile.
-    if (!cancelled() && links_hello && !links_mode) { g_own_udp_match = true; select_match_transport(g_slippi_match); }
+    if (!cancelled() && links_hello && !links_mode && !relay_match) { g_own_udp_match = true; select_match_transport(g_slippi_match); }
   }
   // The relay reports via links, path relay (rooms keeps any path it does not know as "bad").
   room->socket->send(transport::link_report(true, links_mode ? std::string("links")
@@ -5576,7 +5628,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
             : links_hello ? "own UDP (a seat has no YouGame links)" : "own UDP");
   Match out;
   out.ok = true;
-  out.udp_port = links_mode ? 0 : bound_port;
+  out.udp_port = links_mode || relay_match ? 0 : bound_port;
   out.match_id = match_id.rfind("yg-", 0) == 0 && match_id.size() <= 32 ? match_id : my_match_id;
   out.local_index = my_seat;
   out.host = my_seat == 0;
@@ -5921,7 +5973,7 @@ uint8_t local_rank() {
 void end_session(Leave why) {
   online_match_state(false);
   close_room(why);
-  { std::lock_guard<std::mutex> lock(g_mutex); g_own_udp_match = false; select_match_transport(false); }
+  { std::lock_guard<std::mutex> lock(g_mutex); g_own_udp_match = false; g_relay_own = false; select_match_transport(false); }
   set_status("offline");
 }
 

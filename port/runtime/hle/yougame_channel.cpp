@@ -246,11 +246,11 @@ std::string refusal_text(const json& answer) {
   const bool has_words = answer.count("error") && answer["error"].is_string() && !answer["error"].get<std::string>().empty();
   if (code == "notYet") return "YouGame can't do this for a game started on its own yet. Start it from the YouGame app.";
   if (code == "notHere") return "YouGame is still getting ready. Try again in a moment.";
-  // A copy the player started itself that YouGame doesn't recognise is almost always an older download: the app's own
-  // words say so ("isn't the latest version on YouGame…"), so they win over ours.
+  // A copy YouGame doesn't recognise: the app's own words win over ours. Ours never call it out of date,
+  // because the newest build is refused the same way when the app can't look builds up.
   if (code == "unknown_build")
     return has_words ? answer["error"].get<std::string>()
-                     : "This copy of Melee isn't the latest version on YouGame. Get the latest from YouGame, then try again.";
+                     : "YouGame couldn't recognise this copy of Melee. Reinstall it from YouGame, then try again.";
   // Recognised but replaced by a newer build (old_build today; build_replaced once YouGame remembers replaced files).
   // build_replaced may carry `current`, the live build's version: named when present (printable, short).
   if (code == "old_build" || code == "build_replaced") {

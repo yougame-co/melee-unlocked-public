@@ -7,7 +7,7 @@
 //   answer   {"ok":true,"result":{"where":"code","code":{"user_code","verify_url","qr_text","expires_in"}}}
 //            an app older than v2 answers {"ok":true,"result":{"opened":true,"where":"overlay"|"browser"}}
 //   refusal  notYet (show its words, offer the browser), busy + retryAfter (wait, then ask again),
-//            alreadySignedIn (hello again), signInFailed (Try again), badRequest (the browser instead)
+//            alreadySignedIn (hello again), signInFailed (its words, Try again), badRequest (the browser instead)
 //   pushes   signedIn {name?}, signInExpired, signInFailed; any other push type is skipped
 //
 // One code per app: a code still pending is drawn again from here, never asked for again. Asks happen
@@ -251,7 +251,8 @@ class Model {
     if (code == "notYet") { message_ = words.empty() ? kNotYet : words; screen_ = Screen::NotYet; return Ask::None; }
     if (code == "badRequest" && asked == Ask::Code) return ask(Ask::Browser);   // an app that knows no code mode
     if (code == "signInFailed" && answer.count("retryAfter")) retry_at_ = now + wait_ms(answer, kBusyMaxSeconds);
-    return fail(code == "signInFailed" || words.empty() ? kFailed : words);
+    // The app's own words say what went wrong (no WebView2 on this PC, say); the generic line only when it sent none.
+    return fail(words.empty() ? kFailed : words);
   }
 
   // A push on the channel. True when it was one of ours (the caller then says hello again on signedIn).
@@ -270,7 +271,8 @@ class Model {
     }
     if (type == "signInFailed") {
       code_.clear();
-      if (screen_ != Screen::SignedIn) fail(kFailed);
+      const std::string words = text_of(push, "error");
+      if (screen_ != Screen::SignedIn) fail(words.empty() ? kFailed : words);
       return true;
     }
     return false;
