@@ -13,6 +13,7 @@
 #include "slippi_report.h"
 #include "slippi_account.h"
 #include "yougame_link.h"
+#include "online_rows.h"
 #include "yougame_udp_enet.h"
 #include "yougame_mode_policy.h"
 #include "yougame_friends.h"
@@ -2552,6 +2553,34 @@ void Matchmaking::startMatchmaking() {
   // The Friends lobby is YouGame's own room: no Slippi account, blend or Direct code.
   if (search_settings_.friends_lobby && !local_peer.enabled) {
     if (!yougame::active()) { fail("The Friends lobby needs YouGame"); return; }
+    startYouGameMatchmaking();
+    return;
+  }
+  // A YouGame row (Ranked, Unranked, a friend's room) searched with no YouGame connected, e.g. the app was
+  // closed after the menu opened: start YouGame as picking the row does, and search once it answers.
+  // Slippi's sign-in has nothing to do with these rows ("Sign in to Slippi" here was wrong).
+#ifdef YOUGAME_AGENT_TEST_HOOK
+  const bool scripted = yougame::agent_test::agent_script;   // refused below; never opens YouGame's window
+#else
+  const bool scripted = false;
+#endif
+  if (!yougame::session() && !local_peer.enabled && !scripted && online_rows::applied() &&
+      !yougame::mode_policy::slippi_menu_mode(search_settings_.mode, !search_settings_.friend_room.empty())) {
+    host::log("yougame: a YouGame row searched with no YouGame connected: starting YouGame");
+    yougame::first_row_picked();
+    const uint64_t until = time_ms() + 30000;
+    while (!yougame::channel_connected() && time_ms() < until) {
+      if (is_mm_terminated_ || state_ != INITIALIZING) return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (is_mm_terminated_ || state_ != INITIALIZING) return;
+    if (yougame::channel_connected()) yougame::set_launcher_session(true);   // the row was a YouGame one
+    if (!yougame::session()) {
+      host::log("yougame: YouGame did not answer in 30 s; search not started");
+      fail("YouGame isn't running. Open YouGame, then press Start");
+      return;
+    }
+    host::log("yougame: YouGame answered; searching");
     startYouGameMatchmaking();
     return;
   }

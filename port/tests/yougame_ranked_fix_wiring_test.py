@@ -42,6 +42,21 @@ class RankedFixWiringTest(unittest.TestCase):
         wire = (ROOT / "port/runtime/abi/mu_ranked_wire.h").read_text()
         self.assertNotIn("0xFF", wire)
 
+    def test_youGame_row_without_youGame_starts_it_not_slippi(self):
+        source = (ROOT / "port/runtime/hle/slippi_net.cpp").read_text()
+        start = source.split("void Matchmaking::startMatchmaking() {", 1)[1]
+        row = start.index("a YouGame row searched with no YouGame connected: starting YouGame")
+        slippi = start.index("user_->CheckSessionCompatibility(&error)")
+        self.assertLess(row, slippi, "a YouGame row never reaches Slippi's sign-in check")
+        block = start[start.rindex("if (!yougame::session()", 0, row):slippi]
+        self.assertIn("online_rows::applied()", block)
+        self.assertIn("!yougame::mode_policy::slippi_menu_mode(", block)
+        self.assertIn("!scripted", block)
+        self.assertIn("yougame::first_row_picked();", block)
+        self.assertIn("yougame::set_launcher_session(true);", block)
+        self.assertIn("startYouGameMatchmaking();", block)
+        self.assertIn('fail("YouGame isn\'t running. Open YouGame, then press Start");', block)
+
 
 if __name__ == "__main__":
     unittest.main()
