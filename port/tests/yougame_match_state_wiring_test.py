@@ -21,8 +21,10 @@ class MatchStateWiring(unittest.TestCase):
             # 122: then YouGame claude/start-get-c91e 0544f1538 (Get YouGame installs YouGame in the start window, PR 2454).
             # 122.1: then YouGame claude/start-get-fix-d3a1 3def89e29 (PR 2456: no elevated installer from an admin game, stop races).
             # 122.2: then YouGame claude/start-get-label-f6c3 8f982f469 (PR 2462: progress label fits, Esc mid-download not saved).
-            'yougame_start.h': '12f6f31ad9a63137b40389b691332b7e168c80c9f754c75721326b6292132fb9',
-            'yougame.h': 'f0796dd3ab37c6cc6ae96c554458f6638cadeff7268962d99da54baf9b9839de',
+            # 122.6: both from YouGame claude/v2 (3c9a9d020: staging's start installer, the mini app; e367c288d: a game
+            # started before the app finds it on its own).
+            'yougame_start.h': 'dbdf85f423be130797a3497e7ade0692a8b953bf3d472dc6af9bc010fc1c17a4',
+            'yougame.h': '58d758cafd6e0a4b0b1633cf652f3534227bbf66bbcad9b6839535155e62684a',
         }.items():
             self.assertEqual(hashlib.sha256((ROOT / 'port/third_party/yougame_start' / name).read_bytes()).hexdigest(), digest)
 

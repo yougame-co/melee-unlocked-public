@@ -309,7 +309,9 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
   // Reserve Tab before ImGui or the game's keyboard bindings see it. The edge reaches the practice
   // UI whether a text field is active or the overlay is closed.
   if (m == WM_KEYDOWN && w == VK_TAB) {
-    if (!(l & (1 << 30))) g_practice_toggle.store(true);
+    // Shift+Tab in a game started on its own opens the connected app's menu instead.
+    if (!(l & (1 << 30)) && !((GetKeyState(VK_SHIFT) & 0x8000) && yougame::channel_menu_key()))
+      g_practice_toggle.store(true);
     // Tab is reserved for native matchmaking. Never let a binding on the same keyboard key reach
     // Melee for the frame that opens or closes the overlay.
     std::lock_guard<std::mutex> lock(g_keys_mutex); g_keys[VK_TAB] = false; return 0;

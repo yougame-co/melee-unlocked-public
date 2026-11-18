@@ -360,9 +360,11 @@ extern "C" {
 #define YG__TIMEOUT 15.0
 #define YG__LOCAL_HELLO_TIMEOUT 6.0 /* contract section 1: no hello answer in 6 s is no host */
 #define YG__PROBE_COOLDOWN 5.0      /* contract section 1.3 */
-/* After the app ends a connection (an update restarting it, the player quitting and opening it
- * again), the game looks again on its own, every 5 s for 5 minutes, so it reconnects without
- * waiting for its next call. A game that never found the app keeps looking on calls only. */
+/* When a look finds no app (the game started first, then the player installed or opened YouGame)
+ * or the app ends a connection (an update restarting it, the player quitting and opening it
+ * again), the game looks again on its own, every 5 s for 5 minutes, so it connects without waiting
+ * for its next call. After that it looks on calls only, and the next call that finds nothing starts
+ * another 5 minutes. */
 #define YG__RELOOK_EVERY 5.0
 #define YG__RELOOK_FOR 300.0
 /* Player pending (contract section 4; desktop/src/local-channel.ts "PLAYER PENDING"): after a hello
@@ -1347,7 +1349,7 @@ enum {
   YG__EV_REPLY,    /* a failure made here, for call id */
   YG__EV_CLOSED,   /* stdin ended: nothing will answer again */
   YG__EV_UP,       /* the local channel connected for look id */
-  YG__EV_DOWN,     /* look id found nothing, or its connection ended */
+  YG__EV_DOWN,     /* look id found nothing (ok 1: no app channel to open), or its connection ended */
   YG__EV_BROWSER,  /* the feedback page opener for call id finished; ok */
   YG__EV_LOG       /* a log line from the thread (text is a literal) */
 };
@@ -1396,7 +1398,8 @@ static struct {
   long long next_id, local_gen;
   int local_state, hello_sent, hello_done, ready, closed, quit_requested, name_shared, feedback_unsupported;
   double last_probe_at;
-  /* Looking again on its own after the app ended a connection (YG__RELOOK_EVERY), until relook_until. */
+  /* Looking again on its own (YG__RELOOK_EVERY) after a look found no app channel or the app ended a
+   * connection, until relook_until. */
   int relook;
   double relook_until;
   /* Who the player is (yg_player_status); on this connection: the game was told a player, how many
@@ -2230,7 +2233,7 @@ static void *yg__local_main(void *arg)
       break;
     }
     if (pass == 2) {
-      yg__post(YG__EV_DOWN, wanted, 0, NULL, NULL);
+      yg__post(YG__EV_DOWN, wanted, 1, NULL, NULL); /* no app channel at all */
       continue;
     }
     yg__post(YG__EV_UP, wanted, 0, NULL, NULL);
@@ -3210,7 +3213,16 @@ static void yg__handle_event(yg__event *e) {
           yg__log(YG_LOG_INFO, "YouGame: the YouGame app closed the local channel%s", NULL);
           yg__fail_with("noAnswer", "YouGame closed the channel", 1);
         } else {
-          /* Nothing found: the calls that waited for this look answer "not available". */
+          /* Nothing found: the calls that waited for this look answer "not available". When no
+           * app channel was there at all (e->ok), yg_update keeps looking on its own for a while:
+           * a game started before the app (the start window's Get, or the player opening YouGame
+           * by hand) finds it with no call. An app that opened the channel and then dropped it
+           * unanswered (it refused this program, or was full) is not looked at again on its own.
+           * A look that fails while already looking never stretches the window. */
+          if (e->ok && !yg__g.relook) {
+            yg__g.relook = 1;
+            yg__g.relook_until = yg__now() + YG__RELOOK_FOR;
+          }
           yg__fail_with("notAvailable", "not available", 0);
         }
       }
@@ -3454,8 +3466,8 @@ void yg_shutdown(void) {
   yg__g.thread_up = 0;
 }
 
-/* Started on its own, and the app ended the connection: look again every YG__RELOOK_EVERY s until
- * it answers or YG__RELOOK_FOR s have passed (then the next call looks, as before). */
+/* Started on its own, and a look found nothing or the app ended the connection: look again every
+ * YG__RELOOK_EVERY s until it answers or YG__RELOOK_FOR s have passed (then the next call looks). */
 static void yg__relook_tick(void) {
   double every = YG__RELOOK_EVERY, now;
 #ifdef YOUGAME_TESTING

@@ -47,12 +47,22 @@
  *      the installed version is older than `tray_from` (or its file version cannot be read), else
  *      "YouGame isn't running" (also when its identity cannot be read). Linux always takes this
  *      path: a Linux desktop may have no tray.
+ *   M. Windows, the YouGame app's link type is not registered but the YouGame mini app is installed
+ *      (its installer's HKCU Software\YouGame\YouGame Mini value InstallPath, staging "YouGame
+ *      Staging Mini", is exactly %LOCALAPPDATA%\YouGame\mini, staging %LOCALAPPDATA%\YouGame
+ *      Staging\mini, and its YouGame.exe there is a plain local file signed by Fluo Inc.): YouGame
+ *      counts as installed, and step 2's rules apply with that program, started with no arguments
+ *      (the mini app has no window to hide). Its versions are its own, so `tray_from` is only
+ *      required to be set, never compared. The mini app answers on the app's own channel, so step 1
+ *      sees it running.
  *   3. YouGame is not on this computer: the small window says "Play online with YouGame".
  * The small window is YouGame's own, with two buttons. "Get YouGame" on Windows installs YouGame
  * right there: the button turns into a progress bar while it downloads the site's Windows installer
  * over HTTPS, checks it is whole and signed by Fluo Inc. (the same check as the installed program),
  * runs it silently (per-user, never elevated, no wizard, no browser), then starts YouGame in the tray
- * as above (YG_START_OPENED). The X or Esc closes it at any point (YG_START_DECLINED, not
+ * as above (YG_START_OPENED). Staging builds ask the site for its "start" installer, which the site
+ * may answer with the mini app's installer instead of the app's; that one starts the mini app itself
+ * at the end, so the hook waits a moment for it before starting it as in step M. The X or Esc closes it at any point (YG_START_DECLINED, not
  * remembered as Play offline): a download ends, an install already running finishes by itself. If any step fails, and on macOS and Linux, "Get YouGame" opens YouGame's download page in the browser
  * (YG_START_OFFERED). "Play offline" or closing it returns YG_START_DECLINED. It waits for an
  * answer. Every answer and every failure returns, so the game starts as usual.
@@ -70,10 +80,12 @@
  *   Linux: -pthread. Its small window uses /usr/bin/zenity, else /usr/bin/kdialog; with neither
  *     there is no window and the result is YG_START_DECLINED.
  * It downloads only after the player presses Get YouGame on Windows: the installer, from
- * https://yougame.co (staging: https://staging.yougame.co) /api/desktop/download, into
+ * https://yougame.co /api/desktop/download?file=YouGame-windows-x64.exe (staging:
+ * https://staging.yougame.co ...?file=YouGame-Start-windows-x64.exe), into
  * %LOCALAPPDATA%\YouGame Start, removed after it ran. The only programs it starts, after the
  * player's answer or the checks above: on Windows the signed YouGame program at its install location,
- * with the tray link (never when the game runs as administrator), and that installer once its
+ * with the tray link, or the signed mini app's YouGame.exe in its folder, with no arguments (neither
+ * when the game runs as administrator), and that installer once its
  * Fluo Inc. signature checks out, with /S; on Mac codesign and open for the verified bundle; everywhere the system's opener for one fixed https address (the
  * download page); on Linux also zenity or kdialog (the small window). All by absolute path. On macOS and Linux a game
  * that ignores SIGCHLD or reaps every child itself makes those answers read as failures.
@@ -509,6 +521,37 @@ static int yg__start_in_folder(const wchar_t *path, const wchar_t *root, const w
   k = yg__start_wprefix(path, folder);
   if (!k || path[k] != L'\\') return 0;
   return yg__start_wsame(path + k + 1, file);
+}
+
+/* The YouGame mini app (Windows), one entry per flavour: [0] production, [1] staging. Its installer
+   (desktop/mini/installer.nsi) always installs into %LOCALAPPDATA%\<product>\mini, whatever /D says,
+   and records that folder in HKCU <key> value InstallPath (REG_SZ). The program is YouGame.exe there
+   (the mini app's starter, one instance per user and flavour). It has no version resource yet, so
+   unlike the app it is pinned by its folder and Fluo Inc.'s signature alone. */
+static const wchar_t *const yg__start_mini_key[2] = {
+  L"Software\\YouGame\\YouGame Mini", L"Software\\YouGame\\YouGame Staging Mini"};
+static const wchar_t *const yg__start_mini_folder[2] = {L"YouGame\\mini", L"YouGame Staging\\mini"};
+#define YG__START_MINI_FILE L"YouGame.exe"
+
+/* The mini app's program from its InstallPath value: the value must be a drive path that is exactly
+   <local>\<folder> (local: FOLDERID_LocalAppData; trailing backslashes allowed), and then the program
+   is <value>\YouGame.exe, written to `out` (cap characters with the terminator). 1 when taken. */
+static int yg__start_mini_path(int staging, const wchar_t *install, const wchar_t *local, wchar_t *out,
+                               size_t cap) {
+  static const wchar_t file[] = YG__START_MINI_FILE;
+  size_t n, i, f = sizeof file / sizeof *file; /* with its terminator */
+  if (!install || !local || !out) return 0;
+  if (!((install[0] >= L'A' && install[0] <= L'Z') || (install[0] >= L'a' && install[0] <= L'z')) ||
+      install[1] != L':' || install[2] != L'\\')
+    return 0;
+  for (n = 0; install[n]; ++n)
+    if (n >= cap) return 0;
+  while (n > 3 && install[n - 1] == L'\\') --n;
+  if (n + 1 + f > cap) return 0;
+  for (i = 0; i < n; ++i) out[i] = install[i];
+  out[n] = L'\\';
+  for (i = 0; i < f; ++i) out[n + 1 + i] = file[i];
+  return yg__start_in_folder(out, local, yg__start_mini_folder[staging ? 1 : 0], file);
 }
 
 /* The program is the YouGame app of this flavour, by its file name and its version resource texts
@@ -1007,6 +1050,7 @@ static int yg__start_test_macos; /* macOS tray path, without update markers; bot
 static int yg__start_running(int staging);
 static int yg__start_installed(int staging);
 static int yg__start_app_find(int staging, yg__start_app *app);
+static int yg__start_mini_find(int staging, yg__start_app *app);
 static int yg__start_app_named(yg__start_app *app, int staging);
 static int yg__start_app_version(yg__start_app *app, unsigned have[3]);
 static int yg__start_app_signed(yg__start_app *app);
@@ -1066,6 +1110,7 @@ typedef struct yg__start_app {
   int named;       /* its version resource and file name are the YouGame app's (yg__start_allow) */
   int have_ok;     /* its file version was read */
   unsigned have[3];
+  int mini;        /* the mini app's YouGame.exe (yg__start_mini_find): started with no arguments */
 } yg__start_app;
 
 static void yg__start_sleep(unsigned ms) { Sleep(ms); }
@@ -1470,7 +1515,7 @@ static int yg__start_app_find(int staging, yg__start_app *app) {
   BY_HANDLE_FILE_INFORMATION info;
   app->file = INVALID_HANDLE_VALUE;
   app->path[0] = 0;
-  app->named = app->have_ok = 0;
+  app->named = app->have_ok = app->mini = 0;
   if (yg__start_raised() || !yg__start_command(staging, command, 2048) ||
       !yg__start_exe_from_command(command, app->path, YG__START_PATH_CAP))
     return 0;
@@ -1496,6 +1541,67 @@ static int yg__start_app_find(int staging, yg__start_app *app) {
 static void yg__start_app_close(yg__start_app *app) {
   if (app->file != INVALID_HANDLE_VALUE) CloseHandle(app->file);
   app->file = INVALID_HANDLE_VALUE;
+}
+
+/* The mini app's program (see yg__start_mini_key): HKCU's InstallPath, a REG_SZ that ends in its
+   terminator, must be exactly its flavour's folder under FOLDERID_LocalAppData (yg__start_mini_path;
+   the known folder from SHGetKnownFolderPath, loaded from the system directory, never %LOCALAPPDATA%
+   from the game's environment). YouGame.exe there is then held as yg__start_app_find holds the app:
+   read sharing only, opened as itself (a link is seen, never followed), a plain file on a fixed local
+   drive whose final path is the path itself. Its signature is checked by the caller
+   (yg__start_app_signed). Running raised is the caller's check too, so "installed" reads the same
+   either way. */
+static int yg__start_mini_find(int staging, yg__start_app *app) {
+  typedef HRESULT (WINAPI *known_fn)(const GUID *, DWORD, HANDLE, PWSTR *);
+  typedef void (WINAPI *free_fn)(LPVOID);
+  static const GUID local = /* FOLDERID_LocalAppData */
+    {0xf1b32785, 0x6fba, 0x4fcf, {0x9d, 0x55, 0x7b, 0x8e, 0x7f, 0x15, 0x70, 0x91}};
+  wchar_t raw[YG__START_PATH_CAP];
+  BY_HANDLE_FILE_INFORMATION info;
+  HKEY key;
+  LONG rc;
+  DWORD type = 0, size = sizeof raw;
+  HMODULE shell, ole;
+  known_fn known = NULL;
+  free_fn release = NULL;
+  PWSTR root = NULL;
+  int ok = 0;
+  app->file = INVALID_HANDLE_VALUE;
+  app->path[0] = 0;
+  app->named = app->have_ok = 0;
+  app->mini = 1;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, yg__start_mini_key[staging ? 1 : 0], 0, KEY_QUERY_VALUE, &key) !=
+      ERROR_SUCCESS)
+    return 0;
+  rc = RegQueryValueExW(key, L"InstallPath", NULL, &type, (BYTE *)raw, &size);
+  RegCloseKey(key);
+  /* A value that does not end in its terminator is refused, never patched up. */
+  if (rc != ERROR_SUCCESS || type != REG_SZ || size < 2 * sizeof(wchar_t) || size % sizeof(wchar_t) ||
+      raw[size / sizeof(wchar_t) - 1])
+    return 0;
+  shell = yg__start_system_dll(L"shell32.dll");
+  ole = yg__start_system_dll(L"ole32.dll");
+  if (shell && ole) {
+    YG__START_PROC(known, shell, "SHGetKnownFolderPath");
+    YG__START_PROC(release, ole, "CoTaskMemFree");
+  }
+  if (known && release && known(&local, 0, NULL, &root) == S_OK && root)
+    ok = yg__start_mini_path(staging, raw, root, app->path, YG__START_PATH_CAP);
+  if (root && release) release(root);
+  if (ole) FreeLibrary(ole);
+  if (shell) FreeLibrary(shell);
+  if (!ok) return 0;
+  app->file = CreateFileW(app->path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                          FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+  if (app->file == INVALID_HANDLE_VALUE) return 0;
+  if (GetFileType(app->file) != FILE_TYPE_DISK || !GetFileInformationByHandle(app->file, &info) ||
+      (info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
+      !yg__start_held_path_ok(app)) {
+    CloseHandle(app->file);
+    app->file = INVALID_HANDLE_VALUE;
+    return 0;
+  }
+  return 1;
 }
 
 /* The installed program's file version (first three parts), for the leftover-marker check only
@@ -1703,7 +1809,8 @@ static wchar_t *yg__start_env_block(void) {
 }
 
 /* Starts the checked program by its full path (no search), with one argument: the tray link. That is
-   what the link type's own command does; the app then starts with no window. It starts suspended and
+   what the link type's own command does; the app then starts with no window. The mini app's program
+   (app->mini) gets no argument: it has no window, and its command line takes no link. It starts suspended and
    runs only once yg__start_image_is_held confirms it is the held file; otherwise it is ended (and if
    ending it fails, it stays suspended and never runs) and counts as not started. The game's handles
    and environment are not inherited (yg__start_env_block), and it runs in the program's own folder.
@@ -1711,7 +1818,7 @@ static wchar_t *yg__start_env_block(void) {
    end YouGame. */
 
 static int yg__start_app_launch(yg__start_app *app, int staging) {
-  const wchar_t *link = staging ? L"yougame-staging://tray" : L"yougame://tray";
+  const wchar_t *link = app->mini ? NULL : staging ? L"yougame-staging://tray" : L"yougame://tray";
   wchar_t line[YG__START_PATH_CAP + 40], dir[YG__START_PATH_CAP];
   const DWORD flags =
     DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_DEFAULT_ERROR_MODE | CREATE_SUSPENDED |
@@ -1721,7 +1828,7 @@ static int yg__start_app_launch(yg__start_app *app, int staging) {
   PROCESS_INFORMATION pi;
   size_t n = wcslen(app->path), cut = n;
   int attempt, ok = 0;
-  if (n + wcslen(link) + 4 >= sizeof line / sizeof *line) return 0;
+  if (n + (link ? wcslen(link) : 0) + 4 >= sizeof line / sizeof *line) return 0;
   while (cut && app->path[cut - 1] != L'\\') --cut;
   if (cut < 3) return 0;
   if (cut > 3) --cut; /* "C:\Games\YouGame" without its last backslash; a root keeps "C:\" */
@@ -1734,8 +1841,8 @@ static int yg__start_app_launch(yg__start_app *app, int staging) {
     line[0] = L'"';
     memcpy(line + 1, app->path, n * sizeof(wchar_t));
     line[n + 1] = L'"';
-    line[n + 2] = L' ';
-    wcscpy(line + n + 3, link);
+    line[n + 2] = link ? L' ' : 0;
+    if (link) wcscpy(line + n + 3, link);
     memset(&si, 0, sizeof si);
     si.cb = sizeof si;
     memset(&pi, 0, sizeof pi);
@@ -1925,7 +2032,8 @@ static yg__start_ui yg__start_u;
    into %LOCALAPPDATA%\YouGame Start, holds it so it cannot be changed, checks it came whole and is
    signed by Fluo Inc. (yg__start_app_signed, the same check as the installed program), and runs it
    silently ("/S": the one-click per-user installer, never elevated, no wizard, no browser; it writes
-   the link type, so the tray start works right after). The window then closes with
+   the link type, so the tray start works right after; the mini app's installer, which staging's site
+   may send instead, writes its InstallPath and starts the mini app itself). The window then closes with
    YG__START_ANSWER_INSTALLED and yg_start starts YouGame in the tray as Open YouGame does. The X or
    Esc closes it at any point, not remembered as Play offline: a download ends at once, an install already running finishes by
    itself, and the game is never held up waiting for either. A failure falls back to the download
@@ -2046,8 +2154,12 @@ static int yg__start_get_download(const wchar_t *path, int staging) {
   if (!s) goto done;
   net_timeouts(s, 15000, 15000, 30000, 30000);
   c = net_connect(s, staging ? L"staging.yougame.co" : L"yougame.co", 443, 0);
-  if (c) r = net_request(c, L"GET", L"/api/desktop/download?file=YouGame-windows-x64.exe", NULL, NULL, NULL,
-                         0x00800000 /* WINHTTP_FLAG_SECURE */);
+  /* Staging asks for the start installer, which the site answers with the app's installer or the mini
+     app's (its start_get_product setting); production keeps the app's own name until the site serves
+     the start name there too. Either is checked the same way before it runs. */
+  if (c) r = net_request(c, L"GET", staging ? L"/api/desktop/download?file=YouGame-Start-windows-x64.exe"
+                                            : L"/api/desktop/download?file=YouGame-windows-x64.exe",
+                         NULL, NULL, NULL, 0x00800000 /* WINHTTP_FLAG_SECURE */);
   if (!r || yg__start_g.stop || !net_send(r, NULL, 0, NULL, 0, 0, 0) || !net_receive(r, NULL)) goto done;
   len = sizeof status;
   if (!net_query(r, 19 | 0x20000000 /* STATUS_CODE | FLAG_NUMBER */, NULL, &status, &len, NULL) || status != 200)
@@ -3657,6 +3769,56 @@ static int yg__start_tray(int staging, const unsigned want[3], unsigned have[3])
 #endif
 
 #if defined(_WIN32) || defined(YOUGAME_START_TESTING)
+/* The mini app is installed: its program is found in its folder (yg__start_mini_find) and signed by
+   Fluo Inc. (yg__start_app_signed). Only looked for when the app's link type is not registered. */
+static int yg__start_mini_installed(int staging) {
+  yg__start_app app;
+  int ok;
+  if (!yg__start_mini_find(staging, &app)) return 0;
+  ok = yg__start_app_signed(&app) > 0;
+  yg__start_app_close(&app);
+  return ok;
+}
+
+/* The mini app's start: the same held, signed and bound start as yg__start_tray, with no arguments
+   and no version rule (its versions are its own, never the app's tray_from). Never when the game runs
+   raised. */
+static int yg__start_mini_tray(int staging) {
+  yg__start_app app;
+  int r, signature;
+  if (yg__start_raised() || !yg__start_mini_find(staging, &app)) return YG__START_TRAY_REFUSED;
+  if ((signature = yg__start_app_signed(&app)) <= 0)
+    r = signature < 0 ? YG__START_TRAY_FAILED : YG__START_TRAY_REFUSED;
+  else
+    r = yg__start_app_launch(&app, staging) ? YG__START_TRAY_STARTED : YG__START_TRAY_FAILED;
+  yg__start_app_close(&app);
+  return r;
+}
+
+/* The app's checked tray start, or the mini app's when that is what is installed. */
+static int yg__start_tray_or_mini(int mini, int staging, const unsigned want[3], unsigned have[3]) {
+  return mini ? yg__start_mini_tray(staging) : yg__start_tray(staging, want, have);
+}
+
+/* After Get YouGame installed the mini app: its installer starts it by itself at the end (no /NORUN),
+   so give it up to YG__START_MINI_UP_MS to answer on the channel before the hook starts it (a second
+   start of the mini app ends at once: one instance per user and flavour). */
+#define YG__START_MINI_UP_MS 5000
+static int yg__start_mini_up(int staging) {
+  unsigned waited = 0;
+  unsigned long start = yg__start_ms(), elapsed;
+  while (waited < YG__START_MINI_UP_MS) {
+    yg__start_sleep(250);
+    waited += 250;
+    elapsed = (yg__start_ms() - start) & 0xFFFFFFFFUL;
+    if (elapsed > waited) waited = elapsed < YG__START_MINI_UP_MS ? (unsigned)elapsed : YG__START_MINI_UP_MS;
+    if (yg__start_running(staging)) return 1;
+  }
+  return 0;
+}
+#endif
+
+#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
 /* The marker's `to` is already installed: the registered program's file version
    (yg__start_installed_version, which never blocks an installer) reaches `to`
    (yg__start_version_reached). A program that cannot be read (an installer may be replacing it
@@ -3727,6 +3889,7 @@ yg_start_result yg_start(const yg_start_options *o) {
 #if defined(_WIN32) || defined(YOUGAME_START_TESTING)
   char to[YG__START_TO_CAP];
   yg__start_mark mark;
+  int mini = 0; /* step M: the mini app is what is installed */
 #endif
   /* Cleared at entry only for a caller that set the magic: a struct that was never zeroed never
      has its update_to written before a real YG_START_UPDATING. */
@@ -3737,6 +3900,11 @@ yg_start_result yg_start(const yg_start_options *o) {
   ask = o->ask; /* any value but LATER and ON_USE acts as at start */
   if (yg__start_running(staging)) return YG_START_RUNNING;
   installed = yg__start_installed(staging);
+#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
+  /* No app registered, but the mini app is installed (step M): YouGame is installed, and every start
+     below uses the mini app's program. Windows only. */
+  if (!installed && YG__START_UPDATE_SYSTEM && yg__start_mini_installed(staging)) installed = mini = 1;
+#endif
 #if defined(_WIN32) || defined(YOUGAME_START_TESTING)
   /* YouGame quit to install an update: a fact, so quiet runs report it too, and nothing is started
      or shown. Taken whether or not the link type is registered right now, since an installer may
@@ -3754,7 +3922,11 @@ yg_start_result yg_start(const yg_start_options *o) {
   if (installed && YG__START_TRAY_SYSTEM && !o->no_open) {
     unsigned want[3], have[3] = {0, 0, 0};
     if (yg__start_version_parse(o->tray_from, want)) {
+#if defined(_WIN32) || defined(YOUGAME_START_TESTING)
+      int tray = yg__start_tray_or_mini(mini, staging, want, have);
+#else
       int tray = yg__start_tray(staging, want, have);
+#endif
       if (tray == YG__START_TRAY_OLD) text = YG__START_TEXT_UPDATE;
       else if (tray == YG__START_TRAY_FAILED) text = YG__START_TEXT_DIDNT_OPEN;
       else if (tray == YG__START_TRAY_STARTED) {
@@ -3806,18 +3978,27 @@ yg_start_result yg_start(const yg_start_options *o) {
     if (yg__start_running(staging)) return YG_START_OPENED;
     if (yg__start_marker(staging, &mark, to) && (mark.age_ms < 20000 || !yg__start_update_done(staging, to)))
       return yg__start_updating(o, to);
-    if (yg__start_tray(staging, any, have) == YG__START_TRAY_STARTED) {
+    if (yg__start_tray_or_mini(mini, staging, any, have) == YG__START_TRAY_STARTED) {
       int up = yg__start_wait_up(o, staging, have, YG__START_WAIT_MARK);
       /* Started but slow to come up: never send the player to download an app that is starting. */
       return up >= 0 ? (yg_start_result)up : YG_START_DECLINED;
     }
     answer = YG__START_ANSWER_GET;   /* it would not start: the download page puts it right */
   }
-  /* Get YouGame installed it from the window: the same checked tray start as Open YouGame. */
+  /* Get YouGame installed it from the window: the same checked tray start as Open YouGame. The site
+     may have sent the mini app's installer instead (staging's start installer): with no app found,
+     the mini app, which its installer starts by itself, gets a moment to come up, else it is started
+     here (step M). */
   if (answer == YG__START_ANSWER_INSTALLED) {
     unsigned any[3] = {0, 0, 0}, have[3] = {0, 0, 0};
+    int tray;
     if (yg__start_running(staging)) return YG_START_OPENED;
-    if (yg__start_tray(staging, any, have) == YG__START_TRAY_STARTED) {
+    tray = yg__start_tray(staging, any, have);
+    if (tray == YG__START_TRAY_REFUSED && yg__start_mini_installed(staging)) {
+      if (yg__start_mini_up(staging)) return YG_START_OPENED;
+      tray = yg__start_mini_tray(staging);
+    }
+    if (tray == YG__START_TRAY_STARTED) {
       int up = yg__start_wait_up(o, staging, have, YG__START_WAIT_MARK);
       return up >= 0 ? (yg_start_result)up : YG_START_DECLINED;
     }

@@ -3734,6 +3734,28 @@ void relay_key(const char* key) {
   if (g_stdio) write_line(std::string("yg {\"key\":\"") + key + "\"}");
 }
 
+bool channel_menu_key() {
+  if (g_stdio || !g_channel_allowed) return false;
+  static std::atomic<int64_t> last{0};
+  const int64_t now = (int64_t)now_ms();
+  if (now - last.load() < 300) return true;   // the channel takes one menuButton every 300 ms
+  last = now;
+  // No YouGame connected: the same ask as a YouGame row picked first (Get / Open YouGame / offline).
+  if (!g_channel_up.load()) { host::log("yougame: Shift+Tab, no YouGame connected"); first_row_picked(); return true; }
+  if (sign_in_needed()) { host::log("yougame: Shift+Tab, signed out"); sign_in_open(); return true; }
+  std::thread([] {
+    bool opened = false;
+    try {
+      const json j = bridge_channel({{"type", "menuButton"}, {"kind", "keys"}}, 2000);
+      opened = j.value("opened", false) || (j.count("result") && j["result"].is_object() && j["result"].value("opened", false));
+    } catch (...) {}
+    host::log("yougame: Shift+Tab, app menu %s", opened ? "opened" : "not opened");
+    // An app with no overlay (the small start app): the game's own YouGame box when there is one to show.
+    if (!opened && sign_in_needed()) sign_in_open();
+  }).detach();
+  return true;
+}
+
 void pause_event(bool pausable, bool paused, const char* reason) {
   if (!g_stdio) return;
   json event = {{"type", "pause"}, {"pausable", pausable}, {"paused", paused}};

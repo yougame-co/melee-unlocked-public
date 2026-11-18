@@ -50,7 +50,7 @@ class ShortcutsWiringTest(unittest.TestCase):
         self.assertIn('for (const char* line : event.lines) yougame::parity::signals.emit(line);', block)
         self.assertIn('if (m == WM_CHAR || m == WM_SYSCHAR)', block)
         self.assertIn('if (shortcut_swallowed(vk)) return 0;', block)
-        self.assertIn('if (!(l & (1 << 30))) g_practice_toggle.store(true);', window[tab:imgui])
+        self.assertIn('if (!(l & (1 << 30)) && !((GetKeyState(VK_SHIFT) & 0x8000) && yougame::channel_menu_key()))\n      g_practice_toggle.store(true);', window[tab:imgui])
 
     def test_cancel_all_window_lifecycle_events(self):
         window = source("port/runtime/host/window.cpp")
