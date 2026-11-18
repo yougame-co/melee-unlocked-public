@@ -623,3 +623,42 @@ MU_EXCLUSIONS(practice_cpu,
               MU_EXCLUDE(pc_config_frame),
               MU_EXCLUDE(pc_logs),
               MU_EXCLUDE(ghost_applied))
+
+/* Pro AI name tag (ifnametag.c): the name of the pro a pro AI plays as on this CPU slot, in the game's
+ * full-width text, else NULL. The game then shows it on the CPU's own grey tag in place of "CP". */
+const char* mu_pro_tag_text(int slot)
+{
+    static const char* const names[] = {"Mang0", "Zain", "", "Cody", "aMSa"};
+    static char sjis[5][16];
+    const MuPcConfig* c;
+    HSD_GObj* g;
+    int pro;
+    /* Off until the owner approves its look (the CP tag's letters); MELEE_TEST_PRO_TAG shows it in tests. */
+    if (mu_test_getenv("MELEE_TEST_PRO_TAG") == NULL) return NULL;
+    if (slot < 0 || slot > 3 || Player_GetPlayerSlotType(slot) != Gm_PKind_Cpu || !pc_allowed()) return NULL;
+    c = pc_settings();
+    if (!c->enabled) return NULL;
+    g = Player_GetEntity(slot);
+    if (c->preset & 0x80u && c->preset != MU_PC_PRESET_AI) {
+        pro = (int) (c->preset & 0x7Fu);
+    } else if (g != NULL && g->user_data != NULL) {
+        pro = ghost_pro(g->user_data, c);
+    } else {
+        return NULL;
+    }
+    if (pro < 0 || pro > 4 || names[pro][0] == 0) return NULL;
+    if (sjis[pro][0] == 0) {
+        /* Full-width Shift JIS, as name tags are stored: A-Z 8260.., a-z 8281.., 0-9 824F.. */
+        const char* s = names[pro];
+        int n = 0;
+        for (; *s && n < 14; s++) {
+            unsigned code = *s >= 'A' && *s <= 'Z' ? 0x8260u + (unsigned) (*s - 'A')
+                          : *s >= 'a' && *s <= 'z' ? 0x8281u + (unsigned) (*s - 'a')
+                          : *s >= '0' && *s <= '9' ? 0x824Fu + (unsigned) (*s - '0') : 0x8140u;
+            sjis[pro][n++] = (char) (code >> 8);
+            sjis[pro][n++] = (char) code;
+        }
+        sjis[pro][n] = 0;
+    }
+    return sjis[pro];
+}

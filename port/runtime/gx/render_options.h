@@ -207,7 +207,7 @@ struct RenderOptions {
   // playing. The application id is Melee Unlocked's own, registered once for the whole game rather
   // than per player, and it is not a secret (Rich Presence needs no token). A player can override it
   // in the settings to point the presence at an application of their own.
-  bool discord_presence = false;
+  bool discord_presence = true;   // on by default (owner, 0.9.210)
   std::string discord_app_id = "1549608280949792790";
   // Source Port mod profile (Mods/Profiles/<name>.ini) loaded at start; empty = the retail game.
   // Command-line --mod-* flags take precedence. The static recomp ignores it.

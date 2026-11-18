@@ -1816,7 +1816,7 @@ void channel_line(const std::string& line) {
     if (!said.exchange(true)) host::log("yougame channel: bad line from YouGame");
   }
 }
-bool start_channel_probe(bool force);
+bool start_channel_probe(bool force, bool quiet = false);
 // The host closed the connection (it quit, the player signed out or another account signed in), or
 // the probe gave up on it. Waiting requests fail at once; the YouGame rows go back to Coming soon.
 void channel_closed(const std::shared_ptr<channel::Connection>& conn) {
@@ -1857,7 +1857,8 @@ void channel_closed(const std::shared_ptr<channel::Connection>& conn) {
 }
 // One probe: production first, then staging (Linux: three folders each). The first that connects,
 // passes the checks and answers hello is kept. One line in the log per probe.
-bool probe_channel() {
+// quiet: the background re-look (start_channel's watch) logs only a host it finds, not each empty look.
+bool probe_channel(bool quiet = false) {
   g_probe_started = now_ms();
   std::string why;
   const auto where = channel::candidates(&why);
@@ -1913,13 +1914,13 @@ bool probe_channel() {
     fetch_identity_now();   // on this thread, so the Online menu opens the rows once it is in
     return true;
   }
-  if (refused.empty()) host::log("yougame channel: none");
+  if (refused.empty()) { if (!quiet) host::log("yougame channel: none"); }
   else host::log("yougame channel: refused %s", channel::log_text(refused).c_str());
   return false;
 }
 // Starts a probe on its own thread unless one is running or a channel is up. Without `force`, at most
 // one every 5 s (the Online menu's retries).
-bool start_channel_probe(bool force) {
+bool start_channel_probe(bool force, bool quiet) {
   if (!g_channel_allowed || g_channel_up) return false;
   {
     std::lock_guard<std::mutex> lock(g_channel_mutex);
@@ -1927,7 +1928,7 @@ bool start_channel_probe(bool force) {
   }
   if (g_channel_probing.exchange(true)) return false;
   // A probe that brought the channel up cleared the flag itself, and a later probe may own it now.
-  std::thread([] { if (!probe_channel()) g_channel_probing = false; }).detach();
+  std::thread([quiet] { if (!probe_channel(quiet)) g_channel_probing = false; }).detach();
   return true;
 }
 
@@ -2788,6 +2789,16 @@ void start_channel(bool automated) {
     if (host::test_env::getenv("MELEE_NO_YOUGAME_CHANNEL")) { g_channel_allowed = false; return; }
     if (automated && !host::test_env::getenv("MELEE_TEST_YOUGAME_CHANNEL")) { g_channel_allowed = false; return; }
     start_channel_probe(true);
+    // A YouGame app started after the game (Get YouGame in the start window, or opened by hand) is found
+    // without a restart: look again every 4 s while no channel is up. A look is a loopback connect that
+    // fails at once when nothing listens; start_channel_probe refuses overlap and keeps its 5 s gate.
+    std::thread([] {
+      for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(4));
+        if (!g_channel_allowed) return;
+        if (!g_channel_up.load() && !g_channel_probing.load()) start_channel_probe(false, true);
+      }
+    }).detach();
   });
 }
 namespace {

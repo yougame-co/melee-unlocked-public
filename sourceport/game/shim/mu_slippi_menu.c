@@ -35,6 +35,8 @@
 #include <melee/mn/types.h>
 #include <sysdolphin/baselib/gobj.h>
 #include <sysdolphin/baselib/random.h>
+#include <sysdolphin/baselib/sislib.h>
+#include <mu_test_env.h>
 #include <mu_native.h>
 #include <mu_online_menu.h>
 #include <mu_pick_preview.h>
@@ -2268,5 +2270,87 @@ void mu_slippi_scene_install(void)
             installed = 1;
             break;
         }
+    }
+}
+
+
+/* ---- Coming soon, in the menu's own text ----
+ * YouGame's three rows while YouGame is not open yet: "Coming soon" written beside each greyed name
+ * with the menu's description text (its font, canvas and camera), so it is part of the game's
+ * picture like the rest of the menu: shader presets and the CRT look apply to it, and settings and
+ * dialogs draw over it. Shown only while the first page is idle on screen; freed when the menu
+ * moves, and forgotten (never freed twice) when a new menu scene starts. */
+static HSD_Text* soon_text;
+
+typedef struct SoonLayout { float x, y, dx, dy, size; } SoonLayout;
+static SoonLayout soon_layout(void)
+{
+    /* The first row's text, then the step to each next row (the rows step left as they go down),
+     * in the description canvas's units; MELEE_TEST_SOON overrides them for measuring. */
+    SoonLayout l = { 4.6f, -4.5f, -1.5f, 3.0f, 0.028f };   /* measured on captures (0.9.210) */
+    const char* v = mu_test_getenv("MELEE_TEST_SOON");
+    if (v != NULL) {
+        float f[5];
+        int n = 0;
+        while (n < 5 && *v) {   /* [-]digits[.digits], separated by spaces or commas */
+            float sign = 1.0f, val = 0.0f, scale = 0.0f;
+            int digits = 0;
+            if (*v == '-') { sign = -1.0f; v++; }
+            for (; (*v >= '0' && *v <= '9') || *v == '.'; v++) {
+                if (*v == '.') { scale = 1.0f; continue; }
+                val = val * 10.0f + (float) (*v - '0');
+                if (scale > 0.0f) scale *= 10.0f;
+                digits++;
+            }
+            if (!digits) break;
+            f[n++] = sign * (scale > 0.0f ? val / scale : val);
+            while (*v == ' ' || *v == ',') v++;
+        }
+        if (n == 5) { l.x = f[0]; l.y = f[1]; l.dx = f[2]; l.dy = f[3]; l.size = f[4]; }
+    }
+    return l;
+}
+
+void mu_slippi_menu_soon(int canvas, int idle)
+{
+    int show, i;
+    SoonLayout l;
+    if (canvas < 0) {
+        soon_text = NULL;
+        return;
+    }
+    /* Not shown yet: the owner keeps the sticker until a native look is approved. MELEE_TEST_SOON shows it. */
+    show = idle && mu_test_getenv("MELEE_TEST_SOON") != NULL && yougame_soon() && split_page == 0 && mn_804A04F0.cur_menu == MENU_KIND_8;
+    if (!show) {
+        if (soon_text != NULL) {
+            HSD_SisLib_803A5CC4(soon_text);
+            soon_text = NULL;
+        }
+        return;
+    }
+    if (soon_text != NULL) {
+        return;
+    }
+    l = soon_layout();
+    soon_text = HSD_SisLib_803A6754(0, canvas);
+    if (soon_text == NULL) {
+        return;
+    }
+    soon_text->pos_x = l.x;
+    soon_text->pos_y = l.y;
+    soon_text->pos_z = 17.0f;   /* the description's depth: in front of the rows */
+    soon_text->font_size.x = l.size;
+    soon_text->font_size.y = l.size;
+    soon_text->default_kerning = 1;
+    soon_text->default_alignment = 0;
+    for (i = 0; i < 3; i++) {
+        /* A dark copy one step down and right, then the text: the menu labels' outline, simply. */
+        static GXColor shadow = { 0, 0, 0, 200 };
+        static GXColor ink = { 236, 200, 110, 255 };   /* the rows' gold rim */
+        const float x = (l.dx * (float) i) / l.size, y = (l.dy * (float) i) / l.size;
+        int id = HSD_SisLib_803A6B98(soon_text, x + 2.0f, y + 2.0f, "Coming soon");
+        HSD_SisLib_803A74F0(soon_text, id, &shadow);
+        id = HSD_SisLib_803A6B98(soon_text, x, y, "Coming soon");
+        HSD_SisLib_803A74F0(soon_text, id, &ink);
     }
 }

@@ -163,8 +163,8 @@ static bool settings_page_shown(int active_tab, int page) {
   return true;
 }
 
-// A section header: a line that folds the settings under it, up to the next header. The first
-// section of each page starts open, the rest closed; each one's state is remembered. During a search
+// A section header: a line that folds the settings under it, up to the next header. Every section
+// starts open (owner, 0.9.210: settings should not hide); each one's state is remembered. During a search
 // sections draw no header and every setting is searched.
 static void settings_section(const char* title) {
   const int index = g_section_index++;
@@ -175,7 +175,8 @@ static void settings_section(const char* title) {
   ImGui::PushID(g_search_page);
   ImGui::PushID(title);
   const ImGuiID key = ImGui::GetID("open");
-  bool open = storage->GetBool(key, index == 0);
+  bool open = storage->GetBool(key, true);
+  (void)index;
   // "Go to" opens the section the row is in: until it is drawn, every section of that page opens.
   if (!g_goto_label.empty() && g_goto_page == g_search_page) open = true;
   ImGui::Spacing();

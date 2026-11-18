@@ -2549,7 +2549,9 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "lowspec_prev_effects") { int n = std::stoi(value); if (n >= 0 && n <= 3) options.low_spec_previous.effects_level = n; }
       else if (key == "lowspec_prev_dlss") { int n = std::stoi(value); if (n >= 0 && n <= 15) options.low_spec_previous.dlss_mode = n; }   // as "dlss" (FSR is 11 to 15)
       else if (key == "lowspec_prev_subframe") options.low_spec_previous.subframe = value == "0" ? SubFrameMode::Off : value == "2" ? SubFrameMode::AuthoredInterpolate : SubFrameMode::Authored;
-      else if (key == "discord") options.discord_presence = value == "1";
+      // "discord" kept the old off-by-default choice: everyone starts on with 0.9.210, then their own
+      // choice is kept as "discordon".
+      else if (key == "discordon") options.discord_presence = value == "1";
       // A Discord application id is a snowflake; anything else would only be rejected by Discord.
       else if (key == "te_options") { options.te_options = (uint32_t) std::stoul(value, nullptr, 16); }
       else if (key == "mod_profile") { if (value.size() <= 1024) options.mod_profile = value; }
@@ -4232,6 +4234,9 @@ static void draw_native_practice(SettingsState& state, RenderOptions& options,
     if (have_pad) { f.buttons = pad.button; f.stick_x = pad.stick_x; f.stick_y = pad.stick_y; }
     // Only in Training: a VS match with friends or a training mod's exercise stays clean.
     f.hint = show_hint && practice.in_practice && practice.tab_available && practice.phase == Phase::Idle;
+    // MELEE_TEST_PRACTICE_HINT=1 (tests only): the hint in any Training match, for captures of its look.
+    static const bool test_hint = host::test_env::getenv("MELEE_TEST_PRACTICE_HINT") != nullptr;
+    if (test_hint && practice.in_practice) f.hint = show_hint;
     f.search.available = practice.tab_available;
     f.search.can_start = practice.can_start;
     f.search.searching = practice.phase == Phase::Searching;
@@ -5143,6 +5148,62 @@ static void game_mods_panel(const RenderOptions& options) {
   ImGui::Spacing(); ImGui::Separator();
 }
 
+// Settings reopen where the player left them (owner, 0.9.210): the category, whether its page was
+// open, and every section they expanded, kept in settings-view.txt next to the settings file.
+namespace settings_view {
+struct Saved { int tab = -1; bool page = false; std::map<ImGuiID, std::map<ImGuiID, int>> open; };
+Saved g_saved;
+bool g_loaded = false;
+std::string g_last_written;
+std::filesystem::path file(const RenderOptions& options) {
+  return std::filesystem::path(options.settings_path).parent_path() / "settings-view.txt";
+}
+void load(const RenderOptions& options) {
+  if (g_loaded) return;
+  g_loaded = true;
+  std::ifstream in(file(options));
+  std::string key;
+  while (in >> key) {
+    if (key == "tab") in >> g_saved.tab;
+    else if (key == "page") { int v = 0; in >> v; g_saved.page = v != 0; }
+    else if (key == "node") {
+      unsigned long long w = 0, id = 0; int v = 0;
+      if (in >> std::hex >> w >> id >> std::dec >> v) g_saved.open[ImGuiID(w)][ImGuiID(id)] = v ? 1 : 0;
+    } else std::getline(in, key);
+  }
+}
+// Sections are restored as their window appears (a window's open sections live in its storage).
+void restore_nodes() {
+  for (auto it = g_saved.open.begin(); it != g_saved.open.end();) {
+    if (ImGuiWindow* w = ImGui::FindWindowByID(it->first)) {
+      for (const auto& [id, v] : it->second) w->StateStorage.SetInt(id, v);
+      it = g_saved.open.erase(it);
+    } else ++it;
+  }
+}
+void save(const RenderOptions& options, int tab, bool page) {
+  std::ostringstream out;
+  out << "tab " << tab << "\npage " << (page ? 1 : 0) << "\n";
+  std::map<ImGuiID, std::map<ImGuiID, int>> nodes = g_saved.open;   // windows not shown this run keep theirs
+  for (ImGuiWindow* w : ImGui::GetCurrentContext()->Windows) {
+    if (!w || (w->Flags & ImGuiWindowFlags_Tooltip) || std::strncmp(w->Name, "Debug##", 7) == 0) continue;
+    auto& mine = nodes[w->ID];
+    for (const ImGuiStoragePair& pair : w->StateStorage.Data)
+      if (pair.val_i == 0 || pair.val_i == 1) mine[pair.key] = pair.val_i;
+    if (mine.empty()) nodes.erase(w->ID);
+  }
+  for (const auto& [w, ids] : nodes)
+    for (const auto& [id, v] : ids) out << "node " << std::hex << w << " " << id << std::dec << " " << v << "\n";
+  const std::string text = out.str();
+  if (text == g_last_written) return;
+  std::error_code ec;
+  const std::filesystem::path f = file(options), tmp = f.string() + ".tmp";
+  { std::ofstream o(tmp, std::ios::binary | std::ios::trunc); o << text; if (!o) return; }
+  std::filesystem::rename(tmp, f, ec);
+  if (!ec) g_last_written = text;
+}
+}  // namespace settings_view
+
 bool settings_frame(SettingsState& state, RenderOptions& options) {
   const auto fullscreen_clock = [] {
     return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -5471,16 +5532,20 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     }
     if (test_menu_style() >= 0) options.overlay_style = test_menu_style();
   }
+  settings_view::load(options);
   const auto reset_settings_home = [&state](const char* why) {
     if (g_ui_diag) host::log("ui diag: settings reset to home (%s), tab %d", why, state.active_tab);
-    state.active_tab = 0;
+    const int keep = settings_view::g_saved.tab;
+    state.active_tab = keep >= 0 ? std::clamp(keep, 0, 7) : 0;
     state.radial_selection = 0;
     state.home_focus_reset = true;
     state.clean_hover.fill(0.0f);
     state.dashboard_hover.fill(0.0f);
     state.radial_hover.fill(0.0f);
-    state.clean_detail_open = state.dashboard_detail_open = false;
-    state.gd_detail_open = state.radial_detail_open = state.wide_detail_open = false;
+    const bool page = keep >= 0 && settings_view::g_saved.page;   // reopen the page they left open
+    state.radial_selection = state.active_tab;
+    state.clean_detail_open = state.dashboard_detail_open = page;
+    state.gd_detail_open = state.radial_detail_open = state.wide_detail_open = page;
   };
   bool menu_main_focus_pending = false;
   const auto open_menu = [&state, &menu_main_focus_pending]() {
@@ -5489,6 +5554,15 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     state.menu_quit_focus_pending = false;
     menu_main_focus_pending = true;
   };
+  {   // settings open at startup (Auto-open, --pc-settings-open) also come back where they were left
+    static bool start_view = false;
+    if (!start_view) {
+      start_view = true;
+      if (state.open && !settings_fills_window() && g_initial_tab.load(std::memory_order_relaxed) < 0 &&
+          !host::test_env::getenv("MELEE_TEST_SETTINGS_TAB") && !std::getenv("MELEE_SETTINGS_TAB"))
+        reset_settings_home("open at startup");
+    }
+  }
   if (g_guest_options_open_request.exchange(false, std::memory_order_acq_rel)) {
     state.open = true;
     state.practice_open = false;
@@ -5750,13 +5824,18 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   }
   // The menu key (F1 under YouGame, Esc standalone) leaves Settings safely at the main menu.
   // Only selecting its quit row may open the confirmation. Legacy/launcher settings keep close.
+  // On a settings page Esc goes back to the category screen (upstream 0.9.210).
   // While rebinding, Escape cancels the capture without also changing the panel.
   if (signin_up && !state.open && !state.menu_open && host::window_take_escape()) signin_overlay::back();   // Esc: Back
   if (phob_native_open() && host::window_take_escape()) {
     phob_native_close();   // Esc leaves the PhobGCC menu for the Controls tab
   } else if (host::window_take_escape() && state.rebind_action < 0) {
     const int style = options.overlay_style;
+    const bool on_page = (style == 0 && state.clean_detail_open) || (style == 1 && state.dashboard_detail_open) ||
+                         (style == 2 && state.gd_detail_open) || (style == 3 && state.radial_detail_open) ||
+                         (style == 4 && state.wide_detail_open);
     if (state.open && (state.legacy_presentation || style >= 5 || launcher_window)) state.open = false;
+    else if (state.open && on_page) settings_back_page(state, style);
     else if (state.open) { state.open = false; open_menu(); }
     else if (state.practice_open) { state.practice_open = false; state.practice_release_capture = true; }
     else if (state.menu_open) { state.menu_open = false; state.menu_quit = false; }
@@ -5770,6 +5849,23 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     state.open = true;
   }
   if (state.open) { state.menu_open = false; state.practice_open = false; }
+  {   // remember the view while settings show (checked twice a second, written only when it changes)
+    settings_view::restore_nodes();
+    static int tick = 0;
+    static bool was_open = false;
+    if (state.open && !state.legacy_presentation && !launcher_window) {
+      const int style = options.overlay_style;
+      const bool page = (style == 0 && state.clean_detail_open) || (style == 1 && state.dashboard_detail_open) ||
+                        (style == 2 && state.gd_detail_open) || (style == 3 && state.radial_detail_open) ||
+                        (style == 4 && state.wide_detail_open);
+      settings_view::g_saved.tab = state.active_tab;
+      settings_view::g_saved.page = page;
+      if (++tick >= 30 || !was_open) { tick = 0; settings_view::save(options, state.active_tab, page); }
+    } else if (was_open) {
+      settings_view::save(options, settings_view::g_saved.tab < 0 ? 0 : settings_view::g_saved.tab, settings_view::g_saved.page);
+    }
+    was_open = state.open;
+  }
   if (state.menu_open) state.practice_open = false;
   if (!state.menu_open) state.menu_quit = false;
   if (!state.menu_open || !state.menu_quit) state.menu_quit_focus_pending = false;
@@ -10098,7 +10194,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // the local pad before the game reads it, so it is transmitted like any other input and both
     // clients compute the same landing lag: it cannot desync. It is still gated to offline and
     // Direct because it is a fairness question, not a safety one.
-    ImGui::TextUnformatted("L-cancel");
+    settings_section("L-cancel");   // its own section, not under Stage effects (owner, 0.9.210)
     {
       if (settings_lcancel_flash(options)) changed = true;
       const bool ranked = lcancel::automatic_setting_locked();

@@ -766,11 +766,31 @@ int draw_player_chip(HDC dc,const launcher::replay::Player& p,bool winner,int x,
   if(winner) { RECT crown{pill.right-S(9),pill.top-S(12),pill.right+S(9),pill.top+S(4)}; draw_text(dc,L"\x265B",crown,replay_symbols(13),C_GOLD,DT_CENTER|DT_VCENTER|DT_SINGLELINE); }
   return pill.right;
 }
+// A row button as wide as its words in the player's language ("Estad EDsticas" ran past the old
+// English-sized pill): the text plus its padding, never narrower than the English layout.
+int replay_button_width(std::initializer_list<const wchar_t*> labels,int least) {
+  static std::map<std::wstring,int> cache;   // by the shown text, so a language change measures again
+  int widest=0;
+  for(const wchar_t* label:labels) {
+    const std::wstring shown=launcher::lang::txw(label);
+    auto it=cache.find(shown);
+    if(it==cache.end()) {
+      HDC dc=CreateCompatibleDC(nullptr);
+      HGDIOBJ old=SelectObject(dc,replay_font(11,FW_SEMIBOLD));
+      SIZE sz{}; GetTextExtentPoint32W(dc,shown.c_str(),(int)shown.size(),&sz);
+      SelectObject(dc,old); DeleteDC(dc);
+      it=cache.emplace(shown,(int)sz.cx).first;
+    }
+    widest=std::max(widest,it->second);
+  }
+  return std::max(S(least),widest+S(20));
+}
 void card_zones(RECT card,RECT* stats,RECT* watch,RECT* queue,RECT* del) {
   *watch={card.right-S(46),card.top+S(12),card.right-S(16),card.top+S(42)};
-  *stats={card.right-S(118),card.top+S(14),card.right-S(56),card.top+S(40)};
-  *queue={card.right-S(156),card.top+S(13),card.right-S(128),card.top+S(41)};
-  *del={card.right-S(222),card.top+S(14),card.right-S(166),card.top+S(40)};
+  const int sw=replay_button_width({L"Stats"},62), dw=replay_button_width({L"Delete",L"Sure?"},56);
+  *stats={card.right-S(56)-sw,card.top+S(14),card.right-S(56),card.top+S(40)};
+  *queue={stats->left-S(38),card.top+S(13),stats->left-S(10),card.top+S(41)};
+  *del={queue->left-S(10)-dw,card.top+S(14),queue->left-S(10),card.top+S(40)};
 }
 void draw_replay_card(DRAWITEMSTRUCT* item,HDC dc);
 void draw_replay(DRAWITEMSTRUCT* item) {

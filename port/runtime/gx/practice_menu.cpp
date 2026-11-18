@@ -56,6 +56,7 @@ struct Font {
   ImGuiContext* context = nullptr;
   ImTextureData tex;
   Glyph glyph[128];
+  float cap_mid = 16.0f;   // the middle of the capital letters' ink, in the 32-pixel glyph cell
 };
 Font g_font;
 
@@ -134,6 +135,20 @@ void font_load() {
     for (int y = 0; y < 32 && sum < 64; ++y)
       for (int x = 0; x < 32; ++x) sum += out[((oy + y) * 1024 + ox + x) * 4 + 3] > 64;
     if (sum >= 8) ++inked;
+  }
+  {
+    // Where capitals sit in the cell, from the ink of H, E and T: text is centred on that, so words and
+    // button glyphs share one line.
+    int top = 32, bottom = -1;
+    for (const char* p = "HET"; *p; ++p) {
+      const int g = g_font.glyph[(unsigned char)*p].index;
+      if (g < 0) continue;
+      const int ox = (g % 32) * 32, oy = (g / 32) * 32;
+      for (int y = 0; y < 32; ++y)
+        for (int x = 0; x < 32; ++x)
+          if (out[((oy + y) * 1024 + ox + x) * 4 + 3] > 96) { top = std::min(top, y); bottom = std::max(bottom, y); }
+    }
+    if (bottom >= top) g_font.cap_mid = (top + bottom + 1) * 0.5f;
   }
   if (checked < 30 || inked < checked) {
     host::log("practice menu: the disc's font looks wrong (%d of %d letters and digits drawn); the PC font is used", inked, checked);
@@ -1012,6 +1027,12 @@ void bar_path(ImDrawList* dl, float left, float top, float right, float h, float
   dl->PathLineTo(ImVec2(left, top + h));
 }
 
+// The y to give text() so its capital letters are centred on cy (the game's font, else the PC one).
+float text_y_centered(float cy, float px) {
+  if (!font_ready()) return cy - px * 0.55f;
+  return cy - g_font.cap_mid * px / 32.0f;
+}
+
 // The GameCube buttons the hints show.
 float glyph_width(char which, float u);
 void button_glyph(ImDrawList* dl, float x, float cy, float u, char which, float a) {
@@ -1021,27 +1042,35 @@ void button_glyph(ImDrawList* dl, float x, float cy, float u, char which, float 
       const float r = 12.0f * u;
       dl->AddCircleFilled(ImVec2(x + r, cy + 1.5f * u), r, with_alpha(IM_COL32(10, 77, 23, 255), a), 20);
       dl->AddCircleFilled(ImVec2(x + r, cy), r, with_alpha(IM_COL32(47, 170, 70, 255), a), 20);
-      text(dl, x + r - text_width(13.0f * u, "A") * 0.5f, cy - 7.0f * u, 13.0f * u, white, "A", 0, false);
+      text(dl, x + r - text_width(13.0f * u, "A") * 0.5f, text_y_centered(cy, 13.0f * u), 13.0f * u, white, "A", 0, false);
       break;
     }
     case 'B': {
       const float r = 9.5f * u;
       dl->AddCircleFilled(ImVec2(x + r, cy + 1.5f * u), r, with_alpha(IM_COL32(92, 13, 8, 255), a), 20);
       dl->AddCircleFilled(ImVec2(x + r, cy), r, with_alpha(IM_COL32(214, 44, 34, 255), a), 20);
-      text(dl, x + r - text_width(11.0f * u, "B") * 0.5f, cy - 6.0f * u, 11.0f * u, white, "B", 0, false);
+      text(dl, x + r - text_width(11.0f * u, "B") * 0.5f, text_y_centered(cy, 11.0f * u), 11.0f * u, white, "B", 0, false);
       break;
     }
     case 'S': {
       const float w = glyph_width('S', u), h = 14.0f * u;
       dl->AddRectFilled(ImVec2(x, cy - h * 0.5f), ImVec2(x + w, cy + h * 0.5f), with_alpha(IM_COL32(190, 192, 202, 255), a), h * 0.5f);
-      text(dl, x + (w - text_width(9.0f * u, "START")) * 0.5f, cy - 5.0f * u, 9.0f * u, with_alpha(IM_COL32(30, 30, 36, 255), a), "START", 0, false);
+      text(dl, x + (w - text_width(9.0f * u, "START")) * 0.5f, text_y_centered(cy, 9.0f * u), 9.0f * u, with_alpha(IM_COL32(30, 30, 36, 255), a), "START", 0, false);
       break;
     }
-    case 'D': {
+    case 'D':
+    case 'U':
+    case 'V': {   // the D-pad; U and V light its Up or Down arm
       const float s = 22.0f * u, t = s / 3.0f;
-      const ImU32 c = with_alpha(IM_COL32(214, 216, 224, 255), a);
+      const bool lit = which != 'D';
+      const ImU32 c = with_alpha(lit ? IM_COL32(120, 122, 132, 255) : IM_COL32(214, 216, 224, 255), a);
       dl->AddRectFilled(ImVec2(x + t, cy - s * 0.5f), ImVec2(x + 2 * t, cy + s * 0.5f), c, 2.0f * u);
       dl->AddRectFilled(ImVec2(x, cy - t * 0.5f), ImVec2(x + s, cy + t * 0.5f), c, 2.0f * u);
+      if (lit) {
+        const ImU32 on = with_alpha(IM_COL32(255, 214, 64, 255), a);
+        const float y0 = which == 'U' ? cy - s * 0.5f : cy + t * 0.5f;
+        dl->AddRectFilled(ImVec2(x + t, y0), ImVec2(x + 2 * t, y0 + s * 0.5f - t * 0.5f), on, 2.0f * u);
+      }
       break;
     }
     case 'X':
@@ -1049,13 +1078,13 @@ void button_glyph(ImDrawList* dl, float x, float cy, float u, char which, float 
       const char label[2] = {which, 0};
       const float w = 24.0f * u, h = 18.0f * u;
       dl->AddRectFilled(ImVec2(x, cy - h * 0.5f), ImVec2(x + w, cy + h * 0.5f), with_alpha(IM_COL32(214, 216, 224, 255), a), h * 0.5f);
-      text(dl, x + w * 0.5f - text_width(11.0f * u, label) * 0.5f, cy - 6.0f * u, 11.0f * u, with_alpha(IM_COL32(40, 40, 46, 255), a), label, 0, false);
+      text(dl, x + w * 0.5f - text_width(11.0f * u, label) * 0.5f, text_y_centered(cy, 11.0f * u), 11.0f * u, with_alpha(IM_COL32(40, 40, 46, 255), a), label, 0, false);
       break;
     }
     case 'Z': {
       const float w = 22.0f * u, h = 16.0f * u;
       dl->AddRectFilled(ImVec2(x, cy - h * 0.5f), ImVec2(x + w, cy + h * 0.5f), with_alpha(IM_COL32(108, 72, 196, 255), a), 4.0f * u);
-      text(dl, x + w * 0.5f - text_width(11.0f * u, "Z") * 0.5f, cy - 6.0f * u, 11.0f * u, white, "Z", 0, false);
+      text(dl, x + w * 0.5f - text_width(11.0f * u, "Z") * 0.5f, text_y_centered(cy, 11.0f * u), 11.0f * u, white, "Z", 0, false);
       break;
     }
     case 'L':
@@ -1063,7 +1092,7 @@ void button_glyph(ImDrawList* dl, float x, float cy, float u, char which, float 
       const char label[2] = {which, 0};
       const float w = 22.0f * u, h = 16.0f * u;
       dl->AddRectFilled(ImVec2(x, cy - h * 0.5f), ImVec2(x + w, cy + h * 0.5f), with_alpha(IM_COL32(150, 154, 168, 255), a), 4.0f * u);
-      text(dl, x + w * 0.5f - text_width(11.0f * u, label) * 0.5f, cy - 6.0f * u, 11.0f * u, white, label, 0, false);
+      text(dl, x + w * 0.5f - text_width(11.0f * u, label) * 0.5f, text_y_centered(cy, 11.0f * u), 11.0f * u, white, label, 0, false);
       break;
     }
     default: break;
@@ -1074,7 +1103,7 @@ float glyph_width(char which, float u) {
     case 'A': case 'X': case 'Y': return 24.0f * u;
     case 'B': return 19.0f * u;
     case 'S': return std::max(30.0f * u, text_width(9.0f * u, "START") + 9.0f * u);
-    case 'D': case 'Z': case 'L': case 'R': return 22.0f * u;
+    case 'D': case 'U': case 'V': case 'Z': case 'L': case 'R': return 22.0f * u;
     default: return 0;
   }
 }
@@ -1090,8 +1119,9 @@ float hints(ImDrawList* dl, float x, float cy, float u, const char* spec, float 
     if (*p == '|') ++p;
     if (draw) button_glyph(dl, pen, cy, u, which, a);
     pen += glyph_width(which, u) + 6.0f * u;
-    if (draw) text(dl, pen, cy - 9.0f * u, 17.0f * u, with_alpha(IM_COL32(255, 255, 255, 255), a), word.c_str());
-    pen += text_width(17.0f * u, word.c_str()) + 16.0f * u;
+    if (draw) text(dl, pen, text_y_centered(cy, 17.0f * u), 17.0f * u, with_alpha(IM_COL32(255, 255, 255, 255), a), word.c_str());
+    // A "+" between two buttons sits evenly between them; a phrase gets the wider gap.
+    pen += text_width(17.0f * u, word.c_str()) + (word == "+" ? 6.0f : 16.0f) * u;
   }
   return pen - x;
 }
@@ -1401,7 +1431,7 @@ void draw_offer(ImDrawList* dl, const Frame& f) {
   const float w = text_width(25 * u, f.search.offer.c_str()) + 110 * u;
   const float left = (f.game_x0 + f.game_x1 - w) * 0.5f, top = f.game_y0 + 170 * u, h = 50 * u;
   draw_bar(dl, left, top, left + w, h, u, true, f.search.offer.c_str(), "", true, pulse, false);
-  const char* spec = "D:Up  Search|D:Down  Keep training";
+  const char* spec = "U:Search|V:Keep training";
   const float hw = hints(dl, 0, 0, u, spec, 1.0f, false);
   hints(dl, (f.game_x0 + f.game_x1 - hw) * 0.5f, top + h + 8 * u, u, spec, 1.0f);
 }
@@ -1417,7 +1447,10 @@ void draw_intro(ImDrawList* dl, const Frame& f) {
   const float gu = (f.game_y1 - f.game_y0) / 720.0f;
   // After "Go!" and before the player is busy: 1.5 to 10 seconds in, unless the search-again question is up.
   constexpr float kFrom = 1.5f, kTo = 10.0f;
-  if (f.intro && since > kFrom && since < kTo && f.search.offer.empty()) {
+  // The big banner in the middle is gone (owner 11-17: it covered the match start and looked cluttered);
+  // only the small corner hint below is left.
+  constexpr bool kBanner = false;
+  if (kBanner && f.intro && since > kFrom && since < kTo && f.search.offer.empty()) {
     const float u = gu * 0.82f;
     const float fa = std::min(ease((since - kFrom) / 0.35f), ease((kTo - since) / 0.45f));
     const float slide = (1.0f - ease((since - kFrom) / 0.3f)) * 30.0f * u;
@@ -1426,7 +1459,7 @@ void draw_intro(ImDrawList* dl, const Frame& f) {
     const float cx = (f.game_x0 + f.game_x1) * 0.5f;
     const float w = text_width(25 * u, title) + 110 * u, left = cx - w * 0.5f, top = f.game_y0 + 170 * u, h = 50 * u;
     draw_bar(dl, left - slide, top, left + w - slide, h, u, true, title, "", true, fa, false);
-    const char* keys = "S:+|D:Up  +|Z:Open";
+    const char* keys = "S:+|U:+|Z:Open";
     const float kw = hints(dl, 0, 0, u, keys, fa, false);
     hints(dl, cx - kw * 0.5f, top + h + 8 * u, u, keys, fa);
     // Kept between the Training logo and its damage display.
@@ -1439,10 +1472,13 @@ void draw_intro(ImDrawList* dl, const Frame& f) {
     }
     return;
   }
-  // Then small at the top right: the buttons and what they open (dimmer after half a minute).
-  const float u = gu * 0.8f, alpha = since < 30.0f ? 0.95f : 0.55f;
-  const char* spec = neural_ghosts() ? "S:+|D:Up  +|Z:Practice menu: Fight a pro, find a match"
-                                     : "S:+|D:Up  +|Z:Find a match, practice menu";
+  // Then small at the top right: the buttons and what they open, for the first 15 seconds of each
+  // Training match only (owner 11-17: it must not stay on screen), fading out over the last second.
+  constexpr float kCornerFor = 15.0f;
+  if (since >= kCornerFor) return;
+  const float u = gu * 0.8f, alpha = 0.95f * std::min(1.0f, kCornerFor - since);
+  const char* spec = neural_ghosts() ? "S:+|U:+|Z:Practice menu: Fight a pro, find a match"
+                                     : "S:+|U:+|Z:Find a match, practice menu";
   const float hw = hints(dl, 0, 0, u, spec, alpha, false);
   hints(dl, f.game_x1 - hw - 8 * u, f.game_y0 + 30 * u, u, spec, alpha);
 }
