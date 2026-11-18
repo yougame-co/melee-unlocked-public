@@ -761,6 +761,12 @@ struct Backend {
   // called once at the start of each presented frame, before its moment in time is chosen.
   virtual bool reflex_pacing(double) { return false; }
   virtual void reflex_sleep() {}
+  // How long the latest measured shown frame took from the start of its recording here to the GPU
+  // finishing it (seconds), with a serial that changes with every new measurement. Without V-Sync
+  // that is when it reaches the screen. False where it is not measured.
+  virtual bool display_lag(double& seconds, uint64_t& serial) const { (void)seconds; (void)serial; return false; }
+  // Tests (MELEE_TEST_SHOWN_TRACE): the moment of the game the next submitted frame shows, host seconds.
+  virtual void note_shown_moment(double) {}
   // What the display side reported since the last call (D3D12: DXGI frame statistics), for the
   // "pacing:" line. Called on the render thread.
   virtual std::string display_timing_line() { return "display statistics not available"; }

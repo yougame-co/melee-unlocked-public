@@ -185431,7 +185431,7 @@ index a9841632c..9f22ab616 100644
      gobjproc =
          HSD_GObj_SetupProc(GObj_Create(0, 1, 0x80), mnLanguage_8024BFE0, 0);
 diff --git a/src/melee/mn/mnmain.c b/src/melee/mn/mnmain.c
-index dc6746eee..b3c08fa55 100644
+index dc6746eee..f45a2463a 100644
 --- a/src/melee/mn/mnmain.c
 +++ b/src/melee/mn/mnmain.c
 @@ -1,4 +1,7 @@
@@ -185829,20 +185829,26 @@ index dc6746eee..b3c08fa55 100644
              gm_801A4B60();
              return;
          }
-@@ -2484,7 +2630,12 @@ void mn_8022D594(HSD_GObj* gp)
+@@ -2484,7 +2630,18 @@ void mn_8022D594(HSD_GObj* gp)
          case SEL_VS_TOURNAMENT:
              sfxForward();
              data = gm_GetCurrentSceneExitData();
 +#ifdef MU_NATIVE
-+            /* General Codes, "Debug Menu": the Tournament entry opens the debug menu. */
-+            data->pending_mode = mu_general_codes() ? GM_DEBUG : GM_TOURNAMENT;
++            /* Tournament Melee is Tournament Melee: mod discs put their own modes there (ACE's
++             * extra modes). Only the packs whose settings menu is reached this way (the 20XX Hack
++             * Pack, 20XX TE) open the debug menu engine from it. */
++            {
++                extern int mu_hp_loaded(void);
++                extern int mu_te_general(void);
++                data->pending_mode = mu_general_codes() && (mu_hp_loaded() || mu_te_general()) ? GM_DEBUG : GM_TOURNAMENT;
++            }
 +#else
              data->pending_mode = GM_TOURNAMENT;
 +#endif
              gm_801A4B60();
              break;
          case SEL_VS_SPECIAL:
-@@ -2596,9 +2747,20 @@ void mn_8022D7F4(HSD_GObj* gp)
+@@ -2596,9 +2753,20 @@ void mn_8022D7F4(HSD_GObj* gp)
              break;
          case SEL_1P_EVENT:
              sfxForward();
@@ -185864,7 +185870,7 @@ index dc6746eee..b3c08fa55 100644
          case SEL_1P_TRAINING:
              sfxForward();
              data = gm_GetCurrentSceneExitData();
-@@ -2727,7 +2889,7 @@ void mnMain_Scene_OnFrame(void)
+@@ -2727,7 +2895,7 @@ void mnMain_Scene_OnFrame(void)
          sfxBack();
          mn_8022F268();
          gm_801603B0();
@@ -185873,7 +185879,7 @@ index dc6746eee..b3c08fa55 100644
          lbMthp_8001F800();
          mn_8022EBDC();
          HSD_SisLib_803A5E70();
-@@ -2924,7 +3086,16 @@ void mnMain_Scene_OnEnter(void* user_data)
+@@ -2924,7 +3092,16 @@ void mnMain_Scene_OnEnter(void* user_data)
              &MenMainCursorSs_Top.shapeanim_joint,
              "MenMainCursorSs_Top_shapeanim_joint",
  
@@ -185891,7 +185897,7 @@ index dc6746eee..b3c08fa55 100644
  
          if (lbLang_IsSavedLanguageUS()) {
              HSD_SisLib_803A62A0(0, "SdMenu.usd", "SIS_MenuData");
-@@ -2944,7 +3115,7 @@ void mnMain_Scene_OnEnter(void* user_data)
+@@ -2944,7 +3121,7 @@ void mnMain_Scene_OnEnter(void* user_data)
  
      switch (data->menu_kind) {
      case MENU_KIND_EVENT:
@@ -185900,7 +185906,7 @@ index dc6746eee..b3c08fa55 100644
          break;
      case MENU_KIND_MULTI_VS:
          mnHyaku_8024CD64(data->hovered_selection);
-@@ -2959,7 +3130,11 @@ void mnMain_Scene_OnEnter(void* user_data)
+@@ -2959,7 +3136,11 @@ void mnMain_Scene_OnEnter(void* user_data)
          break;
      }
      lbAudioAx_80023F28(gmMainLib_8015ECB0());
@@ -185913,7 +185919,7 @@ index dc6746eee..b3c08fa55 100644
  }
  
  char null_terminator[1] = "\0";
-@@ -3043,3 +3218,48 @@ void mn_8022EBDC(void)
+@@ -3043,3 +3224,48 @@ void mn_8022EBDC(void)
  /// fn_8022F538\n"); } void mn_8022FB88() { OSPanic(__FILE__, __LINE__, "not
  /// implemented: mn_8022FB88\n"); } void mn_8022FD18() { OSPanic(__FILE__,
  /// __LINE__, "not implemented: mn_8022FD18\n"); }

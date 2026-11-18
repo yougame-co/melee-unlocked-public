@@ -147,6 +147,15 @@ class ThreadedBackend final : public Backend {
     int lock_logged = 0;   // off: about 1 ms less delay, but less even motion (measured 10-23)
     double handover_span = 0.0; uint64_t handover_span_seq = 0;
     bool handover_now = false; double handover_due = 0.0, submit_typical = 0.0, submit_first_typical = 0.0;
+    // Without V-Sync a frame reaches the screen when the GPU finishes it, and that took 2 to 6 ms after
+    // its moment was chosen as busy scenes came and went (a 0.9.210 report: a 60 Hz screen, frame cap
+    // 480, V-Sync off, "the game feels faster and slower"). Taken at the render start, every frame shown
+    // in a busy stretch was a few ms older than in a quiet one, so motion slowed down and caught up.
+    // The moment now moves with how much longer or shorter than usual the frame is expected to take
+    // (the last few measured frames against the long average), so the average stays where it was.
+    // MELEE_SHOWN_LEAD=0 (tests): the render start only.
+    static const bool shown_lead = [] { const char* v = std::getenv("MELEE_SHOWN_LEAD"); return !(v && *v == '0'); }();
+    double lag_fast = 0.0, lag_slow = 0.0, solve_fast = 0.0, solve_slow = 0.0; uint64_t lag_serial = 0;
     // An in-between present whose game frame is superseded while its re-pose is being built is not
     // submitted: the new frame takes that slot instead of waiting a whole period for the next one.
     // MELEE_STALE_DISCARD=0 keeps the old behaviour (measurement only).
@@ -409,7 +418,7 @@ class ThreadedBackend final : public Backend {
       }
       const Frame& current = frames[cur];
       bool should_render;
-      double t = 0.0;
+      double t = 0.0, shown_moment = 0.0;
       if (!subframes) {
         should_render = current.sequence != rendered_sequence;   // once per simulation frame
         // A paused replay sends no new frames, but its bar and the settings panel still have to be
@@ -491,7 +500,11 @@ class ThreadedBackend final : public Backend {
           }
           return ph;
         };
-        t = phase_for(now);
+        double lead = 0.0;
+        if (shown_lead && !live_options.vsync && !scanline_active && !handover_now && options_.pin_phase < 0 && lag_slow > 0.0)
+          lead = std::min(std::max((lag_fast - lag_slow) + (solve_fast - solve_slow), -0.004), 0.004);
+        t = phase_for(now + lead);
+        shown_moment = base + t * SIM_PERIOD;
         if (options_.pin_phase >= 0) {
           // Development: one presented frame per simulation frame at a fixed phase, so two runs of
           // the same script produce pictures that can be compared one for one.
@@ -516,6 +529,7 @@ class ThreadedBackend final : public Backend {
       renderer->set_present_deadline(!(subframes && cap_period > 0 && !reflex_pacing) || scanline_active ? 0
                                      : handover_now ? (last_submission > 0 ? last_submission + 0.5 * cap_period : 0) : next_present);
       solver_pair_counter().store(subframes ? solver.pair_count() : 0, std::memory_order_relaxed);   // for the backends' "gpu:" line
+      renderer->note_shown_moment(shown_moment);
       const double render_start = host::now_seconds();
       double solver_ms = 0;
       if (subframes && have_prev) {
@@ -551,6 +565,19 @@ class ThreadedBackend final : public Backend {
       reflex_slept = false;
       const double present_wait = renderer->presentation_wait_seconds();
       render_budget = std::max(render_budget * 0.95, render_end-render_start-present_wait+0.0002);
+      if (subframes) {
+        // The two parts of a frame's time to the screen that change with the scene: the re-pose
+        // here, and the recording plus GPU work the backend measures (a frame or two later).
+        const double s = std::min(solver_ms / 1000.0, 0.010);
+        solve_fast = solve_fast > 0.0 ? solve_fast + 0.35 * (s - solve_fast) : s;
+        solve_slow = solve_slow > 0.0 ? solve_slow + 0.01 * (s - solve_slow) : s;
+        double lag = 0.0; uint64_t serial = 0;
+        if (renderer->display_lag(lag, serial) && serial != lag_serial) {
+          lag_serial = serial;
+          lag_fast = lag_fast > 0.0 ? lag_fast + 0.35 * (lag - lag_fast) : lag;
+          lag_slow = lag_slow > 0.0 ? lag_slow + 0.01 * (lag - lag_slow) : lag;
+        }
+      }
       { const double s = std::min(render_end - render_start - present_wait, 0.010);
         if (current.sequence != rendered_sequence) submit_first_typical = submit_first_typical > 0.0 ? submit_first_typical + 0.05 * (s - submit_first_typical) : s;
         else submit_typical = submit_typical > 0.0 ? submit_typical + 0.02 * (s - submit_typical) : s; }

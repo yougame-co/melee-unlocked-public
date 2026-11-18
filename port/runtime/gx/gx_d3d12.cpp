@@ -496,6 +496,12 @@ class D3D12Backend : public Backend {
     reflex_token_ = streamline::reflex_sleep((uint32_t)frame_counter_ + 1);   // submit_frame counts this frame next
   }
   double presentation_wait_seconds() const override { return present_wait_; }
+  bool display_lag(double& seconds, uint64_t& serial) const override {
+    if (!display_lag_serial_) return false;
+    seconds = display_lag_; serial = display_lag_serial_;
+    return true;
+  }
+  void note_shown_moment(double moment) override { pending_moment_ = moment; }
   // DXGI's own count of what reached the screen: presents shown, vertical refreshes that went by,
   // and refreshes that showed the previous frame again. Frame statistics are only reported while
   // the swap chain owns the display (exclusive or independent flip); while Windows composes the
@@ -1119,6 +1125,14 @@ class D3D12Backend : public Backend {
   bool timer_pending_[FRAME_SLOTS] = {};
   uint64_t timer_freq_ = 0;
   double gpu_frame_ms_sum_ = 0; uint32_t gpu_frame_ms_samples_ = 0;   // since the last "gpu:" line
+  // When each slot's frame started recording (host seconds) and whether it was shown; the GPU's end
+  // timestamp, put on the host clock through the queue's clock calibration, gives display_lag().
+  double slot_cpu_start_[FRAME_SLOTS] = {}, slot_moment_[FRAME_SLOTS] = {};
+  bool slot_shown_[FRAME_SLOTS] = {};
+  double pending_moment_ = 0.0, display_lag_ = 0.0;
+  uint64_t display_lag_serial_ = 0;
+  uint64_t clock_gpu_ = 0, clock_cpu_ = 0; double clock_offset_ = 0.0, clock_at_ = -1.0;
+  FILE* shown_trace_ = nullptr;
   void read_gpu_timers();
   int slot_ = 0;
   ComPtr<ID3D12GraphicsCommandList> list_;
@@ -5238,6 +5252,14 @@ void D3D12Backend::read_gpu_timers() {
   if (mask & 2) { const float v = ms(2, 3); if (v >= 0.0f) g_dlss5_pass_ms = v; }
 #endif
   if (mask & 4) { const float v = ms(4, 5); if (v >= 0.0f) { gpu_frame_ms_sum_ += v; ++gpu_frame_ms_samples_; } }
+  if ((mask & 4) && slot_shown_[slot_] && clock_at_ >= 0.0 && ts[5] != 0) {
+    static const double qpc_hz = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart > 0 ? (double)f.QuadPart : 1e7; }();
+    const double gpu_end = (double)clock_cpu_ / qpc_hz + clock_offset_ +
+                           (double)(int64_t)(ts[5] - clock_gpu_) / (double)timer_freq_;
+    const double lag = gpu_end - slot_cpu_start_[slot_];
+    if (lag > 0.0 && lag < 0.1) { display_lag_ = lag; ++display_lag_serial_; }
+    if (shown_trace_) std::fprintf(shown_trace_, "%.6f,%.6f,%.6f\n", slot_cpu_start_[slot_], gpu_end, slot_moment_[slot_]);
+  }
   static uint64_t logged = 0;
   if (mask & 3) {
 #ifdef GX_DLSS5
@@ -5639,6 +5661,26 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
   ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), sampler_heap_.Get()};
   list_->SetDescriptorHeaps(2, heaps);
   if (timer_heap_) list_->EndQuery(timer_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_ * TIMERS_PER_SLOT + 4);   // frame start, for the "gpu:" line
+  {
+    const double started = host::now_seconds();
+    slot_cpu_start_[slot_] = started; slot_moment_[slot_] = pending_moment_; slot_shown_[slot_] = false;
+    if (timer_freq_ && (clock_at_ < 0.0 || started - clock_at_ > 0.5)) {
+      // The GPU's timestamps on the host clock, refreshed twice a second (the two clocks drift apart slowly).
+      static const double qpc_hz = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart > 0 ? (double)f.QuadPart : 1e7; }();
+      UINT64 gpu = 0, cpu = 0;
+      if (SUCCEEDED(queue_->GetClockCalibration(&gpu, &cpu))) {
+        clock_gpu_ = gpu; clock_cpu_ = cpu; clock_offset_ = host::now_seconds() - (double)cpu / qpc_hz; clock_at_ = started;
+      }
+    }
+    static bool trace_opened = false;
+    if (!trace_opened) {
+      trace_opened = true;
+      if (const char* p = host::test_env::getenv("MELEE_TEST_SHOWN_TRACE"); p && *p && (shown_trace_ = std::fopen(p, "w"))) {
+        std::setvbuf(shown_trace_, nullptr, _IOFBF, 1 << 20);
+        std::fputs("cpu_start,gpu_end,moment\n", shown_trace_);
+      }
+    }
+  }
   DxrScene dxr_scene;
   bool dxr_scene_ready = false;
   // The 0.7 DXR pass (CPU-rebuilt scene, a few fps in matches) is replaced by the path tracer
@@ -5901,9 +5943,13 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
           yougame::box_present::agent_override(), true, paced, !fullscreen_state_.exclusive_active, synced, yougame::embed_toplevel());
       if (const auto line = yougame::box_present::announcement(present)) host::log("%s", line);
       const double present_call = Stopwatch::now();
-      // Probe hidden standalone windows as DXGI asks, except during frame generation.
-      // Embedded launches keep drawing so the first-frame ready signal releases the app cover.
+      // While the window cannot be seen (minimized, or alt-tabbed out of exclusive fullscreen),
+      // only test whether it can again, as DXGI asks. Presenting on regardless fed screen capture
+      // (a Discord stream) frames that flashed an old picture. Not under frame generation, which
+      // paces its own presents. Embedded launches keep drawing so the first-frame ready signal
+      // releases the app cover.
       const bool test_only = occluded_ && fg_applied_ <= 0 && !yougame::embedded();
+      slot_shown_[slot_] = !test_only;
       const HRESULT present_result = [&] { host::perf::Scope wait_cost(host::perf::Stage::Wait);
           if (test_only) return swapchain_->Present(0, DXGI_PRESENT_TEST);
           return swapchain_->Present(present.interval, present.flags); }();

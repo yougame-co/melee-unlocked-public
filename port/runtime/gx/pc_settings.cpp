@@ -4565,6 +4565,22 @@ static std::string lab_colour_text(uint32_t c) {
 // silently, and the player only saw the old values come back at the next start.
 std::string g_settings_save_error;
 
+// Puts a freshly written settings file in place of the old one. Windows Defender, the search indexer or
+// a sync client can hold the old file open for a moment after each save, and the swap then failed with
+// access denied or a sharing violation: the change was lost and the panel said settings could not be
+// saved. A few short retries ride that out; a folder the game cannot write to never gets this far.
+static bool replace_settings_file(const std::filesystem::path& temporary, const std::filesystem::path& path) {
+  for (int attempt = 0;; ++attempt) {
+    if (MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return true;
+    const unsigned long code = GetLastError();
+    if (attempt >= 12 || (code != ERROR_ACCESS_DENIED && code != ERROR_SHARING_VIOLATION && code != ERROR_LOCK_VIOLATION)) {
+      SetLastError(code);
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5 + attempt * 3));
+  }
+}
+
 static bool write_settings_file_impl(const SettingsState& state, const RenderOptions& options);
 static bool write_settings_file(const SettingsState& state, const RenderOptions& options) {
   if (write_settings_file_impl(state, options)) { g_settings_save_error.clear(); return true; }
@@ -4824,7 +4840,7 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
     if (g_named_profile_active[t] && !g_active_profile[t].empty()) file << "\nactiveprofile" << t << " " << g_active_profile[t];
   file << '\n';
   file.close();
-  const bool saved = file.good() && MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+  const bool saved = file.good() && replace_settings_file(temporary, path);
   host::log(saved ? "settings: file saved" : "settings: file save failed");
   return saved;
 }
@@ -4851,7 +4867,7 @@ bool consume_lag_test_launch(const std::string& settings_path) {
   std::ofstream out(temporary);   // text mode, as write_settings_file writes it
   out << text;
   out.close();
-  return out.good() && MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+  return out.good() && replace_settings_file(temporary, path);
 }
 
 // 20XX TE has its own switch for two things the port already does: its "Disable screen rumble" is

@@ -47,6 +47,17 @@ std::string read_text(const std::filesystem::path& path) {
 bool has_key_line(const std::string& text, const std::string& key) {
   return text.rfind(key + " ", 0) == 0 || text.find("\n" + key + " ") != std::string::npos;
 }
+// Every file this test writes lives in a folder of its own: other tests (and other checkouts' test
+// runs) share the temp folder, and loading settings writes delay-migration.ini beside the file.
+std::filesystem::path test_dir() {
+  static const std::filesystem::path dir = [] {
+    const auto d = std::filesystem::temp_directory_path() /
+                   ("melee_settings_load_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(d);
+    return d;
+  }();
+  return dir;
+}
 }
 
 int main() {
@@ -165,7 +176,7 @@ int main() {
   aspect_options.true_widescreen = true;
   CHECK(gx::presented_aspect(aspect_options, 1920, 1080) == 16.0f / 9.0f);
 
-  const fs::path path = fs::temp_directory_path() / "melee_unlocked_settings_load_test.ini";
+  const fs::path path = test_dir() / "melee_unlocked_settings_load_test.ini";
   {
     std::ofstream(path) << "fps 144\n";
     gx::RenderOptions no_vsync_key;
@@ -311,7 +322,7 @@ int main() {
   {
     // Profiles: every field round-trips, old profiles get the default processing, bounds and bad
     // records are handled without touching the caller's tuning.
-    const auto folder = fs::temp_directory_path() / ("melee_dlss5_profiles_" +
+    const auto folder = test_dir() / ("melee_dlss5_profiles_" +
       std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     gx::dlss5::profile_set_folder((folder / "settings.ini").string());
     CHECK(gx::dlss5::profile_save("roundtrip", options.dlss5_tuning));
@@ -388,7 +399,7 @@ int main() {
   }
   // ... and across a restart: the kept values come back from the settings file.
   {
-    const fs::path low_path = fs::temp_directory_path() / "melee_unlocked_settings_lowspec_test.ini";
+    const fs::path low_path = test_dir() / "melee_unlocked_settings_lowspec_test.ini";
     {
       std::ofstream f(low_path);
       f << "lowspec 1\nbackend d3d11\nfps 60\nscale 1\nssaa 1\nanisotropy 1\n"
@@ -410,7 +421,7 @@ int main() {
   // ... and for a Vulkan player with an FSR mode: saved and loaded, Low spec off gives Vulkan and the
   // same FSR mode back (the file could only say d3d11 or d3d12, and modes above 10 were dropped).
   {
-    const fs::path low_path = fs::temp_directory_path() / "melee_unlocked_settings_lowspec_vk_test.ini";
+    const fs::path low_path = test_dir() / "melee_unlocked_settings_lowspec_vk_test.ini";
     gx::RenderOptions o;
     o.settings_path = low_path.string();
     o.api = gx::RenderApi::Vulkan; o.dlss_mode = 12;
@@ -430,7 +441,7 @@ int main() {
   // The Lossless adapter lag test arms one launch. 0.9.62's switch stayed on, so every launch after
   // it booted to an FFA character select that rumbled and turned the picture black and white on X/A.
   {
-    const fs::path diagnostic_path = fs::temp_directory_path() / "melee_unlocked_settings_lagtest_test.ini";
+    const fs::path diagnostic_path = test_dir() / "melee_unlocked_settings_lagtest_test.ini";
     { std::ofstream f(diagnostic_path); f << "losslesslagtest 1\nfps 144\n"; }
     gx::RenderOptions o;
     o.settings_path = diagnostic_path.string();
@@ -462,7 +473,7 @@ int main() {
   // ours, all with the settings file's keys unchanged. A file in 0.8.1's format loads the same values,
   // saving writes every key it had, and the two new keys (the Advanced groups) default to closed.
   {
-    const fs::path old_path = fs::temp_directory_path() / "melee_unlocked_settings_081_test.ini";
+    const fs::path old_path = test_dir() / "melee_unlocked_settings_081_test.ini";
     {
       std::ofstream f(old_path);
       f << "fps 144\nscale 3\nfullscreen 1\nexclusivefullscreen 0\nvsync 0\nwidescreen 0\n"
@@ -508,7 +519,7 @@ int main() {
   // One Display choice and one Widescreen choice: a file with both of a pair on (possible only by
   // hand) loads as one of them, exclusive fullscreen and True widescreen filling the screen.
   {
-    const fs::path pair_path = fs::temp_directory_path() / "melee_unlocked_settings_pairs_test.ini";
+    const fs::path pair_path = test_dir() / "melee_unlocked_settings_pairs_test.ini";
     { std::ofstream f(pair_path); f << "fullscreen 1\nexclusivefullscreen 1\nwidescreen 1\ntruewidescreen 1\n"; }
     gx::RenderOptions o;
     o.settings_path = pair_path.string();
@@ -524,7 +535,7 @@ int main() {
   // A transient DXGI refusal must not make the next unrelated settings save turn exclusive off.
   // Both renderers use this session state for the fallback window and Present's tearing flag.
   {
-    const fs::path display_path = fs::temp_directory_path() / "melee_unlocked_exclusive_retry_test.ini";
+    const fs::path display_path = test_dir() / "melee_unlocked_exclusive_retry_test.ini";
     gx::RenderOptions requested;
     requested.settings_path = display_path.string();
     requested.exclusive_fullscreen = true;
@@ -557,7 +568,7 @@ int main() {
   // Widescreen is True widescreen only (0.9.63): a saved Slippi code choice fills the screen and
   // is saved that way, so a player who had it keeps a wide picture.
   {
-    const fs::path ws_path = fs::temp_directory_path() / "melee_unlocked_settings_slippi_ws_test.ini";
+    const fs::path ws_path = test_dir() / "melee_unlocked_settings_slippi_ws_test.ini";
     { std::ofstream f(ws_path); f << "widescreen 1\ntruewidescreen 0\ntruewsaspect 1\n"; }
     gx::RenderOptions o;
     o.settings_path = ws_path.string();
@@ -603,7 +614,7 @@ int main() {
   }
   // The Advanced groups remember being opened, and a file without their keys reads as closed again.
   {
-    const fs::path adv_path = fs::temp_directory_path() / "melee_unlocked_settings_advanced_test.ini";
+    const fs::path adv_path = test_dir() / "melee_unlocked_settings_advanced_test.ini";
     { std::ofstream f(adv_path); f << "advancedvideo 1\nadvancedoverlays 0\n"; }
     gx::RenderOptions o;
     o.settings_path = adv_path.string();
@@ -624,7 +635,7 @@ int main() {
   }
   // Reloading preferences replaces the texture-pack choice list rather than doubling it.
   {
-    const fs::path path = fs::temp_directory_path() / "melee_texture_reload_test.ini";
+    const fs::path path = test_dir() / "melee_texture_reload_test.ini";
     { std::ofstream out(path); out << "texpackoff HD Textures\ntexpackoff HD Textures\n"; }
     gx::RenderOptions o;
     o.settings_path = path.string();
@@ -643,7 +654,7 @@ int main() {
   // Trigger values per family: saved only when changed, read back, clamped; a file without them
   // leaves every trigger at Full (255) and saving writes no trigger line.
   {
-    const fs::path trig_path = fs::temp_directory_path() / "melee_unlocked_settings_trigger_test.ini";
+    const fs::path trig_path = test_dir() / "melee_unlocked_settings_trigger_test.ini";
     { std::ofstream f(trig_path); f << "trigger_switch_l 100\ntrigger_xbox_r 999\n"; }
     gx::RenderOptions o;
     o.settings_path = trig_path.string();
@@ -669,7 +680,7 @@ int main() {
   // Stick radius per family: saved only when below 100, read back, clamped to 50..100, and applied
   // as a plain scale that leaves a stick at 100 untouched.
   {
-    const fs::path radius_path = fs::temp_directory_path() / "melee_unlocked_settings_radius_test.ini";
+    const fs::path radius_path = test_dir() / "melee_unlocked_settings_radius_test.ini";
     { std::ofstream f(radius_path); f << "radius_xbox_main 80\nradius_switch_c 10\n"; }
     gx::RenderOptions o;
     o.settings_path = radius_path.string();
@@ -703,7 +714,7 @@ int main() {
   // Per-binding levels: read beside their bindings, clamped, saved only when set; a file without
   // them leaves every binding at its default and saving writes no level line.
   {
-    const fs::path level_path = fs::temp_directory_path() / "melee_unlocked_settings_level_test.ini";
+    const fs::path level_path = test_dir() / "melee_unlocked_settings_level_test.ini";
     const int L = (int)host::BindAction::L, R = (int)host::BindAction::R, Z = (int)host::BindAction::Z, A = (int)host::BindAction::A;
     // A file from before L and R were split: a leveled L was "press the trigger this deep", which is L analog now.
     const int LA = (int)host::BindAction::LAnalog;
@@ -738,7 +749,7 @@ int main() {
   }
   // Audio mode 3 (ASIO) with its driver name (spaces) and buffer round-trips; out-of-range modes clamp.
   {
-    const fs::path asio_path = fs::temp_directory_path() / "melee_unlocked_settings_asio_test.ini";
+    const fs::path asio_path = test_dir() / "melee_unlocked_settings_asio_test.ini";
     { std::ofstream f(asio_path); f << "audio_mode 3\naudio_asio_driver MOTU M Series\naudio_asio_buffer 64\n"; }
     gx::RenderOptions o;
     o.settings_path = asio_path.string();
@@ -762,7 +773,7 @@ int main() {
   // Each mode keeps its Windows endpoint and ASIO preference independently. Opening a
   // missing driver later must not erase the requested driver or the selected buffer.
   {
-    const fs::path path = fs::temp_directory_path() /
+    const fs::path path = test_dir() /
       ("melee_audio_choice_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".ini");
     const int choices[] = {0, 64, 96, 128, 192, 256, 384, 512};
     const std::string endpoint = "{0.0.0.00000000}.{12345678-1234-1234-1234-123456789abc}";
@@ -805,7 +816,7 @@ int main() {
 
   // Old flash keys keep their behavior; the explicit chooser is independent of file key order.
   {
-    const fs::path flash_path = fs::temp_directory_path() / "melee_unlocked_lcancel_flash_test.ini";
+    const fs::path flash_path = test_dir() / "melee_unlocked_lcancel_flash_test.ini";
     int vol = 0;
     for (int mode = 0; mode < 7; ++mode) for (int color = 0; color < 3; ++color) {
       for (int order = 0; order < 2; ++order) {
@@ -848,7 +859,7 @@ int main() {
   // without the key reads as off, and a file from when it was 20XX TE's word 2 bit 0x800000 turns the
   // option on once: the bit itself is cleared, not saved again, and the other TE bits stay.
   {
-    const fs::path cpu_path = fs::temp_directory_path() / "melee_unlocked_settings_cpu20xx_test.ini";
+    const fs::path cpu_path = test_dir() / "melee_unlocked_settings_cpu20xx_test.ini";
     int vol = 0;
     gx::RenderOptions o;
     o.settings_path = cpu_path.string();
@@ -890,7 +901,7 @@ int main() {
   {
     // A saved PlayStation layout survives the start: the settings are read before the window is
     // made, and making it used to put the default DualSense buttons back over them.
-    const fs::path ds = fs::temp_directory_path() / "mu_settings_ds4_test.ini";
+    const fs::path ds = test_dir() / "mu_settings_ds4_test.ini";
     { std::ofstream f(ds); f << "ds40_A " << host::DS4_SQUARE << "\n"; }
     gx::RenderOptions o; o.settings_path = ds.string(); int vol = 70;
     gx::load_pc_settings(o, vol);
@@ -904,7 +915,7 @@ int main() {
   // Restrictions are not settings. Saving volume/video in a vanilla listing must keep
   // the profile, training choices and input assist for the next normal launch.
   {
-    const auto vanilla_path = fs::temp_directory_path() / "mu_settings_vanilla_listing_test.ini";
+    const auto vanilla_path = test_dir() / "mu_settings_vanilla_listing_test.ini";
     {
       std::ofstream f(vanilla_path);
       f << "mod_profile My ACE Profile\nmod_tmce_enabled 1\nmod_te_enabled 1\n"
@@ -929,5 +940,6 @@ int main() {
     fs::remove(vanilla_path);
   }
   if (g_failures == 0) std::printf("settings load: all checks passed\n");
+  { std::error_code ec; fs::remove_all(test_dir(), ec); }
   return g_failures == 0 ? 0 : 1;
 }
