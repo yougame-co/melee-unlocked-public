@@ -105,6 +105,7 @@ std::atomic<bool> g_capturing{false};   // a control rebind is waiting for its k
 MessageCallback g_on_message;
 std::atomic<bool> g_ui_capture{false};
 std::atomic<uint16_t> g_ui_withheld{0};
+std::atomic<uint8_t> g_keyboard_port_mask{0};   // bit n: the game's port n is fed by the keyboard (input_keyboard_button_label)
 std::mutex g_ui_pad_mutex;
 PadState g_ui_pad{};
 PadState g_ui_pads[4]{};
@@ -2186,6 +2187,11 @@ struct UiSnapshot {
           pads[yougame::agent_test::current_fight_sample.port];
     }
 #endif
+    {
+      uint8_t keyboard_mask = 0;
+      for (int i = 0; i < 4; ++i) if (keyboard_ports[i]) keyboard_mask |= (uint8_t)(1u << i);
+      g_keyboard_port_mask.store(keyboard_mask, std::memory_order_relaxed);
+    }
     std::lock_guard<std::mutex> lock(g_ui_pad_mutex);
 #ifdef YOUGAME_AGENT_TEST_HOOK
     g_ui_agent_step = scripted.step;
@@ -2356,6 +2362,52 @@ void input_poll(PadState out[4]) {
   }
 
   input_debug_snapshot(debug);
+}
+
+namespace {
+// A short on-screen name for a key, the ones the settings page shows for the common keys.
+bool short_key_name(int vk, char* out, size_t n) {
+  if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) { std::snprintf(out, n, "%c", (char)vk); return true; }
+  if (vk >= VK_F1 && vk <= VK_F12) { std::snprintf(out, n, "F%d", vk - VK_F1 + 1); return true; }
+  if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD0 + 9) { std::snprintf(out, n, "Num %d", vk - VK_NUMPAD0); return true; }
+  const char* name = nullptr;
+  switch (vk) {
+    case VK_RETURN: name = "Enter"; break;
+    case VK_SPACE: name = "Space"; break;
+    case VK_TAB: name = "Tab"; break;
+    case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT: name = "Shift"; break;
+    case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL: name = "Ctrl"; break;
+    case VK_MENU: case VK_LMENU: case VK_RMENU: name = "Alt"; break;
+    case VK_BACK: name = "Backspace"; break;
+    case VK_LEFT: name = "Left"; break;
+    case VK_RIGHT: name = "Right"; break;
+    case VK_UP: name = "Up"; break;
+    case VK_DOWN: name = "Down"; break;
+    case VK_OEM_1: name = ";"; break;
+    case VK_OEM_PLUS: name = "="; break;
+    case VK_OEM_COMMA: name = ","; break;
+    case VK_OEM_MINUS: name = "-"; break;
+    case VK_OEM_PERIOD: name = "."; break;
+    case VK_OEM_2: name = "/"; break;
+    case VK_OEM_3: name = "`"; break;
+    case VK_OEM_4: name = "["; break;
+    case VK_OEM_5: name = "\\"; break;
+    case VK_OEM_6: name = "]"; break;
+    case VK_OEM_7: name = "'"; break;
+    default: return false;   // an unusual key: the caller keeps the GameCube name
+  }
+  std::snprintf(out, n, "%s", name);
+  return true;
+}
+}  // namespace
+
+bool input_keyboard_button_label(int port, uint16_t pad_button, char* out, size_t n) {
+  if (!out || n < 2 || port < 0 || port > 3 || !pad_button) return false;
+  if (!(g_keyboard_port_mask.load(std::memory_order_relaxed) & (1u << port))) return false;
+  int vk = 0;
+  for (size_t i = 0; i < (size_t)BindAction::Count; ++i)
+    if (kActionPadBit[i] == pad_button) { vk = g_key_bindings.vk[i]; break; }
+  return vk != 0 && short_key_name(vk, out, n);
 }
 
 void input_read_devices(PadState out[4]) {

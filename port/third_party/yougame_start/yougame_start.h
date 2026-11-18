@@ -290,12 +290,14 @@ static int yg__start_compose(int which, int on_use, const char *name, int needs,
     case YG__START_TEXT_MISSING:
       if (needs) {
         t = snprintf(w->title, sizeof w->title, "%s needs YouGame", upper);
-        b = snprintf(w->body, sizeof w->body, "YouGame is a free app. Get it, then start %s again.", lower);
+        b = snprintf(w->body, sizeof w->body, "YouGame is a free app. Get it, sign in or make an account, then start "
+                     "%s again.", lower);
       } else {
         t = g ? snprintf(w->title, sizeof w->title, "Play %s online", g)
               : snprintf(w->title, sizeof w->title, "Play online with YouGame");
         b = snprintf(w->body, sizeof w->body,
-                     "YouGame is a free app that runs online matches, friends and ranked play for %s.", lower);
+                     "YouGame is a free app that runs online matches, friends and ranked play for %s. You sign in "
+                     "or make an account after it installs.", lower);
       }
       break;
     case YG__START_TEXT_UPDATE:

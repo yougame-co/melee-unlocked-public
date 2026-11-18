@@ -160,7 +160,8 @@ int main() {
         import online_menu_test as menu
         css = source('sourceport/game/shim/mu_slippi_css.c')
         self.assertIn('mu_slippi_practice_available() && (trigger & HSD_PAD_Z)', function(css, 'mu_slippi_css_inputs'))
-        self.assertIn('if (mu_slippi_practice_available())\n        set_text(ST_PRESS_D, "Z: Practice vs CPU");', css)
+        # 122.19: the hint names the keyboard player's key for Z (z_key, "Z" on a controller).
+        self.assertIn('if (mu_slippi_practice_available()) {\n        snprintf(prompt, sizeof prompt, "%s: Practice vs CPU", z_key);\n        set_text(ST_PRESS_D, prompt);', css)
         predicate = menu.fixture.extract(css, 'mu_slippi_practice_available')
         inputs = function(css, 'mu_slippi_css_inputs')
         idle = inputs[inputs.index('case MU_SLP_MM_IDLE:'):inputs.index('case MU_SLP_MM_INITIALIZING:')]
@@ -184,6 +185,7 @@ int doubles_teams() { return 0; } void mu_slippi_sss_find_match() { std::abort()
 unsigned char chosen;unsigned char* char_chosen=&chosen;
 int capability,p2p,ready,allowed,starts,searches;
 std::string hint;
+char z_key[16]="Z",prompt[64];
 int st_opp_picks=-1; const void* m=nullptr;
 void opponent_picks_line(const void*,char*,size_t) { std::abort(); }
 void set_text(int,const char* text) { hint=text; }

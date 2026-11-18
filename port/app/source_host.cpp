@@ -2274,6 +2274,7 @@ constexpr uint8_t CMD_CSS_FRAME = 0xDA;  // every character select frame (shim/m
 constexpr uint8_t CMD_ARENA_HAND = 0xDB;  // the online CSS hand (shim/mu_slippi_css.c): an arena room's side panels; upstream 0xEF, CMD_YOUGAME_MENU in this build
 constexpr uint8_t CMD_ARENA_PICK = 0xDC;  // the online CSS pick (shim/mu_slippi_sss.c): an arena room's portraits; upstream 0xEE, MU_MAKER_COMMAND in this build
 constexpr uint8_t CMD_ARENA_PAIRING = 0xDD;  // an arena room's pairing count (shim/mu_slippi_css.c, hle/slippi_arena.h); upstream 0xED, MU_PICK_PREVIEW_COMMAND in this build
+constexpr uint8_t CMD_BUTTON_LABEL = 0xDF;  // a prompt's key name for a keyboard player (shim/mu_slippi_css.c mu_host_button_label): payload port, PAD bit (BE16); reply the name, empty for none
 constexpr uint8_t CMD_GHOST_AI = 0xEA;         // a pro AI's controller for this frame (hle/ghost_ai.h)
 constexpr uint8_t CMD_STAGE_SONGS = 0xEB;      // a stage's main and alternate songs (gr/ground.c, hle/jukebox.h)
 void apply_content_mode(int mode);
@@ -2752,7 +2753,8 @@ int32_t h_slippi_command(uint8_t command, const uint8_t* payload, uint32_t paylo
   if (yougame::console::console_active() &&
       (command == CMD_LAB_SAVE || command == CMD_LAB_LOAD || command == CMD_GHOST_AI ||
        command == CMD_PRACTICE_CPU || command == CMD_SKIN_CYCLE || command == CMD_STAGE_SKIN_CYCLE ||
-       command == CMD_ZELDA_AS_SHEIK || command == CMD_CSS_FRAME)) {   // the same on every console machine
+       command == CMD_ZELDA_AS_SHEIK || command == CMD_CSS_FRAME ||
+       command == CMD_BUTTON_LABEL)) {   // the same on every console machine
     if (response_size) *response_size = 0;
     return 0;
   }
@@ -2880,6 +2882,12 @@ int32_t h_slippi_command(uint8_t command, const uint8_t* payload, uint32_t paylo
                           !host::gameplay::vanilla_only();
           if (on) host::log("game: Zelda starts as Sheik (setting)");
           reply.push_back(on ? 1 : 0);
+          return true;
+        }
+        if (c == CMD_BUTTON_LABEL && n == 3) {   // shim/mu_slippi_css.c: the key bound to a button, keyboard ports only
+          char name[16];
+          if (host::input_keyboard_button_label(p[0], (uint16_t)(p[1] << 8 | p[2]), name, sizeof name))
+            for (const char* q = name; *q; ++q) reply.push_back((uint8_t)*q);
           return true;
         }
         if (c == CMD_ARENA_HAND && n == 4) {   // shim/mu_slippi_css.c: the CSS hand, in tenths

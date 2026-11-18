@@ -191,6 +191,16 @@ int main() {
     ScreenFlags off;
     CHECK(!(screen_view(v, off).mode & MU_LOBBY_M_STAGE_SELECT));
   }
+  // ---- nor keep a closed Doubles home searching: its pad (and B out) would stay taken ----
+  {
+    Control::View v;
+    v.profile = Profile::Doubles; v.searching = true;
+    ScreenFlags f; f.armed = true;
+    CHECK(screen_view(v, f).mode & MU_LOBBY_M_SEARCHING);
+    f.closed = true;
+    CHECK(!(screen_view(v, f).mode & MU_LOBBY_M_SEARCHING) && (screen_view(v, f).mode & MU_LOBBY_M_DOUBLES));
+    CHECK(screen_view(v, f).block_hint == MU_LOBBY_HINT_CLOSED);
+  }
   // ---- the arming and the note: a select from another arming never leaves; why a setup fell through ----
   {
     Control::View v;

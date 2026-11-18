@@ -331,6 +331,11 @@ void input_read_devices(PadState out[4]);
 // every connected controller (including an adapter plugged into physical port 2-4).
 // Publishes live UI/chords from this one read, before console_hardware applies capture.
 void input_read_console_devices(PadState out[4]);
+// The key bound to a GameCube button (a PAD bit, 0x0010 for Z) when the game's `port` (0-3) was fed by
+// the keyboard on the last read, for on-screen prompts: "Hold E to disconnect", not "Hold Z". Writes a
+// short name and returns true; false for a controller, an unbound button or an unusual key, when the
+// prompt keeps the GameCube name. The prompt only: what the keys do is unchanged.
+bool input_keyboard_button_label(int port, uint16_t pad_button, char* out, size_t n);
 // Scripted runs (--script): true while a script is driving the pads, and the pads the script will
 // deliver at retrace `retrace` (no state is changed by asking).
 bool input_script_active();

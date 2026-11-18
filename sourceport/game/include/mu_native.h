@@ -882,6 +882,7 @@ int mu_slippi_sss_lock_in(int stage_behavior);           /* FN_TX_LOCK_IN: -2 ra
 void mu_slippi_sss_report_pick(int chosen);              /* the CSS pick to the host when it changes (arena rooms) */
 void mu_css_frame(void);                                 /* every character select frame, any mode: the host's CSS features */
 int mu_human_zelda_as_sheik(void);                       /* Settings > Game > Zelda starts as Sheik; 0 online and in replays */
+int mu_host_button_label(int port, unsigned button_mask, char* out, int n); /* a keyboard port's key for a pad button, for prompts; 0 keeps the GameCube name */
 void mu_slippi_css_hand(int port, float x, float y);     /* the CSS hand, each frame (arena rooms' side panels) */
 void mu_slippi_sss_find_match(void);                     /* FN_TX_FIND_MATCH (B4, typed code) */
 void mu_slippi_sss_run_callback(int stage_behavior);     /* r13-0x5018 lock-in callback */

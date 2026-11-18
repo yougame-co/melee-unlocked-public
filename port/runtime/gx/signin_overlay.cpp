@@ -35,6 +35,7 @@ const char* label(Button b) {
     case Button::Cancel: return words::kCancel;
     case Button::Restart: return words::kRestartNow;
     case Button::Feedback: return words::kFeedback;
+    case Button::OpenOnYouGame: return words::kOpenOnYouGame;
     case Button::None: break;
   }
   return "";
@@ -191,9 +192,12 @@ void draw(float x0, float y0, float x1, float y1) {
     ImGui::Dummy(ImVec2(0, 4.0f * u));
     ImGui::PushFont(nullptr, font_size(13.0f * u));
     bool first = true;
+    // One row while they fit, the next button on a new line when it wouldn't (three on the YouGame box).
+    const float row_x2 = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
     for (Button b : v.buttons) {
       if (b == Button::None) continue;
-      if (!first) ImGui::SameLine();
+      const float w = ImGui::CalcTextSize(label(b)).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+      if (!first && ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x + w <= row_x2) ImGui::SameLine();
       if (first && new_screen) { ImGui::SetKeyboardFocusHere(); ImGui::SetNavCursorVisible(true); }
       if (ImGui::Button(label(b))) pressed = b;
       first = false;

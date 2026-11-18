@@ -122,7 +122,10 @@ inline MuLobbyView screen_view(const Control::View& v, const ScreenFlags& f) {
               (v.started ? MU_LOBBY_F_STARTED : 0) | (v.unsupported ? MU_LOBBY_F_UNSUPPORTED : 0) |
               (f.inviting ? MU_LOBBY_F_INVITING : 0) | (f.guest ? MU_LOBBY_F_GUEST : 0);
   const bool doubles = v.profile == Profile::Doubles;
-  out.mode = (unsigned char)((doubles ? MU_LOBBY_M_DOUBLES : 0) | (doubles && v.searching ? MU_LOBBY_M_SEARCHING : 0) |
+  // A closed room's last state can't keep it searching either: Rooms never sends the search's end once the
+  // room is gone, and the select takes the player's whole pad while it searches (mu_lobby_pads, its B a
+  // cancel the closed lobby refuses), so "Lobby closed. Hold B to exit" could not be left (11-18).
+  out.mode = (unsigned char)((doubles ? MU_LOBBY_M_DOUBLES : 0) | (doubles && v.searching && !f.closed ? MU_LOBBY_M_SEARCHING : 0) |
                             (!doubles && f.armed && !f.closed && v.state.stage_select ? MU_LOBBY_M_STAGE_SELECT : 0));
 #if MU_SQUAD
   if (!doubles && v.state.rules.squad) out.mode |= MU_LOBBY_M_SQUAD;

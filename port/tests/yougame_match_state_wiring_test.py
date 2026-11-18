@@ -23,7 +23,8 @@ class MatchStateWiring(unittest.TestCase):
             # 122.2: then YouGame claude/start-get-label-f6c3 8f982f469 (PR 2462: progress label fits, Esc mid-download not saved).
             # 122.6: both from YouGame claude/v2 (3c9a9d020: staging's start installer, the mini app; e367c288d: a game
             # started before the app finds it on its own).
-            'yougame_start.h': 'dbdf85f423be130797a3497e7ade0692a8b953bf3d472dc6af9bc010fc1c17a4',
+            # 122.19: then YouGame claude/v2 4198ed40e (PR 2506: the offer says sign-in comes after the install).
+            'yougame_start.h': '324ccc7bcfa3958152f0b18d3c81525ebd196bf5b71380e47bc1f77a170ebb0f',
             'yougame.h': '58d758cafd6e0a4b0b1633cf652f3534227bbf66bbcad9b6839535155e62684a',
         }.items():
             self.assertEqual(hashlib.sha256((ROOT / 'port/third_party/yougame_start' / name).read_bytes()).hexdigest(), digest)

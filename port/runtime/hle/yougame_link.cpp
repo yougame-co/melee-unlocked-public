@@ -3749,17 +3749,47 @@ bool home_view(signin::View& out) {
   out = g_home.view();
   return true;
 }
+// Open on YouGame: the installed app's link (yougame://g/melee-unlocked, the app on the game's page, as
+// open_app), or with no app the site's game page in the browser. Test runs open nothing (may_open_outside).
+void home_open_on_yougame() {
+  static std::atomic<int64_t> last{0};
+  const int64_t now = (int64_t)now_ms();
+  if (now - last.load() < 3000) return;   // one open per press, not one per repeated confirm
+  last = now;
+  std::thread([] {
+    signin::Home::Opened how = signin::Home::Opened::Failed;
+    if (app_installed_now()) {
+      // Asked now, still opening, or asked under 30 s ago (open_app's own wait): the app has it.
+      const int64_t asked_at = g_app_opened_at.load();
+      if (open_app("Open on YouGame pressed") || g_app_opening.load() ||
+          (asked_at != 0 && (int64_t)now_ms() - asked_at < 30000 && !g_app_stale.load()))
+        how = signin::Home::Opened::App;
+    } else if (may_open_outside("Open on YouGame picked, page")) {
+      const bool staging = kStartStaging || g_app_staging.load();
+      if (open_outside(staging ? "https://staging.yougame.co/g/melee-unlocked" : "https://yougame.co/g/melee-unlocked"))
+        how = signin::Home::Opened::Site;
+    }
+    host::log("yougame: home box, Open on YouGame: %s",
+              how == signin::Home::Opened::App ? "app asked" : how == signin::Home::Opened::Site ? "game page opened" : "not opened");
+    std::lock_guard<std::mutex> lock(g_home_mutex);
+    g_home.opened(how);
+  }).detach();
+}
 void home_press(signin::Button button) {
   if (button == signin::Button::Feedback) {
     host::log("yougame: home box, Send feedback");
     std::thread([] {
-      bool ok = false;
-      try { ok = bridge_channel({{"type", "openFeedback"}}, 3000).value("ok", false); } catch (...) {}
-      host::log("yougame: openFeedback %s", ok ? "answered" : "not answered");
-      if (ok) { std::lock_guard<std::mutex> lock(g_home_mutex); g_home.feedback_sent(); }
+      json answer;   // null: no answer
+      try { answer = bridge_channel({{"type", "openFeedback"}}, 3000); } catch (...) {}
+      const json result = answer.is_object() && answer.count("result") && answer["result"].is_object() ? answer["result"] : json::object();
+      host::log("yougame: openFeedback %s", !answer.is_object() ? "not answered" : !answer.value("ok", false) ? "refused"
+                                            : result.value("opened", false) ? "opened" : "answered, not opened");
+      std::lock_guard<std::mutex> lock(g_home_mutex);
+      g_home.feedback_answer(answer);
     }).detach();
     return;
   }
+  if (button == signin::Button::OpenOnYouGame) { host::log("yougame: home box, Open on YouGame"); home_open_on_yougame(); return; }
   if (button == signin::Button::Back) {
     host::log("yougame: home box, Back");
     std::lock_guard<std::mutex> lock(g_home_mutex);

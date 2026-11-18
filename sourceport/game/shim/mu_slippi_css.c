@@ -304,6 +304,28 @@ int mu_human_zelda_as_sheik(void)
     return mu_online_abi_command(CMD_ZELDA_AS_SHEIK, NULL, 0, reply, sizeof reply, &got) == 0 && got >= 1 && reply[0] != 0;
 }
 
+#define CMD_BUTTON_LABEL 0xDF
+/* The key a keyboard player presses for a GameCube button (HSD_PAD_Z, HSD_PAD_B), for the prompts
+ * below: the keyboard's Z key is the pad's A and E is its Z, so "Hold Z to disconnect" sent keyboard
+ * players to the wrong key (11-18). The host answers from the live key bindings, only for a port the
+ * keyboard feeds; 0 leaves `out` alone and the prompt keeps the GameCube name. */
+int mu_host_button_label(int port, unsigned button_mask, char* out, int n)
+{
+    static unsigned char reply[4096];   /* the host's minimum response capacity */
+    unsigned char payload[3];
+    unsigned int got = 0;
+    if (out == NULL || n < 2 || port < 0 || port > 3) return 0;
+    payload[0] = (unsigned char) port;
+    payload[1] = (unsigned char) (button_mask >> 8);
+    payload[2] = (unsigned char) button_mask;
+    if (mu_online_abi_command(CMD_BUTTON_LABEL, payload, sizeof payload, reply, sizeof reply, &got) != 0 ||
+        got == 0 || got >= (unsigned int) n)
+        return 0;
+    memcpy(out, reply, got);
+    out[got] = 0;
+    return 1;
+}
+
 #define CMD_ARENA_HAND 0xDB /* upstream 0xEF: CMD_YOUGAME_MENU in this build */
 /* mnCharSel_CursorThink, after the hand moved: the online CSS's own player's hand goes to the host
  * (x, y as the screen's units, 0.1 steps) when it moved, for an arena room's side panels: a hand
@@ -902,6 +924,8 @@ static void text_think(HSD_GObj* gobj)
     char link_line[128] = { 0 };
     int updating;
     char rank_lines[6][128] = { { 0 } };
+    /* The keys the prompts name: the bound key for a keyboard player, else the GameCube button. */
+    char z_key[16] = "Z", b_key[16] = "B", prompt[64];
     const char* s;
     int idx, i;
     u8 conn = m->connection_state;
@@ -918,6 +942,10 @@ static void text_think(HSD_GObj* gobj)
 
     (void) gobj;
     pick_preview_frame();
+    if (ctrl_port != NULL) {
+        mu_host_button_label(*ctrl_port, HSD_PAD_Z, z_key, sizeof z_key);
+        mu_host_button_label(*ctrl_port, HSD_PAD_B, b_key, sizeof b_key);
+    }
     if (doubles_teams() && conn == MU_SLP_MM_CONNECTION_SUCCESS) {
         dt.doubles_connected = 1;
     }
@@ -1015,22 +1043,24 @@ static void text_think(HSD_GObj* gobj)
         set_text(st_opp_picks, picks);
     }
 #if defined(YOUGAME_RANKED_BRANCH) && YOUGAME_RANKED_BRANCH
-    if (mu_slippi_practice_available())
-        set_text(ST_PRESS_D, "Z: Practice vs CPU");
+    if (mu_slippi_practice_available()) {
+        snprintf(prompt, sizeof prompt, "%s: Practice vs CPU", z_key);
+        set_text(ST_PRESS_D, prompt);
+    }
 #endif
 
-    /* Press / hold Z */
+    /* Press / hold Z (the keyboard player's key for it) */
+    prompt[0] = 0;
     if (conn == MU_SLP_MM_CONNECTION_SUCCESS) {
-        set_text_fmt(ST_PRESS_Z, "Hold Z to %s", "disconnect");
+        snprintf(prompt, sizeof prompt, "Hold %s to disconnect", z_key);
     } else if (updating) {
-        set_text(ST_PRESS_Z, "Press Z, then hold B to update");
+        snprintf(prompt, sizeof prompt, "Press %s, then hold %s to update", z_key, b_key);
     } else if (conn == MU_SLP_MM_ERROR) {
-        set_text_fmt(ST_PRESS_Z, "Press Z to %s", "clear error");
+        snprintf(prompt, sizeof prompt, "Press %s to clear error", z_key);
     } else if (conn > MU_SLP_MM_IDLE) {
-        set_text_fmt(ST_PRESS_Z, "Press Z to %s", "cancel");
-    } else {
-        set_text(ST_PRESS_Z, "");
+        snprintf(prompt, sizeof prompt, "Press %s to cancel", z_key);
     }
+    set_text(ST_PRESS_Z, prompt);
 
     /* Clear lines, spinners and error lines */
     for (idx = ST_LINE1; idx <= ST_LINE3; idx += 2) {
@@ -1118,7 +1148,8 @@ static void text_think(HSD_GObj* gobj)
             goto spinners;
         }
         if (doubles_waiting && m->local_ready == 0) {
-            set_text(idx, doubles_closed ? "Match closed. Hold B to exit" : "Connecting to players");
+            snprintf(prompt, sizeof prompt, "Match closed. Hold %s to exit", b_key);
+            set_text(idx, doubles_closed ? prompt : "Connecting to players");
             dt.spinner[1] = doubles_closed ? 0 : 1;
             goto spinners;
         }

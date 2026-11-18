@@ -457,7 +457,7 @@ class DoublesTeamsWiring(unittest.TestCase):
         css = read('sourceport/game/shim/mu_slippi_css.c')
         self.assertIn('int doubles_waiting = doubles_teams() && conn < MU_SLP_MM_CONNECTION_SUCCESS;', css)
         self.assertIn('"Connecting to players"', css)
-        self.assertIn('"Match closed. Hold B to exit"', css)
+        self.assertIn('"Match closed. Hold %s to exit", b_key', css)   # 122.19: the keyboard player's key for B
         self.assertLess(css.index('if (doubles_waiting && m->local_ready == 0) {'), css.index('action = "enter code";'))
 
     def test_home_returns_on_the_main_menu(self):
