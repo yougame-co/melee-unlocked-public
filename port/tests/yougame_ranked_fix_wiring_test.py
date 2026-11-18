@@ -66,6 +66,9 @@ class RankedFixWiringTest(unittest.TestCase):
         self.assertIn("if (now_ms() - pass_at > 240000) {", block)
         self.assertIn("renew_ticket(now_ms() + 5000);", block)
         self.assertIn("if (renewed) pass_at = now_ms();", link)
+        # A room ticket Rooms puts on "matched" wins over the search ticket.
+        self.assertIn('pass = m["ticket"].get<std::string>();', block)
+        self.assertLess(block.index('pass = m["ticket"]'), block.index("now_ms() - pass_at > 240000"))
 
 
     def test_own_udp_never_binds_a_listener_windows_asks_about(self):

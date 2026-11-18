@@ -4700,6 +4700,12 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
         if (blend && !search.claim()) { decline(); return fail("Cancelled"); }
         // The match room takes the queue's ticket; after a long search it has expired and the room refuses
         // it (401 "Bad or expired ticket"), losing the match. Past 4 minutes, a fresh one first.
+        // Rooms can renew it itself: "matched" then carries a room ticket (good for this room join only).
+        if (m.count("ticket") && m["ticket"].is_string() && !m["ticket"].get<std::string>().empty()) {
+          pass = m["ticket"].get<std::string>();
+          pass_at = now_ms();
+          host::log("yougame: the match came with a fresh room ticket");
+        }
         if (now_ms() - pass_at > 240000) {
           host::log("yougame: queue ticket is %llu s old: renewing it for the match room", (unsigned long long)((now_ms() - pass_at) / 1000));
           renew_ticket(now_ms() + 5000);

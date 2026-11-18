@@ -19,12 +19,16 @@
 #include "ghost_ai.h"
 #include "phillip_ai.h"
 #include "native_practice.h"
+#include "render_options.h"
 #include "slippi_online.h"
+#include "slippi_arena.h"
+#include "cosmetic_mods.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
 
 #include <algorithm>
+#include <map>
 #include <cctype>
 #include <cfloat>
 #include <cmath>
@@ -232,6 +236,22 @@ void text(ImDrawList* dl, float x, float y, float px, uint32_t color, const char
   glyph_run(dl, x, y, px, color, s, skew);
 }
 
+// One letter centred on its ink at (cx, cy): the game's 32-pixel cell keeps blank columns either side
+// (the font's own metrics) and capitals stand between rows 4 and 28. Button letters sit dead centre.
+void center_char(ImDrawList* dl, float cx, float cy, float px, uint32_t color, char c) {
+  const char s[2] = {c, 0};
+  if (!font_ready() || g_font.glyph[(unsigned char)c].index < 0) {
+    const ImVec2 sz = ImGui::GetFont()->CalcTextSizeA(px * 0.82f, FLT_MAX, 0, s);
+    dl->AddText(nullptr, px * 0.82f, ImVec2(cx - sz.x * 0.5f, cy - sz.y * 0.5f), color, s);
+    return;
+  }
+  const Glyph& g = g_font.glyph[(unsigned char)c];
+  const float k = px / 32.0f;
+  // The cell's ink centre: columns left..(32-right) (measured: A 4..28), rows 2..28. A tiny skew keeps the
+  // run off its whole-pixel snapping, so the letter lands exactly on the badge's centre.
+  glyph_run(dl, cx - (34.0f - g.left - g.right) * 0.5f * k, cy - 15.5f * k, px, color, s, 1e-6f);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The menu model
 namespace {
@@ -346,7 +366,7 @@ bool cpu_page(Page p) {
 enum class Kind { Page, Toggle, Percent, Number, Choice, Odds, Flag, Action, Info };
 enum Action : int {
   kActNone, kActUnranked, kActCancel, kActWindow, kActDefaults, kActPreset = 100, kActLoad = 200, kActSave = 300, kActGhost = 400,
-  kActTeams = 500, kActBlocked = 600,
+  kActTeams = 500, kActBlocked = 600, kActWarmupBack = 650, kActWarmupAdjust = 651,
   // "Stronger Pro AI (Requires additional download)": the question after picking a pro, and the
   // Fight a pro page's own download row.
   kActStrongerYes = 700, kActStrongerNotNow, kActStrongerAlways, kActStrongerNever, kActStrongerAll
@@ -500,12 +520,49 @@ std::string value_of(const Row& r) {
   }
 }
 
+// The warm-up room's match windows (an arena room): the menu edits these bytes, which follow the
+// settings (RenderOptions::live_warmup_*); a change made here is written back the next frame.
+uint8_t g_watch[4] = {0xFF, 0xFF, 0xFF, 0xFF}, g_watch_read[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+void sync_watch() {
+  int* live[4] = {&gx::RenderOptions::live_warmup_watch(), &gx::RenderOptions::live_warmup_pip_size(),
+                  &gx::RenderOptions::live_warmup_pip_corner(), &gx::RenderOptions::live_spectate_view()};
+  for (int i = 0; i < 4; ++i)
+    if (g_watch[i] != 0xFF && g_watch[i] != g_watch_read[i]) {
+      *live[i] = g_watch[i];
+      if (i == 1 || i == 2) gx::RenderOptions::live_warmup_pip_cw().store(0.0f);   // a size or place: not the picked spot
+    }
+  for (int i = 0; i < 4; ++i) g_watch[i] = g_watch_read[i] = (uint8_t)*live[i];
+}
+const char* const kViewNames[] = {"Standard", "Lab view", "Light"};
+const char* const kWatchNames[] = {"Not shown", "Small", "Big"};
+const char* const kWatchSizes[] = {"Small", "Medium", "Large"};
+const char* const kWatchCorners[] = {"Top right", "Bottom right", "Bottom left", "Top left", "Side bar"};
+
 std::vector<Row> rows_for(Page p) {
   std::vector<Row> rows;
   MuPcConfig& c = g_c;
   const Search& s = g_f.search;
   switch (p) {
     case Page::Root: {
+      if (g_f.warmup.active) {
+        // The warm-up room: the way back first, then the CPU to spar with.
+        std::string who;
+        for (const auto& p : g_f.warmup.peers) who += (who.empty() ? "" : ", ") + p.name;
+        const std::string about = g_f.warmup.arena ? std::string("Back to the room's character select.")
+            : "Back to the character select, still connected" + (who.empty() ? std::string(".") : " to " + who + ".");
+        rows.push_back(action_row("Back to the match", kActWarmupBack, "", about.c_str()));
+        if (g_f.warmup.arena) {
+          rows.push_back(choice_row("Room's match", &g_watch[0], kWatchNames, 3,
+                                    "Small: the room's match in a small window over Training. Big: the match fills the screen and Training is the small window."));
+          rows.push_back(choice_row("Match view", &g_watch[3], kViewNames, 3,
+                                    "Standard: the game itself. Lab view: the flat Lab look. Light: simple shapes on the stage's outline, the least work for the PC."));
+          rows.push_back(choice_row("Small window size", &g_watch[1], kWatchSizes, 3, "How big the small window is. Its edges also size it with the mouse."));
+          rows.push_back(choice_row("Small window place", &g_watch[2], kWatchCorners, 5, "Where the small window sits: a corner, or the black bar right of the picture. It can also be dragged and sized with the mouse."));
+          rows.push_back(action_row("Move and resize", kActWarmupAdjust, "",
+                                    "Pick up the small window with the controller: the stick moves it, X makes it bigger and Y smaller, D-pad up and down change the match view. A when done.",
+                                    gx::RenderOptions::live_warmup_watch() != 0));
+        }
+      }
       std::string q = s.searching ? s.mode + " " + s.elapsed : (s.available ? "Off" : "Training only");
       rows.push_back(page_row("Search", Page::Queue, q, s.searching ? "Searching. Keep training; the match starts when one is found."
                                                                     : "Find a match while you train."));
@@ -868,6 +925,66 @@ void open_keyboard(int target, const std::string& text) {
   push(Page::Code);
 }
 
+void draw_adjust_hint(ImDrawList* dl, const Frame& f);   // below, with the warm-up's boxes
+
+// ---- Move and resize: the warm-up room's small window with the controller ----
+// Picked from the Practice menu: the menu's rows step aside and the controller moves the small window
+// (the stick), sizes it (X bigger, Y smaller) and changes the match view (D-pad up and down; the match
+// window shows its style list meanwhile). A, B or Start puts it down. The place is kept (the
+// settings' warmup_pip_cx/cy/cw) until a size or place is picked again.
+bool g_adjust = false;
+uint16_t g_adjust_prev = 0xFFFF;
+double g_adjust_last = 0.0, g_adjust_since = 0.0;
+void adjust_begin() {
+  g_adjust = true;
+  g_adjust_since = g_f.time;
+  g_adjust_prev = 0xFFFF;   // the A that picked the row is not a press here
+  g_adjust_last = g_f.time;
+  slippi::arena::pip_adjust(true);
+}
+void adjust_end() {
+  if (!g_adjust) return;
+  g_adjust = false;
+  slippi::arena::pip_adjust(false);
+}
+void adjust_frame(ImDrawList* dl, const Frame& f, Result& out) {
+  const float dt = std::clamp((float)(f.time - g_adjust_last), 0.0f, 0.1f);
+  g_adjust_last = f.time;
+  const uint16_t b = f.armed ? f.buttons : 0;
+  const uint16_t pressed = f.armed ? (uint16_t)(b & ~g_adjust_prev) : 0;
+  g_adjust_prev = f.armed ? b : 0xFFFF;
+  auto& lx = gx::RenderOptions::live_warmup_pip_cx();
+  auto& ly = gx::RenderOptions::live_warmup_pip_cy();
+  auto& lw = gx::RenderOptions::live_warmup_pip_cw();
+  float x = lx.load(), y = ly.load(), w = lw.load();
+  const auto axis = [](int v) {
+    const float a = std::clamp(v / 80.0f, -1.0f, 1.0f);
+    return std::fabs(a) < 0.22f ? 0.0f : (a - std::copysign(0.22f, a)) / 0.78f;
+  };
+  const float sx = f.armed ? axis(f.stick_x) : 0.0f, sy = f.armed ? axis(f.stick_y) : 0.0f;
+  bool moved = false;
+  if (sx != 0.0f || sy != 0.0f) {   // half the area a second with the stick all the way over
+    x += sx * 0.5f * dt;
+    y -= sy * 0.5f * dt;
+    moved = true;
+  }
+  if (b & 0x0400) { w *= 1.0f + 0.7f * dt; moved = true; }   // X: bigger
+  if (b & 0x0800) { w *= 1.0f - 0.7f * dt; moved = true; }   // Y: smaller
+  if (moved && w > 0.01f) {   // (before the arena has read where it is, w is still 0: nothing moves)
+    lx.store(std::clamp(x, 0.0f, 1.0f));
+    ly.store(std::clamp(y, 0.0f, 1.0f));
+    lw.store(std::clamp(w, 0.12f, 0.9f));
+  }
+  int& view = gx::RenderOptions::live_spectate_view();
+  if (pressed & 0x0008) view = (view + 2) % 3;   // D-pad up
+  if (pressed & 0x0004) view = (view + 1) % 3;   // D-pad down
+  bool done = (pressed & (0x0100 | 0x0200 | 0x1000)) != 0;
+  if (f.keyboard && !ImGui::GetIO().WantTextInput)
+    done |= ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false);
+  if (done) { adjust_end(); out.close = true; return; }
+  draw_adjust_hint(dl, f);
+}
+
 void press(Page p, Row& r, Result& out) {
   if (!r.enabled) return;
   switch (r.kind) {
@@ -880,6 +997,8 @@ void press(Page p, Row& r, Result& out) {
     case Kind::Action: break;
     default: return;
   }
+  if (r.action == kActWarmupBack) { slippi::native_practice::submit_warmup_return(); out.close = true; return; }
+  if (r.action == kActWarmupAdjust) { adjust_begin(); return; }
   if (r.action == kActUnranked) { out.start_unranked = true; return; }
   if (r.action == kActCancel) { out.cancel_search = true; return; }
   if (r.action == kActWindow) { out.open_window = true; return; }
@@ -1033,6 +1152,15 @@ float text_y_centered(float cy, float px) {
   return cy - g_font.cap_mid * px / 32.0f;
 }
 
+// A rectangle with its own radius at each corner (top left, top right, bottom right, bottom left), as
+// the draw list's path: fill it with PathFillConvex.
+void corner_path(ImDrawList* dl, float x0, float y0, float x1, float y1, float tl, float tr, float br, float bl) {
+  dl->PathArcTo(ImVec2(x0 + tl, y0 + tl), tl, IM_PI, IM_PI * 1.5f, 8);
+  dl->PathArcTo(ImVec2(x1 - tr, y0 + tr), tr, IM_PI * 1.5f, IM_PI * 2.0f, 8);
+  dl->PathArcTo(ImVec2(x1 - br, y1 - br), br, 0.0f, IM_PI * 0.5f, 8);
+  dl->PathArcTo(ImVec2(x0 + bl, y1 - bl), bl, IM_PI * 0.5f, IM_PI, 8);
+}
+
 // The GameCube buttons the hints show.
 float glyph_width(char which, float u);
 void button_glyph(ImDrawList* dl, float x, float cy, float u, char which, float a) {
@@ -1042,14 +1170,14 @@ void button_glyph(ImDrawList* dl, float x, float cy, float u, char which, float 
       const float r = 12.0f * u;
       dl->AddCircleFilled(ImVec2(x + r, cy + 1.5f * u), r, with_alpha(IM_COL32(10, 77, 23, 255), a), 20);
       dl->AddCircleFilled(ImVec2(x + r, cy), r, with_alpha(IM_COL32(47, 170, 70, 255), a), 20);
-      text(dl, x + r - text_width(13.0f * u, "A") * 0.5f, text_y_centered(cy, 13.0f * u), 13.0f * u, white, "A", 0, false);
+      center_char(dl, x + r, cy, 13.0f * u, white, 'A');
       break;
     }
     case 'B': {
       const float r = 9.5f * u;
       dl->AddCircleFilled(ImVec2(x + r, cy + 1.5f * u), r, with_alpha(IM_COL32(92, 13, 8, 255), a), 20);
       dl->AddCircleFilled(ImVec2(x + r, cy), r, with_alpha(IM_COL32(214, 44, 34, 255), a), 20);
-      text(dl, x + r - text_width(11.0f * u, "B") * 0.5f, text_y_centered(cy, 11.0f * u), 11.0f * u, white, "B", 0, false);
+      center_char(dl, x + r, cy, 11.0f * u, white, 'B');
       break;
     }
     case 'S': {
@@ -1078,21 +1206,29 @@ void button_glyph(ImDrawList* dl, float x, float cy, float u, char which, float 
       const char label[2] = {which, 0};
       const float w = 24.0f * u, h = 18.0f * u;
       dl->AddRectFilled(ImVec2(x, cy - h * 0.5f), ImVec2(x + w, cy + h * 0.5f), with_alpha(IM_COL32(214, 216, 224, 255), a), h * 0.5f);
-      text(dl, x + w * 0.5f - text_width(11.0f * u, label) * 0.5f, text_y_centered(cy, 11.0f * u), 11.0f * u, with_alpha(IM_COL32(40, 40, 46, 255), a), label, 0, false);
+      center_char(dl, x + w * 0.5f, cy, 11.0f * u, with_alpha(IM_COL32(40, 40, 46, 255), a), which);
       break;
     }
     case 'Z': {
       const float w = 22.0f * u, h = 16.0f * u;
       dl->AddRectFilled(ImVec2(x, cy - h * 0.5f), ImVec2(x + w, cy + h * 0.5f), with_alpha(IM_COL32(108, 72, 196, 255), a), 4.0f * u);
-      text(dl, x + w * 0.5f - text_width(11.0f * u, "Z") * 0.5f, text_y_centered(cy, 11.0f * u), 11.0f * u, white, "Z", 0, false);
+      center_char(dl, x + w * 0.5f, cy, 11.0f * u, white, 'Z');
       break;
     }
     case 'L':
-    case 'R': {   // the triggers
+    case 'R': {   // the shoulder buttons, a mirrored pair: the outer top corner round, the rest eased
       const char label[2] = {which, 0};
-      const float w = 22.0f * u, h = 16.0f * u;
-      dl->AddRectFilled(ImVec2(x, cy - h * 0.5f), ImVec2(x + w, cy + h * 0.5f), with_alpha(IM_COL32(150, 154, 168, 255), a), 4.0f * u);
-      text(dl, x + w * 0.5f - text_width(11.0f * u, label) * 0.5f, text_y_centered(cy, 11.0f * u), 11.0f * u, white, label, 0, false);
+      const float w = 24.0f * u, h = 17.0f * u, x1 = x + w, y0 = cy - h * 0.5f, y1 = cy + h * 0.5f;
+      const float big = h * 0.6f, ease = 3.0f * u;
+      const float tl = which == 'L' ? big : ease, tr = which == 'L' ? ease : big;
+      corner_path(dl, x, y0 + 1.6f * u, x1, y1 + 1.6f * u, tl, tr, ease, ease);   // its edge, underneath
+      dl->PathFillConvex(with_alpha(IM_COL32(40, 42, 52, 255), a));
+      corner_path(dl, x, y0, x1, y1, tl, tr, ease, ease);
+      dl->PathFillConvex(with_alpha(IM_COL32(178, 182, 196, 255), a));
+      const float band = h * 0.42f, in = 1.6f * u;   // the light along its top
+      corner_path(dl, x + in, y0 + in, x1 - in, y0 + band, std::min(std::max(0.0f, tl - in), band - in), std::min(std::max(0.0f, tr - in), band - in), 0, 0);
+      dl->PathFillConvex(with_alpha(IM_COL32(224, 228, 238, 255), a));
+      center_char(dl, x + w * 0.5f, cy + 0.5f * u, 11.0f * u, with_alpha(IM_COL32(28, 30, 38, 255), a), which);
       break;
     }
     default: break;
@@ -1103,7 +1239,8 @@ float glyph_width(char which, float u) {
     case 'A': case 'X': case 'Y': return 24.0f * u;
     case 'B': return 19.0f * u;
     case 'S': return std::max(30.0f * u, text_width(9.0f * u, "START") + 9.0f * u);
-    case 'D': case 'U': case 'V': case 'Z': case 'L': case 'R': return 22.0f * u;
+    case 'D': case 'U': case 'V': case 'Z': return 22.0f * u;
+    case 'L': case 'R': return 24.0f * u;
     default: return 0;
   }
 }
@@ -1436,11 +1573,358 @@ void draw_offer(ImDrawList* dl, const Frame& f) {
   hints(dl, (f.game_x0 + f.game_x1 - hw) * 0.5f, top + h + 8 * u, u, spec, 1.0f);
 }
 
+// ---------------------------------------------------------------------------------------------
+// The warm-up room over Training: a panel in the left bar saying whom the player is still connected
+// to and what they are doing (or, in an arena room, the place in line and the game's score), the
+// sparring partner and the way back; and a notice in the same plain box when something happens.
+const char* const kWarmupShort[] = {"Falcon", "DK", "Fox", "G&W", "Kirby", "Bowser", "Link", "Luigi", "Mario",
+    "Marth", "Mewtwo", "Ness", "Peach", "Pikachu", "ICs", "Puff", "Samus", "Yoshi", "Zelda", "Sheik",
+    "Falco", "Y. Link", "Doc", "Roy", "Pichu", "Ganon"};
+
+// A plain dialog box: dark, a thin gold rim, the same rounding everywhere (the warm-up's panel and
+// its notices; not a menu button, nothing here is pressed).
+void warm_box(ImDrawList* dl, float x0, float y0, float x1, float y1, float k, float a) {
+  dl->AddRectFilled(ImVec2(x0 + 2 * k, y0 + 3 * k), ImVec2(x1 + 2 * k, y1 + 3 * k), with_alpha(IM_COL32(0, 0, 0, 110), a), 7 * k);
+  dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), with_alpha(IM_COL32(12, 14, 24, 236), a), 7 * k);
+  dl->AddRect(ImVec2(x0, y0), ImVec2(x1, y1), with_alpha(kGold, 0.85f * a), 7 * k, 0, std::max(1.0f, 1.4f * k));
+}
+
+// The warm-up's boxes in the black bar: floating with 16 px all round (warm_box), or flush, filling the bar
+// from the screen edge to the picture like the Arena corner cards (MELEE_TEST_PANEL_FLUSH for comparison).
+bool panel_flush() { return gx::RenderOptions::live_warmup_panel_style() != 0; }   // the warm-up panel look setting
+bool panel_top() { return gx::RenderOptions::live_warmup_panel_style() == 2; }   // the side card at the top of the bar
+// The flush look, as the Arena corner cards draw theirs: no outline, a wash of the warm-up's gold that is
+// strongest at the top and fades into the bar by 85% of the way down, and one solid 3 px stripe on the
+// picture's side.
+void flush_box(ImDrawList* dl, float x0, float y0, float x1, float y1, float k, float a) {
+  // As the Arena corner cards: a wash strongest at the top, faint from 85% down, a gold stripe on the picture's side.
+  const float y85 = y0 + (y1 - y0) * 0.85f;
+  const int start = dl->VtxBuffer.Size;
+  dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y85), IM_COL32(255, 255, 255, 255));
+  for (int i = start; i < dl->VtxBuffer.Size; ++i) {
+    ImDrawVert& v = dl->VtxBuffer[i];
+    const float t = std::clamp((v.pos.y - y0) / std::max(1.0f, y85 - y0), 0.0f, 1.0f);
+    v.col = with_alpha(IM_COL32(233, 180, 76, (int)(120 + (16 - 120) * t)), a);
+  }
+  dl->AddRectFilled(ImVec2(x0, y85), ImVec2(x1, y1), with_alpha(IM_COL32(233, 180, 76, 16), a));
+  dl->AddRectFilled(ImVec2(x1 - 3.0f * std::max(1.0f, k * 0.66f), y0), ImVec2(x1, y1), with_alpha(kGoldText, a));
+}
+
+// Move and resize (the controller and the small window): what the buttons do, for its first 5 seconds
+// only (then it fades; the Practice menu's row says the same). In the black bar left of the picture,
+// where the warm-up panel sits (the panel is not drawn while the menu is open), so it covers no game;
+// with no bar, at the picture's bottom left corner. One button a row, the words lined up.
+void draw_adjust_hint(ImDrawList* dl, const Frame& f) {
+  const float since = (float)(f.time - g_adjust_since);
+  const float a = std::min(ease(since / 0.25f), ease((5.0f - since) / 0.6f));
+  if (since >= 5.0f || a <= 0.01f) return;
+  const float gh = f.game_y1 - f.game_y0;
+  const bool in_bar = f.game_x0 >= 120.0f;
+  // 16 from the screen edge and 16 from the picture: the bar's middle, never touching the game
+  const bool flush = in_bar && panel_flush();
+  const float pw = in_bar ? (flush ? f.game_x0 : f.game_x0 - 32.0f) : std::min(170.0f * gh / 720.0f, (f.game_x1 - f.game_x0) * 0.3f);
+  const float x0 = in_bar ? (flush ? 0.0f : 16.0f) : f.game_x0 + 12.0f, x1 = x0 + pw;
+  const float k = std::clamp(pw / 150.0f, 0.6f, 2.6f), pad = 12 * k, slack = 6 * k, cx = x0 + pw * 0.5f;
+  float tpx = 12 * k;
+  while (tpx > 7 * k && text_width(tpx, "MOVE AND RESIZE") > pw - 2 * pad) tpx *= 0.94f;   // inside the padding
+  const float wpx = 12 * k, row = 24 * k, r = 9.5f * k;   // every badge the same size, one centre line
+  struct Item { char glyph; const char* word; };
+  const Item items[] = {{'C', "MOVE"}, {'X', "BIGGER"}, {'Y', "SMALLER"}, {'D', "VIEW"}, {'A', "DONE"}};
+  float ww = 0;
+  for (const Item& it : items) ww = std::max(ww, text_width(wpx, it.word));
+  const float gap = 10 * k, h = pad + tpx + slack + 12 * k + row * 5 + pad - 4 * k;
+  const float top = in_bar ? (flush && panel_top() ? f.game_y0 : f.game_y0 + gh * 0.17f) : f.game_y1 - h - 12 * k;
+  if (flush) flush_box(dl, x0, top, x1, top + h, k, a);
+  else warm_box(dl, x0, top, x1, top + h, k, a);
+  float y = top + pad;
+  const char* const title = "MOVE AND RESIZE";
+  text(dl, cx - text_width(tpx, title) * 0.5f, y + (tpx + slack) * 0.5f - tpx * 0.55f, tpx,
+       with_alpha(flush ? IM_COL32(255, 255, 255, 255) : kGoldText, a), title, flush ? 0.18f : 0.0f);
+  y += tpx + slack;
+  dl->AddLine(ImVec2(x0 + pad, y + 6 * k), ImVec2(x1 - pad, y + 6 * k), flush ? with_alpha(IM_COL32(255, 255, 255, 28), a) : with_alpha(kGold, 0.35f * a),
+              std::max(1.0f, 1.0f * k));
+  y += 12 * k;
+  const float bx = cx - (2 * r + gap + ww) * 0.5f, gx = bx + r;   // the badges' centre column, the words after it
+  for (const Item& it : items) {
+    const float cy = y + row * 0.5f;
+    const ImVec2 c(gx, cy);
+    const ImU32 grey = with_alpha(IM_COL32(214, 218, 228, 255), a), dark = with_alpha(IM_COL32(32, 34, 42, 255), a);
+    dl->AddCircleFilled(ImVec2(c.x, c.y + 1.5f * k), r, with_alpha(IM_COL32(0, 0, 0, 120), a), 24);   // its edge underneath
+    switch (it.glyph) {
+      case 'A': dl->AddCircleFilled(c, r, with_alpha(IM_COL32(47, 170, 70, 255), a), 24); center_char(dl, c.x, c.y, 13 * k, with_alpha(IM_COL32(255, 255, 255, 255), a), 'A'); break;
+      case 'X': case 'Y': dl->AddCircleFilled(c, r, grey, 24); center_char(dl, c.x, c.y, 12 * k, dark, it.glyph); break;
+      case 'D': {   // the D-pad: a plus on the grey badge
+        dl->AddCircleFilled(c, r, grey, 24);
+        const float t = 2.2f * k, l = 5.6f * k;
+        dl->AddRectFilled(ImVec2(c.x - t, c.y - l), ImVec2(c.x + t, c.y + l), dark, 1.0f * k);
+        dl->AddRectFilled(ImVec2(c.x - l, c.y - t), ImVec2(c.x + l, c.y + t), dark, 1.0f * k);
+        break;
+      }
+      default: {   // the control stick: the badge as its well, a raised cap in the middle
+        dl->AddCircleFilled(c, r, with_alpha(IM_COL32(150, 154, 168, 255), a), 24);
+        dl->AddCircleFilled(c, r * 0.58f, grey, 20);   // the cap dead centre in its well
+        break;
+      }
+    }
+    text(dl, gx + r + gap, cy - wpx * 0.55f, wpx, with_alpha(IM_COL32(255, 255, 255, 255), a), it.word);
+    y += row;
+  }
+}
+
+const char* const kWarmupNames[] = {"Captain Falcon", "Donkey Kong", "Fox", "Game & Watch", "Kirby", "Bowser", "Link",
+    "Luigi", "Mario", "Marth", "Mewtwo", "Ness", "Peach", "Pikachu", "Ice Climbers", "Jigglypuff", "Samus", "Yoshi",
+    "Zelda", "Sheik", "Falco", "Young Link", "Dr. Mario", "Roy", "Pichu", "Ganondorf"};
+
+// L and R held together, "[L] + [R]  label", centred on `cx` (draw false only measures); the buttons
+// at `u`, the words at `px`, everything on the centre line `cy`. Returns the width.
+float lr_hold(ImDrawList* dl, float cx, float cy, float u, const char* label, float px, ImU32 ink, float a, bool draw = true) {
+  const float gw = glyph_width('L', u), plus = text_width(px, "+"), g = 4.0f * u;
+  const bool words = label && *label;
+  const float lw = words ? text_width(px, label) : 0.0f, lg = words ? 9.0f * u : 0.0f;
+  const float total = gw + g + plus + g + gw + lg + lw;
+  if (!draw) return total;
+  float x = cx - total * 0.5f;
+  button_glyph(dl, x, cy, u, 'L', a);
+  x += gw + g;
+  text(dl, x, cy - px * 0.55f, px, with_alpha(ink, a), "+");
+  x += plus + g;
+  button_glyph(dl, x, cy, u, 'R', a);
+  x += gw + lg;
+  if (words) text(dl, x, cy - px * 0.55f, px, with_alpha(ink, a), label);
+  return total;
+}
+
+// The game's own stock icon of a fighter and costume (host/cosmetic_mods.h), one texture each.
+struct StockIcon { ImTextureData* tex = nullptr; bool tried = false; ImGuiContext* context = nullptr; };
+std::map<int, StockIcon> g_stock_icons;
+ImTextureData* stock_icon(int character, int costume) {
+  if (character < 0 || character > 25) return nullptr;
+  costume = std::clamp(costume, 0, 5);
+  StockIcon& icon = g_stock_icons[character * 8 + costume];
+  if (icon.tex) gx::keep_user_texture(icon.tex, icon.context);
+  if (!icon.tried) {
+    icon.tried = true;
+    std::vector<uint8_t> rgba;
+    int w = 0, h = 0;
+    if (host::cosmetics::standard_stock_icon(character, costume, &rgba, &w, &h) && w > 0 && h > 0) {
+      icon.tex = IM_NEW(ImTextureData)();
+      icon.tex->Create(ImTextureFormat_RGBA32, w, h);
+      std::memcpy(icon.tex->GetPixels(), rgba.data(), rgba.size());
+      icon.tex->UsedRect = ImTextureRect{0, 0, (unsigned short)w, (unsigned short)h};
+      gx::keep_user_texture(icon.tex, icon.context);
+    }
+  }
+  return icon.tex;
+}
+
+// The game's menu font keeps only a stub of g, j, p, q and y below the line (it reads as cut off),
+// so the warm-up's words are set in capitals, as Melee's own menus are.
+std::string caps(std::string s) {
+  for (char& c : s) c = (char)std::toupper((unsigned char)c);
+  return s;
+}
+
+void draw_warmup(ImDrawList* dl, const Frame& f) {
+  const Warmup& w = f.warmup;
+  if (!w.active || w.in_small_window) return;
+  const float gh = f.game_y1 - f.game_y0;
+  // The panel: in the black bar left of the picture (the room's small window takes the bar on the
+  // right); with no bars (true widescreen) over the picture's left edge, under Training's logo.
+  const float bar = f.game_x0;
+  const bool in_bar = bar >= 120.0f;
+  const bool flush = in_bar && panel_flush();
+  const float pw = in_bar ? (flush ? bar : bar - 32.0f) : std::min(250.0f * gh / 720.0f, (f.game_x1 - f.game_x0) * 0.28f);
+  const float x0 = in_bar ? (flush ? 0.0f : 16.0f) : f.game_x0 + 12.0f, x1 = x0 + pw;   // 16 from the screen edge and the picture, or flush
+  const float k = std::clamp(pw / 150.0f, 0.6f, 2.6f);   // laid out for a 150-pixel panel
+  const float pad = 16 * k, inner = pw - 2 * pad, cx = x0 + pw * 0.5f;   // 16 inside the rim, long lines shrink to fit
+  const ImU32 white = IM_COL32(255, 255, 255, 255), dim = IM_COL32(176, 182, 196, 255);
+  const ImU32 gold = kGoldText, green = IM_COL32(110, 226, 120, 255), red = IM_COL32(255, 112, 112, 255);
+
+  // Rows top to bottom. Every text row is its type size plus the same 3 above and below, and is
+  // centred across the panel; a rule has the same room on both sides. So the space between any two
+  // things is one of two steps, and the box reads the same from either side.
+  struct Part { std::string s; ImU32 col; };
+  struct Row { int kind; float h; float px; std::vector<Part> parts; int fighter; };   // 0 text, 2 rule, 3 L+R, 4 fighter
+  std::vector<Row> rows;
+  const float slack = 6 * k;
+  const auto line = [&](float px, std::vector<Part> parts) {
+    for (Part& part : parts) part.s = caps(std::move(part.s));
+    rows.push_back({0, px * k + slack, px * k, std::move(parts), -1});
+  };
+  const auto rule = [&]() { rows.push_back({2, 12 * k, 0, {}, -1}); };
+  const auto name_of = [](int c) { return c >= 0 && c < 26 ? std::string(kWarmupNames[c]) : std::string(); };
+
+  line(12, {{"WARM-UP", flush ? white : gold}});
+  rule();
+  if (w.arena) {
+    std::string place = w.place.empty() ? std::string("In the room") : w.place;
+    for (char& c : place) c = (char)std::toupper((unsigned char)c);
+    line(15, {{place, white}});
+    int shown = 0;
+    for (const auto& p : w.fighter) shown += w.score && p.present;
+    if (shown) {
+      // Each player: name and percent on one line, their stocks as the game's stock icons under it;
+      // "vs" between the sides.
+      int done = 0;
+      for (int i = 0; i < 4; ++i) {
+        if (!w.score || !w.fighter[i].present) continue;
+        if (done && done == (shown + 1) / 2) line(10, {{"vs", dim}});
+        rows.push_back({4, 19 * k + 18 * k, 0, {}, i});
+        ++done;
+      }
+    } else if (!w.versus.empty()) {
+      line(12, {{w.versus, dim}});
+    }
+  } else {
+    if (w.peers.empty()) line(15, {{"Connected", white}});
+    for (size_t i = 0; i < w.peers.size(); ++i) {
+      const auto& p = w.peers[i];
+      line(15, {{p.name.empty() ? std::string("Opponent") : p.name, white}});
+      const std::string ch = name_of(p.character);
+      switch (p.state) {
+        case 1: line(12, ch.empty() ? std::vector<Part>{{"READY", green}} : std::vector<Part>{{"READY", green}, {ch, white}}); break;
+        case 2: line(12, {{"WARMING UP TOO", gold}}); break;
+        case 3: line(12, {{"LEFT", red}}); break;
+        default: line(12, ch.empty() ? std::vector<Part>{{"PICKING", dim}} : std::vector<Part>{{"PICKED", gold}, {ch, white}}); break;
+      }
+    }
+  }
+  if (!w.sparring.empty()) {
+    rule();
+    line(10.5f, {{"SPARRING", gold}});
+    line(13, {{w.sparring, white}});
+  }
+  rule();
+  const float gu = 0.9f * k;   // the L and R buttons, at a size their letters read at
+  rows.push_back({3, 17 * gu + slack, 0, {}, -1});
+  line(10.5f, {{"Hold to go back", dim}});
+
+  float h = 2 * pad;
+  for (const Row& r : rows) h += r.h;
+  // A flush panel hangs from the top of the bar, as the Arena corner cards do; the rounded box sits lower.
+  const float top = flush && panel_top() ? f.game_y0 : f.game_y0 + gh * (in_bar ? 0.17f : 0.15f);
+  if (flush) flush_box(dl, x0, top, x1, top + h, k, 1.0f);
+  else warm_box(dl, x0, top, x1, top + h, k, 1.0f);
+  float y = top + pad;
+  for (const Row& r : rows) {
+    const float cy = y + r.h * 0.5f;
+    if (r.kind == 0) {
+      const float skew = flush && &r == &rows.front() ? 0.18f : 0.0f;   // the flush look's title leans, as RED CORNER
+      // The parts with one space between them, shrunk together to fit, centred.
+      float total = 0;
+      const float space = text_width(r.px, " ");
+      for (size_t i = 0; i < r.parts.size(); ++i) total += text_width(r.px, r.parts[i].s.c_str()) + (i ? space : 0.0f);
+      const float scale = total > inner ? inner / total : 1.0f;
+      const float px = r.px * scale;
+      float x = cx - total * scale * 0.5f;
+      for (size_t i = 0; i < r.parts.size(); ++i) {
+        if (i) x += space * scale;
+        text(dl, x, cy - px * 0.55f, px, r.parts[i].col, r.parts[i].s.c_str(), skew);
+        x += text_width(px, r.parts[i].s.c_str());
+      }
+    } else if (r.kind == 2) {
+      dl->AddLine(ImVec2(x0 + pad, cy), ImVec2(x1 - pad, cy), flush ? IM_COL32(255, 255, 255, 28) : with_alpha(kGold, 0.35f), std::max(1.0f, 1.0f * k));
+    } else if (r.kind == 3) {
+      lr_hold(dl, cx, cy, gu, nullptr, 13 * k, white, 1.0f);
+    } else if (r.kind == 4) {
+      const auto& p = w.fighter[r.fighter];
+      // Line one: the name, centred like every other row of the panel.
+      const float npx = 13 * k, ny = y + 3 * k + npx * 0.5f;
+      std::string name = caps(p.name.empty() ? "P" + std::to_string(r.fighter + 1) : p.name);
+      float nx = npx;
+      while (nx > 7 * k && text_width(nx, name.c_str()) > inner) nx *= 0.92f;
+      text(dl, cx - text_width(nx, name.c_str()) * 0.5f, ny - nx * 0.55f, nx, white, name.c_str());
+      // Line two, one centred group: a stock icon for each stock left (the game's own, in their
+      // colour; a count beside one icon when there are more than fit), then the percent, larger
+      // than the name, on the icons' centre line.
+      const float is = 12 * k, ig = 2 * k, ly = y + 19 * k + 9 * k, iy = ly - is * 0.5f;
+      const float ppx = 15 * k, pg = 7 * k;
+      char pct[16];
+      std::snprintf(pct, sizeof pct, "%d%%", (int)(p.percent + 0.5f));
+      const float pct_w = text_width(ppx, pct);
+      ImTextureData* t = stock_icon(p.character, p.costume);
+      const int stocks = std::max(0, p.stocks);
+      const int fits = std::max(1, (int)((inner - pct_w - pg + ig) / (is + ig)));
+      const bool count = stocks > std::min(fits, 6);
+      // What stands after the icons: whose stocks (no icon on this disc), or how many.
+      std::string after;
+      float spx = 0;
+      if (count) { after = "x " + std::to_string(stocks); spx = 11 * k; }
+      else if (!t && stocks && p.character >= 0 && p.character < 26) { after = caps(kWarmupShort[p.character]); spx = 10 * k; }
+      const int icons = count ? 1 : stocks;
+      const float icons_w = icons ? icons * is + (icons - 1) * ig : 0.0f;
+      const float after_w = after.empty() ? 0.0f : 2 * k + text_width(spx, after.c_str());
+      const float left_w = icons_w + after_w;
+      float ix = cx - (left_w + (left_w > 0 ? pg : 0.0f) + pct_w) * 0.5f;
+      for (int n = 0; n < icons; ++n) {
+        if (t) dl->AddImage(t->GetTexRef(), ImVec2(ix, iy), ImVec2(ix + is, iy + is));
+        else dl->AddCircleFilled(ImVec2(ix + is * 0.5f, ly), is * 0.4f, dim, 12);
+        ix += is + (n + 1 < icons ? ig : 0.0f);
+      }
+      if (!after.empty()) {
+        text(dl, ix + 2 * k, ly - spx * 0.55f, spx, dim, after.c_str());
+        ix += after_w;
+      }
+      if (left_w > 0) ix += pg;
+      text(dl, ix, ly - ppx * 0.55f, ppx, white, pct);
+    }
+    y += r.h;
+  }
+  if (w.hold > 0.0f) {   // L+R held: a thin bar under the panel fills toward going back
+    const float bx0 = x0 + pad, bx1 = x1 - pad;
+    dl->AddRectFilled(ImVec2(bx0, top + h + 5 * k), ImVec2(bx1, top + h + 8 * k), with_alpha(IM_COL32(255, 255, 255, 40), 1.0f), 2 * k);
+    dl->AddRectFilled(ImVec2(bx0, top + h + 5 * k), ImVec2(bx0 + (bx1 - bx0) * std::clamp(w.hold, 0.0f, 1.0f), top + h + 8 * k),
+                      with_alpha(kYellowBottom, 1.0f), 2 * k);
+  }
+
+  // A notice over the picture for what just happened (the room's turn: while it counts down), in
+  // the same plain box, between Training's logo and its displays. The title, and under it the way
+  // to act on it ("[L] + [R]  Hold to go now"), both centred, the same room above and below.
+  std::string title, sub;
+  float a = 0.0f;
+  if (w.countdown_ms >= 0) {
+    title = "Your turn in " + std::to_string((w.countdown_ms + 999) / 1000);
+    sub = "Hold to go now";
+    a = 1.0f;
+  } else if (w.banner) {
+    const std::string who = w.banner_peer >= 0 && w.banner_peer < (int)w.peers.size() ? w.peers[w.banner_peer].name : std::string("The room");
+    const float life = w.banner == 2 ? 8.0f : 4.0f;
+    if (w.banner_age < life) {
+      a = std::min(ease(w.banner_age / 0.25f), ease((life - w.banner_age) / 0.5f));
+      switch (w.banner) {
+        case 1: title = who + " is ready"; break;
+        case 2: title = who + " left"; sub = "Hold to go back"; break;
+        case 3: title = who + " is warming up too"; break;
+        case 4: title = "Your turn"; break;
+        case 5: title = who + " is back on the select"; break;
+        default: break;
+      }
+    }
+  }
+  if (!title.empty() && a > 0.01f) {
+    title = caps(title);
+    sub = caps(sub);
+    const float u = gh / 720.0f;
+    const float tpx = 24 * u, spx = 15 * u, bu = 0.95f * u;
+    const float pad_x = 24 * u, pad_y = 15 * u, gap_y = 9 * u, sub_h = 17 * bu;
+    const float tw = text_width(tpx, title.c_str());
+    const float sw = sub.empty() ? 0.0f : lr_hold(dl, 0, 0, bu, sub.c_str(), spx, white, a, false);
+    const float bw = std::max(tw, sw) + 2 * pad_x;
+    const float bh = pad_y + tpx + (sub.empty() ? 0.0f : gap_y + sub_h) + pad_y;
+    const float bcx = (f.game_x0 + f.game_x1) * 0.5f;
+    const float bx = bcx - bw * 0.5f, by = f.game_y0 + gh * 0.24f;
+    warm_box(dl, bx, by, bx + bw, by + bh, u, a);
+    text(dl, bcx - tw * 0.5f, by + pad_y + tpx * 0.5f - tpx * 0.55f, tpx, with_alpha(white, a), title.c_str());
+    if (!sub.empty()) lr_hold(dl, bcx, by + pad_y + tpx + gap_y + sub_h * 0.5f, bu, sub.c_str(), spx, IM_COL32(214, 218, 230, 255), a);
+  }
+}
+
 // Until the menu has been opened three times (Frame::hint) it introduces itself in every look: a banner
 // near the top for the first seconds of Training, then the buttons drawn small at the top right.
 double g_hint_since = -1.0;
 void draw_intro(ImDrawList* dl, const Frame& f) {
   if (!f.hint) { g_hint_since = -1.0; return; }
+  if (f.warmup.active && f.warmup.in_small_window) return;   // Training as the room's small window
   // The search-again question comes first; the introduction starts once it is answered.
   if (g_hint_since < 0.0 || !f.search.offer.empty()) g_hint_since = f.time;
   const float since = (float)(f.time - g_hint_since);
@@ -1450,7 +1934,8 @@ void draw_intro(ImDrawList* dl, const Frame& f) {
   // The big banner in the middle is gone (owner 11-17: it covered the match start and looked cluttered);
   // only the small corner hint below is left.
   constexpr bool kBanner = false;
-  if (kBanner && f.intro && since > kFrom && since < kTo && f.search.offer.empty()) {
+  // In the warm-up room the player is already matched: no "find a match" introduction either.
+  if (kBanner && f.intro && !f.warmup.active && since > kFrom && since < kTo && f.search.offer.empty()) {
     const float u = gu * 0.82f;
     const float fa = std::min(ease((since - kFrom) / 0.35f), ease((kTo - since) / 0.45f));
     const float slide = (1.0f - ease((since - kFrom) / 0.3f)) * 30.0f * u;
@@ -1477,8 +1962,9 @@ void draw_intro(ImDrawList* dl, const Frame& f) {
   constexpr float kCornerFor = 15.0f;
   if (since >= kCornerFor) return;
   const float u = gu * 0.8f, alpha = 0.95f * std::min(1.0f, kCornerFor - since);
-  const char* spec = neural_ghosts() ? "S:+|U:+|Z:Practice menu: Fight a pro, find a match"
-                                     : "S:+|U:+|Z:Find a match, practice menu";
+  const char* spec = f.warmup.active   ? "S:+|U:+|Z:Practice menu"
+                     : neural_ghosts() ? "S:+|U:+|Z:Practice menu: Fight a pro, find a match"
+                                       : "S:+|U:+|Z:Find a match, practice menu";
   const float hw = hints(dl, 0, 0, u, spec, alpha, false);
   hints(dl, f.game_x1 - hw - 8 * u, f.game_y0 + 30 * u, u, spec, alpha);
 }
@@ -2000,6 +2486,7 @@ ReplayPanel replay_panel(int style, const Frame& f, const ReplayPanelIn& panel_i
 }
 
 Result frame(int style, const Frame& f) {
+  sync_watch();   // the match-window rows' last change, then the settings as they are now
   Result out;
   g_f = f;
   g_c = practice_cpu::config();
@@ -2021,8 +2508,48 @@ Result frame(int style, const Frame& f) {
     }
   }
   if (!f.open) {
+    // Test: MELEE_TEST_ADJUST_HINT=<seconds>: that long into a warm-up, the Move and resize box shows in
+    // the panel's place for its 5 seconds (as with the menu open), for pictures.
+    static double warm_since = -1.0;
+    static bool hint_shown = false;
+    if (!f.warmup.active) warm_since = -1.0;
+    else if (warm_since < 0.0) warm_since = f.time;
+    if (const char* t = host::test_env::getenv("MELEE_TEST_ADJUST_HINT"); t && warm_since >= 0.0 && !hint_shown &&
+        f.time - warm_since >= std::atof(t)) {
+      hint_shown = true;
+      g_adjust_since = f.time;
+    }
+    if (hint_shown && f.time - g_adjust_since < 5.0) { draw_adjust_hint(dl, f); return out; }
+    // Test: MELEE_TEST_ADJUST_PAD=<seconds>: that long into a warm-up, Move and resize runs on a scripted
+    // controller through the same code as a real one: stick left 0.6 s, X held 0.8 s, D-pad down, then A.
+    static double pad_at = -1.0;
+    static int pad_step = 0;
+    if (const char* t = host::test_env::getenv("MELEE_TEST_ADJUST_PAD"); t && warm_since >= 0.0 && pad_step < 6) {
+      const double since = f.time - warm_since - std::atof(t);
+      if (since >= 0.0 && (pad_step > 0 || slippi::arena::pip_active())) {   // once the small window is up
+        // Counted in drawn frames, not seconds: a hidden run draws its overlay only a few times a second.
+        static int n = 0;
+        if (pad_step == 0) { adjust_begin(); pad_at = f.time; pad_step = 1; n = 0; host::log("practice menu: test: Move and resize begins"); }
+        ++n;
+        Frame pad = f;
+        pad.armed = true;
+        pad.buttons = 0;
+        pad.stick_x = pad.stick_y = 0;
+        if (n >= 4 && n < 14) pad.stick_x = -80;              // stick left
+        if (n >= 16 && n < 26) pad.buttons = 0x0400;          // X: bigger
+        if (n == 30) pad.buttons = 0x0004;                    // D-pad down: the next view
+        if (n == 36) pad.buttons = 0x0100;                    // A: done
+        if (n == 4 || n == 16 || n == 30 || n == 36) host::log("practice menu: test: pad step at drawn frame %d", n);
+        if (g_adjust) adjust_frame(dl, pad, out);
+        if (!g_adjust && pad_step < 6) { pad_step = 6; host::log("practice menu: test: Move and resize done"); }
+        out.close = false;   // the menu is not open in this test
+        return out;
+      }
+    }
+    adjust_end();   // the menu shut some other way: put the small window down
+    draw_warmup(dl, f);
     draw_offer(dl, f);
-    draw_intro(dl, f);
+    draw_intro(dl, f);   // its corner hint stays in every Training match, the warm-up's included
     switch (style) {
       case kBars: draw_bars_closed(dl, f); break;
       case kRails: draw_rails_closed(dl, f); break;
@@ -2033,6 +2560,10 @@ Result frame(int style, const Frame& f) {
     return out;
   }
   if (g_stack.empty()) g_stack.push_back(Level{});
+  if (g_adjust) {
+    if (!f.warmup.active) adjust_end();   // the warm-up is over: nothing to move
+    else { adjust_frame(dl, f, out); return out; }
+  }
   // Input first, on this frame's rows.
   std::vector<Row> rows = rows_for(level().page);
   Level& lv = level();

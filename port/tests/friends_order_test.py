@@ -111,7 +111,7 @@ int main(){if(host::test_env::agent_copy())std::abort();host::test_env::agent_ru
         self.assertLess(login.index('if (agent_lock::blocked(agent_lock::Operation::Login)) return false;'),login.index('account::resolve'))
 
     def test_room_css_picker_and_leave_wiring(self):
-        native=body(read('port/runtime/hle/native_practice.cpp'),'tick')
+        native=body(read('port/runtime/hle/native_practice.cpp'),'void tick')
         self.assertLess(native.index('!friends_lobby.room().empty()'),native.index('request_major(2)'))
         self.assertLess(native.index('request_major(2)'),native.index('yougame::pick_friend_room'))
         self.assertIn('current_major() == 2 && current_minor() == 0',native)
@@ -253,7 +253,7 @@ int main() {
  printf("disconnect roles: %d checks passed\n",checks);
 }
 ''')
-        native=body(read('port/runtime/hle/native_practice.cpp'),'tick')
+        native=body(read('port/runtime/hle/native_practice.cpp'),'void tick')
         self.assertIn('g_shared_was_active && !shared_active',native)
         self.assertIn('friends_entry(held_room,friends_lobby.host(),true)',native)
         self.assertIn('if (yougame::mode_policy::friends_shared_menus && !shared_active && yougame::console::entry.available())',native)

@@ -338,10 +338,11 @@ void set_native_view(void (*fill)(MuLcancelView* out)) { g_native_view = fill; }
 void agent_test_view(MuLcancelView* out) { gather(*out); }
 #endif
 void set_automatic(bool on) {
-  g_automatic.store(policy::automatic_after_toggle(slippi::online::session_mode(), automatic_enabled(), on),
+  // A parked session (warming up in Training) still counts: the opponent was told at connect time.
+  g_automatic.store(policy::automatic_after_toggle(slippi::online::session_mode_or_parked(), automatic_enabled(), on),
                     std::memory_order_relaxed);
 }
-bool automatic_setting_locked() { return policy::automatic_setting_locked(slippi::online::session_mode()); }
+bool automatic_setting_locked() { return policy::automatic_setting_locked(slippi::online::session_mode_or_parked()); }
 bool indicator_enabled() { return flash_mode() != MU_LCFLASH_OFF; }
 bool automatic_enabled() { return g_automatic.load(std::memory_order_relaxed); }
 

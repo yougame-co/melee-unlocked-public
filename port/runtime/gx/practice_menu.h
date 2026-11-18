@@ -28,6 +28,31 @@ struct Search {
   std::string offer;        // after an online session: "... Search Unranked again?" (D-pad Up / Down)
 };
 
+// The warm-up room (hle/slippi_warmup.h): Training while staying connected to the opponent, or while
+// waiting for a turn in an arena room. Drawn over Training while the menu is shut.
+struct Warmup {
+  bool active = false;
+  bool arena = false;
+  bool in_small_window = false;     // this Training is the room's small window: nothing drawn over it
+  std::string mode;                 // "Direct", "Teams", "Arena"
+  // state: 0 picking, 1 ready, 2 warming up, 3 left; character: locked in with, else picked (-1 not known)
+  struct Peer { std::string name; int state = 0; int character = -1; };
+  std::vector<Peer> peers;
+  int banner = 0;                   // 1 ready, 2 left, 3 warming up too, 4 your turn, 5 back on the select
+  float banner_age = 99.0f;         // seconds
+  int banner_peer = -1;
+  int countdown_ms = -1;            // the arena's "your turn" countdown
+  float hold = 0.0f;                // L+R held toward going back (0..1)
+  std::string sparring;             // "Zain", "Marth CPU"
+  std::string place, versus;        // arena: "Next up", "HERO vs WISE"
+  bool score = false;               // arena: the game's score below
+  uint32_t frame = 0;
+  struct Fighter {
+    bool present = false; int character = -1; int stocks = 0; float percent = 0;
+    int costume = 0; std::string name;   // the stock icon's costume; the player's name ("" not known)
+  } fighter[4];
+};
+
 struct Frame {
   float display_w = 0, display_h = 0;
   float game_x0 = 0, game_y0 = 0, game_x1 = 0, game_y1 = 0;   // the game picture in the window
@@ -40,6 +65,7 @@ struct Frame {
   bool hint = false;            // closed: show how to open it
   bool intro = false;           // never opened yet: the banner first, then only the corner hint
   Search search;
+  Warmup warmup;
   double time = 0;              // seconds, for animation and key repeat
   uint32_t unlocked = 0xFFFFFFFFu;   // characters the memory card has (a bit per character kind)
 };

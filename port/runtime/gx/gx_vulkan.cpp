@@ -79,6 +79,7 @@ void vulkan_forget_failed_starts() {}
 #ifdef GX_PC_SETTINGS
 #include "pc_settings.h"
 #include "coming_soon_overlay.h"
+#include "lab_view.h"
 #include "pc_settings_shared.h"
 #include "texture_pack.h"
 #include "imgui.h"
@@ -1769,6 +1770,11 @@ class VulkanBackend final : public Backend {
     aux_clear_pending_ = true;
     in_match_ = frame_in_match(frame);
     if (in_match_ != was_in_match_) { upscale_reset_ = true; was_in_match_ = in_match_; }
+#ifdef GX_PC_SETTINGS
+    // As Direct3D: decided after the panel ran (settings_frame above), where the Lab view chose whether it
+    // covers this frame; only a match is ever skipped, so menus draw as usual.
+    lab_skip_scene_ = settings_ui_ready() && opts_.lab_skip_scene && in_match_ && lab::covering();
+#endif
 #ifdef _WIN32
     {
       bool ui_drawn = false;   // the settings panel open: frames are shown as rendered (no generated panel)
@@ -2416,6 +2422,8 @@ class VulkanBackend final : public Backend {
 
   // ---- Draws ----
   void draw(const Frame& frame, const DrawCall& dc, const DrawMatrices* matrices, size_t vertex_override) {
+    // The Lab view is painting over this frame: nothing the game draws would be seen.
+    if (lab_skip_scene_) return;
     if (skip_for_effects(effects_filter_, dc)) return;
     if (skip_for_lightweight(lightweight_filter_, frame, dc)) return;
     const float* vp = reinterpret_cast<const float*>(&dc.xf_regs[0x1A]);
@@ -3503,6 +3511,7 @@ class VulkanBackend final : public Backend {
   // ---- AMD FSR ----
   bool upscaling_ = false, upscale_in_place_ = false, upscaled_now_ = false, upscale_reset_ = true, upscale_logged_ = false;
   bool aux_clear_pending_ = false, in_match_ = false, was_in_match_ = false, fsr_tried_ = false, efb_blit_upscale_ = false;
+  bool lab_skip_scene_ = false;   // the Lab view covers this frame and its scene is not drawn (draw)
   int upscale_mode_ = 0, forced_scale_ = 0;
   uint32_t upscale_w_ = 0, upscale_h_ = 0;
   Image mvec_img_, hud_img_, upscale_out_;

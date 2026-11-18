@@ -37,6 +37,13 @@ struct Options {
 #endif
   std::string replay_dir = "replays";        // where .slp recordings are written
   std::string lab_dir = "Lab";               // Lab view character packs (tools/build_lab_assets.py)
+  // An arena room's match window (slippi_arena.h, launch_arena_viewer): how it shows the match (0 the
+  // game's own picture, 1 the Slippi Lab view, 2 light: stick figures on the stage's outline, the 3D
+  // scene not drawn), changed from its corner selector or by the game that opened it (owner: its
+  // window, which keeps the choice in its settings).
+  bool spectate = false;
+  int spectate_view = 0;
+  uint64_t spectate_owner = 0;
   std::string card_dir = "User/GC/CardA";    // memory card slot A as a folder of .gci files
   std::string audio_dump;        // optional WAV file receiving everything the AI DMA plays
   std::string input_log;         // --input-log: CSV of every PADRead (retrace, port, buttons, sticks, triggers)
@@ -333,6 +340,9 @@ void input_script_peek(uint32_t retrace, PadState out[4]);
 void input_note_pad_frame(int32_t frame);
 // The state the game read on the last PADRead, for the on-screen controller overlay.
 void input_last_pads(PadState out[4]);
+// Tests only (MELEE_TEST_WARMUP's lr role): these buttons held on port 0 from the next poll on, as if
+// the controller pressed them (the game and every reader of input_last_pads see them); 0 lets go.
+void input_test_hold(uint16_t buttons);
 // GameCube controller adapter (WUP-028 over WinUSB): fills plugged ports, returns their mask.
 uint32_t gcadapter_poll(PadState out[4]);
 // PhobGCC settings for an adapter port (phob.h): applied to every report while enabled.

@@ -1223,6 +1223,12 @@ target_include_directories(port_arena_rules_test PRIVATE runtime/hle)
 target_compile_features(port_arena_rules_test PRIVATE cxx_std_17)
 target_compile_options(port_arena_rules_test PRIVATE /EHsc)
 add_test(NAME port_arena_rules COMMAND port_arena_rules_test)
+# Warm-up room: Training while staying connected, the opponent's states, the arena's turn countdown.
+add_executable(port_warmup_test tests/warmup_test.cpp runtime/hle/slippi_warmup.cpp)
+target_include_directories(port_warmup_test PRIVATE runtime/hle)
+target_compile_features(port_warmup_test PRIVATE cxx_std_17)
+target_compile_options(port_warmup_test PRIVATE /EHsc)
+add_test(NAME port_warmup COMMAND port_warmup_test)
 # Developer tool: reads a running game's spectator server and writes the arena feed's live recording.
 add_executable(port_arena_feed_probe tests/arena_feed_probe.cpp runtime/hle/arena_feed.cpp runtime/hle/native_replay_stream.cpp)
 target_include_directories(port_arena_feed_probe PRIVATE runtime/hle third_party)

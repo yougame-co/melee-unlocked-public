@@ -20,6 +20,7 @@
 #define MU_BUILD_CAPS2_ARENA 0x08          /* takes arena room messages (NP_MSG_MU_ARENA); upstream sends caps 0x10 */
 #define MU_BUILD_CAPS2_AUTO_LCANCEL 0x10    /* presses for L-cancels this session; upstream sends caps 0x20 */
 #define MU_BUILD_CAPS2_GECKO 0x20          /* takes Gecko code messages (NP_MSG_MU_GECKO); upstream sends caps 0x40 */
+#define MU_BUILD_CAPS2_WARMUP 0x40         /* takes and sends warm-up messages (NP_MSG_MU_WARMUP); upstream sends caps 0x80 */
 #define MU_FRIENDS_LOBBY_OLD_BUILD_TEXT "A player's game can't play the Friends lobby yet. Everyone needs the latest Melee Unlocked."
 
 static inline int mu_local_partner_capable(unsigned caps2) { return (caps2 & MU_BUILD_CAPS2_LOCAL_PARTNER) != 0; }

@@ -43,6 +43,47 @@ void window_set_dpi_callback(DpiCallback cb);
 void window_pump();
 void window_set_fullscreen(bool enabled);
 bool window_is_fullscreen();
+// Windows: the game window (an HWND); and picture in picture for the warm-up room's two windows
+// (hle/slippi_arena.cpp): mode 1 small (borderless, on top, dragged and sized with the mouse, never
+// taking the focus), 2 big (borderless, filling what it is given), 0 back exactly as it was; mute
+// turns that game's sound off while it is not back. window_send_pip asks another game's window (the
+// room's viewer); window_of_process finds the game window of a process.
+void* window_native();
+void window_set_pip(int mode, bool mute);
+void window_send_pip(void* window, int mode, bool mute);
+int window_pip_answer();   // the mode the other window answered it took since the last send, -1 none yet
+// The room's match window's view (options.spectate_view: 0 the game, 1 Slippi Lab view, 2 light): set in
+// it from the game that opened it; reported back from its corner selector (window_spectate_choice
+// answers it once, -1 when nothing new); the selector's own rectangle, which takes clicks.
+void window_send_spectate_view(void* window, int view);
+void window_report_spectate_view(int view);
+int window_spectate_choice();
+// The room's match window's buttons (its list): 1 WARM UP, 2 PICTURE IN PICTURE (make the match small),
+// 3 FULL SIZE. Reported to the game that opened it, which takes each once (-1: none new).
+void window_report_spectate_action(int action);
+int window_spectate_action();
+void window_set_hot_rect(int x0, int y0, int x1, int y1);
+// This window's own picture in picture state (0 as it was, 1 small, 2 big): the small one draws its frame.
+int window_pip_mode();
+// The mouse was over this window in the last two seconds (the small window: its own hit test sees it).
+bool window_hovered_recently();
+// Clicks on the small window that did not move it, since the last call (they open its style menu).
+int window_take_clicks();
+// The room's match window tells the game that opened it what it shows, frame by frame: per port 14 bits
+// (stocks << 10 | percent, stocks 15 = nobody there), port 0 lowest. The game's panel shows exactly that.
+void window_report_score(uint64_t packed);
+bool window_viewer_score(uint64_t* packed);   // false: nothing in the last second
+bool window_moving();      // the small window is being dragged or sized with the mouse
+// The small window picked with the controller (Practice menu, Move and resize): its grip and style
+// menu show. Set here for this game's own window, or sent to the room's match window.
+bool window_selected();
+void window_set_selected(bool on);
+void window_send_selected(void* window, bool on);
+// The game picture's shape in this window (width / height, as the overlay draws it): the room's small
+// window goes into the black bar beside a 4:3 picture.
+void window_note_picture_aspect(float aspect);
+float window_picture_aspect();
+void* window_of_process(uint32_t pid);
 #ifndef _WIN32
 // Linux video/render thread: uses page visibility after X11 adoption, SDL otherwise.
 bool window_visible();

@@ -130,6 +130,39 @@ bool online_status_visible();
 // Dolphin and builds before 0.9.200 never send it, so it is false against them.
 bool opponent_auto_lcancel();
 
+// Warm-up room (slippi_warmup.h). Between matches with someone the player is connected to (Direct,
+// Teams), the connection can be parked while the player goes to Training: the link, its selections
+// and chat stay exactly as they are on the network thread, and the game sees no session at all
+// (session_mode() -1, is_online_match() false), so Training plays as offline Training does. Back on
+// the online character select the pair plays on. Simulation thread.
+struct WarmupPeer {
+  std::string name;
+  bool ready = false;      // locked in on their character select
+  int warmup = -1;         // 1 warming up too, 0 on the select, -1 their build does not say
+  int character = -1;      // their pick once locked in (Slippi's external id), -1 not known
+  int costume = 0;
+  int picked = -1;         // their pick on the select before locking in (our builds tell it), -1 not known
+};
+struct WarmupLink {
+  bool parked = false;
+  bool link_up = false;    // connected, with every opponent still there
+  int mode = -1;           // Matchmaking::OnlinePlayMode
+  int peers = 0;
+  WarmupPeer peer[3];
+};
+// Whether the player can warm up now; `why` says why not (shown under the button).
+bool warmup_possible(std::string* why = nullptr);
+bool warmup_park();        // true when the connection is now parked
+void warmup_unpark();      // the player is on the way back to the select
+bool warmup_parked();
+// The character this player has on the online character select (Slippi's external id), sent to an
+// opponent on our build when it changes, so their warm-up says what was picked before any lock-in.
+void warmup_note_pick(int character, int costume);
+WarmupLink warmup_link();  // also while not parked: the connected pair as it stands
+// session_mode(), or the parked session's mode while warming up: for settings that must not change
+// under the opponent's feet in the middle of a session (automatic L-cancel).
+int session_mode_or_parked();
+
 // Native practice uses the same Slippi matchmaking implementation as the game's online menus.
 // These calls are simulation-thread only. native_poll_match is deliberately side-effecting and
 // must be advanced no more than once per intended 60 Hz tick, just like CMD_GET_MATCH_STATE.
@@ -216,7 +249,9 @@ std::unique_ptr<Matchmaking> arena_matchmaking();
 bool arena_pop_from_match(std::vector<uint8_t>& out);
 // Locks in this character and colour with a random legal stage when a Direct pair is connected and
 // not locked in (the arena test harness only, where nobody presses Start). True if it did.
-bool arena_lock_in(uint8_t character, uint8_t color);
+// random_stage false: the character only, the stage left to the stage select (a rematch's loser
+// counterpicks there; the warm-up tests play it so).
+bool arena_lock_in(uint8_t character, uint8_t color, bool random_stage = true);
 // Counts arena pairings: the room bumps it each time it starts a search for a new opponent, and the
 // online character select gives the first game's stage pick to player 1, as a peer-to-peer session
 // does (a fresh pair has no previous winner). 0 outside a room.

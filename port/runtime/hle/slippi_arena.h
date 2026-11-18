@@ -59,6 +59,7 @@ struct View {
   bool watching_live = false;               // a viewer window is open on this game
   std::string status;                       // one plain line: what this member's game is doing
   std::string notice;                       // a short-lived line beside the room tab (a full room), else empty
+  uint16_t warming = 0;                     // who is warming up in Training (the warm-up room), a bit per member id
 };
 View view();
 // Tests only (MELEE_TEST_ARENA_FIXTURE=<state>[:long]): view() answers a made-up room so the panel can
@@ -81,6 +82,8 @@ bool search_busy();
 // The online character select's pick (the game shim, cmd 0xEE): Slippi's external character id, or
 // kNone while no character is picked, and the costume. Shown as this member's portrait in the room.
 void set_css_pick(uint8_t character, uint8_t costume);
+// That pick (Source Port: the select reports it), false when none is known.
+bool css_pick(uint8_t* character, uint8_t* costume);
 // The online character select's hand (the game shim, cmd 0xEF), in tenths of the screen's units
 // (x -350 at the left edge, 260 or 290 at the right), and when it last moved.
 void set_css_hand(int16_t x10, int16_t y10);
@@ -88,6 +91,45 @@ bool css_hand(float* x, float* y);   // false before the first report
 // Rooms for players (the tab, the panels, the room logic, the settings rows). MELEE_TEST_ARENA_ROOMS=0
 // (tests only) turns them off, for runs that compare a game with and without them.
 bool rooms_enabled();
+
+// ---- warm-up room (slippi_warmup.h), simulation thread ----
+// A member who is not about to fight may go to Training while the room goes on: the room's link is
+// its own connection and stays up. `why` says why not ("Your match is next").
+bool warmup_ok(std::string* why = nullptr);
+// The member went to warm up (true: Training, then anywhere offline) or is back on the character
+// select (false). The room's match window stays; where and how big follows the player (pip_tick).
+void set_warming(bool on);
+// The warm-up room's small window moved and sized with the controller (Practice menu, Move and resize):
+// on picks it (where it is now becomes RenderOptions::live_warmup_pip_cx/cy/cw, and it shows it is
+// picked), off puts it down. The arena's own thread applies it; any thread may call.
+void pip_adjust(bool on);
+bool pip_active();   // the two windows are laid out now (a small window is up)
+// The room's match while the player is not fighting: big on the select (PICTURE IN PICTURE makes it
+// small), as the setting says while away. The side bar's button toggles it (any thread); watch_layout
+// says how it shows now: 0 not laid out, 1 small, 2 big.
+void toggle_watch_layout();
+int watch_layout();
+// The Arena panel's right side bar card on the select: its bottom, a share of the window's height
+// (said each frame it is drawn). The small window sits under it there.
+void note_side_card_bottom(float share);
+// The room put this member in the ring and the ring is full: their game is next.
+bool turn_called();
+// The game the room is playing, for the warm-up room's strip. Score: the fighters' stocks and
+// percent, sent by the first fighter about twice a second (arena_feed kScore).
+struct LiveScore {
+  bool live = false;          // a score arrived for the game running now
+  uint32_t frame = 0;         // the game's frame (60 a second)
+  struct Fighter {
+    bool present = false; uint8_t character = 0xFF, costume = 0, stocks = 0; float percent = 0;
+    std::string name;         // the player's name as the game shows it (older senders: empty)
+  } fighter[4];
+};
+struct WarmupInfo {
+  std::string place;    // "Next up", "2 ahead of you", "Watching", "Your match is next"
+  std::string versus;   // "HERO vs WISE" while a game runs, else ""
+  LiveScore score;
+};
+WarmupInfo warmup_info();
 
 // ---- tests ----
 // The member's last few log-worthy events, for hidden runs (also in the log as "arena: ...").

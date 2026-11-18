@@ -287,6 +287,7 @@ inline std::array<std::string, 4> player_names_for_overlay() { return host::netp
 inline int ping_ms() { return host::netplay::ping_ms(); }
 inline std::vector<int> remote_pings_ms() { return {}; }
 inline int session_mode() { return host::netplay::session_mode(); }
+inline int session_mode_or_parked() { return host::netplay::session_mode(); }   // no warm-up room without Slippi
 inline bool in_online_menus() { return host::netplay::in_online_menus(); }
 inline bool online_status_visible() { return in_online_menus() && !is_online_match(); }
 }  // namespace online

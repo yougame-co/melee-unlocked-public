@@ -21,6 +21,17 @@ static_assert((int)MatchMode::Direct == 2, "Direct must match Slippi's online-mo
 
 int main() {
   std::string code, error;
+  // The warm-up's way back goes through the main menu from these (Source Port), straight from others.
+  CHECK(slippi::native_practice::is_match_mode_major(0x02));    // VS
+  CHECK(slippi::native_practice::is_match_mode_major(0x03));    // Classic
+  CHECK(slippi::native_practice::is_match_mode_major(0x1B));
+  CHECK(!slippi::native_practice::is_match_mode_major(0x1C));   // Training
+  CHECK(!slippi::native_practice::is_match_mode_major(0x2B));   // events
+  CHECK(!slippi::native_practice::is_match_mode_major(0x01));   // the main menu
+  CHECK(!slippi::native_practice::is_match_mode_major(0x08));   // online
+  CHECK(slippi::native_practice::is_offline_gameplay_scene(0x02, 2));
+  CHECK(slippi::native_practice::is_offline_gameplay_scene(0x1C, 2));
+  CHECK(!slippi::native_practice::is_offline_gameplay_scene(0x02, 0));
   CHECK(slippi::native_practice::normalize_direct_code(" abcd # 123 ", &code, &error));
   CHECK(code == "ABCD#123");
   CHECK(slippi::native_practice::normalize_direct_code("ABCDEFGH#123456789", &code, &error));

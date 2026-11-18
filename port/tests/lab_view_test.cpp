@@ -27,6 +27,7 @@
 #include <vector>
 
 namespace host {
+float window_picture_aspect() { return 73.0f / 60.0f; }   // the HUD lays out on the game picture's shape
 Options options;
 uint8_t* ram = nullptr;   // the stage collision test points this at a fake 24 MB guest RAM
 void log(const char* fmt, ...) { va_list a; va_start(a, fmt); std::vfprintf(stderr, fmt, a); va_end(a); std::fputc('\n', stderr); }

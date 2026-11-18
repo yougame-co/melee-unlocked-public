@@ -359,6 +359,11 @@ static void stop_early_inputs() {
 }
 static int g_match_delay = 0;
 bool g_in_online_match = false;
+// Warm-up room (warmup_park): the pair stays connected while the player is in Training.
+bool g_warmup_parked = false;
+uint16_t g_warmup_pick = 0xFF00;           // this player's pick on the select: character << 8 | costume
+uint16_t g_warmup_pick_sent = 0xFFFF;      // what the opponents last got
+const void* g_warmup_pick_link = nullptr;  // on which connection
 GameFacts g_game_facts;   // the negotiated stage and characters, and the last online frame (YouGame's ranked report)
 // Session trace (net_trace.h): one record per online tick for the "Network and timing" overlay.
 // A record stays open until the next tick asks for inputs, because its work time, its rollbacks
@@ -562,7 +567,9 @@ void cleanup_connection(yougame::Leave why = yougame::Leave::Lost) {
     ++g_friends_lobby.note_seq;
     g_friends_lobby.note = g_forced_error;   // why, when it was said before this cleanup (else below)
   }
-  host::log("slippi: connection cleanup");
+  host::log("slippi: connection cleanup%s", g_warmup_parked ? " (the player left the warm-up)" : "");
+  g_warmup_parked = false;
+  g_warmup_pick_sent = 0xFFFF;   // a new opponent gets the pick afresh
   if (g_user) g_user->ResetOnlineCompatibility();
   host::cosmetics::thaw_after_online_session();
   stop_early_inputs();
@@ -2409,9 +2416,98 @@ bool opponent_auto_lcancel() {
 }
 
 int session_mode() {
+  if (g_warmup_parked) return -1;   // warming up in Training: offline, as far as the game is concerned
   const bool session = g_in_online_match || g_play_session_active || (g_matchmaking && g_matchmaking->IsSearching());
   if (!session) return host::netplay::session_mode();   // a peer-to-peer session, or -1
   return (int)g_last_search.mode;
+}
+int session_mode_or_parked() { return g_warmup_parked ? (int)g_last_search.mode : session_mode(); }
+
+// ---------------------------------------------------------------- warm-up room
+static bool warmup_link_complete() {
+  if (!g_netplay || !g_matchmaking) return false;
+  if (g_matchmaking->GetMatchmakeState() != Matchmaking::CONNECTION_SUCCESS) return false;
+  if (g_netplay->GetSlippiConnectStatus() != NetplayClient::ConnectStatus::CONNECTED) return false;
+  return g_netplay->GetActivePlayerIndices().size() == bounded_remote_port_count();
+}
+
+bool warmup_possible(std::string* why) {
+  const auto no = [&](const char* reason) { if (why) *why = reason; return false; };
+  if (g_warmup_parked) return no("Already warming up");
+  if (!g_user || !g_matchmaking || !g_netplay) return no("Not connected");
+  if (g_last_search.mode != Matchmaking::DIRECT && g_last_search.mode != Matchmaking::TEAMS)
+    return no("Direct and Teams only");
+  if (yougame::session()) return no("Not between games of a set");
+  if (!warmup_link_complete()) return no("Not connected");
+  if (!in_online_menus()) return no("From the character select");
+  // A lock-in is final on the wire (Slippi's selections only ever add one), so a player who has
+  // locked in stays: the opponent would otherwise start a match against a player in Training.
+  if (g_local_selections.is_character_selected) return no("Locked in");
+  return true;
+}
+
+bool warmup_park() {
+  std::string why;
+  if (!warmup_possible(&why)) {
+    host::log("slippi: warm-up refused: %s", why.c_str());
+    return false;
+  }
+  stop_early_inputs();
+  // The flag stays set on the character select after a game until the pair is cleaned up; Training
+  // must not look like a match running.
+  g_in_online_match = false;
+  g_warmup_parked = true;
+  g_netplay->SendWarmup(true, (uint8_t)(g_warmup_pick >> 8), (uint8_t)g_warmup_pick);
+  host::log("slippi: warm-up: the %s connection stays up while the player is in Training",
+            g_last_search.mode == Matchmaking::TEAMS ? "Teams" : "Direct");
+  return true;
+}
+
+void warmup_unpark() {
+  if (!g_warmup_parked) return;
+  g_warmup_parked = false;
+  if (g_netplay) g_netplay->SendWarmup(false, (uint8_t)(g_warmup_pick >> 8), (uint8_t)g_warmup_pick);
+  host::log("slippi: warm-up over: back to the character select%s",
+            warmup_link_complete() ? "" : " (the connection was lost meanwhile)");
+}
+
+bool warmup_parked() { return g_warmup_parked; }
+
+void warmup_note_pick(int character, int costume) {
+  g_warmup_pick = character >= 0 && character < 26 ? (uint16_t)(character << 8 | (costume & 0xFF)) : (uint16_t)0xFF00;
+  if (!g_netplay || g_warmup_parked || !warmup_link_complete()) return;
+  if (g_warmup_pick_link != g_netplay.get()) { g_warmup_pick_link = g_netplay.get(); g_warmup_pick_sent = 0xFFFF; }
+  if (g_warmup_pick == g_warmup_pick_sent) return;
+  g_warmup_pick_sent = g_warmup_pick;
+  g_netplay->SendWarmup(false, (uint8_t)(g_warmup_pick >> 8), (uint8_t)g_warmup_pick);
+}
+
+WarmupLink warmup_link() {
+  WarmupLink out;
+  out.parked = g_warmup_parked;
+  if (!g_netplay || !g_matchmaking) return out;
+  out.mode = (int)g_last_search.mode;
+  out.link_up = warmup_link_complete();
+  const int n = std::min<int>(bounded_remote_port_count(), REMOTE_PLAYER_MAX);
+  out.peers = n;
+  const MatchInfo mi = g_netplay->GetMatchInfo();
+  // Remote i is the i-th port other than this player's, in port order (PlayerIdxFromPort).
+  int remote = 0;
+  for (int port = 0; port < 4 && remote < n; ++port) {
+    if (port == (int)g_local_player_index) continue;
+    WarmupPeer& p = out.peer[remote];
+    p.name = g_matchmaking->GetPlayerName((uint8_t)port);
+    p.ready = mi.remote[remote].is_character_selected;
+    if (p.ready && mi.remote[remote].character_id < 26) {
+      p.character = mi.remote[remote].character_id;
+      p.costume = mi.remote[remote].character_color;
+    }
+    p.warmup = g_netplay->RemoteWarmup(remote);
+    const int pick = g_netplay->RemotePick(remote);
+    if (pick >= 0) p.picked = pick >> 8;
+    ++remote;
+  }
+  return out;
 }
 uint32_t remote_shield_color(int slot) { return g_netplay ? g_netplay->RemoteShieldColor(slot) : 0u; }
 int local_player_index() { return p2p_session_up() ? host::netplay::local_player_slot() : (int)g_local_player_index; }
@@ -2427,8 +2523,8 @@ bool in_online_menus() {
 bool native_start_match(int mode, const std::string& connect_code, uint8_t character,
                         uint8_t color, std::string* error, const std::string& friend_room) {
   if (!g_user) init();
-  if (session_mode() >= 0) {
-    if (error) *error = "An online session is already active";
+  if (session_mode() >= 0 || g_warmup_parked) {
+    if (error) *error = g_warmup_parked ? "Warming up: go back to your match first" : "An online session is already active";
     return false;
   }
   if (const char* reason = local_matchmaking_error(mode)) {
@@ -2579,8 +2675,8 @@ bool arena_start_search(int mode, const std::string& code, bool locked, uint8_t 
                         uint8_t team, std::string* error) {
   if (mode != Matchmaking::DIRECT && mode != Matchmaking::TEAMS) return false;
   if (!g_user) init();
-  if (session_mode() >= 0) {
-    if (error) *error = "An online session is already active";
+  if (session_mode() >= 0 || g_warmup_parked) {
+    if (error) *error = g_warmup_parked ? "Warming up: go back to your match first" : "An online session is already active";
     return false;
   }
   if (const char* reason = local_matchmaking_error(mode)) {
@@ -2624,11 +2720,12 @@ std::unique_ptr<Matchmaking> arena_matchmaking() {
 
 bool arena_pop_from_match(std::vector<uint8_t>& out) { return g_netplay && g_netplay->PopArena(out); }
 
-bool arena_lock_in(uint8_t character, uint8_t color) {
+bool arena_lock_in(uint8_t character, uint8_t color, bool random_stage) {
   if (!g_user || !g_matchmaking || !g_netplay) return false;
   if (g_last_search.mode != Matchmaking::DIRECT && g_last_search.mode != Matchmaking::TEAMS) return false;
   if (g_matchmaking->GetMatchmakeState() != Matchmaking::CONNECTION_SUCCESS || g_local_selections.is_character_selected) return false;
-  uint8_t selections[9] = {g_local_selections.team_id, character, color, 1, 0, 0, 3, (uint8_t)g_last_search.mode, 0};   // a random legal stage
+  uint8_t selections[9] = {g_local_selections.team_id, character, color, 1, 0, 0, (uint8_t)(random_stage ? 3 : 0),
+                           (uint8_t)g_last_search.mode, 0};   // a random legal stage, or none yet
   set_match_selections(selections);
   return true;
 }

@@ -77,6 +77,9 @@ bool matchmaking_tab_available(Phase phase, bool playback, bool online_match, bo
 // Matches the runtime's established scene classification for offline gameplay. CSS, stage select,
 // results/menu shells, Slippi online, and replay playback are gated separately.
 bool is_offline_gameplay_scene(uint8_t major, uint8_t minor);
+// A major scene of a match mode other than Training and events (VS and its kinds, Classic, Adventure,
+// All-Star, the multi-man and Home-Run modes...): any of its minors (its selects, its match, results).
+bool is_match_mode_major(uint8_t major);
 // Direct normally initializes these fields when Start is pressed on its CSS. Native matchmaking
 // bypasses that input path and must perform the initialization before the first CSS handoff.
 bool mode_needs_direct_first_match_reset(uint8_t online_mode);

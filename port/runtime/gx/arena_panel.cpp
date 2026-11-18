@@ -13,6 +13,7 @@
 #include "test_env.h"
 #include "slippi_arena.h"
 #include "slippi_online.h"
+#include "native_practice.h"
 #include "yougame_link.h"
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -94,7 +95,11 @@ struct State {
 } g;
 
 // What a lit-up button does.
-enum class Do : uint8_t { None, Rules, AddCode, Spot, Ask, Doubles, Opt0, Opt1, Opt2, Member, Leave };
+enum class Do : uint8_t { None, Rules, AddCode, Spot, Ask, Doubles, Opt0, Opt1, Opt2, Member, Leave, Warmup, Pip };
+// The room's match window's size button (watching): its label says what A on it does.
+constexpr const char* kPipSmall = "Picture in picture";
+constexpr const char* kPipBig = "Full size";
+bool warmup_row_shown();   // the warm-up room's row at the foot of a room's left bar
 struct Item { int side; float y0, y1; Do what; uint8_t member; };
 std::vector<Item> g_items, g_last_items;   // this frame's buttons, and last frame's (to move the hand over)
 float g_mid = 0;                            // the window's middle: left panel or right panel
@@ -111,7 +116,8 @@ Do do_of(char chip, const std::string& label) {
     case 'X': return Do::Spot;
     case 'R': return Do::Doubles;
     case 'B': return Do::Leave;
-    case 'A': return label.rfind("Ask", 0) == 0 ? Do::Ask : Do::None;
+    case 'A': return label.rfind("Ask", 0) == 0 ? Do::Ask : label == kPipSmall || label == kPipBig ? Do::Pip : Do::None;
+    case 'L': return Do::Warmup;   // "+ R  Warm up": L and R held, or A on the row
     default: return Do::None;
   }
 }
@@ -384,20 +390,66 @@ void tag_grey(float x, float y, const char* l) { tag(x, y, l, IM_COL32(201, 208,
 void tag_red(float x, float y, const char* l) { tag(x, y, l, IM_COL32(255, 128, 136, 255), IM_COL32(184, 31, 40, 255), kWhite); }
 
 // The sheet's .gc button chips: X and Y grey kidney, A green disc, Z purple square, B red disc.
+// The L and R triggers: a mirrored pair of shoulder buttons, the outer top corner round and the rest
+// eased, a light band along the top and a dark edge under it (as the warm-up panel draws them);
+// 21 wide, 16 high (the other chips are 16 square). Returns the width.
+void corners(float x0, float y0, float x1, float y1, float tl, float tr, float br, float bl) {
+  dl()->PathArcTo(ImVec2(x0 + tl, y0 + tl), tl, IM_PI, IM_PI * 1.5f, 8);
+  dl()->PathArcTo(ImVec2(x1 - tr, y0 + tr), tr, IM_PI * 1.5f, IM_PI * 2.0f, 8);
+  dl()->PathArcTo(ImVec2(x1 - br, y1 - br), br, 0.0f, IM_PI * 0.5f, 8);
+  dl()->PathArcTo(ImVec2(x0 + bl, y1 - bl), bl, IM_PI * 0.5f, IM_PI, 8);
+}
+void glyph_center(const Ink& k, float cx, float cy, char c) {
+  ImFont* f = font_of(k.face);
+  const float size = size_of(k.face, k.css);
+  ImFontBaked* baked = f ? f->GetFontBaked(size) : nullptr;
+  const ImFontGlyph* g = baked ? baked->FindGlyphNoFallback((ImWchar)(unsigned char)c) : nullptr;
+  const char one[2] = {c, 0};
+  if (!g) { text_center(k, cx, cy - size * .5f, one); return; }
+  dl()->AddText(f, size, ImVec2(std::round(cx - (g->X0 + g->X1) * .5f), std::round(cy - (g->Y0 + g->Y1) * .5f)), k.col, one);
+}
+float trigger_chip(float x, float y, char b, float alpha = 1.0f) {
+  auto fade = [&](ImU32 col) { return (col & ~IM_COL32_A_MASK) | ((ImU32)(((col >> IM_COL32_A_SHIFT) & 0xFF) * alpha) << IM_COL32_A_SHIFT); };
+  const float w = px(21), h = px(16), big = h * .6f, ease = px(2.8f), band = h * .42f, in = px(1.5f);
+  const float tl = b == 'L' ? big : ease, tr = b == 'L' ? ease : big;
+  corners(x, y + px(1.5f), x + w, y + h + px(1.5f), tl, tr, ease, ease);
+  dl()->PathFillConvex(fade(IM_COL32(40, 42, 52, 255)));
+  corners(x, y, x + w, y + h, tl, tr, ease, ease);
+  dl()->PathFillConvex(fade(IM_COL32(178, 182, 196, 255)));
+  corners(x + in, y + in, x + w - in, y + band, std::min(std::max(0.0f, tl - in), band - in), std::min(std::max(0.0f, tr - in), band - in), 0, 0);
+  dl()->PathFillConvex(fade(IM_COL32(224, 228, 238, 255)));
+  const Ink k{Face::Bold, 10, fade(IM_COL32(28, 30, 38, 255))};
+  glyph_center(k, x + w * .5f, y + h * .5f, b);
+  return w;
+}
+float lr_chips_width() {
+  const Ink pk{Face::Bold, 11, kHintText};
+  return px(21) * 2 + px(6) + text_w(pk, "+");
+}
+// L + R together (the warm-up's hold). Returns the width.
+float lr_chips(float x, float y, float alpha = 1.0f) {
+  float at = x + trigger_chip(x, y, 'L', alpha) + px(3);
+  const Ink pk{Face::Bold, 11, (kHintText & ~IM_COL32_A_MASK) | ((ImU32)(255 * alpha) << IM_COL32_A_SHIFT)};
+  text(pk, at, line_top(pk, y, 16), "+");
+  at += text_w(pk, "+") + px(3);
+  at += trigger_chip(at, y, 'R', alpha);
+  return at - x;
+}
+
 void button_chip(float x, float y, char b, float alpha = 1.0f) {
+  if (b == 'L' || b == 'R') { trigger_chip(x, y, b, alpha); return; }
   const float s = px(16);
   ImU32 c = IM_COL32(174, 180, 191, 255), ink = IM_COL32(21, 24, 31, 255);
   float r = px(8);
   if (b == 'A') { c = IM_COL32(23, 178, 107, 255); ink = kWhite; }
   if (b == 'B') { c = IM_COL32(220, 60, 60, 255); ink = kWhite; }
   if (b == 'Z') { c = IM_COL32(123, 82, 214, 255); ink = kWhite; r = px(4); }
-  if (b == 'R' || b == 'S') { c = IM_COL32(110, 118, 134, 255); ink = kWhite; r = px(4); }
+  if (b == 'S') { c = IM_COL32(110, 118, 134, 255); ink = kWhite; r = px(4); }
   auto fade = [&](ImU32 col) { return (col & ~IM_COL32_A_MASK) | ((ImU32)(((col >> IM_COL32_A_SHIFT) & 0xFF) * alpha) << IM_COL32_A_SHIFT); };
   dl()->AddRectFilled(ImVec2(x, y + px(1)), ImVec2(x + s, y + s + px(1)), fade(kBlack), r);
   dl()->AddRectFilled(ImVec2(x, y), ImVec2(x + s, y + s), fade(c), r);
   const Ink k{Face::Bold, 10, fade(ink)};
-  const std::string one(1, b == 'S' ? 'S' : b);
-  text_center(k, x + s * .5f, line_top(k, y, 16), one);
+  glyph_center(k, x + s * .5f, y + s * .5f, b);
 }
 // One row of the sheet's .hints: chip, 6px, 11.5px text.
 void hint(float x, float y, char b, const std::string& label, float w, float alpha = 1.0f, bool live = true) {
@@ -410,11 +462,14 @@ void hint(float x, float y, char b, const std::string& label, float w, float alp
     shade_x(start, x - px(4), x + w + px(2), kGold, IM_COL32(233, 168, 26, 255));
     dl()->AddRect(ImVec2(x - px(4), y - px(3)), ImVec2(x + w + px(2), y + px(19)), IM_COL32(255, 243, 194, 255), px(4), 0, px(1));
   }
-  button_chip(x, y, b, alpha);
+  // 'L' stands for L + R held together (the warm-up): both triggers, then the label.
+  float label_x = px(22);
+  if (b == 'L') label_x = lr_chips(x, y, alpha) + px(6);
+  else button_chip(x, y, b, alpha);
   const ImU32 col = lit ? kInk : (kHintText & ~IM_COL32_A_MASK) | ((ImU32)(255 * alpha) << IM_COL32_A_SHIFT);
   Ink k{lit ? Face::Bold : Face::Body, 11.5f, col};
-  const std::string shown = fit_name(k, label, w - px(22));   // smaller before it is shortened ("Add a friend's co.")
-  text(k, x + px(22), line_top(k, y, 16), shown);
+  const std::string shown = fit_name(k, label, w - label_x);   // smaller before it is shortened ("Add a friend's co.")
+  text(k, x + label_x, line_top(k, y, 16), shown);
 }
 // Hint rows stacked up from `bottom` (gap 5px), returning the top of the first.
 float hints_up(float x, float w, float bottom, const std::vector<std::pair<char, std::string>>& items, float alpha = 1.0f) {
@@ -467,6 +522,8 @@ void slot_card(float x, float y, float w, const View& v, const Member& m, bool y
     text(ak, right - tw, line_top(ak, y, kSlotH), "asks");
     right -= tw + px(4);
   }
+  // In Training for the warm-up room (hle/slippi_warmup.h): a small "training" under the name's line.
+  const bool warming = m.id < 16 && ((v.warming >> m.id) & 1);
   host_badge(x + px(6) + is * .5f, y + px(6) + is, v, &m);
   if (lit) {   // the hand on a player: their ping
     const std::string p = ping_text(v, m.id);
@@ -480,7 +537,13 @@ void slot_card(float x, float y, float w, const View& v, const Member& m, bool y
   Ink nk{Face::Bold, 14, kWhite, false, 1, true, .3f};
   const float nx = x + px(6) + is + px(7);
   const std::string shown = fit_name(nk, m.name, right - nx);
-  text(nk, nx, line_top(nk, y, icon_css + 12), shown);
+  if (warming) {   // the name a little higher, "TRAINING" in small gold capitals under it
+    text(nk, nx, line_top(nk, y - px(6), icon_css + 12), shown);
+    const Ink wk{Face::Body, 9, kGold, false, 0, false, 1.2f};
+    text(wk, nx, line_top(wk, y + px(10), icon_css + 12), "TRAINING");
+  } else {
+    text(nk, nx, line_top(nk, y, icon_css + 12), shown);
+  }
 }
 // Members of a list that did not fit: "+3 more in line".
 int line_after(const Room& r, uint8_t id) {
@@ -821,6 +884,15 @@ void press(Do what, const View& v) {
       break;
     }
     case Do::Leave: leave_panel(); break;
+    case Do::Pip:
+      host::log("arena panel: %s pressed", ar::watch_layout() == 2 ? kPipSmall : kPipBig);
+      ar::toggle_watch_layout();
+      break;
+    case Do::Warmup:
+      host::log("arena panel: WARM UP pressed");
+      slippi::native_practice::submit_warmup();
+      leave_panel();
+      break;
     default: break;
   }
 }
@@ -999,6 +1071,17 @@ float corner(float x0, float x1, float y0, bool red, const View& v, int side, bo
     host_badge(cx - gap * .5f - is * .5f, y + is, v, m[0]);
     host_badge(cx + gap * .5f + is * .5f, y + is, v, m[1]);
   }
+  // A fighter still in Training (the warm-up room) on the way back: a small gold TRAINING over the
+  // foot of the portrait.
+  for (int k = 0; k < fighters; ++k) {
+    if (!m[k] || m[k]->id >= 16 || !((v.warming >> m[k]->id) & 1)) continue;
+    const Ink wk{Face::Bold, 9, kInk};
+    const float tw = text_w(wk, "TRAINING") + px(8), th = px(14);
+    const float icx = fighters == 1 ? cx : (k == 0 ? cx - px(3) - is * .5f : cx + px(3) + is * .5f);
+    const float ty = y + is - th - px(4);
+    dl()->AddRectFilled(ImVec2(icx - tw * .5f, ty), ImVec2(icx + tw * .5f, ty + th), kGold, px(3));
+    text_center(wk, icx, line_top(wk, ty, 14), "TRAINING");
+  }
   y += is + px(8);
   const Ink big{Face::Black, 15, kWhite, false, 1};
   for (int k = 0; k < fighters; ++k) {
@@ -1114,6 +1197,8 @@ void draw_combined(const Bars& b, const View& v, bool corners_look) {
   // The combined look (the default): corners on top, the line and the stands as cards under them.
   const float ly = corner(b.lx0, b.lx1, b.y0, true, v, 0);
   const float ry = corner(b.rx0, b.rx1, b.y0, false, v, 1);
+  // The room's match window in its small size sits under this card (slippi_arena pip_rect).
+  if (ImGui::GetIO().DisplaySize.y > 0) ar::note_side_card_bottom(ry / ImGui::GetIO().DisplaySize.y);
   // Left under: NEXT UP and the line, with an open spot after it.
   float y = ly + px(10);
   tag_gold(b.lx0 + pad, y, "NEXT UP");
@@ -1142,9 +1227,11 @@ void draw_combined(const Bars& b, const View& v, bool corners_look) {
   const int prompt = prompt_kind(v);
   const int my_slot = ar::ring_slot(r, v.self);
   const bool prompt_left = my_slot != 1 || r.doubles;   // the blue corner's player answers on the right
-  float lfoot = legend(b.lx0 + pad, lw - pad * 2, bottom,
-                       prompt && prompt_left && g.focus ? std::vector<std::pair<char, std::string>>{{'A', "Choose"}}
-                                                        : std::vector<std::pair<char, std::string>>{{'Y', "Rules"}, {'Z', "Add a friend's code"}});
+  std::vector<std::pair<char, std::string>> left_items =
+      prompt && prompt_left && g.focus ? std::vector<std::pair<char, std::string>>{{'A', "Choose"}}
+                                       : std::vector<std::pair<char, std::string>>{{'Y', "Rules"}, {'Z', "Add a friend's code"}};
+  if (warmup_row_shown()) left_items.insert(left_items.begin(), {'L', "Warm up"});
+  float lfoot = legend(b.lx0 + pad, lw - pad * 2, bottom, left_items);
   lfoot = z_line(b.lx0 + pad, lw - pad * 2, lfoot);
   if (prompt && prompt_left) {
     std::vector<std::string> l, o;
@@ -1160,6 +1247,8 @@ void draw_combined(const Bars& b, const View& v, bool corners_look) {
   // Right foot: the mode in gold capitals, then this member's X action (and A to ask when free).
   std::vector<std::pair<char, std::string>> right = {x_action(v)};
   const Role role = ar::role(r, v.self);
+  // Watching with the room's match window up: A on this makes it small (picture in picture) or full size.
+  if (role != Role::Fighter && ar::watch_layout() != 0) right.insert(right.begin(), {'A', ar::watch_layout() == 2 ? kPipSmall : kPipBig});
   if (g.side == 2 && role != Role::Fighter && r.asker == ar::kNone) right.push_back({'A', "Ask to play next"});
   if (g.side == 2 && r.members.size() >= 4 && !r.switch_pending) right.push_back({'R', r.doubles ? "Back to singles" : "Doubles"});
   if (g.side == 2) right.push_back({'B', "Close"});
@@ -1368,12 +1457,70 @@ bool test_open_card() {
   return on;
 }
 
+// ---------------------------------------------------------------- the warm-up room's button
+// (hle/slippi_warmup.h): Training while staying connected (Direct, Teams) or while waiting for a
+// turn in a room. Out of a room a card in the left bar, beside the Arena card on the right; in a
+// room a row at the foot of the left bar. L and R held do the same (native_practice.cpp).
+slippi::native_practice::Snapshot::Warmup g_warmup_view;
+bool warmup_row_shown() { return gx::RenderOptions::live_warmup_button() && g_warmup_view.offered && g_warmup_view.enabled; }
+
+void draw_warmup_card(const Bars& b) {
+  const auto& w = g_warmup_view;
+  if (!gx::RenderOptions::live_warmup_button() || !w.offered) return;
+  const bool open = g.side == 1;
+  const float tw = b.lx1 - b.lx0 - px(16), th = px(58);
+  float x = b.lx0 + px(8);
+  const float y = b.y0 + (b.y1 - b.y0) * .42f;
+  // Widescreen: beside the hand's reach at the 4:3 select's left edge (as the Arena card on the right).
+  const float pic_w = b.px1 - b.px0, pic_h = b.y1 - b.y0;
+  if (pic_h > 1.0f && pic_w / pic_h > 1.40f) {
+    const float unit = pic_h / 57.3f;
+    const float reach = (b.px0 + b.px1) * .5f + (kLeftEdge - 5.0f) * unit - px(10) - tw;
+    x = std::max(x, reach);
+  }
+  steel(x, y, x + tw, y + th, open && w.enabled ? kGold : IM_COL32(154, 166, 192, w.enabled ? 200 : 110));
+  if (w.enabled) hot(x, y, y + th, Do::Warmup);
+  // Two lines centred across the box, one face (as the room's cards): its name, and under it the way in
+  // (A while the hand is on it, else L and R held). The same 11 above the name as below the buttons.
+  const float cx = x + tw * .5f;
+  const Ink name{Face::Bold, 15, w.enabled ? kWhite : kDimText};
+  text_center(name, cx, line_top(name, y + px(11), 18), "WARM UP");
+  const float ry = y + th - px(11) - px(16);   // the button row, 16 tall
+  if (!w.enabled) {
+    Ink how{Face::Body, 10.5f, IM_COL32(200, 208, 224, 255)};
+    const std::string why = fit_name(how, w.why.empty() ? std::string("Not now") : w.why, tw - px(20));
+    text_center(how, cx, line_top(how, ry, 16), why);
+  } else {
+    const Ink hk{Face::Body, 11.5f, IM_COL32(214, 220, 234, 255)};
+    const std::string label = open ? "Go now" : "Hold";
+    const float chips = open ? px(16) : lr_chips_width(), gap = px(7);
+    float at = cx - (chips + gap + text_w(hk, label)) * .5f;
+    if (open) button_chip(at, ry, 'A');
+    else lr_chips(at, ry);
+    text(hk, at + chips + gap, line_top(hk, ry, 16), label);
+  }
+  if (w.hold > 0.0f) {   // L+R held: the card fills toward going
+    const float x1 = x + px(4) + (tw - px(8)) * std::clamp(w.hold, 0.0f, 1.0f);
+    dl()->AddRectFilled(ImVec2(x + px(4), y + th - px(6)), ImVec2(x1, y + th - px(3)), kGold, px(2));
+  }
+  // Who on the other side is warming up, centred under the box.
+  std::string other;
+  for (int i = 0; i < w.peers && i < 3; ++i)
+    if (w.peer[i].state == 2) { other = w.peer[i].name + " is warming up"; break; }
+  if (!other.empty()) {
+    const Ink ok{Face::Bold, 10.5f, IM_COL32(255, 228, 128, 255)};
+    const std::vector<std::string> lines = wrap(ok, other, tw);
+    float ly = y + th + px(8);
+    for (const std::string& l : lines) { text_center(ok, cx, line_top(ok, ly, 15), l); ly += px(15); }
+  }
+}
+
 void draw_not_in_room(const Bars& b, const View& v) {
   // Not in a room: the Arena card in the right bar. Pushing the hand into the right edge beside it
   // lights it up; A (or Z) then adds a friend's code, which starts a room.
   if (g.page != Page::None) return;
   const bool open = g.side == 2;
-  const float tw = b.rx1 - b.rx0 - px(16), th = px(86);
+  const float tw = b.rx1 - b.rx0 - px(16), th = px(58);   // the WARM UP box's twin across the select
   float x = b.rx1 - tw - px(8);
   const float y = b.y0 + (b.y1 - b.y0) * .42f;
   // A picture wider than 4:3 (widescreen): the hand stops at the 4:3 select's own edge, far short of
@@ -1395,18 +1542,21 @@ void draw_not_in_room(const Bars& b, const View& v) {
   }
   steel(x, y, x + tw, y + th, open ? kGold : IM_COL32(154, 166, 192, 200));
   hot(x, y, y + th, Do::AddCode);   // so the hand lands on it
-  const Ink sm{Face::Body, 10, kGold, false, 0, false, 1.5f};
-  Ink md{Face::Title, 13, kWhite, true, 2};
-  text(sm, x + px(8), y + px(8), "ARENA");
-  // The sheet's title is wider than this box: set smaller to fit (the italic leans right by 0.16 h).
-  const std::string title = fit_name(md, "PLAY WITH FRIENDS", tw - px(16) - size_of(md.face, 13) * .16f);
-  text(md, x + px(8), y + px(20), title);
+  // As the WARM UP box: its name centred, under it the way in, one face, the same inset top and bottom.
+  const float cx = x + tw * .5f;
+  const Ink name{Face::Bold, 15, kWhite};
+  text_center(name, cx, line_top(name, y + px(11), 18), "ARENA");
+  const float ry = y + th - px(11) - px(16);
   if (open) {
-    hint(x + px(10), y + th - px(26), 'Z', "Add a friend's code", tw - px(16));
+    Ink hk{Face::Body, 11.5f, IM_COL32(214, 220, 234, 255)};
+    const std::string label = fit_name(hk, "Add a friend's code", tw - px(16) - px(7) - px(16));
+    float at = cx - (px(16) + px(7) + text_w(hk, label)) * .5f;
+    button_chip(at, ry, 'Z');
+    text(hk, at + px(16) + px(7), line_top(hk, ry, 16), label);
   } else {
-    Ink how{Face::Body, 9.5f, IM_COL32(200, 208, 224, 255)};
-    const std::string line = fit_name(how, "Push the hand here", tw - px(16));
-    text(how, x + px(8), y + th - px(24), line);
+    Ink how{Face::Body, 11, IM_COL32(200, 208, 224, 255)};
+    const std::string push = fit_name(how, "Push the hand here", tw - px(20));
+    text_center(how, cx, line_top(how, ry, 16), push);
   }
 }
 
@@ -1497,6 +1647,7 @@ void frame(const Frame& f) {
     }
   }
   const View v = ar::view();
+  g_warmup_view = slippi::native_practice::snapshot().warmup;
   const bool visible = f.on_online_menus && !(v.active && v.room.in_game && ar::role(v.room, v.self) == Role::Fighter);
   if (!visible) {
     g.was_visible = false;
@@ -1574,6 +1725,7 @@ void frame(const Frame& f) {
   }
   if (!v.active) {
     if (g.button != 2 && (shown[1] > 0.f || g.page != Page::None)) draw_not_in_room(b, v);
+    if (g.page == Page::None) draw_warmup_card(b);
   } else if (!folded || shown[0] > 0.f || shown[1] > 0.f) {
     switch (g.look) {
       case Look::Combined: draw_combined(b, v, false); break;

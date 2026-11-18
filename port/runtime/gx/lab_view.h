@@ -36,7 +36,8 @@ void native_frame(const MuLookSnapshot& snapshot, const MuLookItems* items = nul
 void draw(bool enabled, float width, float height);
 
 // Looks drawn by this view (PC settings > Low poly and lightweight). Fighters: 0 silhouettes (the
-// default), 1 stick figures, 2 capsules, both from the fighters' hurtbox capsules (read each frame).
+// default), 1 stick figures, 2 capsules, 3 blobs (the body under the stick figure, no lines), all from the
+// fighters' hurtbox capsules (read each frame).
 // Stage: 0 as before, 1 outline (the live collision lines only), 2 blocks (floors and platforms
 // filled into solid shapes), 3 hidden (fighters, items and the HUD on the background). Display only.
 void set_style(int fighters, int stage);

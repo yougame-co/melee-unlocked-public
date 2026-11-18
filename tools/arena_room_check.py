@@ -184,14 +184,18 @@ def main():
         script.write_text(bot_script(i, hand=i == args.hand_test))
         settings = d / "settings.ini"
         shots = bool(args.capture & (1 << i)) or i == args.hand_test   # the panel lives in the overlay
-        settings.write_text("startup 0\nvolume 0\nslippi_spectator 0\n" + ("backend d3d11\n" if shots else ""))
+        # ARENA_SETTINGS_EXTRA: more settings lines for every member, "|" between them (tests).
+        extra_settings = "".join(x + "\n" for x in os.environ.get("ARENA_SETTINGS_EXTRA", "").split("|") if x.strip())
+        settings.write_text("startup 0\nvolume 0\nslippi_spectator 0\n" + ("backend d3d11\n" if shots else "") + extra_settings)
         cmd = [str(exe), "--iso", str(iso), "--hidden", "--volume", "0", "--frames", str(args.frames),
                "--script", str(script), "--replay-dir", str(d), "--log-file", str(d / "port.log"),
                "--user-dir", str(user), "--settings-path", str(settings), "--load-settings", "--time-base", "1",
                "--arena-test", f"{i}/{args.players}/{base}"] + args.extra
         if shots:
             (d / "shots").mkdir(exist_ok=True)
-            cmd += ["--pc-settings", "--window", "1280x720", "--capture", str(d / "shots" / "shot.ppm"), "--capture-every", "120"]
+            # ARENA_SHOT_SIZE: the picture-taking members' window (default 1280x720), e.g. 1920x1080 for full HD pictures.
+            size = os.environ.get("ARENA_SHOT_SIZE", "1280x720")
+            cmd += ["--pc-settings", "--window", size, "--capture", str(d / "shots" / "shot.ppm"), "--capture-every", "120"]
         log = open(d / "log.txt", "w")
         p = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
         procs.append((p, log))

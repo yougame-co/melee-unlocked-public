@@ -296,6 +296,9 @@ std::string costume_slot_file(int css_character, int costume);
 // MnSlChr.usd, as RGBA rows from the top. Sheik shows Zelda's portrait (they share a cell). False
 // when the disc has no such picture. Any thread; the file is read once.
 bool standard_portrait(int css_character, int costume, std::vector<uint8_t>* rgba, int* width, int* height);
+// The game's own stock icon of that fighter number and costume (the disc's HUD file), as RGBA rows from
+// the top; false when the disc has none. Any thread; the file is read once.
+bool standard_stock_icon(int css_character, int costume, std::vector<uint8_t>* rgba, int* width, int* height);
 // Like select_variant for a costume slot, without the restart: an empty asset_id is the standard
 // costume. Refused while an online match is queued or running. Inside the online flow only a skin
 // proven to change looks alone (verdict online_allowed) can be picked; the standard costume always can.

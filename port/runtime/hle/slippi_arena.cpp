@@ -4,9 +4,12 @@
 #include "arena_feed.h"
 #include "slippi_net.h"
 #include "slippi_online.h"
+#include "native_practice.h"
 #include "host.h"
+#include "window.h"
 #include "test_env.h"
 #include "yougame_link.h"
+#include "../gx/render_options.h"
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -44,7 +47,10 @@ int room_limit() {
 
 // Room message kinds (first byte of an NP_MSG_MU_ARENA payload).
 enum Msg : uint8_t { kHello = 1, kWelcome = 2, kRoomState = 3, kAction = 4, kReport = 5, kPings = 6, kFeed = 7,
-                     kClosed = 8 };   // kClosed: the host left, the room is over
+                     kClosed = 8,     // kClosed: the host left, the room is over
+                     kScore = 9,      // the game's stocks and percent (warm-up room strip); older builds ignore it
+                     kWarmup = 10,    // member -> host: this member is in Training (1) or back (0)
+                     kWarming = 11 }; // host -> everyone: who is warming up, a bit per member id (older builds ignore both)
 enum Report : uint8_t { kStarted = 1, kEnded = 2 };
 constexpr uint64_t kRetryMs = 1500;
 
@@ -100,6 +106,87 @@ std::atomic<bool> g_search_busy{false};
 std::atomic<uint64_t> g_room_over_ms{0};   // when this game was last put out of a room (0 never)
 std::atomic<uint16_t> g_css_pick{0xFF00};   // character << 8 | costume, kNone character: none
 uint64_t g_test_wait_since = 0;
+// Warm-up room: this member is in Training; the viewer window waits for the way back (unless the
+// setting keeps it open). The game's score from the first fighter (kScore), for the room's strip.
+bool g_warming = false;
+LiveScore g_score;
+uint32_t g_score_tag = 0;
+uint16_t g_warming_mask = 0;      // who in the room is warming up (the host's word), a bit per member id
+uint16_t g_warming_sent = 0xFFFF; // the host: the mask everyone last got
+// The sender's side: the fighters' stocks and percent per recent frame, sent once a frame is final.
+struct ScoreFrame { int32_t frame = INT32_MIN; uint8_t present = 0, stocks[4] = {}; float percent[4] = {}; };
+ScoreFrame g_score_ring[32];
+uint8_t g_score_char[4] = {0xFF, 0xFF, 0xFF, 0xFF}, g_score_costume[4] = {};
+std::string g_score_name[4];   // each port's name from the Game Start (display name, else the code's tag)
+
+// A Game Start name field (Shift-JIS, NUL padded) as plain text: ASCII kept, the full-width letters,
+// digits and '#' turned into ASCII, anything else left out.
+std::string sjis_ascii(const uint8_t* p, size_t n) {
+  std::string out;
+  for (size_t i = 0; i < n && p[i]; ++i) {
+    const uint8_t c = p[i];
+    if (c < 0x80) { if (c >= 0x20) out.push_back((char)c); continue; }
+    if (i + 1 >= n) break;
+    const unsigned w = (unsigned)(c << 8) | p[i + 1];
+    ++i;
+    if (w >= 0x824F && w <= 0x8258) out.push_back((char)('0' + (w - 0x824F)));
+    else if (w >= 0x8260 && w <= 0x8279) out.push_back((char)('A' + (w - 0x8260)));
+    else if (w >= 0x8281 && w <= 0x829A) out.push_back((char)('a' + (w - 0x8281)));
+    else if (w == 0x8194) out.push_back('#');
+    else if (w == 0x8140) out.push_back(' ');
+  }
+  while (!out.empty() && out.back() == ' ') out.pop_back();
+  return out;
+}
+int32_t g_score_sent_frame = INT32_MIN;
+ScoreFrame g_score_sent;   // the values last sent: a change goes out at once (stocks or whole percent)
+
+// The room's match window (host::options.spectate): it simulates the game itself, so the stocks and
+// percent it shows exist only here. Each frame's are sent to the game that opened it (the warm-up
+// panel shows exactly them): at once on a change, else twice a second.
+void viewer_score_event(const uint8_t* data, uint32_t size) {
+  static uint8_t present = 0, stocks[4] = {};
+  static uint16_t percent[4] = {};
+  static uint64_t sent = ~0ull;
+  static int32_t sent_frame = INT32_MIN;
+  const auto get32 = [](const uint8_t* q) { return (uint32_t)q[0] << 24 | (uint32_t)q[1] << 16 | (uint32_t)q[2] << 8 | q[3]; };
+  const uint8_t* p = data + 1;
+  const uint32_t n = size - 1;
+  if (data[0] == 0x36) {
+    present = 0;
+    for (int i = 0; i < 4; ++i) {
+      const size_t at = 4 + 0x60 + 0x24 * (size_t)i;
+      if (at + 1 < n && p[at + 1] != 3) present |= (uint8_t)(1u << i);
+      stocks[i] = 0;
+      percent[i] = 0;
+    }
+    sent = ~0ull;
+    sent_frame = INT32_MIN;
+  } else if (data[0] == 0x38 && n >= 0x21) {
+    const uint8_t port = p[4];
+    if (port > 3 || p[5]) return;   // a follower (Nana) is not on the score
+    uint32_t bits = get32(p + 0x15);
+    float pct;
+    std::memcpy(&pct, &bits, 4);
+    stocks[port] = p[0x20];
+    percent[port] = (uint16_t)std::clamp((int)std::floor(pct), 0, 999);
+  } else if (data[0] == 0x3C && n >= 4) {
+    const int32_t frame = (int32_t)get32(p);
+    uint64_t packed = 0;
+    for (int i = 0; i < 4; ++i) {
+      const uint64_t v = (present >> i) & 1 ? ((uint64_t)std::min<uint8_t>(stocks[i], 14) << 10 | percent[i]) : (15ull << 10);
+      packed |= v << (14 * i);
+    }
+    if (packed != sent || frame >= sent_frame + 30 || frame < sent_frame) {
+      if (((packed ^ sent) & 0x3C003C003C003C00ull) != 0)   // a stock changed (the 4 stock bits of each port)
+        host::log("spectate: stocks shown at frame %d: %u %u %u %u", frame, (unsigned)(packed >> 10 & 15), (unsigned)(packed >> 24 & 15),
+                  (unsigned)(packed >> 38 & 15), (unsigned)(packed >> 52 & 15));
+      host::window_report_score(packed);
+      sent = packed;
+      sent_frame = frame;
+    }
+  }
+}
 // The game being passed on to the room, and who was in the ring when it began. The room moves on
 // at its Game End report, which can arrive before the feed's last messages: those still go to the
 // members who were watching that game, not to whoever is watching now.
@@ -184,7 +271,22 @@ void open_links() {
 }
 
 // ---- the room (host side) ----
+void broadcast_warming() {
+  if (!g_hosting) return;
+  // Members who left are nobody's business any more.
+  uint16_t present = 0;
+  for (const Member& mm : g_room.members) if (mm.id < 16) present |= (uint16_t)(1u << mm.id);
+  g_warming_mask &= present;
+  if (g_warming_mask == g_warming_sent) return;
+  if (g_warming_sent != 0xFFFF || g_warming_mask) event("warming up in Training: mask %04X (sent to the room)", g_warming_mask);
+  g_warming_sent = g_warming_mask;
+  const std::vector<uint8_t> m = {kWarming, (uint8_t)(g_warming_mask >> 8), (uint8_t)g_warming_mask};
+  for (Link& l : g_links) if (l.id != kNone) send(l, m);
+}
+
 void broadcast_room() {
+  if (g_hosting && g_room.rev != g_sent_rev) g_warming_sent = 0xFFFF;   // with every room change (late joiners)
+  broadcast_warming();
   if (!g_hosting || g_room.rev == g_sent_rev) return;
   g_sent_rev = g_room.rev;
   std::vector<uint8_t> m = {kRoomState};
@@ -249,6 +351,37 @@ void apply_report(uint8_t what, uint32_t tag, const std::string& winner_code) {
 void say_room_full(bool theirs) {
   g_notice = std::string(theirs ? "That" : "The") + " room is full (" + std::to_string(room_limit()) + " players at most)";
   g_notice_until = now_ms() + 10000;
+}
+
+// kScore: tag, frame, then per port: present, character (external), costume, stocks, percent x 10.
+void take_score(const std::vector<uint8_t>& m) {
+  if (m.size() < 9 + 4 * 6) return;
+  LiveScore s;
+  s.live = true;
+  s.frame = get32(&m[5]);
+  for (int i = 0; i < 4; ++i) {
+    const size_t at = 9 + 6 * (size_t)i;
+    auto& f = s.fighter[i];
+    f.present = m[at] != 0;
+    f.character = m[at + 1];
+    f.costume = m[at + 2];
+    f.stocks = m[at + 3];
+    f.percent = (float)((m[at + 4] << 8) | m[at + 5]) / 10.0f;
+  }
+  for (size_t at = 9 + 6 * 4, i = 0; i < 4 && at < m.size(); ++i) {   // names, from builds that send them
+    const size_t len = std::min<size_t>(m[at], 15);
+    if (at + 1 + len > m.size()) break;
+    s.fighter[i].name.assign(m.begin() + (long)at + 1, m.begin() + (long)(at + 1 + len));
+    at += 1 + len;
+  }
+  const uint32_t tag = get32(&m[1]);
+  if (tag != g_score_tag) {
+    int shown = 0;
+    for (const auto& f : s.fighter) shown += f.present;
+    event("live score for game %08X: %d fighters, frame %u", tag, shown, s.frame);
+  }
+  g_score = s;
+  g_score_tag = tag;
 }
 
 void host_message(Link& from, const std::vector<uint8_t>& m) {
@@ -337,6 +470,20 @@ void host_message(Link& from, const std::vector<uint8_t>& m) {
       if (!in_ring_of(g_relay_ring, g_self)) watch_feed(m.data() + 1, m.size() - 1);
       return;
     }
+    case kWarmup:
+      if (from.id != kNone && from.id < 16 && m.size() >= 2) {
+        const uint16_t bit = (uint16_t)(1u << from.id);
+        g_warming_mask = m[1] ? (uint16_t)(g_warming_mask | bit) : (uint16_t)(g_warming_mask & ~bit);
+      }
+      return;
+    case kScore: {
+      // The first fighter's score of the game it is sending: passed on like the feed.
+      if (from.id == kNone || m.size() < 5 || from.id != g_relay_from || get32(&m[1]) != g_relay_tag) return;
+      for (Link& l : g_links)
+        if (&l != &from && l.id != kNone && !in_ring_of(g_relay_ring, l.id)) send(l, m);
+      if (!in_ring_of(g_relay_ring, g_self)) take_score(m);
+      return;
+    }
     default:
       return;
   }
@@ -355,6 +502,300 @@ void close_viewer() {
   CloseHandle(g_viewer);
   g_viewer = nullptr;
 }
+
+// ---- the warm-up room's two windows (RenderOptions::live_warmup_watch) ----
+// Warming up in a room with the room's match on: 1 the match's viewer window small on top of this
+// game (its sound off), 2 the viewer filling the area this game had and this game small on top (its
+// sound off). Size and corner from the settings (the Practice menu changes them too); the small
+// window can be dragged and sized with the mouse as well, which is left alone until the settings
+// change again. Both windows go back exactly as they were when the warm-up ends.
+struct Pip {
+  int applied = 0;
+  int size = -1, corner = -1;
+  void* viewer = nullptr;   // the viewer's game window the layout is on
+  long area[4] = {0, 0, 0, 0};   // this game's window when the layout began (screen: left, top, right, bottom)
+  long client[4] = {0, 0, 0, 0}; // its inside (the picture and its bars), on the screen
+  uint64_t next_find_ms = 0;
+  int viewer_mode = 0;           // what the viewer said it took (1 small, 2 big)
+  int asked = 0;                 // what it was last asked, and when
+  uint64_t asked_ms = 0;
+  float cx = -1, cy = -1, cw = -1;   // the controller's place it was laid out with (live_warmup_pip_*)
+  bool adjusting = false;            // picked with the controller (Practice menu, Move and resize)
+  bool on_select = false;            // laid out for the room's select (under its side card)
+};
+Pip g_pip;
+std::atomic<int> g_pip_adjust_req{0};   // 1 pick the small window with the controller, 2 let it go
+// Watching on the room's character select: the match big (2) by default, small (1) once the player
+// asks (PICTURE IN PICTURE on it, or the side bar's button); big again for each new wait.
+std::atomic<int> g_watch_layout{2};
+std::atomic<int> g_watch_toggle{0};     // the side bar's button pressed (any thread): 1 toggle
+// The right side bar's top card on the select (arena_panel): its bottom as a share of the window's
+// height, and when it was said (ms); the small window sits under it there.
+std::atomic<float> g_card_bottom{0.0f};
+std::atomic<uint64_t> g_card_bottom_ms{0};
+std::atomic<bool> g_pip_up{false};      // the two windows are laid out (pip_active)
+
+#ifdef _WIN32
+void pip_rect(const long area[4], const long client[4], int size, int corner, long out[4]) {
+  // A place picked with the controller: its centre and width as fractions of the area, kept inside it.
+  const float cw = gx::RenderOptions::live_warmup_pip_cw().load();
+  if (cw > 0.01f) {
+    const long aw = area[2] - area[0], ah = area[3] - area[1];
+    long w = std::clamp((long)(aw * cw), std::min<long>(120, aw), std::max<long>(120, aw * 9 / 10)), h = w * 3 / 4;
+    if (h > ah * 9 / 10) { h = ah * 9 / 10; w = h * 4 / 3; }
+    const long x = area[0] + (long)(aw * gx::RenderOptions::live_warmup_pip_cx().load()) - w / 2;
+    const long y = area[1] + (long)(ah * gx::RenderOptions::live_warmup_pip_cy().load()) - h / 2;
+    out[0] = std::clamp(x, area[0], std::max(area[0], area[2] - w));
+    out[1] = std::clamp(y, area[1], std::max(area[1], area[3] - h));
+    out[2] = out[0] + w;
+    out[3] = out[1] + h;
+    return;
+  }
+  // Corner 4: inside the black bar right of the 4:3 picture, level with the warm-up panel in the bar
+  // on the left, so it covers nothing. A bar too narrow for it (true widescreen): the bottom right.
+  if (corner == 4) {
+    const long cw = client[2] - client[0], ch = client[3] - client[1];
+    const long pic = std::min<long>(cw, (long)(ch * std::max(0.5f, host::window_picture_aspect())));
+    const long bar = (cw - pic) / 2;
+    if (bar >= 110 && ch > 0) {
+      const long m = std::max<long>(6, bar / 20);
+      long w = bar - 2 * m, h = w * 3 / 4;
+      if (h > ch * 6 / 10) { h = ch * 6 / 10; w = h * 4 / 3; }
+      out[0] = client[2] - bar + (bar - w) / 2;
+      // level with the warm-up panel across the picture: at the top when the panel is flush in its bar;
+      // on the room's select (the Arena panel's cards in the bars), under the right bar's top card
+      const float card = g_card_bottom.load();
+      if (!g_warming && card > 0.0f && now_ms() - g_card_bottom_ms.load() < 1000)
+        out[1] = client[1] + (long)(ch * card) + 2 * m;
+      else
+        out[1] = client[1] + (gx::RenderOptions::live_warmup_panel_style() == 2 ? m : (long)(ch * 0.17f));
+      out[2] = out[0] + w;
+      out[3] = out[1] + h;
+      return;
+    }
+    corner = 1;
+  }
+  static const float kWidth[3] = {0.25f, 0.34f, 0.45f};   // of the area's width
+  const long aw = area[2] - area[0], ah = area[3] - area[1];
+  long w = (long)(aw * kWidth[std::clamp(size, 0, 2)]), h = w * 3 / 4;
+  if (h > ah * 6 / 10) { h = ah * 6 / 10; w = h * 4 / 3; }
+  const long m = std::max<long>(12, aw / 80);
+  const bool left = corner == 2 || corner == 3, bottom = corner == 1 || corner == 2;
+  out[0] = left ? area[0] + m : area[2] - m - w;
+  out[1] = bottom ? area[3] - m - h : area[1] + m;
+  out[2] = out[0] + w;
+  out[3] = out[1] + h;
+}
+
+void pip_restore(const char* why) {
+  if (g_pip.adjusting) {   // no small window to move any more
+    host::window_set_selected(false);
+    if (g_pip.viewer && IsWindow((HWND)g_pip.viewer)) host::window_send_selected(g_pip.viewer, false);
+    g_pip.adjusting = false;
+  }
+  if (!g_pip.applied) { g_pip.viewer = nullptr; return; }
+  if (g_pip.applied == 2) host::window_set_pip(0, false);
+  if (g_pip.viewer && IsWindow((HWND)g_pip.viewer)) host::window_send_pip(g_pip.viewer, 0, false);
+  event("the two windows are back as they were (%s)", why);
+  g_pip_up.store(false);
+  g_pip = Pip{};
+}
+
+void pip_tick() {
+  // The match window's buttons, and the side bar's: warm up (from the big window), small, full size.
+  const int action = host::window_spectate_action();
+  if (action == 1) {
+    event("WARM UP pressed on the match window");
+    native_practice::submit_warmup();
+  }
+  if (action == 2 || action == 3 || g_watch_toggle.exchange(0)) {
+    const int to = action == 2 ? 1 : action == 3 ? 2 : (g_warming ? gx::RenderOptions::live_warmup_watch() : g_watch_layout.load()) == 2 ? 1 : 2;
+    // Away (warming up, another mode) the setting says how it shows, so the choice is the setting's;
+    // on the select it is this wait's own.
+    if (g_warming) gx::RenderOptions::live_warmup_watch() = to;
+    else g_watch_layout.store(to);
+    event("the room's match %s (%s)", to == 1 ? "small: picture in picture" : "full size", g_warming ? "while away" : "on the select");
+  }
+  // Called for the turn: the windows go back at once, so the countdown shows full size; and the next
+  // wait starts big again.
+  const int setting = std::clamp(gx::RenderOptions::live_warmup_watch(), 0, 2);
+  if (turn_called()) g_watch_layout.store(2);
+  if (!setting && viewer_running()) {   // turned to "Not shown": the window goes (it opens again when turned back on)
+    pip_restore("the match window is off");
+    close_viewer();
+    g_viewer_open_for_tag = false;
+    event("viewer closed: the room's match is not shown");
+    return;
+  }
+  const int want = viewer_running() && !turn_called() && setting ? (g_warming ? setting : g_watch_layout.load()) : 0;
+  if (!want) { pip_restore(!viewer_running() ? "no match window now" : turn_called() ? "this player's turn" : "the match window is off"); return; }
+  // The viewer's game window, found by its process (it takes a moment to open). A new one (the
+  // room's next game) gets the layout afresh.
+  if (!g_pip.viewer || !IsWindow((HWND)g_pip.viewer)) {
+    if (now_ms() < g_pip.next_find_ms) return;
+    g_pip.next_find_ms = now_ms() + 250;
+    void* found = host::window_of_process(GetProcessId(g_viewer));
+    if (!found) return;
+    if (g_pip.applied == 2) host::window_set_pip(0, false);   // this game full again until it is laid out anew
+    if (g_pip.applied) event("a new match window: laying it out again");
+    const bool had_area = g_pip.applied != 0;
+    long area[4], client[4];
+    std::copy(std::begin(g_pip.area), std::end(g_pip.area), area);
+    std::copy(std::begin(g_pip.client), std::end(g_pip.client), client);
+    g_pip = Pip{};
+    if (had_area) {
+      std::copy(std::begin(area), std::end(area), g_pip.area);
+      std::copy(std::begin(client), std::end(client), g_pip.client);
+    }
+    g_pip.viewer = found;
+  }
+  // Test: MELEE_TEST_PIP_ADJUST=<seconds>: that long after the first layout, the controller picks the
+  // small window, moves it to the left middle at a third of the width, and puts it down 5 seconds later.
+  if (g_pip.applied) {
+    static const char* t = host::test_env::getenv("MELEE_TEST_PIP_ADJUST");
+    static uint64_t first = 0;
+    static int step = 0;
+    if (t && step < 3) {
+      if (!first) first = now_ms();
+      const uint64_t at = first + (uint64_t)std::atoi(t) * 1000;
+      if (step == 0 && now_ms() >= at) { g_pip_adjust_req.store(1); step = 1; event("test: pick the small window"); }
+      else if (step == 1 && now_ms() >= at + 1500) {
+        gx::RenderOptions::live_warmup_pip_cx().store(0.22f);
+        gx::RenderOptions::live_warmup_pip_cy().store(0.55f);
+        gx::RenderOptions::live_warmup_pip_cw().store(0.33f);
+        step = 2;
+      } else if (step == 2 && now_ms() >= at + 6000) { g_pip_adjust_req.store(2); step = 3; }
+    }
+  }
+  // The controller picks the small window (Practice menu, Move and resize): where it is now (the mouse
+  // may have moved it) becomes the place it is then moved from, and it shows it is picked.
+  int req = g_pip_adjust_req.exchange(0);
+  if (req == 1 && !g_pip.applied) { g_pip_adjust_req.store(1); req = 0; }   // the small window is not up yet: pick it once it is
+  if (req == 1 && g_pip.applied && !g_pip.adjusting) {
+    const HWND little = (HWND)(g_pip.applied == 1 ? g_pip.viewer : host::window_native());
+    RECT r{};
+    const long aw = g_pip.area[2] - g_pip.area[0], ah = g_pip.area[3] - g_pip.area[1];
+    if (little && aw > 0 && ah > 0 && GetWindowRect(little, &r)) {
+      gx::RenderOptions::live_warmup_pip_cx().store(((r.left + r.right) * 0.5f - g_pip.area[0]) / aw);
+      gx::RenderOptions::live_warmup_pip_cy().store(((r.top + r.bottom) * 0.5f - g_pip.area[1]) / ah);
+      gx::RenderOptions::live_warmup_pip_cw().store((float)(r.right - r.left) / aw);
+    }
+    if (g_pip.applied == 1) host::window_send_selected(g_pip.viewer, true);
+    else host::window_set_selected(true);
+    g_pip.adjusting = true;
+    event("the small window is picked with the controller");
+  } else if (req == 2 && g_pip.adjusting) {
+    if (g_pip.applied == 1) host::window_send_selected(g_pip.viewer, false);
+    else host::window_set_selected(false);
+    g_pip.adjusting = false;
+    event("the small window is put down: %.0f%% wide at %.0f%%, %.0f%% of the area", gx::RenderOptions::live_warmup_pip_cw().load() * 100,
+          gx::RenderOptions::live_warmup_pip_cx().load() * 100, gx::RenderOptions::live_warmup_pip_cy().load() * 100);
+  }
+  const int size = gx::RenderOptions::live_warmup_pip_size(), corner = gx::RenderOptions::live_warmup_pip_corner();
+  const float cx = gx::RenderOptions::live_warmup_pip_cx().load(), cy = gx::RenderOptions::live_warmup_pip_cy().load(),
+              cw = gx::RenderOptions::live_warmup_pip_cw().load();
+  // Where corner 4 puts it moves between the select (under the side card) and away: laid out again then.
+  const bool on_select = !g_warming && g_card_bottom.load() > 0.0f && now_ms() - g_card_bottom_ms.load() < 1000;
+  if (want == g_pip.applied && size == g_pip.size && corner == g_pip.corner && cx == g_pip.cx && cy == g_pip.cy && cw == g_pip.cw &&
+      on_select == g_pip.on_select)
+    return;
+  g_pip.on_select = on_select;
+  const HWND main = (HWND)host::window_native(), viewer = (HWND)g_pip.viewer;
+  if (!main) return;
+  if (!g_pip.area[2]) {   // where this game's window is now: the area both layouts share
+    RECT r{};
+    GetWindowRect(main, &r);
+    g_pip.area[0] = r.left; g_pip.area[1] = r.top; g_pip.area[2] = r.right; g_pip.area[3] = r.bottom;
+    RECT c{};
+    GetClientRect(main, &c);
+    POINT tl{c.left, c.top}, br{c.right, c.bottom};
+    ClientToScreen(main, &tl);
+    ClientToScreen(main, &br);
+    g_pip.client[0] = tl.x; g_pip.client[1] = tl.y; g_pip.client[2] = br.x; g_pip.client[3] = br.y;
+  }
+  // First the viewer takes its new state (it saves where it was), answering when done; only then is
+  // anything moved. A viewer still loading answers late: asked again each second until it does.
+  if (g_pip.viewer_mode != want) {
+    if (g_pip.asked != want || now_ms() - g_pip.asked_ms > 1000) {
+      host::window_send_pip(viewer, want, want == 1);
+      g_pip.asked = want;
+      g_pip.asked_ms = now_ms();
+      return;
+    }
+    if (host::window_pip_answer() != want) return;
+    g_pip.viewer_mode = want;
+  }
+  long box[4];
+  pip_rect(g_pip.area, g_pip.client, size, corner, box);
+  const long* a = g_pip.area;
+  if (want == 1) {
+    if (g_pip.applied == 2) host::window_set_pip(0, false);
+    SetWindowPos(viewer, HWND_TOPMOST, box[0], box[1], box[2] - box[0], box[3] - box[1], SWP_NOACTIVATE);
+  } else {
+    SetWindowPos(viewer, HWND_NOTOPMOST, a[0], a[1], a[2] - a[0], a[3] - a[1], SWP_NOACTIVATE);
+    if (g_pip.applied != 2) host::window_set_pip(1, true);
+    SetWindowPos(main, HWND_TOPMOST, box[0], box[1], box[2] - box[0], box[3] - box[1], SWP_NOACTIVATE);
+  }
+  if (!g_pip.adjusting || want != g_pip.applied)   // not every step while the controller moves it
+    event("the room's match %s: small window %ldx%ld at %ld,%ld in %ldx%ld (inside %ldx%ld at %ld,%ld, picture %.3f, %s)",
+          want == 1 ? "small over this game" : "big, this game small", box[2] - box[0], box[3] - box[1], box[0] - a[0], box[1] - a[1],
+          a[2] - a[0], a[3] - a[1], g_pip.client[2] - g_pip.client[0], g_pip.client[3] - g_pip.client[1], g_pip.client[0] - a[0],
+          g_pip.client[1] - a[1], host::window_picture_aspect(), on_select ? "under the side card" : "level with the panel");
+  g_pip.applied = want;
+  g_pip_up.store(true);
+  g_pip.size = size;
+  g_pip.corner = corner;
+  g_pip.cx = cx;
+  g_pip.cy = cy;
+  g_pip.cw = cw;
+}
+// The match window's view (RenderOptions::live_spectate_view): a change here (the settings, the
+// Practice menu) goes to the window; a choice made at its corner comes back and is kept here.
+void view_tick() {
+  static void* window = nullptr;
+  static uint64_t next_find_ms = 0;
+  static int sent = -1;
+  if (!viewer_running()) { window = nullptr; sent = -1; return; }
+  if (!window || !IsWindow((HWND)window)) {
+    window = nullptr;
+    if (now_ms() < next_find_ms) return;
+    next_find_ms = now_ms() + 250;
+    window = host::window_of_process(GetProcessId(g_viewer));
+    sent = gx::RenderOptions::live_spectate_view();   // it started with this (--spectate-view)
+    if (!window) return;
+  }
+  // Test: MELEE_TEST_ARENA_VIEW=<view>@<seconds>: this game switches the match window's view once.
+  static uint64_t found_ms = 0;
+  if (!found_ms) found_ms = now_ms();
+  static bool test_done = false;
+  if (!test_done) {
+    if (const char* t = host::test_env::getenv("MELEE_TEST_ARENA_VIEW")) {
+      int view = 0, secs = 0;
+      if (std::sscanf(t, "%d@%d", &view, &secs) == 2 && now_ms() >= found_ms + (uint64_t)secs * 1000) {
+        gx::RenderOptions::live_spectate_view() = std::clamp(view, 0, 2);
+        test_done = true;
+        event("test: match view %d", view);
+      }
+    } else test_done = true;
+  }
+  const int chosen = host::window_spectate_choice();
+  if (chosen >= 0 && chosen <= 2) {
+    gx::RenderOptions::live_spectate_view() = chosen;
+    sent = chosen;
+    event("match view %d chosen in its window", chosen);
+  }
+  const int want = std::clamp(gx::RenderOptions::live_spectate_view(), 0, 2);
+  if (want != sent) {
+    host::window_send_spectate_view(window, want);
+    sent = want;
+    event("match view %d sent to its window", want);
+  }
+}
+#else
+void pip_restore(const char*) {}
+void pip_tick() {}
+void view_tick() {}
+#endif
 
 std::string live_path(uint32_t tag) {
   std::error_code ec;
@@ -387,7 +828,9 @@ void watch_feed(const uint8_t* data, size_t size) {
   // The viewer opens once the recording has its first frames (it reads the players from them).
   // Tests with many members (MELEE_ARENA_NO_VIEWER=1): the live recording only, no viewer window.
   static const bool no_viewer = [] { const char* v = std::getenv("MELEE_ARENA_NO_VIEWER"); return v && *v == '1'; }();
-  if (!g_viewer_open_for_tag && g_receiver.stats().frames >= 2 && g_launch_viewer && !no_viewer) {
+  // The setting "Not shown": no window at all, the warm-up panel's score only.
+  const bool shown = gx::RenderOptions::live_warmup_watch() != 0;
+  if (!g_viewer_open_for_tag && g_receiver.stats().frames >= 2 && g_launch_viewer && !no_viewer && shown) {
     g_viewer_open_for_tag = true;
     char name[32];
     std::snprintf(name, sizeof name, "live-%08X.slp", tag);
@@ -436,6 +879,16 @@ void member_message(const std::vector<uint8_t>& m) {
       return;
     case kFeed:
       watch_feed(m.data() + 1, m.size() - 1);
+      return;
+    case kScore:
+      take_score(m);
+      return;
+    case kWarming:
+      if (m.size() >= 3) {
+        const uint16_t mask = (uint16_t)(m[1] << 8 | m[2]);
+        if (mask != g_warming_mask) event("warming up in Training: mask %04X", mask);
+        g_warming_mask = mask;
+      }
       return;
     case kClosed:
       g_member_closed = true;   // handled after the links are read (this closes them)
@@ -868,7 +1321,8 @@ void publish_view() {
   v.room = g_room;
   v.ping_ms = g_ping;
   v.watching_live = viewer_running();
-  v.status = g_status;
+  v.status = g_warming ? std::string("Warming up in Training") : g_status;
+  v.warming = g_warming_mask;
   if (!g_notice.empty() && now_ms() < g_notice_until) {
     v.notice = g_notice;
     if (g_active) v.status = g_notice;   // in a room the looks show it where the status line is
@@ -899,7 +1353,21 @@ bool set_test(const std::string& spec) {
   return true;
 }
 bool test_mode() { return g_test.on; }
-bool locks_in_itself() { return g_test.on || test_autolock(); }
+// Tests: MELEE_TEST_ARENA_AUTOLOCK_AFTER=<frames> holds that lock-in back until the select has been up
+// that long, so a test can lock a player in while the other one is warming up.
+bool autolock_due() {
+  static const int after = [] { const char* v = host::test_env::getenv("MELEE_TEST_ARENA_AUTOLOCK_AFTER"); return v ? std::atoi(v) : 0; }();
+  if (after <= 0) return true;
+  // Asked only while a select is up: a gap in the asking is a new select (a game came between).
+  static uint32_t since = 0, last = 0;
+  const uint32_t now = host::retrace_count();
+  if (!online::in_online_menus() || online::arena_match_status().in_match || now - last > 30) since = 0;
+  last = now;
+  if (!online::in_online_menus()) return false;
+  if (!since) since = now ? now : 1;
+  return now - since >= (uint32_t)after;
+}
+bool locks_in_itself() { return g_test.on || (test_autolock() && autolock_due()); }
 void set_recording_codes(std::vector<uint8_t> codes) { g_codes = std::move(codes); }
 void set_viewer_launcher(std::function<void*(const std::string&)> launch) { g_launch_viewer = std::move(launch); }
 
@@ -1037,10 +1505,94 @@ void tick() {
   run_test_plan();
   broadcast_room();
   steer_match();
+  pip_tick();
+  view_tick();
   publish_view();
 }
 
+namespace {
+// The first fighter's score for the room's warm-up strip: each fighter's stocks and percent as of the
+// newest frame that cannot change any more (a rollback never shows), about twice a second.
+void send_score(const ScoreFrame& f) {
+  std::vector<uint8_t> m = {kScore};
+  put32(m, g_my_tag);
+  put32(m, (uint32_t)f.frame);
+  for (int i = 0; i < 4; ++i) {
+    const bool here = ((f.present >> i) & 1) && g_score_char[i] != 0xFF;
+    const float pct = std::clamp(f.percent[i] * 10.0f, 0.0f, 65535.0f);
+    const uint16_t tenths = (uint16_t)pct;
+    m.push_back(here ? 1 : 0);
+    m.push_back(g_score_char[i]);
+    m.push_back(g_score_costume[i]);
+    m.push_back(f.stocks[i]);
+    m.push_back((uint8_t)(tenths >> 8));
+    m.push_back((uint8_t)tenths);
+  }
+  // Then each port's name (length, bytes): older builds read the first part only.
+  for (int i = 0; i < 4; ++i) {
+    m.push_back((uint8_t)g_score_name[i].size());
+    m.insert(m.end(), g_score_name[i].begin(), g_score_name[i].end());
+  }
+  if (g_hosting) {
+    for (Link& l : g_links) if (l.id != kNone && !in_ring_of(g_send_ring, l.id)) send(l, m);
+  } else {
+    send_to_host(m);
+  }
+}
+
+void score_event(const uint8_t* data, uint32_t size) {
+  const uint8_t command = data[0];
+  const uint8_t* p = data + 1;
+  const uint32_t n = size - 1;
+  if (command == 0x36) {   // Game Start: who plays, in which colours (empty slots have player type 3)
+    for (int i = 0; i < 4; ++i) {
+      const size_t at = 4 + 0x60 + 0x24 * (size_t)i;
+      g_score_char[i] = at + 3 < n && p[at + 1] != 3 ? p[at] : 0xFF;
+      g_score_costume[i] = at + 3 < n ? p[at + 3] : 0;
+      // The name the game shows: display name (Game Start 0x1A5), else the connect code's tag (0x221).
+      std::string name = n >= 0x1A4 + 0x1F * 4 ? sjis_ascii(p + 0x1A4 + 0x1F * i, 0x1F) : std::string();
+      if (name.empty() && n >= 0x220 + 0x0A * 4) {
+        name = sjis_ascii(p + 0x220 + 0x0A * i, 0x0A);
+        const size_t hash = name.find('#');
+        if (hash != std::string::npos) name.resize(hash);
+      }
+      g_score_name[i] = name.substr(0, 15);
+    }
+    for (ScoreFrame& f : g_score_ring) f = ScoreFrame{};
+    g_score_sent_frame = INT32_MIN;
+  } else if (command == 0x38 && n >= 0x21) {   // post-frame: percent (float) at +0x15, stocks at +0x20
+    const int32_t frame = (int32_t)get32(p);
+    const uint8_t port = p[4];
+    if (port > 3 || p[5]) return;   // a follower (Nana) is not a fighter of the score
+    ScoreFrame& f = g_score_ring[(uint32_t)frame & 31u];
+    if (f.frame != frame) { f = ScoreFrame{}; f.frame = frame; }
+    uint32_t bits = get32(p + 0x15);
+    float pct;
+    std::memcpy(&pct, &bits, 4);
+    f.present |= (uint8_t)(1u << port);
+    f.stocks[port] = p[0x20];
+    f.percent[port] = pct;
+  } else if (command == 0x3C && n >= 8) {   // frame end: frames up to the second word are final
+    const int32_t final_frame = (int32_t)get32(p + 4);
+    const ScoreFrame& f = g_score_ring[(uint32_t)final_frame & 31u];
+    bool changed = false;   // a stock lost or the whole percent moved: out now, not at the next half second
+    for (int i = 0; i < 4; ++i)
+      changed |= f.stocks[i] != g_score_sent.stocks[i] || (int)f.percent[i] != (int)g_score_sent.percent[i];
+    if (f.frame == final_frame && (g_score_sent_frame == INT32_MIN || changed || final_frame >= g_score_sent_frame + 30)) {
+      g_score_sent_frame = final_frame;
+      g_score_sent = f;
+      send_score(f);
+    }
+  } else if (command == 0x39) {   // Game End: the newest frame as it ended
+    const ScoreFrame* newest = nullptr;
+    for (const ScoreFrame& f : g_score_ring) if (f.frame != INT32_MIN && (!newest || f.frame > newest->frame)) newest = &f;
+    if (newest) send_score(*newest);
+  }
+}
+}  // namespace
+
 void recording_event(const uint8_t* data, uint32_t size) {
+  if (host::options.spectate && data && size) viewer_score_event(data, size);   // the room's match window
   if (!g_active || !data || !size) return;
   const uint8_t command = data[0];
   if (command == 0x35) { g_table.assign(data, data + size); return; }
@@ -1079,7 +1631,10 @@ void recording_event(const uint8_t* data, uint32_t size) {
       event("sending game %08X to the room", g_my_tag);
     }
   }
-  if (g_sending) g_sender.event(data, size);
+  if (g_sending) {
+    g_sender.event(data, size);
+    score_event(data, size);
+  }
   // Every fighter reports its game's start and end to the host; the first report of each counts.
   if ((command == 0x36 || command == 0x39) && g_my_online) {
     std::vector<uint8_t> m = {kReport, (uint8_t)(command == 0x36 ? kStarted : kEnded)};
@@ -1124,6 +1679,95 @@ void act(Act a, uint8_t arg, const std::string& text) {
 
 bool search_busy() { return g_search_busy.load(); }
 
+// ---- warm-up room ----
+bool turn_called() {
+  if (!g_active || g_self == kNone || g_room.in_game) return false;
+  if (ring_slot(g_room, g_self) < 0) return false;
+  for (int s = 0; s < ring_size(g_room); ++s) if (g_room.ring[s] == kNone) return false;
+  return true;
+}
+
+bool warmup_ok(std::string* why) {
+  const auto no = [&](const char* reason) { if (why) *why = reason; return false; };
+  if (!g_active || g_self == kNone) return no("");
+  if (g_warming) return no("Warming up");
+  if (!g_hosting && (g_links.empty() || !g_links[0].was_ready)) return no("Joining the room");
+  if (turn_called()) return no("Your match is next");
+  if (ring_slot(g_room, g_self) >= 0 && g_room.in_game) return no("");
+  return true;
+}
+
+void pip_adjust(bool on) { g_pip_adjust_req.store(on ? 1 : 2); }
+bool pip_active() { return g_pip_up.load(); }
+void toggle_watch_layout() { g_watch_toggle.store(1); }
+int watch_layout() { return g_pip_up.load() ? g_pip.applied : 0; }
+void note_side_card_bottom(float share) {
+  g_card_bottom.store(share);
+  g_card_bottom_ms.store(now_ms());
+}
+
+void set_warming(bool on) {
+  if (on == g_warming) return;
+  g_warming = on;
+  if (g_active && g_self != kNone && g_self < 16) {
+    if (g_hosting) {
+      const uint16_t bit = (uint16_t)(1u << g_self);
+      g_warming_mask = on ? (uint16_t)(g_warming_mask | bit) : (uint16_t)(g_warming_mask & ~bit);
+    } else {
+      send_to_host({kWarmup, (uint8_t)(on ? 1 : 0)});
+    }
+  }
+  // The match window stays as it is (pip_tick lays it out for where the player is now).
+  event(on ? "warming up (Training, then anywhere offline)" : "back from the warm-up");
+}
+
+WarmupInfo warmup_info() {
+  WarmupInfo w;
+  if (!g_active || g_self == kNone) return w;
+  const int slot = ring_slot(g_room, g_self);
+  if (slot >= 0) {
+    w.place = turn_called() ? "Your match is next" : g_room.in_game ? "Fighting" : "Waiting for an opponent";
+  } else {
+    const int at = line_place(g_room, g_self);
+    w.place = at == 0 ? std::string("Next up") : at > 0 ? std::to_string(at) + " ahead of you" : std::string("Watching");
+  }
+  if (g_room.in_game) {
+    const auto label = [](uint8_t id) {
+      const Member* m = find(g_room, id);
+      if (!m) return std::string("?");
+      std::string s = m->name.empty() ? m->code : m->name;
+      if (m->name.empty()) { const size_t hash = s.find('#'); if (hash != std::string::npos) s.resize(hash); }
+      return s;
+    };
+    if (g_room.doubles)
+      w.versus = label(g_room.ring[0]) + " & " + label(g_room.ring[1]) + " vs " + label(g_room.ring[2]) + " & " + label(g_room.ring[3]);
+    else
+      w.versus = label(g_room.ring[0]) + " vs " + label(g_room.ring[1]);
+    w.score = g_score;
+    w.score.live = g_score.live && g_score_tag == g_receiver_tag && g_receiver_tag != 0;
+    // The match window open: the panel shows what it shows, frame for frame (it simulates the game).
+    uint64_t packed = 0;
+    if (viewer_running() && host::window_viewer_score(&packed)) {
+      for (int i = 0; i < 4; ++i) {
+        const unsigned v = (unsigned)((packed >> (14 * i)) & 0x3FFF), st = v >> 10;
+        auto& fighter = w.score.fighter[i];
+        if (st == 15) { fighter.present = false; continue; }
+        fighter.present = true;
+        fighter.stocks = (uint8_t)st;
+        fighter.percent = (float)(v & 1023);
+      }
+      w.score.live = true;
+      static uint64_t logged = ~0ull;
+      if (((packed ^ logged) & 0x3C003C003C003C00ull) != 0) {   // the panel's stocks changed: as the window shows them
+        event("panel stocks from the match window: %u %u %u %u", (unsigned)(packed >> 10 & 15), (unsigned)(packed >> 24 & 15),
+              (unsigned)(packed >> 38 & 15), (unsigned)(packed >> 52 & 15));
+        logged = packed;
+      }
+    }
+  }
+  return w;
+}
+
 std::atomic<uint32_t> g_css_hand{0xFFFFFFFFu};
 void set_css_hand(int16_t x10, int16_t y10) { g_css_hand.store((uint32_t)(uint16_t)x10 << 16 | (uint16_t)y10); }
 bool css_hand(float* x, float* y) {
@@ -1136,6 +1780,14 @@ bool css_hand(float* x, float* y) {
 
 void set_css_pick(uint8_t character, uint8_t costume) {
   g_css_pick.store((uint16_t)(character << 8 | costume));
+}
+
+bool css_pick(uint8_t* character, uint8_t* costume) {
+  const uint16_t v = g_css_pick.load();
+  if ((v >> 8) >= 26) return false;
+  *character = (uint8_t)(v >> 8);
+  *costume = (uint8_t)v;
+  return true;
 }
 
 bool in_room() {

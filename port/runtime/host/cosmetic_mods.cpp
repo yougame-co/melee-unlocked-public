@@ -3814,7 +3814,8 @@ bool texture_track_keys(const uint8_t* block, size_t size, uint32_t track, std::
 // Frame -> portrait of a character select file, from the first texture animation whose tables hold
 // portraits. False when the file has no such animation (not a character select file, or one built
 // another way): then no portrait is taken from it.
-bool texture_animation_frames(const std::vector<uint8_t>& dat, uint32_t mex_animation, std::map<int, SelectPortrait>* frames);
+bool texture_animation_frames(const std::vector<uint8_t>& dat, uint32_t mex_animation, std::map<int, SelectPortrait>* frames,
+                              uint32_t want_w = kPortraitWidth, uint32_t want_h = kPortraitHeight);
 
 bool select_portraits(const std::vector<uint8_t>& dat, std::map<int, SelectPortrait>* frames, int* mex_stride = nullptr) {
   frames->clear();
@@ -3852,7 +3853,8 @@ bool mex_stock_icons(const std::vector<uint8_t>& dat, std::map<int, SelectPortra
 
 // Frame -> picture of one texture animation: the one at mex_animation, or with UINT32_MAX the first whose
 // tables hold retail character select portraits.
-bool texture_animation_frames(const std::vector<uint8_t>& dat, uint32_t mex_animation, std::map<int, SelectPortrait>* frames) {
+bool texture_animation_frames(const std::vector<uint8_t>& dat, uint32_t mex_animation, std::map<int, SelectPortrait>* frames,
+                              uint32_t want_w, uint32_t want_h) {
   frames->clear();
   const int stride = mex_animation != UINT32_MAX;   // a named animation: any picture size
   const uint64_t data_size = be32(dat.data() + 4), relocations = be32(dat.data() + 8);
@@ -3886,7 +3888,7 @@ bool texture_animation_frames(const std::vector<uint8_t>& dat, uint32_t mex_anim
       entry.pixels = word(image);
       entry.width = be16(block + image + 4); entry.height = be16(block + image + 6); entry.format = word(image + 8);
       if (!entry.width || !entry.height || entry.width > 1024 || entry.height > 1024 ||
-          (!stride && (entry.width != kPortraitWidth || entry.height != kPortraitHeight)) ||
+          (!stride && (entry.width != want_w || entry.height != want_h)) ||
           (entry.format != 8 && entry.format != 9) ||
           (uint64_t)entry.pixels + gx_image_size(entry.width, entry.height, entry.format, 0, 0) > data_size) continue;
       entries[i] = entry; valid[i] = true; ++good;
@@ -7760,6 +7762,38 @@ bool merge_fighter_sounds(const std::vector<uint8_t>& clean, const std::vector<u
   return fighter_sound_overlay(clean, mod, fighter_kind, merged, error);
 }
 }  // namespace testing
+
+// The game's own stock icon of a fighter and costume: the HUD file's (IfAll.usd) icon animation, the
+// frame the game picks (gm_80168B34): the fighter's column, then 30 frames a costume row. Columns are
+// the character select numbers, Sheik after Ganondorf (25), everyone after her one to the left.
+bool standard_stock_icon(int css_character, int costume, std::vector<uint8_t>* rgba, int* width, int* height) {
+  static std::mutex lock;
+  static bool tried = false;
+  static std::vector<uint8_t> file;
+  static std::map<int, SelectPortrait> frames;
+  std::lock_guard<std::mutex> lk(lock);
+  if (!tried) {
+    tried = true;
+    uint32_t offset = 0, size = 0;
+    if ((host::disc_find_file("IfAll.usd", &offset, &size) || host::disc_find_file("IfAll.dat", &offset, &size)) && size &&
+        size <= kMaxAssetBytes) {
+      file.resize(size);
+      if (!host::disc_read(offset, file.data(), size) || !texture_animation_frames(file, UINT32_MAX, &frames, 24, 24)) {
+        file.clear();
+        frames.clear();
+      }
+    }
+    host::log("cosmetics: %zu stock icon frames in the HUD file", frames.size());
+  }
+  if (frames.empty() || css_character < 0 || css_character > 25 || costume < 0 || costume > 5) return false;
+  const int column = css_character == 19 ? 25 : css_character > 19 ? css_character - 1 : css_character;
+  const auto it = frames.find(column + costume * 30);
+  if (it == frames.end()) return false;
+  *rgba = decode_portrait(file.data() + 0x20, it->second);
+  *width = (int)it->second.width;
+  *height = (int)it->second.height;
+  return !rgba->empty();
+}
 
 bool standard_portrait(int css_character, int costume, std::vector<uint8_t>* rgba, int* width, int* height) {
   static std::mutex lock;

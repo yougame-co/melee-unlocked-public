@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "native_practice.h"
 #include "slippi_arena.h"
+#include "slippi_warmup.h"
 
 #include "host.h"
+#include "audio.h"
+#include "ghost_ai.h"
 #include "practice_cpu.h"
+#include "practice_ghosts.h"
 #include "slippi_online.h"
 #include "yougame_link.h"
 #include "yougame_console_engine.h"
@@ -19,8 +23,10 @@
 #include "slippi_playback.h"
 #include "../gx/render_options.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <future>
 #include <memory>
 #include <thread>
@@ -40,6 +46,7 @@ constexpr uint32_t kSceneState = 0x80479D30;
 constexpr uint32_t kMinorSceneControl = 0x80479D58;
 constexpr uint8_t kOnlineMajor = 8;
 constexpr uint8_t kTrainingMajor = 0x1C;
+constexpr uint8_t kMainMenuMajor = 0x01;
 // OFST_R13_ONLINE_MODE is -0x5060 from Melee's r13 base (0x804DB6A0).
 constexpr uint32_t kOnlineMode = 0x804D6640;
 // OFST_R13_ISWINNER (-0x5037) and OFST_R13_CHOSESTAGE (-0x5036). Normal Direct
@@ -52,7 +59,7 @@ constexpr uint32_t kPlayerStride = 0xE90;
 constexpr uint32_t kMatchStage = 0x8046B6A0 + 0x24C8 + 0x0E;
 constexpr uint32_t kSearchTimeoutTicks = 60 * 90;
 
-enum class CommandKind { StartUnranked, StartDirect, StartTeams, Cancel, AcknowledgeFailure, TrainAgainst };
+enum class CommandKind { StartUnranked, StartDirect, StartTeams, Cancel, AcknowledgeFailure, TrainAgainst, Warmup, WarmupReturn };
 struct Command { CommandKind kind; std::string text; };
 
 struct SavedPlayer {
@@ -129,6 +136,36 @@ enum { OP_SCENE, OP_GET_PLAYER, OP_SET_PLAYER, OP_GET_STAGE, OP_SET_STAGE, OP_SE
 static_assert(OP_FRAME_PAUSE == 10 && OP_UNLOCKED == 14 && OP_PAGE_PAUSE == 15 && OP_CSS_PICK == 16 &&
               OP_FRIENDS_RETURN == 17, "practice op numbering (mu_host.h)");
 std::atomic<uint32_t> g_unlocked{0xFFFFFFFFu};   // tick(): the card's unlocked characters, read in Training
+
+// ---- warm-up room state (the room itself is below, "warm-up room") ----
+warmup::Room g_warmup;
+uint8_t g_warmup_mode = 0;            // the online mode byte to give back on the way home
+PracticeConfig g_warmup_css;          // the player's pick on the online select (character, costume, port)
+bool g_warmup_cpu_saved = false;      // the player's own practice CPU, put back when the room ends
+MuPcConfig g_warmup_saved_cpu{};
+bool g_warmup_cpu_applied = false;    // the sparring partner was set for this stay
+int g_warmup_cpu_char = -1;
+uint8_t g_warmup_cpu_costume = 0;
+std::string g_warmup_sparring;
+uint32_t g_warmup_match_ticks = 0;
+float g_warmup_hold = 0.0f;
+bool g_test_press_start = false;   // tests (MELEE_TEST_WARMUP): Start on the online select until locked in
+// Everyone else locked in while the player trained: back at once, and Start on the select for the
+// player as soon as it takes it (the winner locks in, the loser goes to pick the stage).
+bool g_warmup_autostart = false;
+uint32_t g_warmup_autostart_ticks = 0;
+// Back on the select after the opponent left during the warm-up: the player asked for the select, so
+// "back to Training after a session" does not send them straight back.
+bool g_warmup_no_bounce = false;
+// The way back through the main menu (Source Port, from a match of another mode): the select is asked
+// for once the menu is up (warmup_tick). The retrace the menu was asked at, 0 none.
+uint32_t g_warmup_via_menu = 0;
+
+uint64_t steady_ms() {
+  return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+bool warmup_offer(bool* arena, std::string* why);
 
 uint8_t current_major() {
   if (g_bridge) { int32_t a[2] = {}; g_bridge(OP_SCENE, a, 2); return (uint8_t)a[0]; }
@@ -209,12 +246,26 @@ PracticeConfig capture_practice() {
   return out;
 }
 
-// Training's character select starts from its saved match (Source Port; the Static Recomp keeps the
-// player's last Training picks). slot 0: the player, 1: the CPU.
+// Training's character select starts from its saved match. slot 0: the player, 1: the CPU. The Source
+// Port asks its game; the Static Recomp writes the same saved match in console memory: the save
+// data (gmMainLib_804D3EE0, at 0x8045A6C0) holds a VsModeData (0x140 bytes) per VS mode from +0x590,
+// Training is mode 6, its StartMeleeData starts 8 bytes in, and the player blocks (0x24 bytes:
+// character +0, costume +3) follow the 0x60 bytes of rules, as in a Slippi replay's game info block.
 void set_training_pick(int slot, int character, int costume) {
-  if (!g_bridge || character < 0 || character >= 26) return;
-  int32_t a[3] = {slot, character, costume};
-  g_bridge(OP_TRAINING_PICK, a, 3);
+  if (character < 0 || character >= 26 || slot < 0 || slot > 1) return;
+  if (g_bridge) {
+    int32_t a[3] = {slot, character, costume};
+    g_bridge(OP_TRAINING_PICK, a, 3);
+    return;
+  }
+  // Costumes per character kind (external order): a costume the character does not have is the first.
+  static const uint8_t kCostumes[26] = {6, 5, 4, 4, 6, 4, 5, 4, 5, 5, 4, 4, 5, 4, 4, 5, 5, 6, 5, 5, 4, 5, 5, 5, 4, 5};
+  constexpr uint32_t kTrainingPlayers = 0x8045A6C0u + 0x590u + 6u * 0x140u + 8u + 0x60u;
+  const uint32_t at = kTrainingPlayers + (uint32_t)slot * 0x24u;
+  const uint8_t was = host::rd8(at);
+  if (was > 0x21 && was != 0xFF) return;   // neither a character kind nor empty: not the layout this expects
+  host::wr8(at, (uint8_t)character);
+  host::wr8(at + 3, (uint8_t)(costume >= 0 && costume < kCostumes[character] ? costume : 0));
 }
 
 void write_event_backup() {
@@ -477,8 +528,14 @@ void start_search(MatchMode mode, const std::string& connect_code) {
             g_origin_major, g_practice.controller_port + 1);
 }
 
+bool warmup_enter(int port);
+bool warmup_request_back(const char* why);
+int warmup_button_port();
+
 void process_command(Command command) {
   switch (command.kind) {
+    case CommandKind::Warmup: warmup_enter(warmup_button_port()); break;
+    case CommandKind::WarmupReturn: warmup_request_back(command.text.empty() ? "the player asked" : command.text.c_str()); break;
     case CommandKind::StartUnranked:
       start_search(MatchMode::Unranked, {});
       break;
@@ -569,6 +626,56 @@ void publish_snapshot() {
   if (g_offer_shown && g_offer_mode != MatchMode::None)
     out.offer = std::string("Search ") + match_mode_name(g_offer_mode) + " again?";
   out.detail = g_lifecycle.error();
+  {
+    // The warm-up room, for the button, the room's strip and its banners.
+    auto& w = out.warmup;
+    bool arena = false;
+    std::string why;
+    w.enabled = warmup_offer(&arena, &why);
+    const bool on_select = is_online_scene() && current_minor() == 0 && !playback && g_lifecycle.phase() == Phase::Idle;
+    const slippi::online::WarmupLink link = slippi::online::warmup_link();
+    // The button shows with someone connected in Direct or Teams, or in an arena room; else nothing.
+    w.offered = on_select && !g_warmup.active() &&
+                (w.enabled || (link.link_up && (link.mode == 2 || link.mode == 3)) || slippi::arena::in_room());
+    w.why = w.enabled ? std::string() : why;
+    w.active = g_warmup.active();
+    w.stage = (int)g_warmup.stage();
+    w.arena = g_warmup.active() ? g_warmup.kind() == warmup::Kind::Arena : arena;
+    w.mode = w.arena ? "Arena" : link.mode == 3 ? "Teams" : "Direct";
+    if (!w.arena) {
+      w.peers = link.peers;
+      for (int i = 0; i < link.peers && i < 3; ++i) {
+        w.peer[i].name = link.peer[i].name;
+        w.peer[i].state = (int)(g_warmup.active() ? g_warmup.peer(i)
+                               : link.peer[i].warmup == 1 ? warmup::PeerState::WarmingUp
+                               : link.peer[i].ready ? warmup::PeerState::Ready : warmup::PeerState::Picking);
+        w.peer[i].character = link.peer[i].character;
+        w.peer[i].costume = link.peer[i].costume;
+        w.peer[i].picked = link.peer[i].picked;
+      }
+    }
+    const uint64_t now = steady_ms();
+    w.banner = (int)g_warmup.banner();
+    w.banner_age_ms = g_warmup.banner() == warmup::Banner::None ? 0u : (uint32_t)std::min<uint64_t>(now - g_warmup.banner_since_ms(), 0xFFFFFFFFu);
+    w.banner_peer = g_warmup.banner_peer();
+    w.countdown_ms = g_warmup.countdown_left_ms(now);
+    w.hold = g_warmup_hold;
+    w.sparring = g_warmup_sparring;
+    if (w.arena || slippi::arena::in_room()) {
+      const slippi::arena::WarmupInfo info = slippi::arena::warmup_info();
+      w.arena_place = info.place;
+      w.arena_versus = info.versus;
+      w.score_live = info.score.live;
+      w.score_frame = info.score.frame;
+      for (int i = 0; i < 4; ++i) {
+        const auto& p = info.score.fighter[i];
+        w.score_fighter[i] = {p.present, p.character == 0xFF ? -1 : (int)p.character, (int)p.stocks, p.percent, (int)p.costume, p.name};
+      }
+    }
+  }
+  if (g_warmup.active()) {   // no searches from the warm-up room: the player is still in a session
+    out.can_start = false;
+  }
   switch (out.phase) {
     case Phase::Idle: out.status = out.in_practice ? "Practice" : "Ready"; break;
     case Phase::Searching:
@@ -639,6 +746,540 @@ void enter_training_after_session(MatchMode mode, int local_index = -1, int test
   run_decision(g_lifecycle.return_after_session());
 }
 
+// ---------------------------------------------------------------- warm-up room (slippi_warmup.h)
+// Between matches with someone the player is connected to, or while waiting for a turn in an arena
+// room: Training, with the connection kept (slippi::online::warmup_park), then back to the online
+// character select. The opponent's character is the CPU, played by the pro AI of that character when
+// there is one.
+
+// The character select's number for a character name (a pro's character), or -1.
+int css_kind_named(const char* name) {
+  static const char* const kNames[] = {"Captain Falcon", "Donkey Kong", "Fox", "Mr. Game & Watch", "Kirby", "Bowser",
+      "Link", "Luigi", "Mario", "Marth", "Mewtwo", "Ness", "Peach", "Pikachu", "Ice Climbers", "Jigglypuff",
+      "Samus", "Yoshi", "Zelda", "Sheik", "Falco", "Young Link", "Dr. Mario", "Roy", "Pichu", "Ganondorf"};
+  for (int i = 0; i < (int)(sizeof kNames / sizeof kNames[0]); ++i)
+    if (name && std::strcmp(name, kNames[i]) == 0) return i;
+  return -1;
+}
+const char* css_kind_name(int kind) {
+  static const char* const kShort[] = {"Falcon", "DK", "Fox", "Game & Watch", "Kirby", "Bowser", "Link", "Luigi", "Mario",
+      "Marth", "Mewtwo", "Ness", "Peach", "Pikachu", "Ice Climbers", "Puff", "Samus", "Yoshi", "Zelda", "Sheik",
+      "Falco", "Young Link", "Dr. Mario", "Roy", "Pichu", "Ganondorf"};
+  return kind >= 0 && kind < 26 ? kShort[kind] : "CPU";
+}
+
+// The pro whose AI plays this character, as Fight a pro offers them (practice_menu.cpp): on the
+// Source Port the players whose own AI file loaded, elsewhere those with habit tables. -1 none.
+int pro_for_character(int css_kind) {
+  constexpr int n = (int)(sizeof practice_ghosts::kGhosts / sizeof practice_ghosts::kGhosts[0]);
+  bool neural = false;
+  for (int i = 0; i < n; ++i)
+    if (practice_ghosts::kReleased[i] && ghost_ai::specialist_available((unsigned)i)) neural = true;
+  for (int i = 0; i < n; ++i) {
+    if (!practice_ghosts::kReleased[i]) continue;
+    if (!(neural ? ghost_ai::specialist_available((unsigned)i) : practice_ghosts::kGhosts[i].games > 0)) continue;
+    if (css_kind_named(practice_ghosts::kGhosts[i].character) == css_kind) return i;
+  }
+  return -1;
+}
+
+// What the player picked on the online character select (the select writes the pick into the
+// match's player slots as it is made), with the controller that picked it.
+bool online_select_pick(PracticeConfig* out) {
+  *out = {};
+  uint8_t character = 0, costume = 0;
+  const PracticeConfig css = capture_practice();
+  bool picked = slippi::online::local_css_selection(&character, &costume);
+  if (!picked && css.valid && css.players[css.local_slot].character < 26) {
+    character = (uint8_t)css.players[css.local_slot].character;
+    costume = css.players[css.local_slot].costume;
+    picked = true;
+  }
+  if (!picked) return false;
+  out->valid = true;
+  out->local_slot = 0;
+  out->controller_port = css.valid ? css.controller_port : 0;
+  out->stage = css.stage;
+  out->players[0].active = true;
+  out->players[0].character = character;
+  out->players[0].costume = costume;
+  return true;
+}
+
+// Can the player go now: a connected pair (Direct, Teams) or an arena room's wait. `why` when not.
+bool warmup_offer(bool* arena, std::string* why) {
+  *arena = false;
+  if (g_warmup.active()) { *why = "Warming up"; return false; }
+  if (g_lifecycle.phase() != Phase::Idle || slippi::playback::enabled() || !is_online_scene() || current_minor() != 0) {
+    *why = "";
+    return false;
+  }
+  std::string pair_why;
+  if (slippi::online::warmup_possible(&pair_why)) return true;
+  std::string arena_why;
+  if (slippi::arena::warmup_ok(&arena_why)) { *arena = true; return true; }
+  *why = slippi::arena::in_room() && !arena_why.empty() ? arena_why : pair_why;
+  return false;
+}
+
+bool warmup_enter(int port) {
+  bool arena = false;
+  std::string why;
+  if (!warmup_offer(&arena, &why)) {
+    if (!why.empty()) host::log("native practice: warm-up not now: %s", why.c_str());
+    return false;
+  }
+  PracticeConfig pick;
+  if (!online_select_pick(&pick)) {
+    // Nothing picked on the select yet: Training's own last picks then.
+    pick.valid = true;
+    pick.controller_port = port;
+  } else {
+    pick.controller_port = port;
+  }
+  // The CPU: whom the player is about to face again. Their pick once locked in, else the character
+  // they played last game; in a room, whoever fights next is unknown, so the last opponent.
+  int cpu = -1;
+  uint8_t cpu_costume = 0;
+  if (!arena) {
+    const slippi::online::WarmupLink link = slippi::online::warmup_link();
+    for (int i = 0; i < link.peers && cpu < 0; ++i)
+      if (link.peer[i].character >= 0) { cpu = link.peer[i].character; cpu_costume = (uint8_t)link.peer[i].costume; }
+  }
+  if (cpu < 0 && g_last_opponent >= 0) { cpu = g_last_opponent; cpu_costume = g_last_opponent_costume; }
+  if (cpu >= 0 && !(g_unlocked.load(std::memory_order_relaxed) & (1u << cpu))) {
+    host::log("native practice: warm-up: character %d is not unlocked offline; Training keeps its own CPU", cpu);
+    cpu = -1;
+  }
+  if (!arena && !slippi::online::warmup_park()) return false;
+  if (arena) slippi::arena::set_warming(true);
+  g_warmup.set_countdown_ms(gx::RenderOptions::live_warmup_turn_instant() ? 0 : 3000);
+  g_warmup.enter(arena ? warmup::Kind::Arena : warmup::Kind::Pair, steady_ms());
+  g_warmup_mode = online_mode();
+  g_warmup_css = pick;
+  g_warmup_cpu_applied = false;
+  g_warmup_cpu_char = cpu;
+  g_warmup_cpu_costume = cpu_costume;
+  g_warmup_sparring.clear();
+  g_warmup_match_ticks = 0;
+  if (!g_warmup_cpu_saved) { g_warmup_saved_cpu = practice_cpu::config(); g_warmup_cpu_saved = true; }
+  // Into Training the way "back to Training after a session" goes: the player's pick, the CPU picked,
+  // the menus pressed through.
+  g_auto_search = MatchMode::None;
+  g_offer_mode = MatchMode::None;
+  g_offer_shown = false;
+  g_practice = pick;
+  if (pick.players[0].active) {
+    write_event_backup();
+    set_training_pick(0, (int)pick.players[0].character, pick.players[0].costume);
+    if (cpu >= 0) {
+      // Two players cannot wear the same colours of one character.
+      if ((int)pick.players[0].character == cpu && pick.players[0].costume == cpu_costume) cpu_costume = (uint8_t)((cpu_costume + 1) % 4);
+      g_warmup_cpu_costume = cpu_costume;
+      set_training_pick(1, cpu, cpu_costume);
+    }
+  }
+  g_enter_training = pick.players[0].active;
+  g_enter_port = pick.controller_port;
+  g_enter_ticks = 0;
+  g_enter_seen_select = false;
+  request_major(kTrainingMajor);
+  ++g_generation;
+  host::log("native practice: warm-up: to Training (%s), character %d, CPU %d%s", arena ? "arena room" : "connection kept",
+            pick.players[0].active ? (int)pick.players[0].character : -1, cpu, g_enter_training ? "" : " (Training's own picks)");
+  return true;
+}
+
+// The player's own practice CPU again, once the room is over.
+void warmup_restore_cpu() {
+  if (!g_warmup_cpu_saved) return;
+  if (g_warmup_cpu_applied) {
+    practice_cpu::set_config(g_warmup_saved_cpu);
+    host::log("native practice: warm-up: the player's own practice CPU is back (preset %u, %s)",
+              (unsigned)g_warmup_saved_cpu.preset, g_warmup_saved_cpu.enabled ? "on" : "off");
+  }
+  g_warmup_cpu_saved = false;
+  g_warmup_cpu_applied = false;
+}
+
+// The way back: the select again with the connection as it is.
+void warmup_go_back(const char* why) {
+  host::log("native practice: warm-up: back to the online character select (%s)", why);
+  if (g_warmup.kind() == warmup::Kind::Pair) {
+    g_warmup_no_bounce = g_warmup.anyone_left();
+    slippi::online::warmup_unpark();
+  } else {
+    slippi::arena::set_warming(false);
+  }
+  warmup_restore_cpu();
+  g_enter_training = false;
+  frame_pause(0, false);   // never leave the game frozen by frame advance
+  g_practice = g_warmup_css;
+  if (g_practice.valid && g_practice.players[0].active) write_event_backup();
+  set_online_mode(g_warmup_mode);
+  // Source Port: from VS or another match mode (not Training or an event), the online character select
+  // must not come straight after it: the select would set itself up from that mode's leftovers (a
+  // search found from a VS match stopped both games in its KO star setup, mncharsel.c, 0.9.56). Through
+  // the main menu first, as a player goes; the select is asked for once the menu is up.
+  if (g_bridge && is_match_mode_major(current_major())) {
+    host::log("native practice: warm-up: through the main menu first (scene %02X/%02X)", current_major(), current_minor());
+    g_warmup_via_menu = host::retrace_count() | 1u;
+    request_major(kMainMenuMajor);
+  } else {
+    request_major(kOnlineMajor);
+  }
+  ++g_generation;
+}
+
+// The room ended without going back (a scene change never landed): no connection is kept for nobody.
+void warmup_end(const char* why) {
+  host::log("native practice: warm-up over: %s", why);
+  g_warmup_via_menu = 0;
+  if (g_warmup.kind() == warmup::Kind::Pair && slippi::online::warmup_parked()) {
+    slippi::online::warmup_unpark();
+    slippi::online::native_cleanup_match();   // nobody is going back to that select
+  }
+  if (g_warmup.kind() == warmup::Kind::Arena) slippi::arena::set_warming(false);
+  warmup_restore_cpu();
+  ++g_generation;
+}
+
+bool warmup_request_back(const char* why) {
+  const bool match_waiting = g_warmup.ready_waiting();   // everyone else is ready: back to play
+  if (!g_warmup.request_return(steady_ms())) return false;
+  if (match_waiting) { g_warmup_autostart = true; g_warmup_autostart_ticks = 0; }
+  warmup_go_back(why);
+  return true;
+}
+
+// The controller that pressed the button: the one the online select's player uses.
+int warmup_button_port() {
+  const PracticeConfig css = capture_practice();
+  return css.valid ? css.controller_port : 0;
+}
+
+// Tests only: MELEE_TEST_WARMUP=<role>:<enter>:<stay>:<lock> plays one side of a pair, counted in
+// frames on the online character select after a game (connected, not locked in):
+//   warm   goes to the warm-up after <enter>, stays <stay> frames in Training, comes back, then locks
+//          in after <lock> (the rematch starts when both have);
+//   wait   locks in after <lock> and waits (the other side's Training shows "is ready");
+//   leave  leaves the connection after <lock> (the other side's Training shows "left");
+//   idle   does nothing on the select (a player who is away).
+// Only the first select after a game warms up or leaves; later ones lock in after <lock>.
+// Tests only: MELEE_TEST_WARMUP_AWAY=<major>[,<major>...]:<frames>: once away (in Training), every
+// <frames> frames the game goes on to the next major scene of the list (1 the main menu, 2 VS mode's
+// character select, ...), the way a player wanders off while the room goes on.
+void warmup_away_test_tick() {
+  static const char* spec = host::test_env::getenv("MELEE_TEST_WARMUP_AWAY");
+  if (!spec) return;
+  static std::vector<int> majors;
+  static int every = 0;
+  static size_t next = 0;
+  static uint32_t frames = 0, last_retrace = 0;
+  if (!every) {
+    const char* p = spec;
+    for (;;) {
+      char* end = nullptr;
+      const long v = std::strtol(p, &end, 0);
+      if (end == p) break;
+      majors.push_back((int)v);
+      p = end;
+      if (*p != ',') break;
+      ++p;
+    }
+    if (*p == ':') every = std::atoi(p + 1);
+    if (every <= 0 || majors.empty()) { host::log("warm-up test: bad MELEE_TEST_WARMUP_AWAY '%s'", spec); spec = nullptr; return; }
+  }
+  if (g_warmup.stage() != warmup::Stage::Away) { frames = 0; if (!g_warmup.active()) next = 0; return; }
+  const uint32_t retrace = host::retrace_count();
+  if (retrace == last_retrace) return;
+  last_retrace = retrace;
+  if (next >= majors.size() || ++frames < (uint32_t)every) return;
+  frames = 0;
+  const int major = majors[next++];
+  host::log("warm-up test: away to scene %02X (from %02X/%02X)", major, current_major(), current_minor());
+  request_major((uint8_t)major);
+}
+
+void warmup_test_tick() {
+  warmup_away_test_tick();
+  static const char* spec = host::test_env::getenv("MELEE_TEST_WARMUP");
+  if (!spec) return;
+  static std::string role;
+  static int enter_at = 0, stay = 0, lock_at = 0;
+  static bool parsed = false;
+  if (!parsed) {
+    parsed = true;
+    char r[16] = {};
+    if (std::sscanf(spec, "%15[a-z]:%d:%d:%d", r, &enter_at, &stay, &lock_at) != 4) {
+      host::log("warm-up test: bad MELEE_TEST_WARMUP '%s'", spec);
+      spec = nullptr;
+      return;
+    }
+    role = r;
+    host::log("warm-up test: role %s, enter %d, stay %d, lock %d", role.c_str(), enter_at, stay, lock_at);
+  }
+  static uint32_t ticks = 0, training_ticks = 0;
+  static bool done = false, warmed = false;
+  // arena: a room member who is waiting (not in the ring) goes to warm up after <enter> frames on the
+  // select, up to <stay> times; the room's turn call brings them back (the countdown, or at once).
+  if (role == "arena") {
+    static int times = 0;
+    if (g_warmup.active()) { ticks = 0; return; }
+    const bool waiting = is_online_scene() && slippi::online::in_online_menus() && slippi::arena::warmup_ok(nullptr);
+    ticks = waiting ? ticks + 1 : 0;
+    if (ticks == (uint32_t)enter_at && times < stay) {
+      ++times;
+      host::log("warm-up test: arena member goes to warm up (%d)", times);
+      if (!warmup_enter(0)) host::log("warm-up test: could not go");
+    }
+    return;
+  }
+  // lr: as warm, but with L and R held on the controller (host::input_test_hold) for the way in and
+  // the way back, the way a player does it: the hold the game and the warm-up both read.
+  static bool holding = false;
+  const auto hold = [](bool on) {
+    if (on == holding) return;
+    holding = on;
+    host::input_test_hold(on ? 0x0060u : 0u);
+    host::log("warm-up test: %s L and R", on ? "holding" : "let go of");
+  };
+  if (g_warmup.active()) {
+    ticks = 0;
+    if (role == "lr") {
+      if (g_warmup.stage() == warmup::Stage::Going) hold(false);   // let go once it went
+      if (g_warmup.stage() == warmup::Stage::Away && is_training()) {
+        ++training_ticks;
+        if (training_ticks == (uint32_t)stay) hold(true);
+        if (training_ticks > (uint32_t)stay + 120) hold(false);   // never longer than two seconds
+      }
+      if (g_warmup.stage() == warmup::Stage::Returning) hold(false);
+      return;
+    }
+    if (g_warmup.stage() == warmup::Stage::Away && is_training() && ++training_ticks == (uint32_t)stay)
+      warmup_request_back("test: the stay is over");
+    return;
+  }
+  // Not in the warm-up: a hold that did not take it there within a second lets go.
+  static uint32_t held_ticks = 0;
+  held_ticks = holding ? held_ticks + 1 : 0;
+  if (holding && held_ticks > 60) { hold(false); host::log("warm-up test: the hold did not go to the warm-up"); }
+  training_ticks = 0;
+  const slippi::online::ArenaMatchStatus st = slippi::online::arena_match_status();
+  // A player who leaves may already be locked in (a loser locks in by itself in these tests).
+  const bool on_select = is_online_scene() && slippi::online::in_online_menus() && !st.in_match &&
+                         st.state == 4 /* CONNECTION_SUCCESS */ && (!st.local_ready || (role == "leave" && !done));
+  if (!on_select) { ticks = 0; return; }
+  ++ticks;
+  if (!done && (role == "warm") && !warmed && ticks == (uint32_t)enter_at) {
+    warmed = true;
+    if (!warmup_enter(0)) host::log("warm-up test: could not go");
+    return;
+  }
+  if (!done && role == "lr" && !warmed && ticks == (uint32_t)enter_at) {
+    warmed = true;
+    hold(true);   // the select's own hold check takes it from here (a third of a second)
+    return;
+  }
+  if (!done && role == "leave" && ticks == (uint32_t)lock_at) {
+    done = true;
+    host::log("warm-up test: leaving the connection");
+    slippi::online::native_cleanup_match();
+    return;
+  }
+  if (role == "idle" && !done) return;
+  if (ticks == (uint32_t)lock_at) {
+    // As a player does in a rematch: Start on the select (apply_pads presses it). The game then
+    // locks the winner of the last game in with no stage and sends the loser to the stage select
+    // to counterpick (apply_pads presses A there); the match starts when both are ready.
+    g_test_press_start = true;
+    host::log("warm-up test: locked in (Start on the select)");
+    if ((role != "warm" && role != "lr") || warmed) done = true;
+  }
+}
+
+// Tests only: MELEE_TEST_GO_ONLINE=<ticks>:<route> sends the game to the online character select
+// (Direct) <ticks> frames into an offline match (any is_offline_gameplay_scene), as a pull-back from
+// another mode does: route "direct" requests the online scene at once, "menu" goes through the main
+// menu first. The log says where it landed.
+void scene_route_test_tick() {
+  // MELEE_TEST_GOTO_MAJOR=<retrace>:<major>: once, that major scene requested at that retrace (the way
+  // into a mode the scripted pads then play, e.g. 2 for VS mode's character select).
+  {
+    static const char* go = host::test_env::getenv("MELEE_TEST_GOTO_MAJOR");
+    static bool gone = false;
+    unsigned at = 0, major = 0;
+    if (go && !gone && std::sscanf(go, "%u:%u", &at, &major) == 2 && host::retrace_count() >= at) {
+      gone = true;
+      host::log("scene route test: to scene %02X (from %02X/%02X)", major, current_major(), current_minor());
+      request_major((uint8_t)major);
+    }
+  }
+  static const char* spec = host::test_env::getenv("MELEE_TEST_GO_ONLINE");
+  if (!spec) return;
+  static int at = -1, step = 0;
+  static char route[16] = {};
+  static uint32_t ticks = 0, wait = 0;
+  if (at < 0 && std::sscanf(spec, "%d:%15[a-z]", &at, route) != 2) { host::log("scene route test: bad '%s'", spec); spec = nullptr; return; }
+  static uint8_t last_major = 0xFF, last_minor = 0xFF;
+  if (current_major() != last_major || current_minor() != last_minor) {
+    last_major = current_major(); last_minor = current_minor();
+    host::log("scene route test: scene %02X/%02X (retrace %u)", last_major, last_minor, host::retrace_count());
+  }
+  if (step == 0) {
+    if (!is_offline_gameplay_scene(current_major(), current_minor())) { ticks = 0; return; }
+    if (++ticks < (uint32_t)at) return;
+    step = 1;
+    host::log("scene route test: leaving the match %02X/%02X by route %s", current_major(), current_minor(), route);
+    if (std::strcmp(route, "menu") == 0) { request_major(1); return; }
+    set_online_mode(2);
+    request_major(kOnlineMajor);
+    step = 3;
+    return;
+  }
+  if (step == 1 && current_major() == 1 && ++wait > 30) {
+    step = 3;
+    host::log("scene route test: on the main menu, now the online select");
+    set_online_mode(2);
+    request_major(kOnlineMajor);
+  }
+  if (step == 3 && is_online_scene() && slippi::online::in_online_menus()) {
+    step = 4;
+    host::log("scene route test: the online character select is up");
+  }
+}
+
+// Once a frame: what the game and the link say, and what the room answers.
+void warmup_tick() {
+  // L+R held: in Training toward going back (two thirds of a second: both triggers fully in for
+  // that long is no accident in a match), shown on screen as it fills.
+  constexpr uint32_t kBackHold = 40;
+  static uint32_t back_ticks = 0;
+  if (!g_warmup.active()) { back_ticks = 0; g_warmup_hold = 0.0f; return; }
+  const uint64_t now = steady_ms();
+  warmup::Observe o;
+  o.now_ms = now;
+  o.in_training = is_training();
+  o.online_select = is_online_scene() && slippi::online::in_online_menus();
+  // The online scene but not its select (the player picked Online from the menus): no new online game
+  // while the room holds them; the way back. Not while the main menu step of a way back is pending.
+  o.online_menu = is_online_scene() && !o.online_select;
+  if (g_warmup.kind() == warmup::Kind::Pair) {
+    const slippi::online::WarmupLink link = slippi::online::warmup_link();
+    o.link_up = link.link_up;
+    o.peers = link.peers;
+    for (int i = 0; i < link.peers && i < warmup::kMaxPeers; ++i)
+      o.peer[i] = link.peer[i].warmup == 1 ? warmup::PeerState::WarmingUp
+                : link.peer[i].ready ? warmup::PeerState::Ready : warmup::PeerState::Picking;
+  } else {
+    o.turn = slippi::arena::turn_called();
+  }
+  const warmup::Stage before = g_warmup.stage();
+  const warmup::Banner banner_before = g_warmup.banner();
+  switch (g_warmup.tick(o)) {
+    case warmup::Action::None: break;
+    case warmup::Action::GoBack:
+      warmup_go_back(o.online_menu ? "the player went to the online menus: back to the room" : "the room called this player's turn");
+      break;
+    case warmup::Action::Ready:
+      host::audio_ui_sound(2);
+      g_warmup_autostart = true;
+      g_warmup_autostart_ticks = 0;
+      host::log("native practice: warm-up: everyone else locked in (retrace %u)", host::retrace_count());
+      warmup_go_back("everyone else locked in: back to start the match");
+      break;
+    case warmup::Action::Arrived:
+      host::log("native practice: warm-up: on the online character select again (retrace %u)", host::retrace_count());
+      ++g_generation;
+      break;
+    case warmup::Action::GiveUp:
+      warmup_end(before == warmup::Stage::Returning ? "the character select never came back" : "Training never came up");
+      break;
+  }
+  if (g_warmup.banner() != banner_before) {
+    const int p = g_warmup.banner_peer();
+    host::log("native practice: warm-up: %s", g_warmup.banner() == warmup::Banner::PeerReady ? "the opponent is ready"
+              : g_warmup.banner() == warmup::Banner::PeerLeft ? "the opponent left"
+              : g_warmup.banner() == warmup::Banner::PeerWarming ? "the opponent is warming up too"
+              : g_warmup.banner() == warmup::Banner::PeerBack ? "the opponent is back on the select"
+              : g_warmup.banner() == warmup::Banner::YourTurn ? "this player's turn in the room" : "banner cleared");
+    (void)p;
+    // A sound for what asks for the player: the opponent ready, the room calling this player's turn.
+    if (g_warmup.banner() == warmup::Banner::PeerReady || g_warmup.banner() == warmup::Banner::YourTurn) host::audio_ui_sound(2);
+    ++g_generation;
+  }
+
+  // The sparring partner: once the Training match runs, the pro who plays the CPU's character.
+  if (g_warmup.stage() == warmup::Stage::Away && is_training() && current_minor() == 2) {
+    if (++g_warmup_match_ticks == 30) {
+      const PracticeConfig now_cfg = capture_practice();
+      int cpu_kind = -1;
+      for (const SavedPlayer& p : now_cfg.players)
+        if (p.active && p.player_kind == 1 && p.character < 26) { cpu_kind = (int)p.character; break; }
+      const int pro = cpu_kind >= 0 ? pro_for_character(cpu_kind) : -1;
+      MuPcConfig c{};
+      if (!g_warmup_cpu_applied && pro >= 0 && practice_cpu::ghost(pro, c)) {
+        c.enabled = 1;
+        c.tools = g_warmup_saved_cpu.tools;   // the player's own tools (frame advance, ...) stay
+        practice_cpu::set_config(c);
+        g_warmup_cpu_applied = true;
+        g_warmup_sparring = std::string(practice_ghosts::kGhosts[pro].name) + " AI";   // the player's AI, not the player
+        host::log("native practice: warm-up: %s's AI plays the CPU (%s)", practice_ghosts::kGhosts[pro].name,
+                  practice_ghosts::kGhosts[pro].character);
+      } else if (g_warmup_sparring.empty()) {
+        const MuPcConfig live = practice_cpu::config();
+        const int live_pro = (live.preset & 0x80) && live.preset != MU_PC_PRESET_AI ? (int)(live.preset & 0x7F) : -1;
+        g_warmup_sparring = live_pro >= 0 && live_pro < (int)(sizeof practice_ghosts::kGhosts / sizeof practice_ghosts::kGhosts[0])
+                                ? std::string(practice_ghosts::kGhosts[live_pro].name) + " AI"
+                                : std::string(css_kind_name(cpu_kind)) + " CPU";
+        host::log("native practice: warm-up: the CPU is %s", g_warmup_sparring.c_str());
+      }
+      ++g_generation;
+    }
+  } else {
+    g_warmup_match_ticks = 0;
+    // Out of Training (another mode, the menus): the player's own practice CPU again; the pro comes
+    // back with the next Training match.
+    if (g_warmup.stage() == warmup::Stage::Away && !is_training() && g_warmup_cpu_applied) {
+      practice_cpu::set_config(g_warmup_saved_cpu);
+      g_warmup_cpu_applied = false;
+      g_warmup_sparring.clear();
+      host::log("native practice: warm-up: out of Training (scene %02X): the player's own practice CPU is back", current_major());
+      ++g_generation;
+    }
+  }
+  // The way back through the main menu: once the menu is up (a third of a second), the select.
+  if (g_warmup_via_menu) {
+    if (!g_warmup.active() || is_online_scene()) {
+      g_warmup_via_menu = 0;
+    } else if (current_major() == kMainMenuMajor && host::retrace_count() - g_warmup_via_menu > 20) {
+      g_warmup_via_menu = 0;
+      host::log("native practice: warm-up: on the main menu, now the online character select");
+      set_online_mode(g_warmup_mode);
+      request_major(kOnlineMajor);
+    }
+  }
+
+  // The hold back (anywhere the player is away: Training, another mode, the menus).
+  // The hold that brought the player here may still be down when Training comes up: it counts only
+  // after both triggers were let go once in Training.
+  static bool armed = false;
+  bool lr = false;
+  if (g_warmup.stage() == warmup::Stage::Away) {
+    host::PadState pads[4];
+    host::input_last_pads(pads);
+    for (int port = 0; port < 4; ++port)
+      if (pads[port].err == 0 && (pads[port].button & 0x0060u) == 0x0060u && !(pads[port].button & (0x0100u | 0x1000u | 0x0010u))) lr = true;
+    if (!lr) armed = true;
+  } else {
+    armed = false;
+  }
+  if (!armed) lr = false;
+  back_ticks = lr ? back_ticks + 1 : 0;
+  g_warmup_hold = lr ? std::min(1.0f, (float)back_ticks / (float)kBackHold) : 0.0f;
+  if (back_ticks == kBackHold) warmup_request_back(is_training() ? "L+R held in Training" : "L+R held");
+}
+
 }  // namespace
 
 
@@ -675,6 +1316,16 @@ void submit_cancel() {
 void submit_acknowledge_failure() {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_commands.push_back({CommandKind::AcknowledgeFailure, {}});
+}
+
+void submit_warmup() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_commands.push_back({CommandKind::Warmup, {}});
+}
+
+void submit_warmup_return() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  g_commands.push_back({CommandKind::WarmupReturn, "the player chose Back to match"});
 }
 
 // Playing, paused or a menu, for the YouGame button (yougame_game_state.h). Every retrace, before
@@ -1096,23 +1747,42 @@ void tick() {
   // still resets): go to Training to warm up, and the Unranked search starts again by itself once
   // the Training match is running. A third of a second of holding, so brushing both triggers does
   // nothing. Leaving Training for anywhere else first drops the pending search.
+  // With someone connected (Direct, Teams), or waiting for a turn in an arena room, the same hold
+  // goes to the warm-up room instead: Training with the connection kept (warmup_enter).
   {
     static uint32_t lr_ticks = 0;
     bool lr = false;
     static int lr_port = 0;
     static MatchMode lr_mode = MatchMode::None;
-    if (g_lifecycle.phase() == Phase::Idle && g_auto_search == MatchMode::None && is_online_scene() &&
-        current_minor() == 0 &&
-        (online_mode() == (uint8_t)MatchMode::Unranked || online_mode() == (uint8_t)MatchMode::Direct ||
-         online_mode() == (uint8_t)MatchMode::Teams) &&
-        !slippi::playback::enabled() && !slippi::online::is_online_match()) {
-      lr_mode = (MatchMode)online_mode();
-      host::PadState pads[4];
-      host::input_last_pads(pads);
-      for (int port = 0; port < 4; ++port)
-        if ((pads[port].button & 0x0060u) == 0x0060u && !(pads[port].button & (0x0100u | 0x1000u))) { lr = true; lr_port = port; }
+    bool warm = false;
+    if (g_lifecycle.phase() == Phase::Idle && g_auto_search == MatchMode::None && !g_warmup.active() && is_online_scene() &&
+        current_minor() == 0 && !slippi::playback::enabled()) {
+      bool arena = false;
+      std::string why;
+      warm = warmup_offer(&arena, &why);
+      // A Direct or Teams pair that is connected but locked in stays: the hold does nothing then
+      // (the button says "Locked in"). Before a pair connects the hold works as it always did.
+      const bool connected_pair = !warm && slippi::online::warmup_link().link_up &&
+                                  (online_mode() == (uint8_t)MatchMode::Direct || online_mode() == (uint8_t)MatchMode::Teams);
+      const bool plain = !connected_pair &&
+          (online_mode() == (uint8_t)MatchMode::Unranked || online_mode() == (uint8_t)MatchMode::Direct ||
+           online_mode() == (uint8_t)MatchMode::Teams) && !slippi::online::is_online_match();
+      if (warm || plain) {
+        lr_mode = (MatchMode)online_mode();
+        host::PadState pads[4];
+        host::input_last_pads(pads);
+        for (int port = 0; port < 4; ++port)
+          if ((pads[port].button & 0x0060u) == 0x0060u && !(pads[port].button & (0x0100u | 0x1000u))) { lr = true; lr_port = port; }
+      }
     }
     lr_ticks = lr ? lr_ticks + 1 : 0;
+    g_warmup_hold = warm && lr ? std::min(1.0f, (float)lr_ticks / 20.0f) : (g_warmup.active() ? g_warmup_hold : 0.0f);
+    if (warm && lr_ticks == 20) {
+      host::log("native practice: L+R on the online character select; warm-up room");
+      warmup_enter(lr_port);
+      lr_ticks = 21;
+    }
+    if (warm) lr_ticks = std::min<uint32_t>(lr_ticks, 21);
     // Direct: practice while waiting for the code's player, with the code being searched for (or
     // the last one used). No code at all: nothing to search, so L+R does nothing there.
     std::string lr_code;
@@ -1216,6 +1886,26 @@ void tick() {
   }
   for (Command& command : commands) process_command(std::move(command));
 
+  warmup_tick();
+  warmup_test_tick();
+  scene_route_test_tick();
+  // This player's pick on the online character select, for an opponent on our build to see
+  // ("picked Falco") before any lock-in. A few times a second; sent only when it changes.
+  {
+    static uint32_t pick_ticks = 0;
+    if (!g_warmup.active() && is_online_scene() && current_minor() == 0 && ++pick_ticks % 6 == 0) {
+      uint8_t character = 0xFF, costume = 0;
+      if (!slippi::arena::css_pick(&character, &costume)) {
+        const PracticeConfig css = capture_practice();
+        if (css.valid && css.players[css.local_slot].character < 26) {
+          character = (uint8_t)css.players[css.local_slot].character;
+          costume = css.players[css.local_slot].costume;
+        }
+      }
+      slippi::online::warmup_note_pick(character < 26 ? character : -1, costume);
+    }
+  }
+
   // "After an online session ends, go back to Training mode" (Game tab, Online): when the session
   // ends with at least one match played (the other player left, Z held to leave, the connection
   // dropped) and the player is still on the online screens, Training's character select. Only once
@@ -1224,7 +1914,8 @@ void tick() {
     static yougame::unranked::SessionWatch session_watch;
     static int session_mode_seen = -1, local_index_seen = -1;
     static std::string session_code;
-    const bool session = slippi::online::session_mode() >= 0;
+    // A parked session (the warm-up room) is still the same session: nothing has ended.
+    const bool session = slippi::online::session_mode_or_parked() >= 0;
     const bool match_running = slippi::online::is_online_match();
     // A session that was an arena room's (in the room, or its room just ended) is never a finished
     // online session: the room's last game stays "in a match" on the select until its connection is
@@ -1232,9 +1923,10 @@ void tick() {
     static bool from_room = false, session_was = false;
     if (slippi::arena::in_room() || slippi::arena::room_just_ended()) from_room = true;
     else if (!session && !session_was) from_room = false;   // no session left over: the next one is plain
+    const bool session_ended = session_was && !session;
     session_was = session;
     if (session) {
-      session_mode_seen = slippi::online::session_mode();
+      session_mode_seen = slippi::online::session_mode_or_parked();
       if (match_running) {
         local_index_seen = slippi::online::local_player_index();
         // The opponent's character, for Training's CPU afterwards (once a second; the slots are
@@ -1263,10 +1955,13 @@ void tick() {
       // Leaving a room, or the room closing, ends the pair too: the player stays on the select.
       const bool arena_room = slippi::arena::in_room() || from_room;
       from_room = false;
-      if (allow_training && !arena_room && gx::RenderOptions::live_online_back_to_training() && !unranked && g_lifecycle.phase() == Phase::Idle &&
+      // Back on the select after the opponent left during the warm-up: the player asked for the select.
+      const bool no_bounce = g_warmup_no_bounce;
+      if (no_bounce) host::log("native practice: the opponent left during the warm-up; the player stays on the select");
+      if (!no_bounce && allow_training && !arena_room && gx::RenderOptions::live_online_back_to_training() && !unranked && g_lifecycle.phase() == Phase::Idle &&
           is_online_scene() && !slippi::playback::enabled()) {
         enter_training_after_session((MatchMode)session_mode_seen, local_index_seen);
-      } else if (allow_training && !arena_room && gx::RenderOptions::live_online_return_training() && g_lifecycle.phase() == Phase::Idle &&
+      } else if (!no_bounce && allow_training && !arena_room && gx::RenderOptions::live_online_return_training() && g_lifecycle.phase() == Phase::Idle &&
           is_online_scene()) {
         g_origin_major = kTrainingMajor;
         g_restore_training = false;
@@ -1274,6 +1969,7 @@ void tick() {
         run_decision(g_lifecycle.return_after_session());
       }
     }
+    if (session_ended) g_warmup_no_bounce = false;   // once per session, played or not
   }
 
   // Entering major 8 directly skips the title-menu option handler that normally owns this byte.
@@ -1361,9 +2057,38 @@ static void neutral_pads(host::PadState* pads) {
 
 void apply_pads(host::PadState* pads) {
   constexpr uint16_t kDown = 0x0004, kUp = 0x0008, kA = 0x0100, kStart = 0x1000;
+  // Counted in frames, not calls: the Static Recomp's game reads the pads many times a frame on some
+  // menus (about 24 on Training's character select), which ran the 15-second limit out in 38 frames.
+  static uint32_t last_retrace = 0;
+  const uint32_t retrace = host::retrace_count();
+  const bool new_frame = retrace != last_retrace;
+  last_retrace = retrace;
+  if (g_warmup_autostart) {
+    // Back from the warm-up because everyone else is ready: Start on the select, every few frames
+    // until the game takes it (it ignores input for a moment after it comes up). Never on a select
+    // that lost the connection (Start would open the code entry there).
+    const uint8_t major = current_major(), minor = current_minor();
+    if (major == kOnlineMajor && minor == 0) {
+      const slippi::online::ArenaMatchStatus st = slippi::online::arena_match_status();
+      if (st.state != 4 /* CONNECTION_SUCCESS */ || st.local_ready) {
+        g_warmup_autostart = false;
+        host::log("native practice: warm-up: %s (retrace %u)", st.local_ready ? "locked in for the match" : "no connection to start the match on",
+                  host::retrace_count());
+      } else {
+        if (new_frame) ++g_warmup_autostart_ticks;
+        if (g_warmup_autostart_ticks % 6 == 1) pads[g_warmup_css.controller_port & 3].button |= kStart;
+        if (g_warmup_autostart_ticks > 300) { g_warmup_autostart = false; host::log("native practice: warm-up: the select never took Start"); }
+      }
+    } else if (major == kOnlineMajor && minor != 0) {
+      g_warmup_autostart = false;   // the stage select (the loser picks) or the match itself
+      host::log("native practice: warm-up: on to the %s", minor == 1 ? "stage select" : "match");
+    } else if (major != kOnlineMajor && !g_warmup.active()) {
+      g_warmup_autostart = false;   // the way back ended somewhere else (it is kept through the main menu step)
+    }
+  }
   if (g_enter_training) {
     const uint8_t major = current_major(), minor = current_minor();
-    ++g_enter_ticks;
+    if (new_frame) ++g_enter_ticks;
     if (major == kTrainingMajor && minor < 2) g_enter_seen_select = true;
     // The player's own input on Training's menus hands them back at once: the automatic picks below
     // hold every controller neutral, and when they did not take, nothing answered for 15 seconds.
@@ -1384,6 +2109,9 @@ void apply_pads(host::PadState* pads) {
     } else {
       entry_seen = false;
     }
+    // Tests (MELEE_TEST_WARMUP): the bots' match inputs are no player taking over Training's menus.
+    static const bool warmup_test = host::test_env::getenv("MELEE_TEST_WARMUP") != nullptr;
+    if (warmup_test) touched = false;
     if (touched && g_enter_ticks > 20) {
       g_enter_training = false;
       entry_seen = false;
@@ -1393,15 +2121,23 @@ void apply_pads(host::PadState* pads) {
     } else if (g_enter_ticks > 60 * 15 || slippi::online::is_online_match() ||
                (major != kTrainingMajor && major != kOnlineMajor && g_enter_ticks > 180)) {
       g_enter_training = false;
-      host::log("native practice: stopped pressing through Training's menus (scene %02X:%02X)", major, minor);
-    } else if (major == kTrainingMajor && minor == 1 && g_bridge) {
+      host::log("native practice: stopped pressing through Training's menus (scene %02X:%02X, %u frames, online match %d)",
+                major, minor, g_enter_ticks, slippi::online::is_online_match() ? 1 : 0);
+    } else if (major == kTrainingMajor && minor == 1) {
       neutral_pads(pads);
       // Stage select: the same stage as before (Final Destination when there was none), picked at once.
+      // Both engines run the same stage select: it takes SSSData::force_stage_id as a pick (its enter
+      // clears it, so it is set while the select runs). The Static Recomp's is Training's own SSSData,
+      // a static at 0x8048E378 (gmtrainingmode.c), the field at +3.
       const int legal[] = {2, 3, 8, 28, 31, 32};
       int stage = 32;
       for (int s : legal) if ((int)g_practice.stage == s) stage = s;
-      int32_t a[1] = {stage};
-      g_bridge(OP_TRAINING_STAGE, a, 1);
+      if (g_bridge) {
+        int32_t a[1] = {stage};
+        g_bridge(OP_TRAINING_STAGE, a, 1);
+      } else {
+        host::wr8(0x8048E378u + 3u, (uint8_t)stage);
+      }
     } else if (major == kTrainingMajor) {
       // Character select: only Start, which confirms the remembered pick (the Static Recomp also takes A
       // on the stage). Every controller is neutral meanwhile: an A still held from the Practice menu, or a
@@ -1410,6 +2146,30 @@ void apply_pads(host::PadState* pads) {
       if (g_enter_ticks % 40 < 3) pads[g_enter_port & 3].button |= minor == 0 ? kStart : kA;
     } else {
       neutral_pads(pads);   // on the way into Training
+    }
+  }
+  // Tests (MELEE_TEST_WARMUP): the online stage select (a rematch's loser counterpicks) takes the
+  // stage under the cursor, as a player pressing A would.
+  {
+    static const bool test = host::test_env::getenv("MELEE_TEST_WARMUP") != nullptr;
+    static uint32_t sss_ticks = 0;
+    if (test && is_online_scene() && current_minor() == 1) {
+      // The cursor starts at the left edge, off the icons: right onto the grid first, then A.
+      const uint32_t t = new_frame ? ++sss_ticks : sss_ticks;
+      if (t > 20 && t <= 44) pads[0].stick_x = 100;
+      if (t > 60 && t % 40 == 20) { pads[0].button |= kA; if (new_frame) host::log("warm-up test: A on the stage select"); }
+      if (t > 60 && t % 40 == 0) pads[0].stick_x = 80;   // nudge on if that was no stage
+    } else {
+      sss_ticks = 0;
+    }
+    static uint32_t start_ticks = 0;
+    if (g_test_press_start && is_online_scene() && current_minor() == 0 && !slippi::online::arena_match_status().local_ready) {
+      if (new_frame) ++start_ticks;
+      if (start_ticks % 40 == 1) pads[0].button |= kStart;
+    } else {
+      if (g_test_press_start && (!is_online_scene() || current_minor() != 0 || slippi::online::arena_match_status().local_ready))
+        g_test_press_start = false;
+      start_ticks = 0;
     }
   }
   if (g_offer_shown) {

@@ -4726,9 +4726,21 @@ void* launch_arena_viewer(const std::string& path) {
   if (argv) LocalFree(argv);
   const std::filesystem::path live = std::filesystem::u8path(path);
   cmd += L" --replay " + quote(live.wstring());
+  // How it shows the match (its corner switches it; this game keeps the choice, so it says where).
+  cmd += L" --spectate-view " + std::to_wstring(std::clamp(gx::RenderOptions::live_spectate_view(), 0, 2));
+  wchar_t owner[32];
+  swprintf(owner, 32, L"%llx", (unsigned long long)(uintptr_t)host::window_native());
+  cmd += L" --spectate-owner " + std::wstring(owner);
   // Its own recording of what it showed goes beside the live one (tests compare the two).
   cmd += L" --replay-dir " + quote((live.parent_path() / L"viewer").wstring());
   if (hidden) cmd += L" --log-file " + quote((live.parent_path() / (live.stem().wstring() + L".log")).wstring());
+  // Test: MELEE_TEST_VIEWER_SHOTS=1 gives the viewer its overlay (the view selector) and pictures.
+  if (host::test_env::getenv("MELEE_TEST_VIEWER_SHOTS")) {
+    std::error_code ec;
+    std::filesystem::create_directories(live.parent_path() / L"viewer", ec);
+    cmd += L" --pc-settings --window 1280x720 --capture-every 60 --capture " +
+           quote((live.parent_path() / L"viewer" / (live.stem().wstring() + L"-shot.ppm")).wstring());
+  }
   STARTUPINFOW si{};
   si.cb = sizeof si;
   PROCESS_INFORMATION pi{};
@@ -5816,6 +5828,12 @@ bool set_replay(const char* path) {
   if (g_replay_game_start.empty()) { host::log("replay: %s has no Game Start event", path); g_replay.reset(); return false; }
   Slippi::GameSettings* s = g_replay->GetSettings();
   g_replay_stream.set_event_sink(nullptr);   // the viewer's own recording is not broadcast
+#if !defined(MELEE_NO_SLIPPI)
+  // An arena room's match window: its own frames tell the game that opened it the stocks and percent it
+  // shows (slippi_arena.cpp viewer_score_event), so that game's warm-up panel matches it frame for frame.
+  if (host::options.spectate)
+    g_replay_stream.set_event_sink([](const uint8_t* data, uint32_t size) { slippi::arena::recording_event(data, size); });
+#endif
   if (!g_replay_stream.begin(g_replay_game_start, s->geckoCodes)) {
     host::log("replay: cannot start recording: %s", g_replay_stream.error().c_str());
     g_replay.reset();

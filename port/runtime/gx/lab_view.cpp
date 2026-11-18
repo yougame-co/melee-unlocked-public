@@ -9,6 +9,7 @@
 #include "../abi/mu_look_snapshot.h"
 #include "gx_core.h"
 #include "host.h"
+#include "window.h"
 #include "imgui.h"
 #include "earcut/mapbox/earcut.hpp"
 #include <algorithm>
@@ -916,17 +917,27 @@ struct Camera {
 };
 Camera g_camera;   // render thread only
 
-void update_camera(const Frame& f, uint64_t serial) {
+void update_camera(const Frame& f, uint64_t serial, uint16_t stage) {
   if (g_camera.serial != serial) { g_camera = Camera{}; g_camera.serial = serial; }
   if (f.number == g_camera.frame) return;   // eased once per game frame, not per presented frame
   g_camera.frame = f.number;
   float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
   bool any = false;
+  // The room's match window (a small window, host::options.spectate): the whole stage always in frame,
+  // widened for a player off it; a KO'd player is not followed. Elsewhere Slippi Lab's own camera.
+  const bool wide = host::options.spectate;
   for (const auto& port : f.players) {
-    if (!port[0].present) continue;
+    if (!port[0].present || (wide && port[0].action <= 11)) continue;   // KO'd (the Dead states) or asleep
     any = true;
     x0 = std::min(x0, port[0].x); x1 = std::max(x1, port[0].x);
     y0 = std::min(y0, port[0].y); y1 = std::max(y1, port[0].y);
+  }
+  if (wide) {
+    for (const StageShape& st : stages()) {
+      if (st.id != stage) continue;
+      for (const ImVec2& p : st.main) { x0 = std::min(x0, p.x); x1 = std::max(x1, p.x); y0 = std::min(y0, p.y); y1 = std::max(y1, p.y); any = true; }
+      for (const auto& pl : st.platforms) for (const ImVec2& p : pl) { y1 = std::max(y1, p.y + 20.0f); }
+    }
   }
   if (!any) return;
   x0 -= 25; x1 += 25; y0 -= 25; y1 += 25;
@@ -1059,6 +1070,29 @@ void draw_stick_figure(ImDrawList* dl, const View& v, const std::vector<Frame::C
     dl->AddCircleFilled(v(head->ax, head->ay), r, body, 0);
     dl->AddCircle(v(head->ax, head->ay), r, col, 0, 2 * half);
   }
+}
+
+// Blobs: only the body under the stick figure (each hurtbox as a soft, pale shape in the player's
+// colour), no lines. The lightest look; the match window's Light view.
+void draw_body_blobs(ImDrawList* dl, const View& v, const std::vector<Frame::Capsule>& caps, uint32_t colour) {
+  const ImU32 body = mix_with(colour, background_color(), 0.62f);
+  for (const auto& c : caps) {
+    const float r = std::max(1.0f, c.r * v.px);
+    dl->AddCircleFilled(v(c.ax, c.ay), r, body, 0);
+    if (std::hypot(c.bx - c.ax, c.by - c.ay) >= 0.5f) {
+      dl->AddCircleFilled(v(c.bx, c.by), r, body, 0);
+      dl->AddLine(v(c.ax, c.ay), v(c.bx, c.by), body, 2 * r);
+    }
+  }
+}
+
+// The platform a player comes back on after losing a stock (Rebirth, RebirthWait): a short slab
+// under their feet in the stage's colour, as the game shows it.
+void draw_revival_platform(ImDrawList* dl, const View& v, float x, float y) {
+  const ImU32 stage = rgb(stage_color());
+  const ImVec2 a = v(x - 9.0f, y), b = v(x + 9.0f, y - 1.6f);
+  dl->AddRectFilled(ImVec2(std::min(a.x, b.x), std::min(a.y, b.y)), ImVec2(std::max(a.x, b.x), std::max(a.y, b.y)), stage,
+                    std::max(1.0f, 0.8f * v.px));
 }
 
 // Keep each capsule's contour readable where large hurtboxes overlap (notably Bowser's shell).
@@ -1300,11 +1334,16 @@ void outlined_text(ImDrawList* dl, ImFont* font, float size, ImVec2 center_basel
 
 void draw_hud(ImDrawList* dl, const GameInfo& info, const Frame& f, float w, float h) {
   ImFont* font = g_hud_font ? g_hud_font : ImGui::GetFont();
-  // The SVG's 730 x 600 box, fitted and centred the same way as the stage.
-  const float fit = std::min(w / 730.0f, h / 600.0f);
-  const float bw = 730 * fit, bh = 600 * fit, left = (w - bw) / 2, top = (h - bh) / 2;
-  auto at = [&](float xp, float yp) { return ImVec2(left + bw * (0.5f + xp / 100), top + bh * (0.5f + yp / 100)); };
-  const float text = 15 * fit;
+  // Where the game itself keeps these (measured on its own 4:3 picture, as fractions of it): the
+  // timer at the top centre; each player's slot a quarter-ish of the picture apart, stocks in a row
+  // from the slot's left with the percent under them, further right. The name, which the game does
+  // not show there, goes under the percent. Slippi Lab's colours and outlined type.
+  // The game's picture as the window shows it (73:60 for Melee's own, wider with a widescreen code).
+  const float aspect = std::clamp(host::window_picture_aspect(), 1.0f, 2.5f);
+  const float ph = std::min(h, w / aspect), pw = ph * aspect, left = (w - pw) / 2, top = (h - ph) / 2;
+  auto at = [&](float xf, float yf) { return ImVec2(left + pw * xf, top + ph * yf); };
+  const float fit = ph / 600.0f;
+  const float text = 0.062f * ph, pct_px = 0.075f * ph, name_px = 0.030f * ph;
   if (info.timer_on) {   // Timer.tsx: timerStart * 60 - frame index + 123, the game's hundredths
     static const char* const hundredths[60] = {
       "00", "02", "04", "06", "07", "09", "11", "12", "14", "16", "17", "19", "21", "22", "24", "26", "27", "29", "31", "32",
@@ -1314,25 +1353,28 @@ void draw_hud(ImDrawList* dl, const GameInfo& info, const Frame& f, float w, flo
     char t[24];
     std::snprintf(t, sizeof t, "%02d:%02d:%s", frames / 3600, (frames % 3600) / 60, hundredths[frames % 60]);
     const ImVec2 ts = font->CalcTextSizeA(text, FLT_MAX, 0, t);
-    const ImVec2 c = at(0, -42);
-    dl->AddText(font, text, ImVec2(c.x - ts.x / 2, c.y - text * 0.8f), rgb(stage_color()), t);
+    const ImVec2 c = at(0.5f, 0.139f);   // the game's own timer is centred 14% down
+    dl->AddText(font, text, ImVec2(c.x - ts.x / 2, c.y - text * 0.5f), rgb(stage_color()), t);
   }
   for (int port = 0; port < 4; ++port) {
     if (!info.ports[port].present || !f.players[port][0].present) continue;
     const PlayerFrame& p = f.players[port][0];
     const ImU32 col = rgb(player_color(info, port, false));
-    const float xp = -30.0f + 20.0f * port;
+    const float slot = 0.24f * port;   // the game's four places along the bottom, by port
+    const float dot = 0.015f * pw;
     for (int i = 0; i < p.stocks && i < 8; ++i) {
-      const ImVec2 c = at(xp - 2 * (1.5f - i), 40);
-      dl->AddCircleFilled(c, 5 * fit, col, 0);
-      dl->AddCircle(c, 5 * fit, rgb(0x000000), 0, std::max(1.0f, fit));
+      const ImVec2 c = at(0.060f + slot + 0.040f * i, 0.780f);
+      dl->AddCircleFilled(c, dot, col, 0);
+      dl->AddCircle(c, dot, rgb(0x000000), 0, std::max(1.0f, fit));
     }
     char pct[16];
     std::snprintf(pct, sizeof pct, "%d%%", (int)std::floor(p.percent));
-    outlined_text(dl, font, text, at(xp, 44), col, pct, fit);
+    const ImVec2 pc = at(0.197f + slot, 0.890f);   // outlined_text takes the baseline: centre + 0.3 of the size
+    outlined_text(dl, font, pct_px, ImVec2(pc.x, pc.y + pct_px * 0.3f), col, pct, fit);
     std::string name = info.ports[port].name;
     if (name.empty() && p.character < sizeof kCharacterNames / sizeof *kCharacterNames) name = kCharacterNames[p.character];
-    outlined_text(dl, font, text, at(xp, 47), col, name.c_str(), fit);
+    const ImVec2 nc = at(0.197f + slot, 0.955f);
+    outlined_text(dl, font, name_px, ImVec2(nc.x, nc.y + name_px * 0.3f), col, name.c_str(), fit * 0.6f);
   }
 }
 
@@ -1360,7 +1402,7 @@ void draw(bool enabled, float width, float height) {
     f = g_shown;
     serial = g_match_serial;
   }
-  update_camera(f, serial);
+  update_camera(f, serial, info.stage);
   if (!g_camera.valid) return;
   g_covering.store(true, std::memory_order_relaxed);
 
@@ -1369,7 +1411,34 @@ void draw(bool enabled, float width, float height) {
   // simply shows more of the stage to the sides.
   const float area_h = std::max(height * 0.5f, height - std::max(0.0f, g_bottom_reserve.load(std::memory_order_relaxed)));
   const float fit = std::min(width / 730.0f, area_h / 600.0f);
-  const View v{width / 2, area_h / 2, g_camera.scale * fit, g_camera.cx, g_camera.cy};
+  float cam_x = g_camera.cx, cam_y = g_camera.cy;
+  if (host::options.spectate) {   // the match window's view stays inside the stage's blast zones (beyond them is empty grid)
+    const StageShape* bz = nullptr;
+    for (const StageShape& st : stages()) if (st.id == info.stage) bz = &st;
+    const float px = g_camera.scale * fit;
+    if (bz && px > 0) {
+      const float hw = width * 0.5f / px, hh = area_h * 0.5f / px;
+      const float x0 = bz->bz_min.x + hw, x1 = bz->bz_max.x - hw, y0 = bz->bz_min.y + hh, y1 = bz->bz_max.y - hh;
+      cam_x = x0 <= x1 ? std::clamp(cam_x, x0, x1) : (bz->bz_min.x + bz->bz_max.x) * 0.5f;
+      cam_y = y0 <= y1 ? std::clamp(cam_y, y0, y1) : (bz->bz_min.y + bz->bz_max.y) * 0.5f;
+    }
+  }
+  const View v{width / 2, area_h / 2, g_camera.scale * fit, cam_x, cam_y};
+  {   // Test: MELEE_TEST_LAB_TRACE=1 logs what one drawn frame in 15 is made of.
+    static const bool trace = host::test_env::getenv("MELEE_TEST_LAB_TRACE") != nullptr;
+    static int32_t traced = INT32_MIN;
+    if (trace && f.number != traced && (f.number % 15 == 0)) {
+      traced = f.number;
+      char who[160] = {};
+      int at = 0;
+      for (int port = 0; port < 4 && at < 140; ++port)
+        if (f.players[port][0].present)
+          at += std::snprintf(who + at, sizeof who - at, " P%d %.1f,%.1f act %u", port + 1, f.players[port][0].x, f.players[port][0].y,
+                              (unsigned)f.players[port][0].action);
+      host::log("lab trace: frame %d stage %u lines %zu cam %.1f,%.1f scale %.3f fit %.3f window %.0fx%.0f%s", f.number,
+                (unsigned)info.stage, f.stage_lines.size(), g_camera.cx, g_camera.cy, g_camera.scale, fit, width, height, who);
+    }
+  }
 
   ImDrawList* dl = ImGui::GetBackgroundDrawList();
   // Covers the game image entirely; the game still renders underneath (and the other player's
@@ -1386,8 +1455,10 @@ void draw(bool enabled, float width, float height) {
       const PlayerFrame& p = f.players[port][fol];
       if (!p.present) continue;
       const auto& caps = f.capsules[port][fol];
+      if (p.action == 12 || p.action == 13) draw_revival_platform(dl, v, p.x, p.y);   // Rebirth, RebirthWait
       if (fighter_style != 0 && !caps.empty()) {
-        if (fighter_style == 1) draw_stick_figure(dl, v, caps, f.bones[port][fol], player_color(info, port, fol == 1));
+        if (fighter_style == 3) draw_body_blobs(dl, v, caps, player_color(info, port, fol == 1));
+        else if (fighter_style == 1) draw_stick_figure(dl, v, caps, f.bones[port][fol], player_color(info, port, fol == 1));
         else draw_capsule_fighter(dl, v, caps, f.bones[port][fol], rgb(player_color(info, port, fol == 1)));
       } else {
         draw_player(dl, v, info, p, port, fol == 1);
@@ -1395,7 +1466,7 @@ void draw(bool enabled, float width, float height) {
       draw_player_signals(dl, v, info, p, caps, port, fol == 1);
     }
   draw_items(dl, v, f);
-  draw_hud(dl, info, f, width, area_h);
+  draw_hud(dl, info, f, width, height);   // where the game keeps it: the whole picture, under any controls
   {
     std::string notice;
     { std::lock_guard<std::mutex> lock(g_notice_mutex); notice = g_notice; }

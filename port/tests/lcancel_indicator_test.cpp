@@ -31,6 +31,7 @@ void log(const char*, ...) {}
 }
 namespace slippi::online {
 int session_mode() { return network_mode; }
+int session_mode_or_parked() { return network_mode; }   // no warm-up in this test: the same
 int local_player_index() { return local_slot; }
 bool in_online_menus() { return false; }
 }

@@ -298,6 +298,42 @@ struct RenderOptions {
   // After an online session: straight into a Training match, then "search again?" (native_practice.cpp).
   bool online_back_to_training = true;
   static bool& live_online_back_to_training() { static bool value = true; return value; }
+  // Warm-up room (native_practice.cpp, slippi_warmup.h; Game tab, Online). warmup_button: the WARM UP
+  // button on the online character select (L+R works either way). warmup_turn_instant: in an arena
+  // room, the player's turn takes them back from Training at once instead of after a 3 second
+  // countdown. warmup_watch: the room's match while warming up in an arena room: 0 not shown (the
+  // panel's score only), 1 a small window over Training, 2 big, with Training in the small window
+  // (warmup_pip_size 0 small, 1 medium, 2 large; warmup_pip_corner 0 top right, 1 bottom right, 2
+  // bottom left, 3 top left, 4 inside the black bar right of a 4:3 picture (the default, across from
+  // the warm-up panel on the left; a corner when there is no bar); the small window can also be
+  // dragged and sized with the mouse).
+  bool warmup_button = true;
+  static bool& live_warmup_button() { static bool value = true; return value; }
+  // The warm-up's panel and boxes in the black bar: 0 a rounded box with space all round (the default),
+  // 1 a side card: flush in the bar as the Arena corner cards (a gold wash, a gold edge on the picture's
+  // side), level with the room's match window; 2 the side card at the top of the bar, the match window too.
+  int warmup_panel_style = 0;
+  static int& live_warmup_panel_style() { static int value = 0; return value; }
+  bool warmup_turn_instant = false;
+  static bool& live_warmup_turn_instant() { static bool value = false; return value; }
+  int warmup_watch = 1;
+  static int& live_warmup_watch() { static int value = 1; return value; }
+  int warmup_pip_size = 1;
+  static int& live_warmup_pip_size() { static int value = 1; return value; }
+  int warmup_pip_corner = 4;
+  static int& live_warmup_pip_corner() { static int value = 4; return value; }
+  // A place picked with the controller (Practice menu, Move and resize): the small window's centre and
+  // width as fractions of the area the two windows share. Width 0: by size and place above (picking a
+  // size or place clears it).
+  float warmup_pip_cx = 0.5f, warmup_pip_cy = 0.5f, warmup_pip_cw = 0.0f;
+  static std::atomic<float>& live_warmup_pip_cx() { static std::atomic<float> value{0.5f}; return value; }
+  static std::atomic<float>& live_warmup_pip_cy() { static std::atomic<float> value{0.5f}; return value; }
+  static std::atomic<float>& live_warmup_pip_cw() { static std::atomic<float> value{0.0f}; return value; }
+  // An arena room's match window: how it shows the match (0 standard: the game's own picture; 1 the
+  // Slippi Lab view; 2 light: soft shapes on the stage's outline, the 3D scene not drawn). Chosen at
+  // its corner, in the Practice menu or here; the game that opens the window keeps it.
+  int spectate_view = 0;
+  static int& live_spectate_view() { static int value = 0; return value; }
   int slippi_spectator_port = 51441;
   static int& live_slippi_spectator_port() { static int value = 51441; return value; }
   static bool& live_offline_delay() { static bool value = false; return value; }

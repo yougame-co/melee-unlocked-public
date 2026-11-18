@@ -35,6 +35,35 @@ struct Snapshot {
   // Characters the memory card has unlocked, a bit per character kind (all set when not known, and on
   // the Static Recomp). Fight a pro offers a pro only when that pro's character can be picked.
   uint32_t unlocked = 0xFFFFFFFFu;
+  // Warm-up room (slippi_warmup.h): Training while staying connected to the opponent (Direct, Teams)
+  // or while waiting for a turn in an arena room.
+  struct Warmup {
+    // On the online character select: the WARM UP button. offered: shown at all; enabled: works now
+    // (else `why`, a short reason under it, "Locked in").
+    bool offered = false, enabled = false;
+    std::string why;
+    bool active = false;        // in the warm-up room (on the way there, in Training, on the way back)
+    int stage = 0;              // slippi::warmup::Stage
+    bool arena = false;         // an arena room's wait, not a parked pair
+    std::string mode;           // "Direct", "Teams", "Arena"
+    int peers = 0;
+    // state: warmup::PeerState; character: locked in with; picked: on the select before that (our builds)
+    struct Peer { std::string name; int state = 0; int character = -1; int costume = 0; int picked = -1; } peer[3];
+    int banner = 0;             // slippi::warmup::Banner
+    uint32_t banner_age_ms = 0;
+    int banner_peer = -1;
+    int countdown_ms = -1;      // the arena's "your turn" countdown, -1 none
+    float hold = 0.0f;          // 0..1 while L+R is held toward going (or coming back)
+    std::string sparring;       // who the CPU is ("Zain", "Marth CPU"), empty before the match
+    std::string arena_place;    // "Next up", "2 ahead of you", "Watching"
+    std::string arena_versus;   // the game being played in the room: "HERO vs WISE"
+    bool score_live = false;    // the room's game score (slippi::arena::LiveScore)
+    uint32_t score_frame = 0;
+    struct Fighter {
+      bool present = false; int character = -1; int stocks = 0; float percent = 0;
+      int costume = 0; std::string name;   // for the stock icon; the player's name (empty: not sent)
+    } score_fighter[4];
+  } warmup;
 };
 
 Snapshot snapshot();
@@ -47,6 +76,9 @@ void submit_start_teams(const std::string& connect_code);
 void submit_train_against(int character, int costume = 0);
 void submit_cancel();
 void submit_acknowledge_failure();
+// Warm-up room: go to Training from the online character select (the button), or back to the select.
+void submit_warmup();
+void submit_warmup_return();
 
 // Called once per 60 Hz retrace, before the guest advances its frame.
 void tick();

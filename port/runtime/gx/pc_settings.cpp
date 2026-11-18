@@ -2485,6 +2485,16 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "slippi_spectator") options.slippi_spectator = value != "0";
       else if (key == "online_return_training") options.online_return_training = value == "1";
       else if (key == "online_back_to_training") options.online_back_to_training = value == "1";
+      else if (key == "warmup_button") options.warmup_button = value != "0";
+      else if (key == "warmup_panel_style") options.warmup_panel_style = std::clamp(std::atoi(value.c_str()), 0, 2);
+      else if (key == "warmup_turn_instant") options.warmup_turn_instant = value == "1";
+      else if (key == "warmup_watch") options.warmup_watch = std::clamp(std::atoi(value.c_str()), 0, 2);
+      else if (key == "warmup_pip_size") options.warmup_pip_size = std::clamp(std::atoi(value.c_str()), 0, 2);
+      else if (key == "warmup_pip_corner") options.warmup_pip_corner = std::clamp(std::atoi(value.c_str()), 0, 4);
+      else if (key == "warmup_pip_cx") options.warmup_pip_cx = std::clamp((float)std::atof(value.c_str()), 0.0f, 1.0f);
+      else if (key == "warmup_pip_cy") options.warmup_pip_cy = std::clamp((float)std::atof(value.c_str()), 0.0f, 1.0f);
+      else if (key == "warmup_pip_cw") options.warmup_pip_cw = std::clamp((float)std::atof(value.c_str()), 0.0f, 0.9f);
+      else if (key == "spectate_view") options.spectate_view = std::clamp(std::atoi(value.c_str()), 0, 2);
       else if (key == "slippi_spectator_port") options.slippi_spectator_port = std::clamp(std::atoi(value.c_str()), 1, 65535);
 #endif
       else if (key == "cpu_tech") options.cpu_tech = std::clamp(std::atoi(value.c_str()), 0, 5);
@@ -2751,6 +2761,16 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   RenderOptions::live_slippi_spectator_port() = options.slippi_spectator_port;
   RenderOptions::live_online_return_training() = options.online_return_training;
   RenderOptions::live_online_back_to_training() = options.online_back_to_training;
+  RenderOptions::live_warmup_button() = options.warmup_button;
+  RenderOptions::live_warmup_panel_style() = options.warmup_panel_style;
+  RenderOptions::live_warmup_turn_instant() = options.warmup_turn_instant;
+  RenderOptions::live_warmup_watch() = options.warmup_watch;
+  RenderOptions::live_warmup_pip_size() = options.warmup_pip_size;
+  RenderOptions::live_warmup_pip_corner() = options.warmup_pip_corner;
+  RenderOptions::live_warmup_pip_cx().store(options.warmup_pip_cx);
+  RenderOptions::live_warmup_pip_cy().store(options.warmup_pip_cy);
+  RenderOptions::live_warmup_pip_cw().store(options.warmup_pip_cw);
+  RenderOptions::live_spectate_view() = options.spectate_view;
 #endif
   host::g_cpu_20xx.store(options.cpu_20xx, std::memory_order_relaxed);
   RenderOptions::live_cpu_training() = options.cpu_training_word();
@@ -4156,6 +4176,171 @@ static bool draw_practice_cpu_tabs(RenderOptions& options, int tab) {
   return changed;
 }
 
+// An arena room's match window (host::options.spectate) picks how it shows the match: STANDARD,
+// SLIPPI or LIGHT. A pick tells the game that opened the window (which keeps it); that game can
+// change it too (its Practice menu, Move and resize). Big window: three buttons at the bottom right,
+// shown for its first 7 seconds and then only while the mouse moves over it. Small window: nothing on
+// the match; a click on it (one that does not drag it) opens a small list of the three, which closes
+// on a pick, on another click, or after 6 seconds with the mouse away. The controller's Move and
+// resize shows the list while the window is picked.
+static void pick_spectate_view(int i) {
+  static const char* const kNames[3] = {"STANDARD", "LAB VIEW", "LIGHT"};
+  if (host::options.spectate_view == i) return;
+  host::options.spectate_view = i;
+  host::window_report_spectate_view(i);
+  host::log("spectate: view %s (its own control)", kNames[i]);
+}
+
+static void draw_spectate_view_selector() {
+  static const char* const kNames[3] = {"STANDARD", "LAB VIEW", "LIGHT"};
+  ImGuiIO& io = ImGui::GetIO();
+  const float w = io.DisplaySize.x, h = io.DisplaySize.y;
+  if (w <= 0 || h <= 0) return;
+  practice_menu::font_ensure();
+  const double now = ImGui::GetTime();
+  static double shown_at = now, moved_at = -10.0;
+  static ImVec2 last_mouse{-1, -1};
+  const bool mouse_in = ImGui::IsMousePosValid() && io.MousePos.x >= 0 && io.MousePos.y >= 0 && io.MousePos.x < w && io.MousePos.y < h;
+  if (mouse_in && (io.MousePos.x != last_mouse.x || io.MousePos.y != last_mouse.y)) moved_at = now;
+  last_mouse = io.MousePos;
+  // Test: MELEE_TEST_SPECTATE_PICK=<view>@<seconds>: that view picked once, that long after it showed.
+  static int test_view = -2, test_secs = 0;
+  if (test_view == -2) {
+    test_view = -1;
+    if (const char* t = host::test_env::getenv("MELEE_TEST_SPECTATE_PICK"))
+      if (std::sscanf(t, "%d@%d", &test_view, &test_secs) != 2) test_view = -1;
+  }
+  if (test_view >= 0 && now - shown_at >= test_secs) { pick_spectate_view(test_view); test_view = -1; }
+  // Test: MELEE_TEST_SPECTATE_ACTION=<button>@<seconds>: that button of the list (1 WARM UP, 2 PICTURE IN
+  // PICTURE, 3 FULL SIZE) pressed once, that long after the window was first laid out big (1, 2) or small (3).
+  static int test_action = -2, action_secs = 0;
+  static double laid_at = -1.0;
+  if (test_action == -2) {
+    test_action = -1;
+    if (const char* t = host::test_env::getenv("MELEE_TEST_SPECTATE_ACTION"))
+      if (std::sscanf(t, "%d@%d", &test_action, &action_secs) != 2) test_action = -1;
+  }
+  if (test_action > 0) {
+    const bool layout_for_it = host::window_pip_mode() == (test_action == 3 ? 1 : 2);
+    if (layout_for_it && laid_at < 0.0) laid_at = now;
+    if (layout_for_it && now - laid_at >= action_secs) {
+      host::window_report_spectate_action(test_action);
+      host::log("spectate: test: button %d pressed", test_action);
+      test_action = -1;
+    }
+  }
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  const ImU32 gold = IM_COL32(233, 180, 76, 255), ink = IM_COL32(236, 238, 244, 255), dark = IM_COL32(12, 14, 24, 235);
+
+  // The list itself (both windows): STANDARD, LAB VIEW, LIGHT stacked at the top left, a gold dot and gold
+  // letters on the one in use; a click on a row picks it. Under a rule, the window's own buttons (the
+  // room's game takes them, window_report_spectate_action): full size from the small window; from the
+  // big one, warm up or picture in picture (the match small, so the player can go anywhere).
+  struct Action { const char* name; int id; };
+  const auto draw_list = [&](float u, float a, const std::vector<Action>& actions) {
+    const float text_px = 12.0f * u, row_h = 21.0f * u, pad = 7.0f * u, dot = 3.0f * u, rule = actions.empty() ? 0.0f : 9.0f * u;
+    float tw = 0;
+    for (const char* n : kNames) tw = std::max(tw, practice_menu::text_width(text_px, n));
+    for (const Action& act : actions) tw = std::max(tw, practice_menu::text_width(text_px, act.name));
+    const float bw = pad + dot * 2 + 6.0f * u + tw + pad, bh = pad * 0.6f + (3 + actions.size()) * row_h + rule + pad * 0.6f;
+    const float x0 = 8.0f * u, y0 = 8.0f * u;
+    host::window_set_hot_rect((int)x0, (int)y0, (int)(x0 + bw), (int)(y0 + bh));   // its rows take clicks
+    const auto al = [a](ImU32 c) { return (c & ~IM_COL32_A_MASK) | ((ImU32)(((c >> IM_COL32_A_SHIFT) & 0xFF) * a) << IM_COL32_A_SHIFT); };
+    dl->AddRectFilled(ImVec2(x0 + 1.5f * u, y0 + 2.0f * u), ImVec2(x0 + bw + 1.5f * u, y0 + bh + 2.0f * u), al(IM_COL32(0, 0, 0, 90)), 6.0f * u);
+    dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + bw, y0 + bh), al(dark), 6.0f * u);
+    dl->AddRect(ImVec2(x0, y0), ImVec2(x0 + bw, y0 + bh), al(IM_COL32(255, 255, 255, 40)), 6.0f * u, 0, 1.0f);
+    bool picked = false;
+    for (int i = 0; i < 3; ++i) {
+      const float ry = y0 + pad * 0.6f + row_h * i;
+      const ImVec2 r0(x0 + 2.0f * u, ry), r1(x0 + bw - 2.0f * u, ry + row_h);
+      const bool lit = host::options.spectate_view == i;
+      const bool hover = mouse_in && io.MousePos.x >= r0.x && io.MousePos.x < r1.x && io.MousePos.y >= r0.y && io.MousePos.y < r1.y;
+      if (hover) dl->AddRectFilled(r0, r1, al(IM_COL32(255, 255, 255, 26)), 4.0f * u);
+      const float cy = ry + row_h * 0.5f;
+      if (lit) dl->AddCircleFilled(ImVec2(x0 + pad + dot, cy), dot, al(gold), 12);
+      practice_menu::text(dl, x0 + pad + dot * 2 + 6.0f * u, cy - text_px * 0.55f, text_px, al(lit ? gold : ink), kNames[i], 0.0f, false);
+      if (hover && a > 0.5f && ImGui::IsMouseClicked(0)) { pick_spectate_view(i); picked = true; }
+    }
+    if (!actions.empty()) {
+      const float ly = y0 + pad * 0.6f + 3 * row_h + rule * 0.5f;
+      dl->AddLine(ImVec2(x0 + pad, ly), ImVec2(x0 + bw - pad, ly), al(IM_COL32(255, 255, 255, 40)), 1.0f);
+    }
+    for (size_t k = 0; k < actions.size(); ++k) {
+      const float ry = y0 + pad * 0.6f + row_h * (3 + k) + rule;
+      const ImVec2 r0(x0 + 2.0f * u, ry), r1(x0 + bw - 2.0f * u, ry + row_h);
+      const bool hover = mouse_in && io.MousePos.x >= r0.x && io.MousePos.x < r1.x && io.MousePos.y >= r0.y && io.MousePos.y < r1.y;
+      if (hover) dl->AddRectFilled(r0, r1, al(IM_COL32(255, 255, 255, 26)), 4.0f * u);
+      practice_menu::text(dl, x0 + pad + dot * 2 + 6.0f * u, ry + row_h * 0.5f - text_px * 0.55f, text_px, al(ink), actions[k].name, 0.0f, false);
+      if (hover && a > 0.5f && ImGui::IsMouseClicked(0)) {
+        host::window_report_spectate_action(actions[k].id);
+        host::log("spectate: %s pressed", actions[k].name);
+        picked = true;
+      }
+    }
+    return picked;
+  };
+
+  if (host::window_pip_mode() == 1) {
+    // ---- the small window: the list opens on a click ----
+    static bool open = false;
+    static double opened_at = 0.0;
+    const int clicks = host::window_take_clicks();
+    if (clicks > 0) { open = !open; opened_at = now; }
+    const bool picked = host::window_selected();   // the controller is moving it: the list shows
+    if (picked) opened_at = now;
+    if (host::window_hovered_recently() || mouse_in) opened_at = std::max(opened_at, now - 0.001);
+    if (open && !picked && now - opened_at > 6.0) open = false;
+    if (!open && !picked) { host::window_set_hot_rect(0, 0, 0, 0); return; }
+    if (draw_list(std::clamp(std::min(w, h) / 220.0f, 0.55f, 1.6f), 1.0f, {{"FULL SIZE", 3}})) open = false;
+    return;
+  }
+
+  // ---- the big window: the same list at the top left, for its first 7 seconds and while the mouse moves ----
+  host::window_set_hot_rect(0, 0, 0, 0);
+  const float u = std::clamp(h / 720.0f, 0.8f, 3.0f);
+  // Laid out big by the room's game (picture in picture's big half): its buttons under the views.
+  const bool big = host::window_pip_mode() == 2;
+  const bool over = mouse_in && io.MousePos.x < 200.0f * u && io.MousePos.y < (big ? 170.0f : 100.0f) * u;
+  const float since = (float)std::min(now - shown_at - 7.0, now - moved_at - 2.5);   // > 0: time to hide
+  static float a = 1.0f;
+  const float want = (since < 0.0f || over) ? 1.0f : 0.0f;
+  a += (want - a) * std::min(1.0f, io.DeltaTime * 8.0f);
+  if (a < 0.02f) return;
+  if (big) draw_list(u, a, {{"WARM UP", 1}, {"PICTURE IN PICTURE", 2}});
+  else draw_list(u, a, {});
+}
+
+// The small window of the warm-up room's two (host::window_pip_mode() 1): the room's match, or this
+// game's Training while the match fills the screen. No frame on it: a small grip in its bottom right
+// corner says it can be sized (every edge and corner sizes it, anywhere else drags it), shown for its
+// first 7 seconds, then only while the mouse is over it or it is being moved. Picked with the
+// controller (Practice menu, Move and resize) it shows a thin gold outline as well.
+static void draw_small_window_grip() {
+  ImGuiIO& io = ImGui::GetIO();
+  const float w = io.DisplaySize.x, h = io.DisplaySize.y;
+  static double small_since = -100.0;
+  static int last_mode = 0;
+  const int mode = host::window_pip_mode();
+  const double now = ImGui::GetTime();
+  if (mode == 1 && last_mode != 1) small_since = now;
+  last_mode = mode;
+  if (mode != 1 || w <= 0 || h <= 0) return;
+  const bool picked = host::window_selected();
+  const bool show = now - small_since < 7.0 || host::window_hovered_recently() || host::window_moving() || picked;
+  static float a = 0.0f;
+  a += ((show ? 1.0f : 0.0f) - a) * std::min(1.0f, io.DeltaTime * 8.0f);
+  if (a < 0.02f) return;
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  if (picked) dl->AddRect(ImVec2(1, 1), ImVec2(w - 1, h - 1), IM_COL32(233, 180, 76, (int)(230 * a)), 0, 0, 2.0f);
+  else dl->AddRect(ImVec2(0.5f, 0.5f), ImVec2(w - 0.5f, h - 0.5f), IM_COL32(255, 255, 255, (int)(60 * a)), 0, 0, 1.0f);
+  const float s = std::clamp(std::min(w, h) * 0.08f, 9.0f, 16.0f), t = std::max(1.5f, s * 0.11f), e = 3.0f;
+  for (int i = 1; i <= 3; ++i) {   // three short diagonals in the corner, the usual sign of a sizable edge
+    const float d = s * i / 3.0f;
+    dl->AddLine(ImVec2(w - e - d + 1, h - e + 1), ImVec2(w - e + 1, h - e - d + 1), IM_COL32(0, 0, 0, (int)(160 * a)), t);
+    dl->AddLine(ImVec2(w - e - d, h - e), ImVec2(w - e, h - e - d), IM_COL32(236, 238, 244, (int)(220 * a)), t);
+  }
+}
+
 static void draw_native_practice(SettingsState& state, RenderOptions& options,
                                  const slippi::native_practice::Snapshot& practice,
                                  const host::PadState& pad, bool have_pad) {
@@ -4246,10 +4431,48 @@ static void draw_native_practice(SettingsState& state, RenderOptions& options,
     f.search.opponent = practice.opponent;
     f.search.code = practice.connect_code;
     f.search.offer = practice.offer;
+    {
+      // The warm-up room's panel: in Training, and anywhere else offline the player went from there
+      // (stage 2, slippi::warmup::Stage::Away: any mode, its selects and matches, the menus).
+      const auto& w = practice.warmup;
+      f.warmup.active = w.active && (practice.in_practice || w.stage == 2);
+      f.warmup.in_small_window = host::window_pip_mode() == 1;   // Training in the small window: no panel in it
+      f.warmup.arena = w.arena;
+      f.warmup.mode = w.mode;
+      for (int i = 0; i < w.peers && i < 3; ++i)
+        f.warmup.peers.push_back({w.peer[i].name, w.peer[i].state, w.peer[i].character >= 0 ? w.peer[i].character : w.peer[i].picked});
+      f.warmup.banner = w.banner;
+      f.warmup.banner_age = (float)w.banner_age_ms / 1000.0f;
+      f.warmup.banner_peer = w.banner_peer;
+      f.warmup.countdown_ms = w.countdown_ms;
+      f.warmup.hold = w.hold;
+      f.warmup.sparring = w.sparring;
+      f.warmup.place = w.arena_place;
+      f.warmup.versus = w.arena_versus;
+      f.warmup.score = w.score_live;
+      f.warmup.frame = w.score_frame;
+      for (int i = 0; i < 4; ++i)
+        f.warmup.fighter[i] = {w.score_fighter[i].present, w.score_fighter[i].character, w.score_fighter[i].stocks, w.score_fighter[i].percent,
+                               w.score_fighter[i].costume, w.score_fighter[i].name};
+    }
     f.unlocked = practice.unlocked;
-    f.intro = options.practice_opens == 0;
+    f.intro = options.practice_opens == 0 && !practice.warmup.active;   // no "find a match" banner in the warm-up room
     f.time = ImGui::GetTime();
     const practice_menu::Result r = practice_menu::frame(look, f);
+    // The warm-up room's match-window rows write the live settings: saved like the rest.
+    if (options.warmup_watch != RenderOptions::live_warmup_watch() || options.warmup_pip_size != RenderOptions::live_warmup_pip_size() ||
+        options.warmup_pip_corner != RenderOptions::live_warmup_pip_corner() || options.spectate_view != RenderOptions::live_spectate_view() ||
+        options.warmup_pip_cx != RenderOptions::live_warmup_pip_cx().load() || options.warmup_pip_cy != RenderOptions::live_warmup_pip_cy().load() ||
+        options.warmup_pip_cw != RenderOptions::live_warmup_pip_cw().load()) {
+      options.warmup_watch = RenderOptions::live_warmup_watch();
+      options.warmup_pip_size = RenderOptions::live_warmup_pip_size();
+      options.warmup_pip_corner = RenderOptions::live_warmup_pip_corner();
+      options.spectate_view = RenderOptions::live_spectate_view();
+      options.warmup_pip_cx = RenderOptions::live_warmup_pip_cx().load();
+      options.warmup_pip_cy = RenderOptions::live_warmup_pip_cy().load();
+      options.warmup_pip_cw = RenderOptions::live_warmup_pip_cw().load();
+      state.dirty = true;
+    }
     if (r.changed) { state.dirty = true; apply_practice_tools(options); }
     if (r.stronger_changed) { options.pro_ai_stronger = phillip_ai::stronger_choice(); state.dirty = true; }
     const auto close_menu = [&state]() { state.practice_open = false; state.practice_release_capture = true; };
@@ -4459,6 +4682,8 @@ static void draw_replay_practice(RenderOptions& options, const host::PadState& p
   f.buttons = have_pad ? pad.button : 0;
   if (have_pad) { f.stick_x = pad.stick_x; f.stick_y = pad.stick_y; }
   f.time = ImGui::GetTime();
+  // An arena room's match window plays a live match: nothing to take over, no tips, no replay controls.
+  if (host::options.spectate) return;
   replay_hud::frame(std::clamp(options.practice_style, 0, practice_menu::kStyleCount - 1), f);
 }
 
@@ -4763,6 +4988,14 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\nslippi_spectator_port " << options.slippi_spectator_port
        << "\nonline_return_training " << (options.online_return_training ? 1 : 0)
        << "\nonline_back_to_training " << (options.online_back_to_training ? 1 : 0)
+       << "\nwarmup_button " << (options.warmup_button ? 1 : 0) << "\nwarmup_panel_style " << options.warmup_panel_style
+       << "\nwarmup_turn_instant " << (options.warmup_turn_instant ? 1 : 0)
+       << "\nwarmup_watch " << options.warmup_watch
+       << "\nwarmup_pip_size " << options.warmup_pip_size
+       << "\nwarmup_pip_corner " << options.warmup_pip_corner
+       << "\nwarmup_pip_cx " << options.warmup_pip_cx << "\nwarmup_pip_cy " << options.warmup_pip_cy
+       << "\nwarmup_pip_cw " << options.warmup_pip_cw
+       << "\nspectate_view " << options.spectate_view
 #endif
        << "\ncpu_tech " << options.cpu_tech
        << "\ncpu_getup " << options.cpu_getup
@@ -5773,13 +6006,29 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   if (kLabViewAvailable && ImGui::IsKeyPressed(ImGuiKey_F3, false)) { options.lab_view = !options.lab_view; state.dirty = true; host::log("lab view: %s", options.lab_view ? "on" : "off"); }
   // Drawn first, on the background list, so every overlay and window below lands on top of it.
   // Called every frame, off or on, so lab::covering() always describes this frame.
-  lab::set_style(options.look_lab_fighters, options.look_lab_stage);
-  lab::set_enabled(options.lab_view && kLabViewAvailable);
+  // An arena room's match window shows the match its own way (host::options.spectate_view, chosen at
+  // its corner): the game, the Slippi Lab view, or light (soft shapes, the stage's outline, no 3D).
+  bool lab_view_on = options.lab_view;
+  int lab_fighters = options.look_lab_fighters, lab_stage = options.look_lab_stage;
+  if (host::options.spectate) {
+    const int view = host::options.spectate_view;
+    lab_view_on = view != 0;
+    lab_fighters = view == 2 ? 3 : 0;   // light: the fighters as soft shapes only (lab_view.h style 3)
+    lab_stage = view == 2 ? 1 : 0;
+    options.lab_skip_scene = true;   // under the Lab view the 3D scene is not drawn at all
+    static int shown = -1;
+    if (view != shown) {
+      shown = view;
+      host::log("spectate: showing the match %s", view == 0 ? "standard" : view == 1 ? "in the Lab view" : "light");
+    }
+  }
+  lab::set_style(lab_fighters, lab_stage);
+  lab::set_enabled(lab_view_on && kLabViewAvailable);
   lab::set_colors(options.lab_colour, options.lab_colour_background, options.lab_colour_stage);
-  const bool lab_on = options.lab_view && (kLabViewAvailable || options.look_lab_fighters != 0);   // the styles need no packs
+  const bool lab_on = lab_view_on && (kLabViewAvailable || lab_fighters != 0);   // the styles need no packs
   {   // a replay's controls keep the bottom: the Lab view's box and HUD sit above them
     float reserve = 0.0f;
-    if (replay_bar::active() && !replay_bar::all_hidden()) {
+    if (!host::options.spectate && replay_bar::active() && !replay_bar::all_hidden()) {   // the match window has no controls
       reserve = 80.0f * ImGui::GetIO().DisplaySize.y / 720.0f;
       if (replay_bar::shown()) reserve = std::max(reserve, 2.0f * ImGui::GetFontSize() + 46.0f);
     }
@@ -5792,7 +6041,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     static bool fetching = false, tried = false;
     static const bool wired = (lab::set_missing_packs_handler([](const std::string&) { missing = true; }), true);
     (void)wired;
-    if (missing.load() && !tried && options.lab_view && options.look_lab_fighters == 0 &&
+    if (missing.load() && !tried && lab_view_on && lab_fighters == 0 &&
         !std::getenv("MELEE_LAB_NO_DOWNLOAD")) {
       tried = fetching = true;   // once per run: a failure says why and waits for the next start
       host::updater::lab_packs_download(host::options.lab_dir);
@@ -5805,6 +6054,12 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     }
   }
   lab::draw(lab_on && !state.fill_window, ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y);
+  {   // the picture's shape as drawn (4:3 with bars, or wider): the room's small window goes in the bar
+    const ImVec2 screen = ImGui::GetIO().DisplaySize;
+    if (screen.x > 0 && screen.y > 0) host::window_note_picture_aspect(presented_aspect(options, (int)screen.x, (int)screen.y, true));
+  }
+  draw_small_window_grip();
+  if (host::options.spectate) draw_spectate_view_selector();
   // 20XX TE's Input display is the same switch as the Controller overlay (te_pairs_linked), and the
   // overlay already shows the controllers: with it on, TE's own display is not drawn as well.
   const bool te_input_row = training_overlay::input_display() && !options.input_overlay;
@@ -5822,7 +6077,8 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     const float gx0 = (screen.x - gw) * 0.5f, gy0 = (screen.y - gh) * 0.5f;
     coming_soon_overlay::draw(gx0, gy0, gx0 + gw, gy0 + gh);
   }
-  replay_bar::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y, state.open || state.menu_open || state.practice_open || state.fill_window);
+  if (!host::options.spectate)   // the room's live match window: no replay bar (see replay_hud above)
+    replay_bar::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y, state.open || state.menu_open || state.practice_open || state.fill_window);
   if (!clean_replay) screen_label::draw(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y, g_overlay_game_aspect);
   // Start on the controller closes the panel from any page (the open chord is Start + Down + Z,
   // which the input layer swallows whole, so this never fires on the press that opened it).
@@ -10000,6 +10256,75 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         ImGui::SetTooltip("When the other player leaves or the connection drops after a match, you land in a Training\n"
                           "match with the same character. D-pad Up searches again (same mode, same Direct code), Down dismisses.\n"
                           "Direct and Teams only: after an Unranked game you stay on Unranked's character select.");
+      {
+        static const char* const kPanel[] = {"Rounded box", "Side card", "Side card at the top"};
+        ImGui::SetNextItemWidth(220.0f);
+        if (ImGui::Combo("Warm-up panel look", &options.warmup_panel_style, kPanel, 3)) {
+          RenderOptions::live_warmup_panel_style() = options.warmup_panel_style;
+          changed = true;
+        }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("How the warm-up's panel sits in the black bar beside Training: a rounded box with space round it,\n"
+                            "a side card filling the bar as the Arena corner cards do, or that card at the top of the bar.");
+      }
+      if (settings_toggle("Warm-up button on the online character select", &options.warmup_button)) {
+        RenderOptions::live_warmup_button() = options.warmup_button;
+        changed = true;
+      }
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Between games with someone you are connected to (Direct, Teams), or while you wait for your\n"
+                          "turn in an arena room: WARM UP takes you to Training and the connection stays up. Hold L+R\n"
+                          "for the same thing (and again in Training to go back). Off hides the button; L+R still works.");
+      if (settings_toggle("Arena: go back at once when it is your turn (no 3 second countdown)", &options.warmup_turn_instant)) {
+        RenderOptions::live_warmup_turn_instant() = options.warmup_turn_instant;
+        changed = true;
+      }
+      if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Warming up while you wait in an arena room: when the room puts you in the ring, the game\n"
+                          "takes you back to the character select. Off: a 3 second countdown first (L+R goes at once).");
+      {
+        // The room's match while you warm up (the viewer window): not shown, small over Training, or
+        // big with Training small. The Practice menu changes the same three while warming up.
+        static const char* const kWatch[] = {"Not shown (score only)", "Small window over your game", "Big, your game in the small window"};
+        static const char* const kSize[] = {"Small", "Medium", "Large"};
+        static const char* const kCorner[] = {"Top right", "Bottom right", "Bottom left", "Top left", "Right side bar"};
+        ImGui::SetNextItemWidth(300.0f);
+        if (ImGui::Combo("Arena: the room's match while you're away", &options.warmup_watch, kWatch, 3)) {
+          RenderOptions::live_warmup_watch() = options.warmup_watch;
+          changed = true;
+        }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Watching on the room's character select, the match starts full size: PICTURE IN PICTURE\n"
+                            "on it (or A on that button in the side bar) makes it small so you can do anything else.\n"
+                            "Warming up or in any other mode, the match plays as chosen here: in a small window over\n"
+                            "your game, or big with your game in the small window. Not shown: no window, the panel's\n"
+                            "score only. Drag the small window anywhere, or pull its edges to size it.");
+        ImGui::SetNextItemWidth(140.0f);
+        if (ImGui::Combo("Small window size", &options.warmup_pip_size, kSize, 3)) {
+          RenderOptions::live_warmup_pip_size() = options.warmup_pip_size;
+          options.warmup_pip_cw = 0.0f;   // by size and place again, not the place picked with the controller
+          RenderOptions::live_warmup_pip_cw().store(0.0f);
+          changed = true;
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(140.0f);
+        if (ImGui::Combo("Corner", &options.warmup_pip_corner, kCorner, 5)) {
+          RenderOptions::live_warmup_pip_corner() = options.warmup_pip_corner;
+          options.warmup_pip_cw = 0.0f;
+          RenderOptions::live_warmup_pip_cw().store(0.0f);
+          changed = true;
+        }
+        static const char* const kView[] = {"Standard", "Lab view", "Light (simple shapes, cheapest)"};
+        ImGui::SetNextItemWidth(300.0f);
+        if (ImGui::Combo("Arena: the room's match view", &options.spectate_view, kView, 3)) {
+          RenderOptions::live_spectate_view() = options.spectate_view;
+          changed = true;
+        }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("How the room's match window shows the game. Standard: the game itself. Lab view: flat\n"
+                            "silhouettes. Light: simple soft shapes on the stage's outline, the game's 3D\n"
+                            "picture not drawn (least work for the PC). The match window switches it too (click it, or its buttons).");
+      }
       if (!options.online_back_to_training && settings_toggle("After an online session ends, go back to Training mode", &options.online_return_training)) {
         RenderOptions::live_online_return_training() = options.online_return_training;
         changed = true;

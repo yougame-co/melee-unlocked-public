@@ -260,7 +260,127 @@ void apply_embed_geometry(HWND h, WPARAM w, LPARAM l, bool is_view) {
   raise_embed(h);
 }
 
+// Picture in picture (the warm-up room's two windows, hle/slippi_arena.cpp): this game's window, or
+// the room's match in its viewer window, made small (a borderless frame on top of the other one:
+// dragged anywhere, resized from its edges, never taking the focus, its sound off) or big (filling
+// the area the game had), and put back exactly as it was. The game that owns the room asks the
+// other window with a registered message (wParam: 1 small, 2 big, 0 back, +4 muted).
+UINT pip_message() {
+  static const UINT m = RegisterWindowMessageW(L"MeleeUnlocked.PictureInPicture");
+  return m;
+}
+int g_pip = 0;   // 0 as it was, 1 small, 2 big
+bool g_pip_no_focus = false;   // the room's match window: never takes the focus from the game in Training
+std::atomic<int> g_pip_answer{-1};   // the other window's answer: the mode it has taken
+std::atomic<int> g_spectate_choice{-1};   // the match window's view chosen at its corner, -1 none new
+std::atomic<int> g_spectate_action{-1};   // a button pressed on the match window (window_spectate_action), -1 none new
+// The match window's corner selector, in client pixels: clicks there go to it, not to the drag.
+std::atomic<int> g_hot_rect[4] = {0, 0, 0, 0};
+std::atomic<uint64_t> g_hover_tick{0};   // GetTickCount64 when the mouse was last over the small window
+std::atomic<int> g_pip_clicks{0};        // clicks on the small window that did not move it (its style menu)
+std::atomic<bool> g_pip_moving{false};   // being dragged or sized with the mouse
+std::atomic<bool> g_pip_selected{false}; // picked with the controller (Practice menu, Move and resize)
+std::atomic<uint64_t> g_view_score{0}, g_view_score_tick{0};   // what the room's match window shows (packed)
+LONG_PTR g_pip_style = 0, g_pip_exstyle = 0;
+WINDOWPLACEMENT g_pip_place{sizeof(WINDOWPLACEMENT)};
+void pip_apply(HWND h, int mode, bool mute, bool no_focus) {
+  // Never shows a window that is not showing (hidden test runs stay hidden).
+  const LONG_PTR visible = GetWindowLongPtrW(h, GWL_STYLE) & WS_VISIBLE;
+  if (mode && !g_pip) {
+    g_pip_style = GetWindowLongPtrW(h, GWL_STYLE);
+    g_pip_exstyle = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    GetWindowPlacement(h, &g_pip_place);
+  }
+  // The new mode first: the frame changes below send WM_NCCALCSIZE at once, and wnd_proc answers it by
+  // g_pip (no frame only while small). Set after, a window going back kept "no frame" for good: its
+  // title bar never came back, and its inside read as the whole window.
+  const int was = g_pip;
+  g_pip = mode;
+  g_pip_no_focus = mode && no_focus;
+  if (mode == 1) {
+    // WS_THICKFRAME for the sizing edges (WM_NCHITTEST below); WM_NCCALCSIZE keeps the whole window
+    // client, so no frame shows.
+    SetWindowLongPtrW(h, GWL_STYLE, WS_POPUP | WS_THICKFRAME | visible);
+    SetWindowLongPtrW(h, GWL_EXSTYLE, ((g_pip_exstyle | WS_EX_TOOLWINDOW | (no_focus ? WS_EX_NOACTIVATE : 0)) & ~(LONG_PTR)WS_EX_APPWINDOW));
+    SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+  } else if (mode == 2) {
+    SetWindowLongPtrW(h, GWL_STYLE, WS_POPUP | visible);
+    SetWindowLongPtrW(h, GWL_EXSTYLE, g_pip_exstyle | (no_focus ? WS_EX_NOACTIVATE : 0));
+    SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+  } else if (was) {
+    SetWindowLongPtrW(h, GWL_STYLE, (g_pip_style & ~(LONG_PTR)WS_VISIBLE) | visible);
+    SetWindowLongPtrW(h, GWL_EXSTYLE, g_pip_exstyle);
+    if (visible) SetWindowPlacement(h, &g_pip_place);
+    else SetWindowPos(h, nullptr, g_pip_place.rcNormalPosition.left, g_pip_place.rcNormalPosition.top,
+                      g_pip_place.rcNormalPosition.right - g_pip_place.rcNormalPosition.left,
+                      g_pip_place.rcNormalPosition.bottom - g_pip_place.rcNormalPosition.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+  }
+  if (mode != was) log("window: picture in picture %s%s", mode == 1 ? "small" : mode == 2 ? "big" : "off", mode && mute ? " (sound off)" : "");
+  audio_set_page_volume(mode && mute ? 0 : 100);
+}
+
 LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+  // wParam +8: the other window's answer (the mode it took); else a request, answered to the window
+  // in lParam once it is done (so that window moves this one only after it saved where it was).
+  if (m == pip_message()) {
+    if (w & 4096) {   // the room's match window: the stocks and percent it shows now
+      g_view_score.store((uint64_t)l);
+      g_view_score_tick.store(GetTickCount64());
+      return 0;
+    }
+    if (w & 8) { g_pip_answer.store((int)(w & 3)); return 0; }
+    if (w & 32) { g_spectate_choice.store((int)((w >> 8) & 3)); return 0; }   // the match window chose a view
+    if (w & 8192) { g_spectate_action.store((int)((w >> 8) & 3)); return 0; }   // a button on the match window
+    if (w & 64) {   // the game that opened us set one
+      options.spectate_view = (int)((w >> 8) & 3);
+      log("spectate: view %d set by the room's game", options.spectate_view);
+      return 0;
+    }
+    if (w & 128) {   // the game that opened us picked this window with the controller (bit 10), or let it go
+      g_pip_selected.store((w & 1024) != 0);
+      return 0;
+    }
+    pip_apply(h, (int)(w & 3), (w & 4) != 0, (w & 16) != 0);
+    if (l) PostMessageW((HWND)l, pip_message(), (WPARAM)(8 | (w & 3)), 0);
+    return 0;
+  }
+  if (g_pip_no_focus && m == WM_MOUSEACTIVATE) return MA_NOACTIVATE;   // a click never takes the focus from Training
+  if (g_pip == 1) {
+    if (m == WM_ENTERSIZEMOVE) { g_pip_moving.store(true); g_hover_tick.store(GetTickCount64()); }
+    if (m == WM_EXITSIZEMOVE) { g_pip_moving.store(false); g_hover_tick.store(GetTickCount64()); }
+    if (m == WM_NCLBUTTONDOWN && w == HTCAPTION) {
+      // Dragging: the system's own move loop. A press that let go without moving it is a click (it
+      // opens the style menu), counted for the overlay.
+      RECT before{}, after{};
+      GetWindowRect(h, &before);
+      DefWindowProcW(h, m, w, l);
+      GetWindowRect(h, &after);
+      if (EqualRect(&before, &after)) g_pip_clicks.fetch_add(1);
+      return 0;
+    }
+    if (m == WM_NCCALCSIZE && w) return 0;                 // no frame: the whole window is the picture
+    if (m == WM_NCHITTEST) {                                // the edges size it, anywhere else drags it
+      g_hover_tick.store(GetTickCount64());                 // the mouse is over it (its selector shows)
+      RECT r{};
+      GetWindowRect(h, &r);
+      const int x = (int)(short)LOWORD(l), y = (int)(short)HIWORD(l), e = 8;
+      POINT c{x, y};
+      ScreenToClient(h, &c);
+      if (c.x >= g_hot_rect[0].load() && c.x < g_hot_rect[2].load() && c.y >= g_hot_rect[1].load() && c.y < g_hot_rect[3].load())
+        return HTCLIENT;                                    // the view selector takes its clicks
+      const bool left = x < r.left + e, right = x >= r.right - e, top = y < r.top + e, bottom = y >= r.bottom - e;
+      if (top && left) return HTTOPLEFT;
+      if (top && right) return HTTOPRIGHT;
+      if (bottom && left) return HTBOTTOMLEFT;
+      if (bottom && right) return HTBOTTOMRIGHT;
+      if (left) return HTLEFT;
+      if (right) return HTRIGHT;
+      if (top) return HTTOP;
+      if (bottom) return HTBOTTOM;
+      return HTCAPTION;
+    }
+  }
   if (m == WM_MOUSEMOVE && l != g_pointer_at) {   // Windows also sends this when nothing moved
     g_pointer_at = l;
     g_pointer_moved = GetTickCount64();
@@ -661,6 +781,69 @@ void window_set_fullscreen(bool enabled) {
 
 bool window_is_fullscreen() { return g_fullscreen; }
 
+void* window_native() { return g_hwnd; }
+
+void window_set_pip(int mode, bool mute) { if (g_hwnd) pip_apply(g_hwnd, mode, mute, false); }
+
+void window_send_pip(void* window, int mode, bool mute) {
+  // Posted, never waited on (a viewer still loading answers late): it answers when done, and
+  // window_pip_answer() then says the mode it took.
+  g_pip_answer.store(-1);
+  // +16: the room's match window never takes the focus (the game in Training keeps it).
+  if (window) PostMessageW((HWND)window, pip_message(), (WPARAM)((mode & 3) | (mute ? 4 : 0) | 16), (LPARAM)g_hwnd);
+}
+
+int window_pip_answer() { return g_pip_answer.load(); }
+
+void window_send_spectate_view(void* window, int view) {
+  if (window) PostMessageW((HWND)window, pip_message(), (WPARAM)(64 | ((view & 3) << 8)), 0);
+}
+void window_report_spectate_view(int view) {
+  if (options.spectate_owner) PostMessageW((HWND)(uintptr_t)options.spectate_owner, pip_message(), (WPARAM)(32 | ((view & 3) << 8)), 0);
+}
+int window_spectate_choice() { return g_spectate_choice.exchange(-1); }
+void window_report_spectate_action(int action) {
+  if (options.spectate_owner) PostMessageW((HWND)(uintptr_t)options.spectate_owner, pip_message(), (WPARAM)(8192 | ((action & 3) << 8)), 0);
+}
+int window_spectate_action() { return g_spectate_action.exchange(-1); }
+int window_pip_mode() { return g_pip; }
+bool window_hovered_recently() { return GetTickCount64() - g_hover_tick.load() < 2000; }
+int window_take_clicks() { return g_pip_clicks.exchange(0); }
+void window_report_score(uint64_t packed) {
+  if (options.spectate_owner) PostMessageW((HWND)(uintptr_t)options.spectate_owner, pip_message(), (WPARAM)4096, (LPARAM)packed);
+}
+bool window_viewer_score(uint64_t* packed) {
+  if (GetTickCount64() - g_view_score_tick.load() > 1000) return false;
+  *packed = g_view_score.load();
+  return true;
+}
+bool window_moving() { return g_pip_moving.load(); }
+bool window_selected() { return g_pip_selected.load(); }
+void window_set_selected(bool on) { g_pip_selected.store(on); }
+void window_send_selected(void* window, bool on) {
+  if (window) PostMessageW((HWND)window, pip_message(), (WPARAM)(128 | (on ? 1024 : 0)), 0);
+}
+std::atomic<float> g_picture_aspect{4.0f / 3.0f};
+void window_note_picture_aspect(float aspect) { if (aspect > 0.1f && aspect < 10.0f) g_picture_aspect.store(aspect); }
+float window_picture_aspect() { return g_picture_aspect.load(); }
+void window_set_hot_rect(int x0, int y0, int x1, int y1) {
+  g_hot_rect[0] = x0; g_hot_rect[1] = y0; g_hot_rect[2] = x1; g_hot_rect[3] = y1;
+}
+
+void* window_of_process(uint32_t pid) {
+  struct Find { DWORD pid; HWND found; } find{pid, nullptr};
+  EnumWindows([](HWND h, LPARAM p) -> BOOL {
+    auto* f = reinterpret_cast<Find*>(p);
+    DWORD owner = 0;
+    GetWindowThreadProcessId(h, &owner);
+    wchar_t cls[64] = {};
+    if (owner != f->pid || !GetClassNameW(h, cls, 64) || std::wcscmp(cls, L"MeleePortWindow") != 0) return TRUE;
+    f->found = h;
+    return FALSE;
+  }, reinterpret_cast<LPARAM>(&find));
+  return find.found;
+}
+
 namespace {
 std::atomic<uint64_t> g_pending_client_size{0};   // (w << 32) | h, 0 = nothing requested
 
@@ -923,6 +1106,30 @@ bool window_closed() { return g_closed; }
 void window_client_size(int* w, int* h) { *w = g_client_w; *h = g_client_h; }
 #else
 #include "../../linux/window_sdl.inl"
+// The warm-up room's two windows and the match window's view are Windows-only for now (the arena room's
+// viewer window is): these stand in so the shared code links.
+void* window_native() { return nullptr; }
+void window_set_pip(int, bool) {}
+void window_send_pip(void*, int, bool) {}
+int window_pip_answer() { return -1; }
+void* window_of_process(uint32_t) { return nullptr; }
+void window_send_spectate_view(void*, int) {}
+void window_report_spectate_view(int) {}
+int window_spectate_choice() { return -1; }
+void window_report_spectate_action(int) {}
+int window_spectate_action() { return -1; }
+void window_set_hot_rect(int, int, int, int) {}
+int window_pip_mode() { return 0; }
+bool window_hovered_recently() { return false; }
+int window_take_clicks() { return 0; }
+void window_report_score(uint64_t) {}
+bool window_viewer_score(uint64_t*) { return false; }
+bool window_moving() { return false; }
+bool window_selected() { return false; }
+void window_set_selected(bool) {}
+void window_send_selected(void*, bool) {}
+void window_note_picture_aspect(float) {}
+float window_picture_aspect() { return 4.0f / 3.0f; }
 #ifdef __APPLE__
 const char* window_menu_key() { return yougame::stdio_bridge() ? yougame::parity::kMenuHint : "Esc"; }
 #else
@@ -961,6 +1168,7 @@ std::array<PortSource, 4> g_port_feeding{};
 // stays on one thread at one rate.
 std::mutex g_last_pads_mutex;
 PadState g_last_pads[4]{};
+std::atomic<uint16_t> g_test_hold{0};   // input_test_hold (tests only)
 
 namespace {
 bool g_capture_key_baseline[256]{};
@@ -2106,6 +2314,7 @@ void input_poll(PadState out[4]) {
     script_pads(retrace_count(), true, out);
     if (latency_trace_enabled()) note_script_presses(out);
     route_takeover(out);
+    if (const uint16_t held = g_test_hold.load(std::memory_order_relaxed)) { out[0].button |= held; out[0].err = 0; }
     // Scripted runs took this return before the overlay's copy was made below, so the controller
     // overlay stayed blank whenever a script was driving. It is the only way to see the overlay
     // without a controller in hand, so keep it fed here too.
@@ -2128,6 +2337,7 @@ void input_poll(PadState out[4]) {
 #else
   (void)takeover;
 #endif
+  if (const uint16_t held = g_test_hold.load(std::memory_order_relaxed)) { out[0].button |= held; out[0].err = 0; }
   { std::lock_guard<std::mutex> lock(g_last_pads_mutex); for (int port = 0; port < 4; ++port) g_last_pads[port] = out[port]; }
   // MELEE_TEST_PAD_TRACE=<file> (tests only, hidden runs): one line each time a port's input changes,
   // as the game will read it, so a test that drives a controller can check every press arrived.
@@ -2335,6 +2545,8 @@ void input_stop_all_rumble() {
   }
   xinput_rumble_settle();
 }
+
+void input_test_hold(uint16_t buttons) { g_test_hold.store(buttons, std::memory_order_relaxed); }
 
 void input_last_pads(PadState out[4]) {
   std::lock_guard<std::mutex> lock(g_last_pads_mutex);

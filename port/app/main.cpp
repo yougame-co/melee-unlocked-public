@@ -2145,6 +2145,8 @@ static int melee_main(int argc, char** argv) {
     else if (a == "--replay-dir") o.replay_dir = next();
     else if (a == "--compress-replays") g_compress_replays = true;   // tests; players: launcher.ini compressreplays=1
     else if (a == "--lab-dir") o.lab_dir = next();
+    else if (a == "--spectate-view") { o.spectate = true; o.spectate_view = std::clamp(std::atoi(next()), 0, 2); }
+    else if (a == "--spectate-owner") o.spectate_owner = std::strtoull(next(), nullptr, 16);
     else if (a == "--lab-view") gfx.lab_view = true;
     else if (a == "--card-dir") o.card_dir = next();
     // Explicit test opt-in; ordinary hidden replay and online runs never scan Mods.

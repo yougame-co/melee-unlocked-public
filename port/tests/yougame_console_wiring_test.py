@@ -142,7 +142,7 @@ class ConsoleWiring(unittest.TestCase):
         policy = read('port/runtime/hle/' + 'yougame_mode_policy.h')
         self.assertIn('#define YOUGAME_FRIENDS_ROW 1', policy)
         self.assertIn('constexpr bool friends_shared_menus = false;', policy)
-        practice = body(read('port/runtime/hle/native_practice.cpp'), 'tick')
+        practice = body(read('port/runtime/hle/native_practice.cpp'), 'void tick')
         # The console handoff stays compiled behind the policy; Friends joins as known peers.
         handoff = practice.index('yougame::console::friends_entry(room);')
         self.assertIn('if (yougame::mode_policy::friends_shared_menus && g_bridge) {', practice[handoff - 120:handoff])
@@ -281,7 +281,7 @@ class ConsoleWiring(unittest.TestCase):
         self.assertIn('if (yougame::console::console_active()) return 0;',
                       body(self.host, 'h_game_options3'))  # full roster, never the card's
         self.assertIn('if (yougame::console::console_active()) return;',
-                      body(read('port/runtime/hle/native_practice.cpp'), 'tick'))
+                      body(read('port/runtime/hle/native_practice.cpp'), 'void tick'))
         bridge = body(self.host, 'console_practice_bridge')
         self.assertIn('args[0] == -1', bridge)  # only query may reach page pause
         self.assertIn('return -1;', bridge)
