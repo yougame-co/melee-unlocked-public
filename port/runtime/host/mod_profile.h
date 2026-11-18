@@ -19,7 +19,7 @@
 namespace source_port::mods {
 
 enum class LayerKind { Iso, Dir, Gci };
-struct Layer { LayerKind kind; std::filesystem::path path; };
+struct Layer { LayerKind kind; std::filesystem::path path; bool training = false; };   // training: a training mod (Training Mode CE), never counted online
 struct Profile {
   std::string name;               // empty for layers given on the command line
   std::vector<Layer> layers;

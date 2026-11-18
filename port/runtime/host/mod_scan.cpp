@@ -1563,7 +1563,7 @@ std::vector<CardMove> protect_card_folder(const fs::path& card_dir, const fs::pa
 std::vector<Layer> source_port_layers(const ScanResult& result) {
   std::vector<Layer> layers;
   for (const auto& d : result.items)
-    if (d.enabled && d.can_enable && d.kind == Kind::TmCe) layers.push_back({LayerKind::Iso, d.path});
+    if (d.enabled && d.can_enable && d.kind == Kind::TmCe) layers.push_back({LayerKind::Iso, d.path, true});
   for (const auto& d : result.items)
     if (d.enabled && d.can_enable && d.kind == Kind::AssetMod) layers.push_back({LayerKind::Iso, d.path});
   return layers;

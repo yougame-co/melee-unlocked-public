@@ -556,6 +556,7 @@ std::vector<std::filesystem::path> g_mod_gcis;
 std::string g_mod_fingerprint;                 // content identity of the enabled layers, "" = vanilla
 std::string g_direct_fingerprint;              // what Direct compares when not the content identity (Melee Maker)
 bool g_cosmetic_pack = false;                  // a verified official look; standard gameplay online
+bool g_training_only = false;                  // only training mods on: online plays the standard game
 std::filesystem::path g_profile_card;          // the profile's own card folder, "" = the ordinary card
 std::vector<mods::CardImport> g_card_imports;
 
@@ -817,8 +818,25 @@ void load_mod_overlay() {
     return std::any_of(g_mod_overlay.files().begin(), g_mod_overlay.files().end(),
         [path](const ModOverlay::File& file) { return file.path == path; });
   };
-  const bool one_iso = g_mod_layers.size() == 1 && g_mod_layers[0].kind == mods::LayerKind::Iso;
-  g_cosmetic_pack = one_iso && host::cosmetics::official_cosmetic_disc(g_mod_layers[0].path.u8string());
+  // Training mods (Training Mode CE's disc) only feed their own training events, never a match, so
+  // they are left out of what decides how this session plays online (owner 11-17): Animelee with
+  // Training Mode CE on is still a look, and Training Mode CE alone plays anyone.
+  auto training_disc = [](const mods::Layer& layer) {
+    if (layer.training) return true;   // marked by the Mods folder scan
+    if (layer.kind != mods::LayerKind::Iso) return false;
+    return std::any_of(g_mod_overlay.files().begin(), g_mod_overlay.files().end(), [&](const ModOverlay::File& f) {
+      if (f.path != "/tm/eventmenu.dat") return false;
+      std::error_code ec;
+      return f.iso == layer.path || std::filesystem::equivalent(f.iso, layer.path, ec);
+    });
+  };
+  std::vector<const mods::Layer*> play_layers;
+  for (const auto& layer : g_mod_layers) if (!training_disc(layer)) play_layers.push_back(&layer);
+  g_training_only = !g_mod_layers.empty() && play_layers.empty();
+  if (play_layers.size() != g_mod_layers.size())
+    host::log("mods: %s; online matches leave training mods out", g_training_only ? "only training mods are on" : "training mods are on with other mods");
+  const bool one_iso = play_layers.size() == 1 && play_layers[0]->kind == mods::LayerKind::Iso;
+  g_cosmetic_pack = one_iso && host::cosmetics::official_cosmetic_disc(play_layers[0]->path.u8string());
   if (g_cosmetic_pack)
     host::log("mods: verified Animelee look; online uses standard gameplay with verified costumes and music");
   const bool akaneia = one_iso && has("/mxdt.dat") && has("/plsn.dat") && has("/plts.dat");
@@ -846,19 +864,19 @@ void load_mod_overlay() {
   // its code is compiled into the native game (sourceport/game/rogue). Single player, offline.
   if (one_iso) {
     char id[6] = {};
-    std::ifstream disc(g_mod_layers[0].path, std::ios::binary);
+    std::ifstream disc(play_layers[0]->path, std::ios::binary);
     if (disc.read(id, sizeof id) && std::memcmp(id, "GALERM", sizeof id) == 0) {
       mods::status().rogue = true;
       host::log("mods: rogueMelee disc found; Rogue Mode runs natively (1-P Mode > Regular Match)");
     }
     // Melee Maker: the 1.02 game's id; its main.dol carries its build id and the bone tables the
     // native engine (sourceport/game/maker) reads through command 0xEE (maker_source.h).
-    if (!mods::status().rogue && maker::attach(g_mod_layers[0].path)) {
+    if (!mods::status().rogue && maker::attach(play_layers[0]->path)) {
       mods::status().maker = true;
       host::log("mods: Melee Maker %s disc found; its builds run natively", maker::kBuild);
       // Direct: the fingerprint the Static Recomp sends for this disc too (host.cpp), so players on
       // either engine can play each other.
-      const std::string shared = maker::fingerprint(mods::sha256_file(g_mod_layers[0].path));
+      const std::string shared = maker::fingerprint(mods::sha256_file(play_layers[0]->path));
       g_direct_fingerprint = shared;
     }
   }
@@ -3050,7 +3068,7 @@ slippi::online::LocalBuild content_build_for_mode(int mode) {
   build.fingerprint = g_direct_fingerprint.empty() ? g_mod_fingerprint : g_direct_fingerprint;
   build.mod_view = slippi::online::native_source_mod_view(mods, mode, yougame::active(), g_plain_opponent,
                                                          gx::RenderOptions::live_mods_in_direct(), build.fingerprint,
-                                                         g_cosmetic_pack);
+                                                         g_cosmetic_pack || g_training_only);
   // Akaneia and ACE: their added fighters are compiled into this game library (an Akaneia disc is
   // refused without them), so Direct and Teams may pick them, as on the Static Recomp. Before this
   // only Static mod boots said so, and the Source Port refused every added fighter online.
@@ -3079,12 +3097,11 @@ void apply_content_mode(int mode) {
 
 // slippi_online.cpp's word on the Direct opponent (see g_plain_opponent). The view follows at once:
 // nothing of the match is loaded yet when the build wait ends.
-void plain_opponent(bool plain) {
+void plain_opponent(bool plain, const char* why) {
   if (plain == g_plain_opponent) return;
   g_plain_opponent = plain;
-  if (g_view_alias.empty()) return;
-  apply_content_mode(g_content_mode);
-  if (plain) screen_label::show("Opponent is on Slippi Dolphin: this match plays the standard game", 5.0);
+  if (!g_view_alias.empty()) apply_content_mode(g_content_mode);
+  if (plain && why) screen_label::show(why, 6.0);
 }
 
 void prepare_practice_content(int mode, bool activate) {

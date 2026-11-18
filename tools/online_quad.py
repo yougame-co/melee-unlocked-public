@@ -166,7 +166,8 @@ def main():
             if v: slot_env[k] = v
             else: slot_env.pop(k, None)
         log = open(d / "log.txt", "w")
-        p = subprocess.Popen(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env=slot_env)
+        # QUAD_SLOT<i>_CWD: this slot's working folder (its own Mods folder, for mod pairs).
+        p = subprocess.Popen(cmd, cwd=os.environ.get(f"QUAD_SLOT{i}_CWD", str(ROOT)), stdout=log, stderr=subprocess.STDOUT, env=slot_env)
         procs.append((p, log))
         print(f"P{i + 1} pid {p.pid} {engines[i]} {'no script' if args.no_script else Path(scripts[i]).name} --local-peer {i}:{ports[i]}:{remotes}")
         time.sleep(args.stagger)

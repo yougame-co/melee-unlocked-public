@@ -74,6 +74,16 @@ int main() {
   // 40 ms may override its device-derived 18 ms floor. Low still respects the saved target.
   audio.configure_for_output(2, 40, 18);
   CHECK(!audio.adaptive && audio.target_ms == 18);
+  // Shared engine period: a 96 kHz endpoint offering 2 ms (192 frames, fundamental 192) gets 6 ms;
+  // 10 ms endpoints keep 10 ms; 48 kHz with a 128-frame fundamental lands on the next multiple at or
+  // above 6 ms; a driver whose maximum is under 6 ms gets its largest legal period.
+  CHECK(host::shared_period_frames(192, 192, 960, 96000) == 576);
+  CHECK(host::shared_period_frames(480, 480, 480, 48000) == 480);
+  CHECK(host::shared_period_frames(960, 192, 1920, 96000) == 960);
+  CHECK(host::shared_period_frames(128, 128, 480, 48000) == 384);
+  CHECK(host::shared_period_frames(192, 192, 384, 96000) == 384);
+  CHECK(host::shared_period_frames(130, 0, 0, 48000) == 390);   // no fundamental or maximum reported
+  CHECK(host::shared_period_frames(192, 192, 960, 96000, 0) == 192);   // 0 = the driver's minimum
   audio.configure_for_output(2, 120, 18);
   CHECK(audio.target_ms == 18);
   audio.configure_for_output(2, 5, 18);

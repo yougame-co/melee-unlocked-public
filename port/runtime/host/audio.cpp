@@ -126,6 +126,11 @@ std::atomic<uint32_t> g_target_ms{40}, g_device_queue_ms{0}, g_engine_period_us{
 AudioBufferPolicy g_buffer_policy;
 std::string g_requested_device;          // endpoint id (UTF-8); empty = the Windows default device
 std::string g_open_device_id;            // the endpoint actually opened
+// Auto memory key: the endpoint id, plus the period when it was raised above the driver's minimum
+// (0.9.211): the 2 ms period's dropouts had grown Auto to about 95 ms on those devices, and that
+// would take a quarter hour of clean play to settle. A raised period starts fresh at the floor.
+std::string g_auto_key;
+uint32_t g_raised_period_us = 0;
 bool g_exclusive = false;                // the device is held in WASAPI exclusive mode
 constexpr int AUTO_FLOOR_MS = 10, AUTO_START_MS = 40;   // no memory yet: start safe, settle down while clean
 // The smallest ring that never runs dry by design: the device takes one engine period at each event
@@ -759,7 +764,7 @@ bool wasapi_open() {
   if (!g_exclusive && g_client) {
     // Ask every supported format before choosing a stream: a driver's shortest shared period
     // can differ for float32, PCM16 and PCM24. Keep the mix format first on equal periods.
-    struct SharedFormat { WAVEFORMATEXTENSIBLE format{}; UINT32 minimum = 0; bool floating = false, integer32 = false, packed24 = false; uint16_t valid_bits = 16; };
+    struct SharedFormat { WAVEFORMATEXTENSIBLE format{}; UINT32 minimum = 0, period = 0; bool floating = false, integer32 = false, packed24 = false; uint16_t valid_bits = 16; };
     std::vector<SharedFormat> formats;
     WAVEFORMATEX* mix = nullptr;
     uint32_t native_rate = 48000;
@@ -803,6 +808,12 @@ bool wasapi_open() {
       }
       CoTaskMemFree(mix);
     }
+    // MELEE_AUDIO_MIN_PERIOD_MS=N (measurement): the shortest shared period to take; 0 = the driver's
+    // minimum, as before 0.9.211 (see shared_period_frames).
+    const uint32_t min_period_ms = [] {
+      const char* v = std::getenv("MELEE_AUDIO_MIN_PERIOD_MS");
+      return v && *v ? (uint32_t)std::clamp(std::atoi(v), 0, 20) : kMinSharedPeriodMs;
+    }();
     IAudioClient3* query = nullptr;
     if (SUCCEEDED(g_client->QueryInterface(__uuidof(IAudioClient3), (void**)&query))) {
       for (auto& candidate : formats) {
@@ -813,10 +824,14 @@ bool wasapi_open() {
         UINT32 normal = 0, fundamental = 0, minimum = 0, maximum = 0;
         const HRESULT period = supported == S_OK
             ? query->GetSharedModeEnginePeriod(f, &normal, &fundamental, &minimum, &maximum) : supported;
-        if (period == S_OK && minimum) candidate.minimum = minimum;
-        log("audio: shared format %u Hz %u channels %s%u: support %08X, period query %08X, min %.3f ms (%u frames)",
+        if (period == S_OK && minimum) {
+          candidate.minimum = minimum;
+          candidate.period = shared_period_frames(minimum, fundamental, maximum, f->nSamplesPerSec, min_period_ms);
+        }
+        log("audio: shared format %u Hz %u channels %s%u: support %08X, period query %08X, min %.3f ms (%u frames), using %.3f ms",
             f->nSamplesPerSec, f->nChannels, candidate.floating ? "float" : "PCM", f->wBitsPerSample,
-            (unsigned)supported, (unsigned)period, candidate.minimum * 1000.0 / f->nSamplesPerSec, candidate.minimum);
+            (unsigned)supported, (unsigned)period, candidate.minimum * 1000.0 / f->nSamplesPerSec, candidate.minimum,
+            candidate.period * 1000.0 / f->nSamplesPerSec);
       }
       query->Release();
     }
@@ -828,8 +843,9 @@ bool wasapi_open() {
       const bool native_a = a.format.Format.nSamplesPerSec == native_rate, native_b = b.format.Format.nSamplesPerSec == native_rate;
       if (native_a != native_b) return native_a;
       if (a.floating != b.floating) return a.floating;
-      return (uint64_t)a.minimum * b.format.Format.nSamplesPerSec < (uint64_t)b.minimum * a.format.Format.nSamplesPerSec;
+      return (uint64_t)a.period * b.format.Format.nSamplesPerSec < (uint64_t)b.period * a.format.Format.nSamplesPerSec;
     });
+    g_raised_period_us = 0;
     // Failed Initialize can leave a client unusable. Every attempted format gets a fresh client.
     for (const auto& candidate : formats) {
       g_client->Release(); g_client = nullptr;
@@ -838,12 +854,13 @@ bool wasapi_open() {
       hr = g_client->QueryInterface(__uuidof(IAudioClient3), (void**)&client3);
       if (SUCCEEDED(hr)) {
         tag_game_stream(g_client);
-        hr = client3->InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK, candidate.minimum,
+        hr = client3->InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK, candidate.period,
                                                 (const WAVEFORMATEX*)&candidate.format, nullptr);
         client3->Release();
       }
       if (SUCCEEDED(hr)) {
-        low_period = candidate.minimum; g_device_rate = candidate.format.Format.nSamplesPerSec;
+        low_period = candidate.period; g_device_rate = candidate.format.Format.nSamplesPerSec;
+        if (candidate.period != candidate.minimum) g_raised_period_us = (uint32_t)((uint64_t)candidate.period * 1000000 / g_device_rate);
         g_device_channels = candidate.format.Format.nChannels; g_device_float = candidate.floating;
         g_device_int32 = candidate.integer32; g_device_int24 = candidate.packed24;
         g_device_valid_bits = candidate.valid_bits;
@@ -936,7 +953,8 @@ bool wasapi_open() {
     // floor on the direct path (it held there through a 60 s match with one gap, 09-29) or a little
     // above it on the two-stage path; grow after real gaps and settle back while clean.
     g_buffer_policy.configure(0, (int)g_floor_ms);
-    const int remembered = auto_memory_load(g_open_device_id);
+    g_auto_key = g_raised_period_us ? g_open_device_id + " period " + std::to_string(g_raised_period_us) : g_open_device_id;
+    const int remembered = auto_memory_load(g_auto_key);
     g_buffer_policy.target_ms = (uint32_t)std::clamp(remembered > 0 ? remembered : (int)g_floor_ms + (g_direct ? 0 : 8),
                                                      (int)g_floor_ms, 120);
   } else {
@@ -986,7 +1004,7 @@ void wasapi_close() {
   g_running.store(false);
   if (g_thread.joinable()) g_thread.join();
   if (g_remember && g_requested_mode.load() == 0 && !g_exclusive && !g_device_dump && !g_open_device_id.empty())
-    auto_memory_save(g_open_device_id, (int)g_buffer_policy.target_ms);
+    auto_memory_save(g_auto_key.empty() ? g_open_device_id : g_auto_key, (int)g_buffer_policy.target_ms);
   log("audio: ring ended at %.1f ms (floor %u ms, %u surplus trims, %u increases after gaps)", g_target_frames * 1000.0 / SAMPLE_RATE, g_floor_ms, g_trims.load(),
       g_margin_grows.load());
   if (g_device_dump) {

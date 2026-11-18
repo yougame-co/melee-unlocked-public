@@ -273,9 +273,12 @@ class ThreadedBackend final : public Backend {
       // Locked (no sub-frames) keeps the old path: one present per game frame, Reflex markers only.
       // On a display known to follow the frames Reflex holds the same rate as above; on one known to
       // refresh at a fixed rate, "follow the monitor" is its full refresh (V-Sync, when on, paces it).
+      // V-Sync with "follow the monitor" on a display not known to follow the frames: Reflex holds the
+      // refresh too. Left to V-Sync alone, a driver forcing V-Sync off (NVIDIA control panel) ran a
+      // 500 Hz fixed-refresh screen at 745 fps with tearing (0.9.209 report, 11-17).
       const double reflex_hz = vrr == 1 || probe_state == 1 || fg_mult > 1 ? wanted
                              : live_options.fps_cap > 0 ? live_options.fps_cap
-                             : live_options.fps_cap < 0 ? (live_options.vsync ? 0.0 : vrr == 0 ? last_refresh : vrr_cap)
+                             : live_options.fps_cap < 0 ? (vrr == 0 || live_options.vsync ? last_refresh : vrr_cap)
                              : present_uncapped ? 0.0 : 2.0 * last_refresh;
       const bool reflex_pacing = renderer->reflex_pacing(subframes ? reflex_hz : 0.0) && subframes;
       handover_present = handover_env;
@@ -672,7 +675,7 @@ class ThreadedBackend final : public Backend {
           char cap_text[64];
           if (reflex_pacing && reflex_hz > 0)
             std::snprintf(cap_text, sizeof cap_text, "cap %.0f by Reflex%s", reflex_hz,
-                          vrr == 1 ? ", synced under the G-Sync or FreeSync refresh" : live_options.fps_cap < 0 ? ", the monitor's G-Sync limit" : "");
+                          vrr == 1 ? ", synced under the G-Sync or FreeSync refresh" : live_options.fps_cap < 0 ? (vrr == 0 ? ", the monitor's fixed refresh" : ", the monitor's refresh") : "");
           else if (vrr == 1 && cap_period > 0)
             std::snprintf(cap_text, sizeof cap_text, "cap %.0f, synced under the G-Sync or FreeSync refresh", 1.0 / cap_period);
           else if (reflex_pacing) std::snprintf(cap_text, sizeof cap_text, "%s, Reflex", live_options.vsync ? "V-Sync" : "no cap");

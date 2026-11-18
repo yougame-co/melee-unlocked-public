@@ -176,7 +176,7 @@ bool yougame_online_mod_content(int mode) {
 // Vanilla character select kinds are 0-25 and the stage kinds end with the heal stage (0x55); an id
 // past those comes from a build with more content (m-ex adds its fighters and stages after them).
 constexpr uint64_t kBuildWaitMs = 3000;   // how long a mod build waits for the opponent's build message
-static void (*g_plain_opponent_handler)(bool) = nullptr;   // see set_plain_opponent_handler
+static void (*g_plain_opponent_handler)(bool, const char*) = nullptr;   // see set_plain_opponent_handler
 
 // Command ids live in native_slippi_bridge.h, shared with the native game's call path.
 
@@ -1134,7 +1134,7 @@ void start_find_match(const uint8_t* payload, const std::string& friend_room = {
 #endif
   g_last_search = search;
   // A new search: whoever answers may be on this build with the same mod, so the mod shows again.
-  if (g_plain_opponent_handler) g_plain_opponent_handler(false);
+  if (g_plain_opponent_handler) g_plain_opponent_handler(false, nullptr);
   // Restoring the mod view may change the pool since CSS requested its random stage.
   if (use_ranked_rules(search.mode) && g_local_selections.is_stage_selected && g_local_random_stage)
     g_local_selections.stage_id = random_stage(search.mode);
@@ -1179,7 +1179,7 @@ bool start_lobby_search() {
   search.lobby_control = lobby.control;
   lobby.dropped = false;   // this search takes the parked room back (ENTER, or READ after a drop)
   g_last_search = search;
-  if (g_plain_opponent_handler) g_plain_opponent_handler(false);
+  if (g_plain_opponent_handler) g_plain_opponent_handler(false, nullptr);
   host::cosmetics::freeze_for_online_session();
   if (!g_matchmaking) g_matchmaking = std::make_unique<Matchmaking>(g_user.get());
   g_matchmaking->FindMatch(search);
@@ -1406,7 +1406,7 @@ int build_verdict(uint8_t remote_count, std::string* why) {
     logged_for = since;
     host::log("slippi: the opponent sent no build (Slippi Dolphin); this Direct match plays the retail game without %s",
               g_local_build.name.c_str());
-    if (g_plain_opponent_handler) g_plain_opponent_handler(true);
+    if (g_plain_opponent_handler) g_plain_opponent_handler(true, "Opponent is on Slippi Dolphin: this match plays the standard game");
   }
   return 1;
 }
@@ -2264,7 +2264,7 @@ void handle_get_player_settings(std::vector<uint8_t>& q) {
 }  // namespace
 
 Config& config() { return g_config; }
-void set_plain_opponent_handler(void (*handler)(bool plain)) { g_plain_opponent_handler = handler; }
+void set_plain_opponent_handler(void (*handler)(bool plain, const char* why)) { g_plain_opponent_handler = handler; }
 
 void set_local_build(const LocalBuild& build) {
   if (build.mod_view != g_local_build.mod_view || build.fingerprint != g_local_build.fingerprint ||

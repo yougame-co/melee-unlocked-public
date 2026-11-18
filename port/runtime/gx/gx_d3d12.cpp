@@ -520,8 +520,12 @@ class D3D12Backend : public Backend {
     const UINT shown = st.PresentCount - last_frame_stats_.PresentCount;
     const UINT refreshes = st.SyncRefreshCount - last_frame_stats_.SyncRefreshCount;
     last_frame_stats_ = st;
-    std::snprintf(line, sizeof line, "%s, the display owns the frames: %u frames shown over %u refreshes (%u refreshes repeated a frame)",
-                  mode, shown, refreshes, refreshes > shown ? refreshes - shown : 0u);
+    // More frames than refreshes with V-Sync on: the driver overrides V-Sync (NVIDIA control panel
+    // "Vertical sync: Off" or Fast), so the picture tears whatever the game asks for. Log only.
+    const bool vsync_overridden = opts_.vsync && refreshes > 0 && shown > refreshes + refreshes / 20 + 2;
+    std::snprintf(line, sizeof line, "%s, the display owns the frames: %u frames shown over %u refreshes (%u refreshes repeated a frame)%s",
+                  mode, shown, refreshes, refreshes > shown ? refreshes - shown : 0u,
+                  vsync_overridden ? "; V-Sync is on but the driver shows more frames than refreshes (overridden in the driver)" : "");
     return line;
   }
   bool have_frame_stats_ = false;
