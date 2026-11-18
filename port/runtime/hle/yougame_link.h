@@ -243,6 +243,7 @@ struct Search {
   std::string direct_code;    // the opponent's connect code (Direct)
   std::string friend_room;    // internal invite; never an opponent connect code
   uint16_t udp_port = 0;      // the netplay port; STUN and the punch run from it so the NAT mapping is the one ENet uses
+  bool udp_port_fixed = false;   // udp_port was asked for (a fixed Slippi port): bound explicitly, else the system picks
   // Blended Unranked only (yougame_blend.h), called on the search's thread. on_searching: the queue's
   // "searching" count (players searching there, this one included). claim: the queue named a room;
   // false declines it (Slippi's side was first): briefly join and leave the assigned room.

@@ -36,6 +36,17 @@ void yg_enet_select(int direct);
 int yg_enet_selected(void);
 void yg_enet_enable(int enabled);
 int yg_enet_enabled(void);
+/* Own UDP handoff: the punch's socket, still holding its NAT mapping, is parked here instead of closed.
+ * The next native datagram socket created on a thread that called yg_native_adopt_next(port) with the
+ * parked socket's port is that socket, and its bind to that port succeeds without binding again (a
+ * second explicit bind of an all-interfaces port is what makes Windows Firewall ask). Returns the socket
+ * it replaced, left unadopted, for the caller to close (ENET_SOCKET_NULL parks nothing). */
+ENetSocket yg_native_park(ENetSocket socket, unsigned short port);
+void yg_native_adopt_next(unsigned short port);
+/* Backend hooks: the parked socket for a create on an adopting thread (else ENET_SOCKET_NULL), and 1
+ * when a bind is the adopted socket's own (nothing to do). */
+ENetSocket yg_native_take_parked(ENetSocketType type);
+int yg_native_adopted_bind(ENetSocket socket, const ENetAddress *address);
 int yg_enet_channel_ready(void);
 int yg_enet_link_state(unsigned link);
 int yg_enet_link_address(unsigned link, ENetAddress *address);

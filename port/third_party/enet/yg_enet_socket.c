@@ -438,6 +438,34 @@ fail:
     UNLOCK(); return -1;
 }
 #endif
+/* Own UDP handoff (yg_native_park in the header). Shared by win32.c's wrapper below and unix.c. */
+#ifdef _WIN32
+#define YG_TLS __declspec(thread)
+#else
+#define YG_TLS __thread
+#endif
+static ENetSocket parked=ENET_SOCKET_NULL; static unsigned short parked_port=0;
+static YG_TLS unsigned short adopt_port=0; static YG_TLS ENetSocket adopted=ENET_SOCKET_NULL; static YG_TLS unsigned short adopted_port=0;
+ENetSocket yg_native_park(ENetSocket s,unsigned short port) {
+    ENetSocket old; LOCK(); old=parked; parked=s; parked_port=s==ENET_SOCKET_NULL?0:port; UNLOCK();
+    return old==s?ENET_SOCKET_NULL:old;
+}
+void yg_native_adopt_next(unsigned short port) { adopt_port=port; }
+ENetSocket yg_native_take_parked(ENetSocketType t) {
+    ENetSocket s=ENET_SOCKET_NULL; unsigned short want=adopt_port;
+    adopt_port=0;
+    if(!want || t!=ENET_SOCKET_TYPE_DATAGRAM) return ENET_SOCKET_NULL;
+    LOCK(); if(parked!=ENET_SOCKET_NULL && parked_port==want) { s=parked; parked=ENET_SOCKET_NULL; parked_port=0; } UNLOCK();
+    if(s!=ENET_SOCKET_NULL) { adopted=s; adopted_port=want; }
+    return s;
+}
+int yg_native_adopted_bind(ENetSocket s,const ENetAddress *a) {
+    int ok;
+    if(adopted==ENET_SOCKET_NULL || s!=adopted) return 0;
+    ok=a && a->host==ENET_HOST_ANY && a->port==adopted_port;   /* already bound there by the punch */
+    adopted=ENET_SOCKET_NULL; adopted_port=0;
+    return ok;
+}
 #ifdef _WIN32
 static struct { HANDLE section,to_app,to_game,wake; void *view; } handles;
 static void notify_app(void *p) { (void)p; SetEvent(handles.to_app); }
@@ -481,9 +509,18 @@ int yg_native_socket_connect(ENetSocket,const ENetAddress *);
 ENetSocket yg_native_socket_accept(ENetSocket,ENetAddress *);
 int yg_native_socket_shutdown(ENetSocket,ENetSocketShutdown);
 int yg_native_socketset_select(ENetSocket,ENetSocketSet *,ENetSocketSet *,enet_uint32);
-ENetSocket enet_socket_create(ENetSocketType t) { return yg_enet_selected() ? (t==ENET_SOCKET_TYPE_DATAGRAM?yg_enet_create():ENET_SOCKET_NULL) : yg_native_socket_create(t); }
+ENetSocket enet_socket_create(ENetSocketType t) {
+    ENetSocket s;
+    if(yg_enet_selected()) { yg_native_adopt_next(0); return t==ENET_SOCKET_TYPE_DATAGRAM?yg_enet_create():ENET_SOCKET_NULL; }
+    s=yg_native_take_parked(t);   /* the own-UDP punch socket (yg_native_park) */
+    return s!=ENET_SOCKET_NULL?s:yg_native_socket_create(t);
+}
 void enet_socket_destroy(ENetSocket s) { if(yg_enet_is_socket(s)) yg_enet_destroy(s); else yg_native_socket_destroy(s); }
-int enet_socket_bind(ENetSocket s,const ENetAddress *a) { return yg_enet_is_socket(s)?yg_enet_bind(s,a):yg_native_socket_bind(s,a); }
+int enet_socket_bind(ENetSocket s,const ENetAddress *a) {
+    if(yg_enet_is_socket(s)) return yg_enet_bind(s,a);
+    if(yg_native_adopted_bind(s,a)) return 0;
+    return yg_native_socket_bind(s,a);
+}
 int enet_socket_get_address(ENetSocket s,ENetAddress *a) { return yg_enet_is_socket(s)?yg_enet_get_address(s,a):yg_native_socket_get_address(s,a); }
 int enet_socket_set_option(ENetSocket s,ENetSocketOption o,int v) { return yg_enet_is_socket(s)?0:yg_native_socket_set_option(s,o,v); }
 int enet_socket_get_option(ENetSocket s,ENetSocketOption o,int *v) { if(yg_enet_is_socket(s)) { *v=0; return 0; } return yg_native_socket_get_option(s,o,v); }

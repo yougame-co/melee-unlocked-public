@@ -183,8 +183,38 @@ static void real_enet(void) {
     CHECK(enet_socket_create(ENET_SOCKET_TYPE_DATAGRAM)==ENET_SOCKET_NULL && native_creates==1); // no UDP fallback after helper loss
     yg_enet_enable(0);
 }
+/* The own-UDP punch socket handed to the match's ENet: only the adopting thread's next create gets it,
+ * only for the parked port, and its bind there is a no-op; anything else leaves it parked or closes it. */
+static void handoff(void) {
+    ENetAddress any={ENET_HOST_ANY,41234}, other={ENET_HOST_ANY,41235}, loop={ENET_HOST_TO_NET_32(0x7F000001u),41234};
+    CHECK(yg_native_take_parked(ENET_SOCKET_TYPE_DATAGRAM)==ENET_SOCKET_NULL);   /* nothing asked, nothing parked */
+    CHECK(yg_native_park((ENetSocket)77,41234)==ENET_SOCKET_NULL);
+    CHECK(yg_native_take_parked(ENET_SOCKET_TYPE_DATAGRAM)==ENET_SOCKET_NULL);   /* no adopt_next on this thread */
+    yg_native_adopt_next(41235);
+    CHECK(yg_native_take_parked(ENET_SOCKET_TYPE_DATAGRAM)==ENET_SOCKET_NULL);   /* another port */
+    yg_native_adopt_next(41234);
+    CHECK(yg_native_take_parked(ENET_SOCKET_TYPE_STREAM)==ENET_SOCKET_NULL);     /* never a stream */
+    CHECK(yg_native_take_parked(ENET_SOCKET_TYPE_DATAGRAM)==ENET_SOCKET_NULL);   /* one try per adopt_next */
+    yg_native_adopt_next(41234);
+    CHECK(yg_native_take_parked(ENET_SOCKET_TYPE_DATAGRAM)==(ENetSocket)77);
+    CHECK(!yg_native_adopted_bind((ENetSocket)78,&any));                        /* not the adopted socket */
+    CHECK(yg_native_adopted_bind((ENetSocket)77,&any));                         /* already bound: no-op */
+    CHECK(!yg_native_adopted_bind((ENetSocket)77,&any));                        /* once */
+    yg_native_adopt_next(41234);
+    CHECK(yg_native_take_parked(ENET_SOCKET_TYPE_DATAGRAM)==ENET_SOCKET_NULL);   /* taken: gone from the park */
+    CHECK(yg_native_park((ENetSocket)79,41234)==ENET_SOCKET_NULL); yg_native_adopt_next(41234);
+    CHECK(yg_native_take_parked(ENET_SOCKET_TYPE_DATAGRAM)==(ENetSocket)79);
+    CHECK(!yg_native_adopted_bind((ENetSocket)79,&loop));                       /* another address binds for real */
+    CHECK(yg_native_park((ENetSocket)80,41234)==ENET_SOCKET_NULL); yg_native_adopt_next(41234);
+    CHECK(yg_native_take_parked(ENET_SOCKET_TYPE_DATAGRAM)==(ENetSocket)80);
+    CHECK(!yg_native_adopted_bind((ENetSocket)80,&other));
+    CHECK(yg_native_park((ENetSocket)81,41234)==ENET_SOCKET_NULL);
+    CHECK(yg_native_park((ENetSocket)82,41234)==(ENetSocket)81);                /* replaced: the caller closes it */
+    CHECK(yg_native_park(ENET_SOCKET_NULL,0)==(ENetSocket)82);                  /* unpark */
+    CHECK(yg_native_park(ENET_SOCKET_NULL,0)==ENET_SOCKET_NULL);
+}
 int main(void) {
-    basic_io(); real_enet();
+    handoff(); basic_io(); real_enet();
     printf("yg_enet_socket: ring/drop/map/wake/interrupt, real ENet negotiation/reset/reuse and fragmented reliable delivery at 5%% loss passed (%u datagrams, max %u B)\n",datagrams,largest);
     return 0;
 }

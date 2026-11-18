@@ -58,5 +58,32 @@ class RankedFixWiringTest(unittest.TestCase):
         self.assertIn('fail("YouGame isn\'t running. Open YouGame, then press Start");', block)
 
 
+    def test_match_room_gets_a_fresh_ticket_after_a_long_search(self):
+        # Rooms refuses a ticket older than 5 minutes (401); Unranked opens the match room with the queue's.
+        link = (ROOT / "port/runtime/hle/yougame_link.cpp").read_text(encoding="utf-8")
+        start = link.index('if (t == "matched" && m.count("room") && m["room"].is_string()) {\n        room_code = m["room"].get<std::string>();\n        if (blend && !search.claim())')
+        block = link[start:link.index("break;", start)]
+        self.assertIn("if (now_ms() - pass_at > 240000) {", block)
+        self.assertIn("renew_ticket(now_ms() + 5000);", block)
+        self.assertIn("if (renewed) pass_at = now_ms();", link)
+
+
+    def test_own_udp_never_binds_a_listener_windows_asks_about(self):
+        # An explicit all-interfaces bind() made Windows Firewall ask over the first match: the punch socket
+        # binds on its first send, and a direct match's ENet takes that same socket instead of binding again.
+        link = (ROOT / "port/runtime/hle/yougame_link.cpp").read_text(encoding="utf-8")
+        net = (ROOT / "port/runtime/hle/slippi_net.cpp").read_text(encoding="utf-8")
+        self.assertIn("const bool implicit_bind = !requested_port.set && !search.udp_port_fixed;", link)
+        self.assertIn("stunned = stun(udp, external, cancelled);", link)
+        self.assertIn("yg_native_park((ENetSocket)udp, bound_port)", link)
+        create = net.index("client_ = enet_host_create(local, 10, 3, 0, 0);")
+        self.assertIn("if (own_udp && local_port > 0) yg_native_adopt_next((unsigned short)local_port);", net[create - 300:create])
+        self.assertIn("yg_native_adopt_next(0);", net[create:create + 80])
+        for backend in ("port/third_party/enet/unix.c", "port/third_party/enet/yg_enet_socket.c"):
+            src = (ROOT / backend).read_text(encoding="utf-8")
+            self.assertIn("yg_native_adopted_bind", src)
+            self.assertIn("yg_native_take_parked", src)
+
+
 if __name__ == "__main__":
     unittest.main()

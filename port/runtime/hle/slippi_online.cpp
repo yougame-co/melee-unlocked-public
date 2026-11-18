@@ -3355,13 +3355,13 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
       // A YouGame row pressed before the app could say it is signed out (still starting, its page still
       // loading): the shim's wait polls this query once a second, so the card opens on the first poll
       // that knows, not on a second press (11-17: the first press after a cold start sat
-      // ~50 s and then showed nothing). Dropped after the shim's own 180 s wait or any other pick.
+      // ~50 s and then showed nothing). Dropped after the shim's own 10-minute wait or any other pick.
       static std::atomic<int64_t> s_yg_pick{0};
       const auto now_pick_ms = [] {
         return (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
       };
       if (payload_len == 0 && s_yg_pick) {
-        if (now_pick_ms() - s_yg_pick > 180000) s_yg_pick = 0;
+        if (now_pick_ms() - s_yg_pick > 600000) s_yg_pick = 0;
         else if (yougame::sign_in_needed()) { s_yg_pick = 0; yougame::sign_in_open(); }
       }
       // 0x20: the first row picked while YouGame is Coming soon: open the installed app, else the download page.

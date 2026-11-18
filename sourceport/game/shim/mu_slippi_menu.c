@@ -1055,9 +1055,10 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
     buttons = mn_80229624(4);
     if (yg_wait_slot >= 0) {
         /* A YouGame row was picked before YouGame was connected: look again about once a second and
-         * confirm that row by itself once the rows open. Moving off it or leaving the menu cancels. */
+         * confirm that row by itself once the rows open. Moving off it or leaving the menu cancels; the wait
+         * lasts the sign-in code's 10 minutes (a phone sign-in took 3 min 40 s in a walk). */
         if (mn_804A04F0.cur_menu != MENU_KIND_8 || split_page != 0 ||
-            mn_804A04F0.hovered_selection != yg_wait_slot || ++yg_wait_frames > 60u * 180u) {
+            mn_804A04F0.hovered_selection != yg_wait_slot || ++yg_wait_frames > 60u * 600u) {
             yg_wait_slot = -1;
         } else if (yg_wait_frames % 60u == 0) {
             int flags = yougame_query(-1, NULL, 0);

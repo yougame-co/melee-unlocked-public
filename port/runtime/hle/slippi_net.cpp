@@ -610,7 +610,11 @@ NetplayClient::NetplayClient(std::vector<std::string> addrs, std::vector<uint16_
   }
   if (requested.set) local_port = requested.value;
   if (local_port > 0) { local_addr.host = ENET_HOST_ANY; local_addr.port = local_port; local = &local_addr; }
+  // Own UDP: the punch's socket, still bound to this port, becomes the match's (yg_native_park): no second
+  // bind for Windows Firewall to ask about.
+  if (own_udp && local_port > 0) yg_native_adopt_next((unsigned short)local_port);
   client_ = enet_host_create(local, 10, 3, 0, 0);
+  yg_native_adopt_next(0);
   if (!client_) {
     if (requested.set) {
       host::log("%s", yougame::udp::port_error(requested, "bind failed").c_str());
@@ -2866,6 +2870,7 @@ void Matchmaking::startYouGameMatchmaking(const char* status) {
   yougame::Search search;
   if (!youGameSearch(&search)) return;
   search.udp_port = (uint16_t)host_port_;
+  search.udp_port_fixed = port_override_ || forced_port;
   if (status) search.status = status;
   state_ = MATCHMAKING;
   yougame::Match match = yougame::find_match(search, [this] { return is_mm_terminated_ || state_ != MATCHMAKING; });
@@ -3167,6 +3172,7 @@ void Matchmaking::blendMatchmaking() {
   const int yg_port = yougame::search_policy::blend_port((uint16_t)forced_port, rng());
   search.epoch = yougame::begin_search();
   search.udp_port = (uint16_t)yg_port;
+  search.udp_port_fixed = forced_port && yg_port == (int)forced_port;
   search.status = yougame::blend::kSearchBoth;
   search.on_searching = [&](int waiting) {
     std::lock_guard<std::mutex> lk(mutex);

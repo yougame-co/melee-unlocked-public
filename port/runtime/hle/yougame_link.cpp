@@ -3406,10 +3406,16 @@ const char* ask_name(signin::Ask a) { return a == signin::Ask::Code ? "code" : "
 void sign_in_rehello() {
   if (g_signin_rehello.exchange(true)) return;
   std::thread([] {
-    player_arrived();   // the identity is asked again now; an ask in flight runs once more
-    for (int i = 0; i < 400 && g_identity_fetching.load(); ++i) Sleep(50);
+    // The app can push signedIn a moment before its hello carries the player: ask again each second for
+    // up to 8 s, so the panel says "Signed in as <name>" and the picked row carries on without a second press.
     Identity id;
-    { std::lock_guard<std::mutex> lock(g_mutex); id = g_identity; }
+    for (int attempt = 0; attempt < 8; ++attempt) {
+      if (attempt) Sleep(1000);
+      player_arrived();   // the identity is asked again now; an ask in flight runs once more
+      for (int i = 0; i < 400 && g_identity_fetching.load(); ++i) Sleep(50);
+      { std::lock_guard<std::mutex> lock(g_mutex); id = g_identity; }
+      if (id.ok) break;
+    }
     host::log("yougame sign-in: hello again: %s", id.ok ? "player" : "no player yet");
     { std::lock_guard<std::mutex> lock(g_signin_mutex); g_signin.rehello_result(id.ok, id.name, now_ms()); }
     g_signin_rehello = false;
@@ -4585,6 +4591,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   }
   const std::string url = ticket.value("url", "");
   std::string pass = ticket.value("ticket", "");
+  uint64_t pass_at = now_ms();   // a ticket lives 5 minutes at the rooms edge (TICKET_TTL_MS)
   std::string room_code = ticket.count("room") && ticket["room"].is_string() ? ticket["room"].get<std::string>() : "";
   if ((friends_mode || team_code || lobby_route) && room_code.empty()) room_code = friends::room(request);
   std::string error;
@@ -4611,10 +4618,12 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     const auto now = now_ms();
     if (now >= until || cancelled() || (last_renew && now - last_renew < 1500)) return false;
     last_renew = now;
-    return transport::renew_room_ticket(pass, room_code, [&] {
+    const bool renewed = transport::renew_room_ticket(pass, room_code, [&] {
       try { return bridge(request, (int)std::min<uint64_t>(3000, until - now), cancelled); }
       catch (const update::Required&) { update_refused = true; throw; }
     }, [](const char* message) { host::log("%s", message); });
+    if (renewed) pass_at = now_ms();
+    return renewed;
   };
 
   // Unranked: wait in the queue until the matchmaker names a room.
@@ -4689,6 +4698,13 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       if (t == "matched" && m.count("room") && m["room"].is_string()) {
         room_code = m["room"].get<std::string>();
         if (blend && !search.claim()) { decline(); return fail("Cancelled"); }
+        // The match room takes the queue's ticket; after a long search it has expired and the room refuses
+        // it (401 "Bad or expired ticket"), losing the match. Past 4 minutes, a fresh one first.
+        if (now_ms() - pass_at > 240000) {
+          host::log("yougame: queue ticket is %llu s old: renewing it for the match room", (unsigned long long)((now_ms() - pass_at) / 1000));
+          renew_ticket(now_ms() + 5000);
+          if (update_refused) return fail(update::kMessage, false, true);
+        }
         break;
       }
       if (t == "error") return fail(m.value("error", "Matchmaking failed"));
@@ -4825,8 +4841,15 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       host::log("%s", udp::port_error(requested_port, "invalid decimal port").c_str());
       return "The own UDP port is unavailable";
     }
+    // A socket a match never adopted (parked below, its ENet never made) closes.
+    if (const ENetSocket left = yg_native_park(ENET_SOCKET_NULL, 0); left != ENET_SOCKET_NULL) closesocket((SOCKET)left);
+    // No port asked for (no YOUGAME_UDP_PORT, no fixed Slippi port): the first send binds one, on all
+    // interfaces at a port the system picks. Windows Firewall asks nothing for a socket bound that way; an
+    // explicit bind() made it ask "allow public and private networks" over the first match, taking the
+    // keyboard. STUN's first request is that send. A fixed port is a deliberate listener: bound as before.
+    const bool implicit_bind = !requested_port.set && !search.udp_port_fixed;
 #ifdef _WIN32
-    { std::lock_guard<std::mutex> lock(g_mutex);   // once per run: the first bind is when Windows asks
+    if (!implicit_bind) { std::lock_guard<std::mutex> lock(g_mutex);   // once per run: the first bind is when Windows asks
       // The note shows where the search line can carry it (plain or YouGame-only search); a blend search,
       // Friends or a lobby shows its own line, so their first bind passes without it.
       if (!g_firewall_bound) {
@@ -4843,20 +4866,31 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       return "Could not open the network port";
     }
     sockaddr_in bind_addr{};
-    bind_addr.sin_family = AF_INET;
-    if (!udp::bind_port(requested_port, search.udp_port, [&](uint16_t p) {
-      bind_addr.sin_port = htons(p); // zero-initialized INADDR_ANY: all interfaces
-      return bind(udp, (sockaddr*)&bind_addr, sizeof bind_addr) == 0;
-    }, [](const char* message) { host::log("%s", message); }))
-      return "The network port is in use";
     SocketLength length = sizeof bind_addr;
-    if (getsockname(udp, (sockaddr*)&bind_addr, &length) != 0 ||
-        (requested_port.set && ntohs(bind_addr.sin_port) != requested_port.value)) {
-      if (requested_port.set) host::log("%s", udp::port_error(requested_port, "bound port check failed").c_str());
-      return "The own UDP port is unavailable";
+    bool stunned = false, bound = false;
+    if (implicit_bind) {
+      stunned = stun(udp, external, cancelled);
+      bound = getsockname(udp, (sockaddr*)&bind_addr, &length) == 0 && bind_addr.sin_port != 0;
+      if (bound) host::log("yougame: own UDP: port bound by the first send");
+      else host::log("yougame: own UDP: no send bound a port; binding one");   // no STUN server resolved
+    }
+    if (!bound) {
+      bind_addr = sockaddr_in{};
+      bind_addr.sin_family = AF_INET;
+      if (!udp::bind_port(requested_port, search.udp_port, [&](uint16_t p) {
+        bind_addr.sin_port = htons(p); // zero-initialized INADDR_ANY: all interfaces
+        return bind(udp, (sockaddr*)&bind_addr, sizeof bind_addr) == 0;
+      }, [](const char* message) { host::log("%s", message); }))
+        return "The network port is in use";
+      length = sizeof bind_addr;
+      if (getsockname(udp, (sockaddr*)&bind_addr, &length) != 0 ||
+          (requested_port.set && ntohs(bind_addr.sin_port) != requested_port.value)) {
+        if (requested_port.set) host::log("%s", udp::port_error(requested_port, "bound port check failed").c_str());
+        return "The own UDP port is unavailable";
+      }
     }
     bound_port = ntohs(bind_addr.sin_port);
-    if (!stun(udp, external, cancelled)) host::log("yougame: STUN unavailable");
+    if (!stunned && (bound || !stun(udp, external, cancelled))) host::log("yougame: STUN unavailable");
     lan_addr = udp::lan_candidate(std::getenv("YOUGAME_HOST_LAN_IP"), bound_port, lan_ip,
         [](const char* message) { host::log("%s", message); });
     return "";
@@ -5665,6 +5699,12 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   Match out;
   out.ok = true;
   out.udp_port = links_mode || relay_match ? 0 : bound_port;
+  // The match's ENet takes this very socket (slippi_net: yg_native_adopt_next): the NAT mapping the punch
+  // opened stays, and nothing binds the port a second time.
+  if (out.udp_port && udp != INVALID_SOCKET) {
+    if (const ENetSocket left = yg_native_park((ENetSocket)udp, bound_port); left != ENET_SOCKET_NULL) closesocket((SOCKET)left);
+    udp = INVALID_SOCKET;
+  }
   out.match_id = match_id.rfind("yg-", 0) == 0 && match_id.size() <= 32 ? match_id : my_match_id;
   out.local_index = my_seat;
   out.host = my_seat == 0;
