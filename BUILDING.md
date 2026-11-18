@@ -1,8 +1,8 @@
 # Building Melee Unlocked 0.9.206 for YouGame
 
-This source tree corresponds to build 121.1, row `0.9.206-online-test.121.1`.
+This source tree corresponds to build 121.2, row `0.9.206-online-test.121.2`.
 
-Build 121.1 is the main configuration, with all three online modes: the Friends 4-seat lobby, online Doubles (2v2,
+Build 121.2 is the main configuration, with all three online modes: the Friends 4-seat lobby, online Doubles (2v2,
 with YouGame parties) and Squad Strike. It configures the CMake options `MELEE_DOUBLES` and `MELEE_SQUAD_STRIKE`
 ON for the game library and the program; both options are off by default, and the Linux build passes
 `--doubles --squad-strike`. The Doubles and Squad Strike files and their terms are listed in NOTICE.
@@ -33,7 +33,7 @@ of runtime resources. A source scan passing does not validate reconstruction.
 
 The retained manual CI workflow and tools/ci instructions describe an older
 release. They depend on omitted patch inputs and the former source-only CMake
-change; do not dispatch them as a build-121.1 recipe. Use the integrated sources,
+change; do not dispatch them as a build-121.2 recipe. Use the integrated sources,
 not those patches. The commands below describe current source targets, not a
 validated disc-free build or a complete packaging recipe.
 
@@ -54,7 +54,7 @@ cmake -S . -B build-review -G "Visual Studio 17 2022" -A x64 -DMELEE_BUILD_EXPER
 cmake --build build-review --config Release --target melee_source --parallel
 ```
 
-YouGame's build 121.1 hosts were also configured with `-DMELEE_YOUGAME_START_STAGING=ON` (Windows and Linux),
+YouGame's build 121.2 hosts were also configured with `-DMELEE_YOUGAME_START_STAGING=ON` (Windows and Linux),
 so they start and link YouGame Staging only; leave it off to build a host that looks for YouGame itself.
 
 Supply the matching SDKs required by the configured rendering features. See
@@ -104,5 +104,5 @@ Supply your own uncompressed Melee NTSC 1.02 ISO using `--iso`, with the matchin
 game library and lawfully reconstructed runtime resources beside the host.
 The public source does not include a disc, DOL, extracted Nintendo assets or a
 complete runtime package. The YouGame app supplies its own launch arguments.
-Do not infer that build 121.1 is reproducible from this snapshot alone: resource
+Do not infer that build 121.2 is reproducible from this snapshot alone: resource
 provenance, missing inputs and platform builds still need verification.

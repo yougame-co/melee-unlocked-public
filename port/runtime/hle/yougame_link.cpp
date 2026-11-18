@@ -942,6 +942,10 @@ class Socket {
   void agent_test_drop_room() { if (broker_) broker_->agent_test_drop_room(); }
 #endif
   bool open(const std::string& address, std::string* error, int timeout, const std::function<bool()>& cancelled) {
+    // The Unranked queue reopens on the same Socket after a drop: end the old connection and join its
+    // reader first. A new std::thread assigned over a joinable one calls std::terminate, which closed
+    // the game with "the game stopped itself (abort)" on the first 1006 drop of a search (121.1, 11-17).
+    if (ws_ || reader_.joinable()) close();
     Url u;
     if (!parse_url(address, u) || (!u.secure && u.host != L"127.0.0.1" && u.host != L"localhost")) {
       *error = "Invalid YouGame rooms address";
@@ -986,6 +990,11 @@ class Socket {
       *error = status == 403 ? "YouGame refused the ticket" : status ? "YouGame refused the connection (HTTP " + std::to_string(status) + ")"
                                                                   : "Could not connect to YouGame";
       return false;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      queue_.clear();
+      closed_ = false;
     }
     reader_ = std::thread([this] { read_loop(); });
     return true;
