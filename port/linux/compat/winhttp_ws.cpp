@@ -12,9 +12,11 @@
 #endif
 #include <poll.h>
 #include <sys/socket.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -47,6 +49,8 @@ struct WebSocket {
   std::function<bool()> opening_cancelled;
   std::mutex send_mutex, io_mutex;
   winhttp_ws::Decoder decoder; // reader only
+  std::vector<uint8_t> close_frame;  // the peer's close payload, once it has come (reader only)
+  bool closed_by_peer = false;
   ~WebSocket() {
     if (multi) { curl_multi_remove_handle(multi, curl); curl_multi_cleanup(multi); }
     if (curl) curl_easy_cleanup(curl);
@@ -243,6 +247,7 @@ DWORD WinHttpWebSocketReceive(HINTERNET socket, LPVOID buffer, DWORD size, LPDWO
     const auto result = ws->decoder.next(static_cast<uint8_t*>(buffer), size, count, decoded_type, control);
     if (result == winhttp_ws::Result::Error) return io_error;
     if (result == winhttp_ws::Result::Data || result == winhttp_ws::Result::Close) {
+      if (result == winhttp_ws::Result::Close) { ws->close_frame = control; ws->closed_by_peer = true; }
       *got = (DWORD)count;
       *type = static_cast<WINHTTP_WEB_SOCKET_BUFFER_TYPE>(decoded_type);
       return NO_ERROR;
@@ -257,6 +262,19 @@ DWORD WinHttpWebSocketReceive(HINTERNET socket, LPVOID buffer, DWORD size, LPDWO
     if (error) return error;
     ws->decoder.feed(data, received);
   }
+}
+// The peer's close code and reason, as WinHTTP gives them after a close buffer: 1005 when the close
+// carried no code, and ERROR_INVALID_OPERATION (4317) before any close came.
+DWORD WinHttpWebSocketQueryCloseStatus(HINTERNET socket, USHORT* status, LPVOID reason, DWORD length, LPDWORD reason_length) {
+  auto ws = find_socket(socket);
+  if (!ws || !status || !reason_length || (!reason && length)) return invalid_parameter;
+  if (!ws->closed_by_peer) return 4317;
+  const std::vector<uint8_t>& frame = ws->close_frame;
+  *status = frame.size() >= 2 ? USHORT((frame[0] << 8) | frame[1]) : USHORT(1005);
+  const DWORD n = frame.size() > 2 ? (DWORD)std::min<size_t>(frame.size() - 2, length) : 0;
+  if (n) std::memcpy(reason, frame.data() + 2, n);
+  *reason_length = n;
+  return NO_ERROR;
 }
 DWORD WinHttpWebSocketShutdown(HINTERNET socket, USHORT status, LPVOID reason, DWORD length) {
   auto ws = find_socket(socket);

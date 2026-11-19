@@ -75,5 +75,6 @@ void WinHttpSetCancelCallback(HINTERNET request, const std::function<bool()>& ca
 HINTERNET WinHttpWebSocketCompleteUpgrade(HINTERNET request, DWORD_PTR context);
 DWORD WinHttpWebSocketSend(HINTERNET socket, WINHTTP_WEB_SOCKET_BUFFER_TYPE type, LPVOID buffer, DWORD size);
 DWORD WinHttpWebSocketReceive(HINTERNET socket, LPVOID buffer, DWORD size, LPDWORD got, WINHTTP_WEB_SOCKET_BUFFER_TYPE* type);
+DWORD WinHttpWebSocketQueryCloseStatus(HINTERNET socket, USHORT* status, LPVOID reason, DWORD length, LPDWORD reason_length);
 DWORD WinHttpWebSocketShutdown(HINTERNET socket, USHORT status, LPVOID reason, DWORD length);
 BOOL WinHttpCrackUrl(LPCWSTR url, DWORD length, DWORD flags, URL_COMPONENTS* parts);
