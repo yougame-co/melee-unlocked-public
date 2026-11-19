@@ -48,8 +48,9 @@ class UnrankedOpponentLeftTest(unittest.TestCase):
     def test_host_sets_the_flag_only_where_the_opponents_link_dropped(self):
         online = source('port/runtime/hle/slippi_online.cpp')
         self.assertIn('bool g_unranked_opponent_left = false;', online)
-        # Exactly one place sets it: the match-state poll's "connected, but the link is gone" branch.
-        self.assertEqual(online.count('g_unranked_opponent_left = true;'), 1)
+        # Two places set it: the match-state poll's "connected, but the link is gone" branch, and (122.28) the
+        # first in-game input poll that finds the opponent gone. The second survives the game's own cleanup.
+        self.assertEqual(online.count('g_unranked_opponent_left = true;'), 2)
         state = online[online.index('void prepare_online_match_state(std::vector<uint8_t>& q) {'):]
         at = state.index('g_unranked_opponent_left = true;')
         branch = state[state.rindex('} else {', 0, at):at]
@@ -59,11 +60,25 @@ class UnrankedOpponentLeftTest(unittest.TestCase):
         for arg in ('yougame::session()', '(int)g_last_search.mode', '!g_last_search.friend_room.empty()',
                     'g_play_session_active', 'yougame::own_room_dropped()'):
             self.assertIn(arg, branch[decide:branch.index('cleanup_connection();')])
-        # Every cleanup clears it (the player's own hold-Z, clearing an error, the main menu), and so does Start.
+        # Every cleanup resets it to the in-game leave (122.28), so a lobby-side note never outlives its cleanup
+        # but a game the opponent ended keeps it; Start (a new search) clears both.
         cleanup = online[online.index('void cleanup_connection(yougame::Leave why'):]
-        self.assertIn('g_unranked_opponent_left = false;', cleanup[:cleanup.index('finish_summary(')])
+        self.assertIn('g_unranked_opponent_left = g_unranked_left_in_game;', cleanup[:cleanup.index('finish_summary(')])
         find = online[online.index('    case CMD_FIND_OPPONENT:'):]
-        self.assertIn('g_unranked_opponent_left = false;', find[:find.index('start_find_match(payload)')])
+        self.assertIn('g_unranked_opponent_left = g_unranked_left_in_game = false;',
+                      find[:find.index('start_find_match(payload)')])
+
+    def test_in_game_leave_sets_it_before_the_disconnect_reply(self):
+        online = source('port/runtime/hle/slippi_online.cpp')
+        inputs = online[online.index('  if (is_disconnected()) {\n    // YouGame Unranked'):]
+        inputs = inputs[:inputs.index('q.push_back(3);')]
+        self.assertIn('!is_leaving', inputs)   # this player's own quit never shows it
+        self.assertIn('g_unranked_left_in_game = g_unranked_opponent_left = true;', inputs)
+        self.assertLess(inputs.index('g_unranked_left_in_game = g_unranked_opponent_left = true;'),
+                        inputs.index('finish_summary("disconnected");'))
+        for arg in ('yougame::session()', '(int)g_last_search.mode', '!g_last_search.friend_room.empty()',
+                    'g_play_session_active', 'yougame::own_room_dropped()'):
+            self.assertIn(arg, inputs)
         # The game reads it through the optional data subcommand.
         data = online[online.index('    case CMD_YOUGAME_DATA:'):]
         data = data[:data.index('default: return false; // optional subcommand unknown to this host')]

@@ -334,6 +334,9 @@ bool g_play_session_active = false;
 // The Unranked character select says "Opponent left" (MU_YG_SUB_UNRANKED_NOTE) until the next search or
 // any other cleanup. Set only where the opponent's link dropped (prepare_online_match_state). Game thread.
 bool g_unranked_opponent_left = false;
+// Set where a match's inputs first find the opponent gone mid-game (handle_online_inputs). The game then
+// shows DISCONNECTED and its own cleanup follows, which turns this into the note instead of clearing it.
+bool g_unranked_left_in_game = false;
 uint8_t g_local_player_index = 0, g_remote_player_index = 1;
 uint32_t g_stall_frame_counts[REMOTE_PLAYER_MAX] = {};
 int g_frames_to_skip = 0, g_frames_to_advance = 0, g_fall_behind = 0, g_fall_far_behind = 0;
@@ -565,7 +568,9 @@ bool discord_join_pending() {
 // is the player leaving, the checks below drop a connection that broke or a match they refuse.
 void cleanup_connection(yougame::Leave why = yougame::Leave::Lost) {
   g_slippi_link.cancel([](const char* line) { host::log("%s", line); });
-  g_unranked_opponent_left = false;   // the one caller that sets it does so after this cleanup
+  // The match-state poll sets it after this cleanup; a game that ended because the opponent went keeps it
+  // through the game's own cleanup that follows (g_unranked_left_in_game). Anything else clears it.
+  g_unranked_opponent_left = g_unranked_left_in_game;   // kept until the next search (CMD_FIND_OPPONENT)
   finish_summary(why == yougame::Leave::Quit ? "quit" : why == yougame::Leave::Next ? "completed" : "disconnected");
   // The Friends lobby: Next and Lost park its room for the next search (yougame_link.h Leave); any other
   // cleanup leaves the room, and the select can only go back.
@@ -993,6 +998,16 @@ void handle_online_inputs(const uint8_t* payload, uint32_t size, std::vector<uin
   // connection does, and the other players take it for a disconnect too.
   if (is_leaving && !is_disconnected() && g_netplay) g_netplay->ForceDisconnect();
   if (is_disconnected()) {
+    // YouGame Unranked: the opponent left mid-game (closed the game, or their connection went), not this
+    // player (is_leaving). Read now, while the session and its room are still here; the game's cleanup
+    // after DISCONNECTED makes it the character select's "Opponent left".
+    if (!is_leaving && !g_unranked_left_in_game && g_summary.active &&
+        yougame::unranked::opponent_left(yougame::session(), (int)g_last_search.mode,
+            !g_last_search.friend_room.empty(), g_play_session_active,
+            yougame::session() && yougame::own_room_dropped())) {
+      g_unranked_left_in_game = g_unranked_opponent_left = true;
+      host::log("yougame: unranked: the opponent left mid-game; the character select says so until the next search");
+    }
     finish_summary("disconnected");
     q.push_back(3);
     return;
@@ -3262,7 +3277,7 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
     case CMD_LOAD_SAVESTATE: handle_load_savestate(payload); return true;
     case CMD_GET_MATCH_STATE: prepare_online_match_state(q); return true;
     case CMD_FIND_OPPONENT:
-      g_unranked_opponent_left = false;   // a new search: the last opponent's leave is old news
+      g_unranked_opponent_left = g_unranked_left_in_game = false;   // a new search: the last leave is old news
 #ifdef MELEE_DOUBLES
       // The Doubles CSS's search (mu_slippi_css.c): no code, it joins the home's match room.
       if (payload[0] == Matchmaking::TEAMS && yougame::active()) {
