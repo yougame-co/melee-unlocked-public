@@ -859,6 +859,69 @@ int mu_test_css_char(int port)
     return n;
 }
 
+/* MELEE_TEST_CSS_HAND=<x>,<y>[,<after>] (tests only): P1's hand is held at x, y (the select's
+ * units: the right limit is x 26) every frame of a CSS visit from frame <after> of the visit on
+ * (0 by default), so a capture can put the hand on what lies there. A plain A can pick a fighter
+ * first (MELEE_TEST_CSS_CHAR) when <after> leaves it the time. */
+int mu_test_css_hand(int port, float* x, float* y)
+{
+    static int parsed = 0, on = 0, after = 0, visit = 0, frames = 0;
+    static float hx = 0.0f, hy = 0.0f;
+    if (!parsed) {
+        const char* v = mu_test_getenv("MELEE_TEST_CSS_HAND");
+        float field[3] = { 0.0f, 0.0f, 0.0f };
+        int n = 0;
+        parsed = 1;
+        if (v != NULL && *v != '\0') {
+            const char* p = v;
+            while (n < 3) {
+                float sign = 1.0f, value = 0.0f, scale = 0.0f;
+                int digits = 0;
+                if (*p == '-') {
+                    sign = -1.0f;
+                    ++p;
+                }
+                for (; (*p >= '0' && *p <= '9') || *p == '.'; ++p) {
+                    if (*p == '.') {
+                        scale = 1.0f;
+                        continue;
+                    }
+                    value = value * 10.0f + (float) (*p - '0');
+                    if (scale > 0.0f) {
+                        scale *= 10.0f;
+                    }
+                    ++digits;
+                }
+                if (digits == 0) {
+                    break;
+                }
+                field[n++] = sign * (scale > 0.0f ? value / scale : value);
+                if (*p != ',') {
+                    break;
+                }
+                ++p;
+            }
+        }
+        on = n >= 2;
+        hx = field[0];
+        hy = field[1];
+        after = n >= 3 ? (int) field[2] : 0;
+    }
+    if (!on || port != 0) {
+        return 0;
+    }
+    if (visit != css_char_visit) {   /* a new CSS visit (mu_test_css_enter) counts from 0 again */
+        visit = css_char_visit;
+        frames = 0;
+    }
+    if (frames++ < after) {
+        return 0;
+    }
+    *x = hx;
+    *y = hy;
+    return 1;
+}
+
 /* MELEE_TEST_ADVENTURE_SCENE=<n> (tests only): Adventure starts at scene n, the decimal minor id
  * (stage * 8 + part: 33 is the Kirby team, 34 Giant Kirby, 25 the Zelda fight). Unset: -1. */
 int mu_test_adventure_scene(void)

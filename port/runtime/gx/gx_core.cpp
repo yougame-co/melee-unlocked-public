@@ -1119,6 +1119,13 @@ static size_t parse_command_inner(const uint8_t* d, size_t len) {
     g_native_stage_map = d[1];
     return 2;
   }
+  // Private token from the native online character select's camera (mncharsel.c), sent after the
+  // background, icons and panels (GX links 0 and 1) and before the coins and hands: the first one of
+  // a frame marks that place (Frame::under_hand_command).
+  if (op == 0xF8) {
+    if (g_frame.under_hand_command < 0) g_frame.under_hand_command = (int32_t)g_frame.commands.size();
+    return 1;
+  }
   // Private token from native HSD_PObjDisp while owners are tracked: the PObj is an envelope draw.
   if (op == 0xF2) {
     if (len < 2) return incomplete(2);

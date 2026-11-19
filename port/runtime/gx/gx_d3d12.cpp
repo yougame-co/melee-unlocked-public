@@ -85,6 +85,7 @@ static_assert(MU_RTX_PASS_PARTICLES == 1, "remix_effect_draw (gx_core.h) tests t
 #include "gecko_data.h"
 #ifdef GX_PC_SETTINGS
 #include "pc_settings.h"
+#include "arena_panel.h"
 #include "coming_soon_overlay.h"
 #include "lab_view.h"
 #endif
@@ -765,6 +766,8 @@ class D3D12Backend : public Backend {
                                        int video_slot);
   void draw_video_background(const std::shared_ptr<const video_bg::Frame>& frame,
                              int video_slot, const EfbCopy& screen);
+  void draw_under_hand(const EfbCopy& screen);
+  bool under_hand_logged_ = false;
   ID3D12Resource* get_texture(const TextureRef& t, uint32_t* w, uint32_t* h);
   D3D12_GPU_DESCRIPTOR_HANDLE bind_textures(const DrawCall& dc);
   D3D12_GPU_DESCRIPTOR_HANDLE bind_samplers(const DrawCall& dc);
@@ -2948,6 +2951,30 @@ void D3D12Backend::draw_video_background(
   list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   list_->DrawInstanced(3, 1, 0, 0);
   bind_efb_targets();
+}
+
+// The Arena card into the EFB at the native select's mark, under the coins and hands
+// (arena_panel::under_hand_draw_data): the screen copy's rectangle is the window's game picture.
+void D3D12Backend::draw_under_hand(const EfbCopy& screen) {
+#ifdef GX_PC_SETTINGS
+  if (!settings_ui_) return;
+  D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+  rtv.ptr += (msaa_on() ? 8 : 3) * rtv_size_;
+  list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  const float s = (float)scale_;
+  const bool drew = settings_ui_->draw_under_hand(list_.Get(), msaa_on() ? msaa_samples_ : 1u, screen.src_x * s, screen.src_y * s,
+                                                  screen.src_w * s, screen.src_h * s, (float)efb_w_, (float)efb_h_);
+  // The game's heaps and targets again; every draw sets its own pipeline, root signature and buffers.
+  ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), sampler_heap_.Get()};
+  list_->SetDescriptorHeaps(2, heaps);
+  bind_efb_targets();
+  if (drew && !under_hand_logged_) {
+    under_hand_logged_ = true;
+    host::log("arena panel: the card is drawn into the picture under the hands (D3D12)");
+  }
+#else
+  (void)screen;
+#endif
 }
 
 // The Remix layer carries, exactly as the game drew them, the scene's effects (remix_effect_draw) and
@@ -5549,6 +5576,7 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
   // the old set, so drop it and let the next draw rebuild what it needs.
   if (settings_ui_ && settings_textures_dirty()) { wait_gpu(); textures_.clear(); texture_sets_.clear(); }
   if (settings_ui_) { settings_set_game_aspect(output_aspect()); settings_set_hud_snapshot(frame); }
+  arena_panel::set_under_hand(settings_ui_ && frame.under_hand_command >= 0);   // drawn in the command loop
   Stopwatch ui_sw;
   if (settings_ui_ && settings_ui_->begin(opts_)) {
     apply_fullscreen_mode();
@@ -5866,6 +5894,8 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
           }
         }
       }
+      // The native select's coins and hands start here: the Arena card goes under them.
+      if ((int64_t)command_index == frame.under_hand_command && screen) draw_under_hand(*screen);
       draw_video_slot_ = -1;
       execute_draw(frame, dc, overrides ? overrides + cmd.index : nullptr);
       // The SSS backdrop's guest material tints arbitrary footage blue/purple. Keep the learned

@@ -78,6 +78,7 @@ void vulkan_forget_failed_starts() {}
 #endif
 #ifdef GX_PC_SETTINGS
 #include "pc_settings.h"
+#include "arena_panel.h"
 #include "coming_soon_overlay.h"
 #include "lab_view.h"
 #include "pc_settings_shared.h"
@@ -95,6 +96,7 @@ void vulkan_forget_failed_starts() {}
 #include <filesystem>
 #include <chrono>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -742,6 +744,8 @@ class VulkanBackend final : public Backend {
               }
             }
           }
+          // The native select's coins and hands start here: the Arena card goes under them.
+          if ((int64_t)(&command - frame.commands.data()) == frame.under_hand_command && screen) draw_under_hand(*screen);
           draw_video_slot_ = -1;
           draw(frame, dc, overrides ? overrides + command.index : nullptr, vertex_offsets_[command.index]);
           if (fullscreen && screen && fullscreen_slot == 1 && draw_video_slot_ == 1 && !background_drawn) {
@@ -1752,6 +1756,7 @@ class VulkanBackend final : public Backend {
       const bool old_vsync = opts_.vsync;
       // With a shader preset the Coming soon stickers go into the picture, under the preset (as Direct3D).
       coming_soon_overlay::set_in_picture(shader_was_on_ && imgui_picture_pipeline_ != VK_NULL_HANDLE);
+      arena_panel::set_under_hand(frame.under_hand_command >= 0 && !card_failed_);   // drawn in the command loop
       if (settings_frame(settings_state_, opts_)) {
         apply_fullscreen_mode();
         if (opts_.vsync != old_vsync) swapchain_dirty_ = true;
@@ -3150,6 +3155,46 @@ class VulkanBackend final : public Backend {
     blit(f.cmd, p, *video, linear_, k);
     bound_pipeline_ = VK_NULL_HANDLE;   // the next game draw binds its own
   }
+  // The Arena card into the EFB at the native select's mark, under the coins and hands
+  // (arena_panel::under_hand_draw_data): the screen copy's rectangle is the window's game picture.
+  // Its own pass with the colour target alone (the EFB pass may carry depth, motion vectors and
+  // the HUD mask, which ImGui's pipeline does not write); the next game draw begins the EFB again.
+  void draw_under_hand(const EfbCopy& screen) {
+#ifdef GX_PC_SETTINGS
+    if (!settings_ui_ready() || lab_skip_scene_) return;
+    const VkPipeline p = card_pipeline();
+    if (p == VK_NULL_HANDLE) return;
+    ImDrawData data;
+    if (!arena_panel::under_hand_draw_data(&data, float(screen.src_x * scale_), float(screen.src_y * scale_), float(screen.src_w * scale_),
+                                           float(screen.src_h * scale_), (float)width_, (float)height_))
+      return;
+    end_efb();
+    Frame_& f = frames_[slot_];
+    barrier(f.cmd, efb_color_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    const bool msaa = samples_ != VK_SAMPLE_COUNT_1_BIT;
+    if (msaa) barrier(f.cmd, msaa_color_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    color.imageView = msaa ? msaa_color_.view : efb_color_.view; color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    if (msaa) {
+      color.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT; color.resolveImageView = efb_color_.view;
+      color.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
+    VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    info.renderArea = {{0, 0}, {width_, height_}}; info.layerCount = 1;
+    info.colorAttachmentCount = 1; info.pColorAttachments = &color;
+    vkCmdBeginRendering(f.cmd, &info);
+    ImGui_ImplVulkan_RenderDrawData(&data, f.cmd, p);
+    vkCmdEndRendering(f.cmd);
+    bound_pipeline_ = VK_NULL_HANDLE;   // the next game draw binds its own
+    if (!under_hand_logged_) {
+      under_hand_logged_ = true;
+      host::log("arena panel: the card is drawn into the picture under the hands (Vulkan)");
+    }
+#else
+    (void)screen;
+#endif
+  }
   // Border art across the window through the shared present shader (its art_frame: the picture's
   // rectangle casts a soft shadow on the art), with the Direct3D renderers' constants.
   // clip: draw only there (the bars, when a shader preset cleared the window); null: the window.
@@ -3375,7 +3420,7 @@ class VulkanBackend final : public Backend {
     info.QueueFamily = queue_family_; info.Queue = queue_; info.DescriptorPoolSize = 64;
     // Buffers for three overlay draws per swap image: the panel each frame, and the Coming soon
     // stickers drawn into a shader preset's picture as well, with frames in flight.
-    info.MinImageCount = 2; info.ImageCount = (uint32_t)std::max<size_t>(swap_images_.size(), 2) * 3;
+    info.MinImageCount = 2; info.ImageCount = (uint32_t)std::max<size_t>(swap_images_.size(), 2) * 4;   // and the Arena card under the hands
     info.UseDynamicRendering = true;
     info.PipelineInfoMain.PipelineRenderingCreateInfo = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     info.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
@@ -3388,10 +3433,29 @@ class VulkanBackend final : public Backend {
     picture.PipelineRenderingCreateInfo.pColorAttachmentFormats = &kPictureFormat;
     imgui_picture_pipeline_ = ImGui_ImplVulkan_CreateExtraPipeline(&picture);
     if (imgui_picture_pipeline_ == VK_NULL_HANDLE) host::log("vulkan: no overlay pipeline for the preset picture; Coming soon stays over the window");
+    card_info_ = picture;   // the EFB is R8G8B8A8 too; its sample count is set per pipeline (card_pipeline)
+  }
+  // The overlay pipeline for the EFB at its current sample count, for the Arena card under the hands.
+  VkPipeline card_pipeline() {
+    if (card_failed_) return VK_NULL_HANDLE;
+    VkPipeline& p = card_pipelines_[samples_];
+    if (p == VK_NULL_HANDLE) {
+      ImGui_ImplVulkan_PipelineInfo info = card_info_;
+      info.MSAASamples = samples_;
+      p = ImGui_ImplVulkan_CreateExtraPipeline(&info);
+      if (p == VK_NULL_HANDLE) {
+        card_failed_ = true;
+        card_pipelines_.erase(samples_);
+        host::log("vulkan: no overlay pipeline for the EFB; the Arena card stays over the window");
+      }
+    }
+    return p;
   }
   void destroy_settings_ui() {
     if (!settings_ready_) return;
     if (imgui_picture_pipeline_ != VK_NULL_HANDLE) { vkDestroyPipeline(device_, imgui_picture_pipeline_, nullptr); imgui_picture_pipeline_ = VK_NULL_HANDLE; }
+    for (auto& [samples, p] : card_pipelines_) if (p != VK_NULL_HANDLE) vkDestroyPipeline(device_, p, nullptr);
+    card_pipelines_.clear();
     ImGui_ImplVulkan_Shutdown();
     settings_context_destroy();
     settings_ready_ = false;
@@ -3399,6 +3463,9 @@ class VulkanBackend final : public Backend {
   SettingsState settings_state_;
   bool settings_ready_ = false;
   VkPipeline imgui_picture_pipeline_ = VK_NULL_HANDLE;   // the overlay for the preset's picture texture
+  ImGui_ImplVulkan_PipelineInfo card_info_{};
+  std::map<VkSampleCountFlagBits, VkPipeline> card_pipelines_;   // the overlay for the EFB, by sample count
+  bool card_failed_ = false, under_hand_logged_ = false;
 #endif
 
   VulkanWindow window_;

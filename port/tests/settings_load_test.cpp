@@ -245,6 +245,25 @@ int main() {
   int restarted = 70;
   gx::load_pc_settings(reloaded, restarted);
   CHECK(restarted == 35);
+  // Discord presence turned off stays off after a save and a restart. The choice was saved under a
+  // key the load does not read, so it came back on at every start.
+  {
+    gx::D3D12Options off = options;
+    off.discord_presence = false;
+    CHECK(gx::save_pc_settings(off, 35));
+    gx::RenderOptions fresh;
+    fresh.settings_path = path.string();
+    int v = 0;
+    gx::load_pc_settings(fresh, v);
+    CHECK(!fresh.discord_presence);
+    off.discord_presence = true;
+    CHECK(gx::save_pc_settings(off, 35));
+    gx::RenderOptions again;
+    again.settings_path = path.string();
+    gx::load_pc_settings(again, v);
+    CHECK(again.discord_presence);
+    CHECK(gx::save_pc_settings(options, 35));
+  }
 
   CHECK(options.efb_scale == 2);
   CHECK(!options.fod_reflections);

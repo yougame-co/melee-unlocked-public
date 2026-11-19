@@ -162,7 +162,82 @@ void load_recent() {
 }
 
 // ---------------------------------------------------------------- drawing basics
-ImDrawList* dl() { return ImGui::GetForegroundDrawList(); }
+// Over the window, after the game picture; or the list of the Arena card under the hands (g_under).
+ImDrawList* g_target = nullptr;
+ImDrawList* dl() { return g_target ? g_target : ImGui::GetForegroundDrawList(); }
+// The Arena card out of a room, drawn into the game picture under the coins and hands when the frame
+// has the native select's mark (under_hand_draw_data); built in the ImGui frame `frame`.
+struct Under {
+  bool wanted = false;           // the renderer draws the list at the mark this frame
+  ImDrawList* list = nullptr;
+  ImGuiContext* context = nullptr;   // the list's ImGui context (the panel makes a new one when HDR switches)
+  int frame = -1;
+  ImVec2 pos, size;              // the game picture in the window
+} g_under;
+// Starts this frame's list over the game picture and makes it the target of the drawing.
+void begin_under(float x0, float y0, float x1, float y1) {
+  if (g_under.context != ImGui::GetCurrentContext()) {
+    if (g_under.list) IM_DELETE(g_under.list);
+    g_under.list = IM_NEW(ImDrawList)(ImGui::GetDrawListSharedData());
+    g_under.context = ImGui::GetCurrentContext();
+  }
+  ImDrawList* d = g_under.list;
+  d->_ResetForNewFrame();
+  d->PushTexture(ImGui::GetIO().Fonts->TexRef);
+  // Built against the whole window, as the foreground list (text is cut to the clip rectangle as it
+  // is laid out); end_under then clips the commands to the picture and spill_under draws the rest.
+  d->PushClipRectFullScreen();
+  g_under.pos = ImVec2(x0, y0);
+  g_under.size = ImVec2(x1 - x0, y1 - y0);
+  g_under.frame = ImGui::GetFrameCount();
+  g_target = d;
+}
+void end_under() {
+  if (!g_target || g_target != g_under.list) return;
+  g_target = nullptr;
+  g_under.list->_PopUnusedDrawCmd();
+  const ImVec4 picture(g_under.pos.x, g_under.pos.y, g_under.pos.x + g_under.size.x, g_under.pos.y + g_under.size.y);
+  for (ImDrawCmd& cmd : g_under.list->CmdBuffer) cmd.ClipRect = picture;
+}
+bool under_this_frame() {
+  return g_under.list && g_under.context == ImGui::GetCurrentContext() && g_under.frame == ImGui::GetFrameCount() &&
+         g_under.list->VtxBuffer.Size > 0;
+}
+// The part of the card past the game picture's sides (a 4:3 picture's bar is narrower than the
+// card, which then reaches over the picture's edge): over the window as before, cut at the
+// picture's edges. The hands never reach past the picture.
+void spill_under(float display_w, float display_h) {
+  if (!under_this_frame()) return;
+  ImDrawList* fg = ImGui::GetForegroundDrawList();
+  const ImDrawList* u = g_under.list;
+  const float px0 = g_under.pos.x, px1 = g_under.pos.x + g_under.size.x;
+  const ImVec4 sides[2] = {ImVec4(0, 0, px0, display_h), ImVec4(px1, 0, display_w, display_h)};
+  for (const ImVec4& side : sides) {
+    if (side.z - side.x < 0.5f) continue;
+    for (const ImDrawCmd& cmd : u->CmdBuffer) {
+      if (cmd.UserCallback || cmd.ElemCount == 0) continue;
+      unsigned lo = ~0u, hi = 0;
+      for (unsigned i = 0; i < cmd.ElemCount; ++i) {
+        const unsigned v = cmd.VtxOffset + u->IdxBuffer[(int)(cmd.IdxOffset + i)];
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+      }
+      const int count = (int)(hi - lo + 1);
+      fg->PushTexture(cmd.TexRef);
+      // The list's own clip is the picture (begin_under), which is what this part lies outside of.
+      fg->PushClipRect(ImVec2(side.x, side.y), ImVec2(side.z, side.w), true);
+      fg->PrimReserve((int)cmd.ElemCount, count);
+      const unsigned base = fg->_VtxCurrentIdx;
+      for (int j = 0; j < count; ++j) fg->_VtxWritePtr[j] = u->VtxBuffer[(int)lo + j];
+      fg->_VtxWritePtr += count;
+      for (unsigned i = 0; i < cmd.ElemCount; ++i)
+        *fg->_IdxWritePtr++ = (ImDrawIdx)(base + cmd.VtxOffset + u->IdxBuffer[(int)(cmd.IdxOffset + i)] - lo);
+      fg->_VtxCurrentIdx += (unsigned)count;
+      fg->PopClipRect();
+      fg->PopTexture();
+    }
+  }
+}
 float g_k = 1.0f;   // sheet pixels to window pixels: 1 at a 152-pixel bar
 float px(float v) { return v * g_k; }
 
@@ -1533,6 +1608,12 @@ void draw_not_in_room(const Bars& b, const View& v) {
     x = std::min(x, reach);
   }
   g_card_left = x;
+  // Over the game picture with the native select's mark this frame: into the picture's own list,
+  // so the coins and hands pass over the card as over the icons (a part past the picture's edge is
+  // drawn over the window, spill_under). Elsewhere (in the bar beside a 4:3 picture in a wide
+  // window, other scenes, the Static Recomp) over the window as before.
+  struct EndUnder { ~EndUnder() { end_under(); } } end_under_at_return;
+  if (g_under.wanted && x < b.px1 && x + tw > b.px0) begin_under(b.px0, b.y0, b.px1, b.y1);
   if (!v.notice.empty()) {   // a full room said no: the reason, above the card
     const Ink nk{Face::Bold, 11, kWhite};
     std::vector<std::string> lines = wrap(nk, v.notice, tw);
@@ -1613,6 +1694,23 @@ void check_text(const Bars& b) {
 }  // namespace
 
 void set_fonts(const Fonts& fonts) { g_fonts = fonts; }
+
+void set_under_hand(bool on) { g_under.wanted = on; }
+
+bool under_hand_draw_data(ImDrawData* out, float x, float y, float w, float h, float target_w, float target_h) {
+  if (!under_this_frame() || g_under.size.x <= 0 || g_under.size.y <= 0 || w <= 0 || h <= 0) return false;
+  // The picture's window rectangle lands on (x, y, w, h) of the target. ImGui's renderers put
+  // DisplayPos at the target's corner, so the corner is that far up and left of the picture.
+  const ImVec2 k(w / g_under.size.x, h / g_under.size.y);
+  out->Clear();
+  out->Valid = true;
+  out->AddDrawList(g_under.list);
+  out->DisplayPos = ImVec2(g_under.pos.x - x / k.x, g_under.pos.y - y / k.y);
+  out->DisplaySize = ImVec2(target_w / k.x, target_h / k.y);
+  out->FramebufferScale = k;
+  out->Textures = &ImGui::GetPlatformIO().Textures;   // the font atlas, should it change this frame
+  return true;
+}
 int look() { load(); return (int)g.look; }
 const char* look_name(int l) { return kLookNames[std::clamp(l, 0, kLookCount - 1)]; }
 void set_look(int l) { load(); g.look = (Look)std::clamp(l, 0, kLookCount - 1); save(); }
@@ -1741,12 +1839,18 @@ void frame(const Frame& f) {
   // The Arena card beside a widescreen hand's reach slides the whole way out from there.
   const float right_span = g_card_left > 0.0f ? std::max(bar, f.display_w - g_card_left) : bar;
   const float shift[2] = {(1.0f - shown[0]) * (bar + px(10)), (1.0f - shown[1]) * (right_span + px(10))};
-  if (shift[0] > 0.5f || shift[1] > 0.5f)
-    for (int i = start; i < draw->VtxBuffer.Size; ++i) {
-      ImDrawVert& vert = draw->VtxBuffer[i];
+  auto slide = [&](ImDrawList* list, int from) {
+    for (int i = from; i < list->VtxBuffer.Size; ++i) {
+      ImDrawVert& vert = list->VtxBuffer[i];
       if (vert.pos.x < g_mid) vert.pos.x -= shift[0];
       else vert.pos.x += shift[1];
     }
+  };
+  if (shift[0] > 0.5f || shift[1] > 0.5f) {
+    slide(draw, start);
+    if (under_this_frame()) slide(g_under.list, 0);
+  }
+  spill_under(f.display_w, f.display_h);
   if (textcheck_on() && shown[0] >= 0.999f && shown[1] >= 0.999f) check_text(b);
   // The buttons drawn this frame are the ones the hand moves over next frame.
   g_last_items.swap(g_items);

@@ -13,6 +13,7 @@
 #include <cstdint>
 
 struct ImFont;
+struct ImDrawData;
 
 namespace arena_panel {
 
@@ -48,6 +49,14 @@ void set_button_mode(int mode);
 
 // UI thread, once per overlay frame, inside ImGui. Draws nothing outside the online menus.
 void frame(const Frame& f);
+// Out of a room, the Arena card under the hands: the renderer says before the overlay frame whether
+// this game frame has the native select's mark (gx Frame::under_hand_command) and it will draw the
+// card there. Without it the card is drawn over the window as everything else.
+void set_under_hand(bool on);
+// The card's ImGui lists for the renderer to draw into its picture at the mark, built in the
+// current ImGui frame. The game picture lands on (x, y, w, h) of a target of target_w x target_h
+// pixels. False when the card was not drawn into the picture this frame.
+bool under_hand_draw_data(ImDrawData* out, float x, float y, float w, float h, float target_w, float target_h);
 // True while the room menu has the controller (the game must not see those presses).
 bool wants_capture();
 // GameCube buttons the game must not see even while the menu is shut: Z, which opens the room

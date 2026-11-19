@@ -251,6 +251,11 @@ struct Frame {
   int8_t test_fill = -1;
   // Render semantics the native game sent with this frame's draws (empty unless rtx_semantics_enabled).
   RtxFrameSemantics rtx;
+  // The native online character select's mark (private token 0xF8, mncharsel.c): the index in
+  // `commands` of the first draw after the background, icons and panels, where the coins and hands
+  // begin. The renderers draw the Arena card into the picture there (arena_panel::under_hand_draw_data).
+  // -1 for none.
+  int32_t under_hand_command = -1;
   // Reserve enough storage for an ordinary match before the first large scene is decoded. DrawCall
   // is about 5 KB, so a vector growth during a Stadium transformation can otherwise copy several
   // megabytes on the simulation thread and miss a 16.7 ms frame. Recycled frames retain this memory.
@@ -275,7 +280,7 @@ struct Frame {
   // and the renderer decides when to present by comparing sequences. Leaving a stale one on a
   // buffer that is about to be refilled is only harmless while every producer remembers to assign
   // one before pushing.
-  void clear() { vertices.clear(); segments.clear(); draws.clear(); copies.clear(); commands.clear(); hud_players = {}; player_names = {}; sequence = 0; source_retrace = source_match_frame = 0; time = 0.0; tick = {}; discontinuous = false; hard_cut = false; test_fill = -1; rtx.clear(); }
+  void clear() { vertices.clear(); segments.clear(); draws.clear(); copies.clear(); commands.clear(); hud_players = {}; player_names = {}; sequence = 0; source_retrace = source_match_frame = 0; time = 0.0; tick = {}; discontinuous = false; hard_cut = false; test_fill = -1; under_hand_command = -1; rtx.clear(); }
 };
 
 // Display latency test for photodiode testers that press X + D-pad Down (LDAT, pico lag testers;

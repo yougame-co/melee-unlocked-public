@@ -7,6 +7,7 @@
 #endif
 #include "pc_settings.h"
 #include "pc_settings_shared.h"
+#include "arena_panel.h"
 #include "coming_soon_overlay.h"
 #include "host.h"
 #include "imgui.h"
@@ -33,6 +34,7 @@ struct ImGuiD3D11 {
   ComPtr<ID3D11InputLayout> layout;
   ComPtr<ID3D11Buffer> constants, vertices, indices;
   ComPtr<ID3D11BlendState> blend;
+  ComPtr<ID3D11BlendState> blend_keep_alpha;   // the same, leaving the target's alpha (the game's EFB)
   ComPtr<ID3D11DepthStencilState> depth;
   ComPtr<ID3D11RasterizerState> raster;
   ComPtr<ID3D11SamplerState> sampler;
@@ -74,6 +76,8 @@ bool create_device_objects(ImGuiD3D11& r) {
   blend.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
   blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
   if (FAILED(r.device->CreateBlendState(&blend, &r.blend))) return false;
+  blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED | D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE;
+  if (FAILED(r.device->CreateBlendState(&blend, &r.blend_keep_alpha))) return false;
   D3D11_DEPTH_STENCIL_DESC dd{};
   dd.DepthEnable = FALSE; dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO; dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
   if (FAILED(r.device->CreateDepthStencilState(&dd, &r.depth))) return false;
@@ -125,7 +129,7 @@ void update_texture(ImGuiD3D11& r, ImTextureData* tex) {
   }
 }
 
-void render_draw_data(ImGuiD3D11& r, ImDrawData* draw_data) {
+void render_draw_data(ImGuiD3D11& r, ImDrawData* draw_data, bool keep_alpha = false) {
   if (draw_data->DisplaySize.x <= 0.0f || draw_data->DisplaySize.y <= 0.0f) return;
   if (draw_data->Textures)
     for (ImTextureData* tex : *draw_data->Textures)
@@ -195,7 +199,7 @@ void render_draw_data(ImGuiD3D11& r, ImDrawData* draw_data) {
   r.context->PSSetShader(r.ps.Get(), nullptr, 0);
   r.context->PSSetSamplers(0, 1, &sampler);
   const float blend_factor[4] = {0, 0, 0, 0};
-  r.context->OMSetBlendState(r.blend.Get(), blend_factor, 0xFFFFFFFFu);
+  r.context->OMSetBlendState(keep_alpha ? r.blend_keep_alpha.Get() : r.blend.Get(), blend_factor, 0xFFFFFFFFu);
   r.context->OMSetDepthStencilState(r.depth.Get(), 0);
   r.context->RSSetState(r.raster.Get());
 
@@ -275,6 +279,14 @@ void PcSettingsUID3D11::draw_picture_overlay(uint32_t w, uint32_t h) {
   if (!impl_->ready || !ImGui::GetCurrentContext()) return;
   ImDrawData data;
   if (coming_soon_overlay::picture_draw_data(&data, (float)w, (float)h)) render_draw_data(impl_->renderer, &data);
+}
+
+bool PcSettingsUID3D11::draw_under_hand(float x, float y, float w, float h, float target_w, float target_h) {
+  if (!impl_->ready || !ImGui::GetCurrentContext()) return false;
+  ImDrawData data;
+  if (!arena_panel::under_hand_draw_data(&data, x, y, w, h, target_w, target_h)) return false;
+  render_draw_data(impl_->renderer, &data, true);
+  return true;
 }
 
 }  // namespace gx

@@ -133,7 +133,9 @@ constexpr bool kLabViewAvailable = true;
 #include <mmsystem.h>
 #ifdef _WIN32
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <wrl/client.h>
+#pragma comment(lib, "d3dcompiler.lib")
 #else
 #include "backends/imgui_impl_sdl2.h"
 #include <SDL.h>
@@ -3675,6 +3677,18 @@ struct PcSettingsUI::Impl {
   std::array<bool, 4096> used{};
   UINT stride = 0;
   SettingsState state;
+  // The Arena card under the hands (draw_under_hand): ImGui's lists drawn into the game's EFB, whose
+  // format and sample count ImGui's own pipeline (the swap chain's, one sample) does not match.
+  Microsoft::WRL::ComPtr<ID3D12Device> device;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> card_root;
+  Microsoft::WRL::ComPtr<ID3DBlob> card_vs, card_ps;
+  std::map<uint32_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>> card_pso;   // by sample count
+  // Vertices and indices, one slot per call in turn: more slots than the renderer has frames in flight.
+  static constexpr uint32_t kCardSlots = 8, kCardSlotBytes = 1u << 20;
+  Microsoft::WRL::ComPtr<ID3D12Resource> card_upload;
+  uint8_t* card_mapped = nullptr;
+  uint32_t card_next = 0;
+  bool card_failed = false;
 };
 
 void PcSettingsUI::set_hdr_paper_white(float nits) { g_settings_hdr_nits = nits; }
@@ -3699,6 +3713,7 @@ PcSettingsUI::PcSettingsUI(void* window, ID3D12Device* device, ID3D12CommandQueu
   desc.NumDescriptors = (UINT)state.used.size(); desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
   if (FAILED(device->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&state.heap)))) host::die("PC settings descriptor heap creation failed");
   state.stride = device->GetDescriptorHandleIncrementSize(desc.Type);
+  state.device = device;
   ImGui_ImplDX12_InitInfo info{}; info.Device = device; info.CommandQueue = queue; info.NumFramesInFlight = 9;   // FSR frame generation draws the overlay twice per frame (two presents), and the Coming soon stickers under a shader preset once more
   info.RTVFormat = (DXGI_FORMAT)rtv_format; info.DSVFormat = DXGI_FORMAT_UNKNOWN;
   info.SrvDescriptorHeap = state.heap.Get(); info.UserData = &state;
@@ -5013,7 +5028,7 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
                                      std::to_string(g_custom_preset.aniso) + " " + std::to_string(g_custom_preset.dlss) + " " +
                                      std::to_string(g_custom_preset.fps) + " " + std::to_string(g_custom_preset.sub)
                                : std::string())
-       << "\ndiscord " << (options.discord_presence ? 1 : 0);
+       << "\ndiscordon " << (options.discord_presence ? 1 : 0);   // the key the load reads ("discord" was never read back)
   // Only when set: "key value" parsing would swallow the next line on an empty value.
   if (!options.discord_app_id.empty()) file << "\ndiscord_app_id " << options.discord_app_id;
   if (!options.mod_profile.empty()) file << "\nmod_profile " << options.mod_profile;
@@ -12269,6 +12284,153 @@ void PcSettingsUI::draw_picture_overlay(ID3D12GraphicsCommandList* list, uint32_
   if (!coming_soon_overlay::picture_draw_data(&data, (float)w, (float)h)) return;
   ID3D12DescriptorHeap* heap = impl_->heap.Get(); list->SetDescriptorHeaps(1, &heap);
   ImGui_ImplDX12_RenderDrawData(&data, list);
+}
+
+namespace {
+const char* kCardShader = R"(
+cbuffer C : register(b0) { float4x4 projection; };
+struct VI { float2 pos : POSITION; float4 col : COLOR0; float2 uv : TEXCOORD0; };
+struct PI { float4 pos : SV_POSITION; float4 col : COLOR0; float2 uv : TEXCOORD0; };
+PI vs(VI i) { PI o; o.pos = mul(projection, float4(i.pos, 0, 1)); o.col = i.col; o.uv = i.uv; return o; }
+SamplerState s0 : register(s0);
+Texture2D t0 : register(t0);
+float4 ps(PI i) : SV_Target { return i.col * t0.Sample(s0, i.uv); }
+)";
+}  // namespace
+
+bool PcSettingsUI::draw_under_hand(ID3D12GraphicsCommandList* list, uint32_t samples, float x, float y, float w, float h,
+                                   float target_w, float target_h) {
+  Impl& m = *impl_;
+  if (!ImGui::GetCurrentContext() || m.card_failed || !m.device) return false;
+  ImDrawData data;
+  if (!arena_panel::under_hand_draw_data(&data, x, y, w, h, target_w, target_h)) return false;
+  using Microsoft::WRL::ComPtr;
+  auto fail = [&](const char* what) {
+    m.card_failed = true;
+    host::log("arena panel: the card's Direct3D 12 pipeline failed (%s); it stays over the picture", what);
+    return false;
+  };
+  if (!m.card_root) {
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    D3D12_ROOT_PARAMETER params[2]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[0].Constants.Num32BitValues = 16;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[1].DescriptorTable = {1, &range};
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC rd{2, params, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+    ComPtr<ID3DBlob> blob, error;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) ||
+        FAILED(m.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&m.card_root))))
+      return fail("root signature");
+    if (FAILED(D3DCompile(kCardShader, std::strlen(kCardShader), "arena_card", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &m.card_vs, &error)) ||
+        FAILED(D3DCompile(kCardShader, std::strlen(kCardShader), "arena_card", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &m.card_ps, &error)))
+      return fail("shaders");
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width = (UINT64)Impl::kCardSlots * Impl::kCardSlotBytes; bd.Height = 1;
+    bd.DepthOrArraySize = 1; bd.MipLevels = 1; bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    void* mapped = nullptr;
+    if (FAILED(m.device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                 IID_PPV_ARGS(&m.card_upload))) ||
+        FAILED(m.card_upload->Map(0, nullptr, &mapped)))
+      return fail("upload buffer");
+    m.card_mapped = (uint8_t*)mapped;
+  }
+  ComPtr<ID3D12PipelineState>& pso = m.card_pso[samples];
+  if (!pso) {
+    static const D3D12_INPUT_ELEMENT_DESC elements[] = {
+      {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, (UINT)offsetof(ImDrawVert, pos), D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+      {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, (UINT)offsetof(ImDrawVert, uv), D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+      {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, (UINT)offsetof(ImDrawVert, col), D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    };
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = m.card_root.Get();
+    pd.VS = {m.card_vs->GetBufferPointer(), m.card_vs->GetBufferSize()};
+    pd.PS = {m.card_ps->GetBufferPointer(), m.card_ps->GetBufferSize()};
+    // Alpha blended over the picture; the EFB's own alpha stays as the game left it.
+    D3D12_RENDER_TARGET_BLEND_DESC& b = pd.BlendState.RenderTarget[0];
+    b.BlendEnable = TRUE;
+    b.SrcBlend = D3D12_BLEND_SRC_ALPHA; b.DestBlend = D3D12_BLEND_INV_SRC_ALPHA; b.BlendOp = D3D12_BLEND_OP_ADD;
+    b.SrcBlendAlpha = D3D12_BLEND_ONE; b.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA; b.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    b.LogicOp = D3D12_LOGIC_OP_NOOP;
+    b.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.InputLayout = {elements, 3};
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;   // the EFB's format
+    pd.SampleDesc.Count = std::max(1u, samples);
+    if (FAILED(m.device->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&pso)))) { m.card_pso.erase(samples); return fail("pipeline"); }
+  }
+  // A font atlas that grew this frame is uploaded first, as ImGui's renderer does.
+  if (data.Textures)
+    for (ImTextureData* tex : *data.Textures)
+      if (tex->Status != ImTextureStatus_OK) ImGui_ImplDX12_UpdateTexture(tex);
+  if (data.TotalVtxCount == 0) return false;
+  const size_t vbytes = (size_t)data.TotalVtxCount * sizeof(ImDrawVert), ibytes = (size_t)data.TotalIdxCount * sizeof(ImDrawIdx);
+  const size_t ioffset = (vbytes + 255) & ~(size_t)255;
+  if (ioffset + ibytes > Impl::kCardSlotBytes) {
+    static bool said = false;
+    if (!said) { said = true; host::log("arena panel: the card has more vertices than its buffer holds; not drawn"); }
+    return false;
+  }
+  const uint32_t slot = m.card_next++ % Impl::kCardSlots;
+  uint8_t* vdst = m.card_mapped + (size_t)slot * Impl::kCardSlotBytes;
+  uint8_t* idst = vdst + ioffset;
+  for (const ImDrawList* dl : data.CmdLists) {
+    std::memcpy(vdst, dl->VtxBuffer.Data, dl->VtxBuffer.Size * sizeof(ImDrawVert)); vdst += dl->VtxBuffer.Size * sizeof(ImDrawVert);
+    std::memcpy(idst, dl->IdxBuffer.Data, dl->IdxBuffer.Size * sizeof(ImDrawIdx)); idst += dl->IdxBuffer.Size * sizeof(ImDrawIdx);
+  }
+  const D3D12_GPU_VIRTUAL_ADDRESS base = m.card_upload->GetGPUVirtualAddress() + (UINT64)slot * Impl::kCardSlotBytes;
+  D3D12_VERTEX_BUFFER_VIEW vbv{base, (UINT)vbytes, sizeof(ImDrawVert)};
+  D3D12_INDEX_BUFFER_VIEW ibv{base + ioffset, (UINT)ibytes, sizeof(ImDrawIdx) == 2 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT};
+  const float l = data.DisplayPos.x, t = data.DisplayPos.y, r = l + data.DisplaySize.x, btm = t + data.DisplaySize.y;
+  // Column-major for mul(projection, pos), as ImGui's own renderers lay it out.
+  const float projection[16] = {
+    2.0f / (r - l), 0.0f, 0.0f, 0.0f,
+    0.0f, 2.0f / (t - btm), 0.0f, 0.0f,
+    0.0f, 0.0f, 0.5f, 0.0f,
+    (r + l) / (l - r), (t + btm) / (btm - t), 0.5f, 1.0f,
+  };
+  ID3D12DescriptorHeap* heap = m.heap.Get();
+  list->SetDescriptorHeaps(1, &heap);
+  list->SetPipelineState(pso.Get());
+  list->SetGraphicsRootSignature(m.card_root.Get());
+  list->SetGraphicsRoot32BitConstants(0, 16, projection, 0);
+  list->IASetVertexBuffers(0, 1, &vbv);
+  list->IASetIndexBuffer(&ibv);
+  list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  const D3D12_VIEWPORT vp{0, 0, target_w, target_h, 0, 1};
+  list->RSSetViewports(1, &vp);
+  int vertex_offset = 0, index_offset = 0;
+  const ImVec2 off = data.DisplayPos, k = data.FramebufferScale;
+  for (const ImDrawList* dl : data.CmdLists) {
+    for (const ImDrawCmd& cmd : dl->CmdBuffer) {
+      if (cmd.UserCallback || cmd.ElemCount == 0) continue;
+      const float x0 = std::max(0.0f, (cmd.ClipRect.x - off.x) * k.x), y0 = std::max(0.0f, (cmd.ClipRect.y - off.y) * k.y);
+      const float x1 = std::min(target_w, (cmd.ClipRect.z - off.x) * k.x), y1 = std::min(target_h, (cmd.ClipRect.w - off.y) * k.y);
+      if (x1 <= x0 || y1 <= y0) continue;
+      const ImTextureID id = cmd.GetTexID();
+      if (id == ImTextureID_Invalid) continue;
+      const D3D12_RECT sc{(LONG)x0, (LONG)y0, (LONG)x1, (LONG)y1};
+      list->RSSetScissorRects(1, &sc);
+      list->SetGraphicsRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{(UINT64)id});
+      list->DrawIndexedInstanced(cmd.ElemCount, 1, cmd.IdxOffset + index_offset, (INT)(cmd.VtxOffset + vertex_offset), 0);
+    }
+    index_offset += dl->IdxBuffer.Size;
+    vertex_offset += dl->VtxBuffer.Size;
+  }
+  return true;
 }
 #endif
 #ifndef _WIN32

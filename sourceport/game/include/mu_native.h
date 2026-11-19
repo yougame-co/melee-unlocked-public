@@ -966,5 +966,6 @@ int mu_test_vs_stage(void);                  /* MELEE_TEST_VS_STAGE, -1 when uns
 int mu_test_mex_icon(void);                  /* MELEE_TEST_MEX_ICON, -1 when unset (tests only) */
 int mu_test_css_char(int port);              /* MELEE_TEST_CSS_CHAR, once per CSS visit, -1 otherwise (tests only) */
 void mu_test_css_enter(void);                /* a new CSS visit for mu_test_css_char */
+int mu_test_css_hand(int port, float* x, float* y); /* MELEE_TEST_CSS_HAND=<x>,<y>[,<after>]: P1's hand held there (tests only) */
 int mu_test_adventure_scene(void);           /* MELEE_TEST_ADVENTURE_SCENE, -1 when unset (tests only) */
 #endif

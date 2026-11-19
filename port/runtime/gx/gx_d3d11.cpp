@@ -74,6 +74,7 @@
 #include "gecko_data.h"
 #ifdef GX_PC_SETTINGS
 #include "pc_settings.h"
+#include "arena_panel.h"
 #include "coming_soon_overlay.h"
 #include "lab_view.h"
 #endif
@@ -375,6 +376,7 @@ class D3D11Backend : public Backend {
   std::unique_ptr<PcSettingsUID3D11> settings_ui_;
 #endif
   bool lab_skip_scene_ = false;   // the Lab view covers this frame and its scene is not drawn (submit_frame)
+  bool under_hand_logged_ = false;
   // During construction a failure means "this machine cannot run D3D11": throw so the caller can
   // fall back to D3D12. Afterwards (a resolution change mid-session) it is a genuine fatal error.
   bool starting_ = true;
@@ -419,6 +421,7 @@ class D3D11Backend : public Backend {
                                      int video_slot);
   void draw_video_background(const std::shared_ptr<const video_bg::Frame>& frame,
                              int video_slot, const EfbCopy& screen);
+  void draw_under_hand(const EfbCopy& screen);
   TextureEntry* get_texture(const TextureRef& t);
   ID3D11SamplerState* get_sampler(uint32_t mode0, uint32_t mode1);
   void bind_textures(const DrawCall& dc);
@@ -1451,6 +1454,34 @@ void D3D11Backend::draw_video_background(
   bind_efb_targets();
 }
 
+// The Arena card into the EFB at the native select's mark, under the coins and hands
+// (arena_panel::under_hand_draw_data): the screen copy's rectangle is the window's game picture.
+void D3D11Backend::draw_under_hand(const EfbCopy& screen) {
+#ifdef GX_PC_SETTINGS
+  if (!settings_ui_) return;
+  unbind_shader_resources();
+  ID3D11RenderTargetView* rtv = efb_rtv_.Get();
+  context_->OMSetRenderTargets(1, &rtv, nullptr);
+  const float s = (float)scale_;
+  const bool drew = settings_ui_->draw_under_hand(screen.src_x * s, screen.src_y * s, screen.src_w * s, screen.src_h * s,
+                                                  (float)efb_w_, (float)efb_h_);
+  // The game's own state again: the ImGui renderer bound its buffers, shaders and states.
+  reset_bound();
+  ID3D11Buffer* vb = vertex_buffer_.get();
+  UINT stride = sizeof(Vertex), offset = 0;
+  context_->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+  context_->IASetIndexBuffer(index_buffer_.get(), DXGI_FORMAT_R32_UINT, 0);
+  context_->IASetInputLayout(layout_.Get());
+  bind_efb_targets();
+  if (drew && !under_hand_logged_) {
+    under_hand_logged_ = true;
+    host::log("arena panel: the card is drawn into the picture under the hands (D3D11)");
+  }
+#else
+  (void)screen;
+#endif
+}
+
 TextureEntry* D3D11Backend::get_texture(const TextureRef& t) {
   auto ec = efb_copies_.find(t.addr);
   if (ec != efb_copies_.end() && ec->second.resource) {
@@ -2165,6 +2196,7 @@ void D3D11Backend::submit_frame(const Frame& frame, const DrawMatrices* override
   } float_environment;
 #ifdef GX_PC_SETTINGS
   if (settings_ui_) { settings_set_game_aspect(output_aspect()); settings_set_hud_snapshot(frame); }
+  arena_panel::set_under_hand(settings_ui_ && frame.under_hand_command >= 0);   // drawn in the command loop
   if (settings_ui_ && settings_ui_->begin(opts_)) {
     apply_fullscreen_mode();
     if (pick_scale() != scale_) { host::log("d3d11: dropping %zu EFB copy textures, internal scale %d -> %d", efb_copies_.size(), scale_, pick_scale()); efb_copies_.clear(); create_efb(); }
@@ -2438,6 +2470,8 @@ void D3D11Backend::submit_frame(const Frame& frame, const DrawMatrices* override
             }
           }
         }
+        // The native select's coins and hands start here: the Arena card goes under them.
+        if ((int64_t)command_index == frame.under_hand_command && screen) draw_under_hand(*screen);
         draw_video_slot_ = -1;
         if (plans_[cmd.index].valid) execute_draw(dc, plans_[cmd.index]);
         if (fullscreen && screen && fullscreen_slot == 1 && draw_video_slot_ == 1 && !background_drawn) {
