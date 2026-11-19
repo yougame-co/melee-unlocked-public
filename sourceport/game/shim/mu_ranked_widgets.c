@@ -266,6 +266,9 @@ struct MuRankedWidgets {
     HSD_Text *text, *names[2];
     unsigned missing, canvas, ranks_frames, forfeit_frames;
     int forfeit;
+    /* The player's own keys for A, B and X/Y: a keyboard port's bound keys, else the GameCube names. */
+    char key_a[16], key_b[16], key_xy[40];
+    int keyboard_xy;   /* X/Y are keyboard keys: the disc's "Press X/Y to change" art names the wrong ones */
 };
 
 static HSD_GObj* track(MuRankedWidgets* w, HSD_GObj* obj)
@@ -521,6 +524,7 @@ MuRankedWidgets* mu_ranked_widgets_create(const MuRankedSetupModel* m)
     const MuMatchState* ms=mu_slippi_match_state();
     if (!w) return NULL;
     memset(w,0,sizeof *w);
+    strcpy(w->key_a,"A"); strcpy(w->key_b,"B"); strcpy(w->key_xy,"X/Y");
     if (DVDConvertPathToEntrynum("GameSetup_gui.dat") >= 0) {
         w->archive=lbArchive_LoadArchive("GameSetup_gui.dat");
         if (w->archive) w->gui=HSD_ArchiveGetPublicAddress(w->archive,"ScGamTour_scene_data");
@@ -600,6 +604,20 @@ MuRankedWidgets* mu_ranked_widgets_create(const MuRankedSetupModel* m)
     if (m->set && m->local_player<2) header_ranks(w,m);
     return w;
 }
+void mu_ranked_widgets_keys(MuRankedWidgets* w, int port)
+{
+    /* dolphin/pad.h bits, as mu_ranked_pad_buttons reads them: A 0x100, B 0x200, X 0x400, Y 0x800. */
+    char x[16]="X", y[16]="Y";
+    int kx, ky;
+    if (!w) return;
+    strcpy(w->key_a,"A"); strcpy(w->key_b,"B");
+    mu_host_button_label(port,0x100,w->key_a,sizeof w->key_a);
+    mu_host_button_label(port,0x200,w->key_b,sizeof w->key_b);
+    kx=mu_host_button_label(port,0x400,x,sizeof x);
+    ky=mu_host_button_label(port,0x800,y,sizeof y);
+    w->keyboard_xy=kx || ky;   /* a controller keeps "X/Y" and the disc's own art */
+    sprintf(w->key_xy,"%s/%s",x,y);   /* each name under 16 chars: fits 40 */
+}
 static unsigned description(const MuRankedSetupModel* m, const MuRankedSetupStep* s)
 {
     int local=s->player == m->local_player;
@@ -617,7 +635,7 @@ void mu_ranked_widgets_draw(MuRankedWidgets* w, const MuRankedSetupModel* m, con
     int local=s && s->player == m->local_player;
     int char_step=s && (s->type == MU_SETUP_COLOR || s->type == MU_SETUP_CHARACTER);
     int active=s != NULL, disconnected=m->status == MU_SETUP_DISCONNECTED || m->status == MU_SETUP_INVALID;
-    int forfeit;
+    int forfeit, color_hint;
     char timer[8], line[256];
     unsigned col=mu_ranked_timer_text(timer,s ? s->seconds : 0,m->frames,local);
     GXColor colors[3]={{255,255,255,255},{254,202,52,255},{255,50,50,255}};
@@ -630,7 +648,10 @@ void mu_ranked_widgets_draw(MuRankedWidgets* w, const MuRankedSetupModel* m, con
     visibility(&w->disconnect,disconnected && !forfeit);
     if (disconnected && w->disconnect.root) tint(w->disconnect.root,1,(GXColor){255,0,0,255});
     material(&w->description,0,disconnected ? RETURN_CSS : s ? description(m,s) : GET_READY);
-    visibility(&w->description,!active || !local || (!v->confirming && !v->dialog));
+    /* The colour step's art reads "Same color selected. Press X/Y to change". On a keyboard those
+     * are other keys (C/V by default): the art gives way to the same line with the bound keys. */
+    color_hint=active && local && s->type == MU_SETUP_COLOR && !v->confirming && !v->dialog && w->keyboard_xy;
+    visibility(&w->description,!color_hint && (!active || !local || (!v->confirming && !v->dialog)));
     for (i=0; i<2; ++i) {
         int visible=active && local && v->confirming && !v->dialog && (i == 0 || s->type != MU_SETUP_COLOR);
         visibility(&w->buttons[i],visible);
@@ -693,11 +714,21 @@ void mu_ranked_widgets_draw(MuRankedWidgets* w, const MuRankedSetupModel* m, con
         } else if (char_step) strcpy(line,"Waiting for opponent's character");
         else line[0]=0;
         text_set(w->text,2,line);
-        text_set(w->text,3,v->dialog ? "Arrows: character  X/Y: costume  A: choose  B: cancel" :
-            v->confirming ? (v->button ? "OK   >Redo    A: confirm  B: redo" : ">OK   Redo    A: confirm  B: redo") :
-            "Arrows: move  A: select  B: clear  X/Y: costume");
+        if (v->dialog)
+            sprintf(line,"Arrows: character  %s: costume  %s: choose  %s: cancel",w->key_xy,w->key_a,w->key_b);
+        else if (v->confirming)
+            sprintf(line,"%s    %s: confirm  %s: redo",v->button ? "OK   >Redo" : ">OK   Redo",w->key_a,w->key_b);
+        else sprintf(line,"Arrows: move  %s: select  %s: clear  %s: costume",w->key_a,w->key_b,w->key_xy);
+        text_set(w->text,3,line);
         text_set(w->text,4,"GameSetup visuals unavailable");
-    } else for (i=1; i<5; ++i) text_set(w->text,i,"");
+    } else {
+        for (i=1; i<5; ++i) text_set(w->text,i,"");
+        if (color_hint) {
+            /* Line 3 sits where the description art does (y 240 + 45 on the 640x480 canvas). */
+            sprintf(line,"Same color selected. Press %s to change",w->key_xy);
+            text_set(w->text,3,line);
+        }
+    }
 }
 void mu_ranked_widgets_free(MuRankedWidgets* w)
 {

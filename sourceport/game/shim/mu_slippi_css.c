@@ -925,7 +925,7 @@ static void text_think(HSD_GObj* gobj)
     int updating;
     char rank_lines[6][128] = { { 0 } };
     /* The keys the prompts name: the bound key for a keyboard player, else the GameCube button. */
-    char z_key[16] = "Z", b_key[16] = "B", prompt[64];
+    char z_key[16] = "Z", b_key[16] = "B", start_key[16] = "START", prompt[64];
     const char* s;
     int idx, i;
     u8 conn = m->connection_state;
@@ -945,6 +945,7 @@ static void text_think(HSD_GObj* gobj)
     if (ctrl_port != NULL) {
         mu_host_button_label(*ctrl_port, HSD_PAD_Z, z_key, sizeof z_key);
         mu_host_button_label(*ctrl_port, HSD_PAD_B, b_key, sizeof b_key);
+        mu_host_button_label(*ctrl_port, HSD_PAD_START, start_key, sizeof start_key);
     }
     if (doubles_teams() && conn == MU_SLP_MM_CONNECTION_SUCCESS) {
         dt.doubles_connected = 1;
@@ -1167,7 +1168,8 @@ static void text_think(HSD_GObj* gobj)
             } else {
                 action = "search";
             }
-            set_text_fmt(idx, "Press START to %s", action);
+            snprintf(prompt, sizeof prompt, "Press %s to %s", start_key, action);
+            set_text(idx, prompt);
             dt.spinner[1] = 1;
             goto spinners;
         }

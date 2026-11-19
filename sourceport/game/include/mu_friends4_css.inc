@@ -1540,6 +1540,7 @@ typedef struct {
     unsigned char spin[3];       /* each line's spinner: 0 none, 1 waiting, 2 done */
     const char* gray;            /* the gray row: what B or the tab does now */
     char error[MU_LOBBY_NOTE];   /* a problem, in red over the lines (they are cleared, as Slippi's) */
+    char gray_text[40];          /* the gray row with the player's own key (mu_f4_panel_keys) */
 } MuF4Panel;
 
 /* A name or note in the panel: the letters Melee's font draws (letters, digits, space . : - , '), else a space. */
@@ -1687,6 +1688,58 @@ static void mu_f4_panel_put(int sub, const char* s, const GXColor* color)
 /* The Doubles panel, every frame (doubles: 0 blanks it, as behind the curtain): the partner door's state goes
  * to the log once per change; each subtext is written only when it changes, and the spinners turn every
  * MU_F4_SPIN_FRAMES frames as Slippi's do. */
+/* "Press START", "Press B", "Hold B" with a keyboard player's own keys (Enter, X by default): the
+ * panel's words are the GameCube names, which on a keyboard are other keys. A controller (no label
+ * from the host) keeps them. Bounded to each buffer; a name that would not fit keeps the old word. */
+/* The decomp's MSL string.h (on the game's include path) has no strstr: a plain first-match search. */
+static char* mu_f4_find(char* text, const char* word)
+{
+    size_t i, n = strlen(word);
+    if (!text || !n) return NULL;
+    for (; *text; ++text) {
+        for (i = 0; i < n && text[i] == word[i]; ++i) {}
+        if (i == n) return text;
+    }
+    return NULL;
+}
+static void mu_f4_key_word(char* text, size_t size, const char* word, const char* key)
+{
+    char out[MU_LOBBY_NOTE];
+    char* at = mu_f4_find(text, word);
+    size_t head, word_n, key_n, tail;
+    if (!at || !key || !key[0]) return;
+    head = (size_t) (at - text);
+    word_n = strlen(word);
+    key_n = strlen(key);
+    tail = strlen(at + word_n);
+    if (head + key_n + tail + 1 > size || head + key_n + tail + 1 > sizeof out) return;
+    memcpy(out, text, head);
+    memcpy(out + head, key, key_n);
+    memcpy(out + head + key_n, at + word_n, tail + 1);
+    memcpy(text, out, head + key_n + tail + 1);
+}
+static void mu_f4_panel_keys(MuF4Panel* p, const char* b_key, const char* start_key)
+{
+    char press_b[24] = "", hold_b[24] = "", press_start[24] = "";
+    size_t n;
+    if (!p) return;
+    /* Each replacement keeps its verb: "Press START" becomes "Press Enter", never just "Enter". */
+    if (b_key && b_key[0] && strlen(b_key) < 16) {
+        sprintf(press_b, "Press %s", b_key);
+        sprintf(hold_b, "Hold %s", b_key);
+    }
+    if (start_key && start_key[0] && strlen(start_key) < 16) sprintf(press_start, "Press %s", start_key);
+    mu_f4_key_word(p->line[1], sizeof p->line[1], "Press START", press_start);
+    mu_f4_key_word(p->error, sizeof p->error, "Hold B", hold_b);
+    if (p->gray && p->gray[0]) {
+        n = strlen(p->gray);
+        if (n < sizeof p->gray_text) {
+            memcpy(p->gray_text, p->gray, n + 1);
+            mu_f4_key_word(p->gray_text, sizeof p->gray_text, "Press B", press_b);
+            p->gray = p->gray_text;
+        }
+    }
+}
 static void mu_f4_panel(const MuLobbyView* v, int doubles, unsigned hint, int noted, const char* note, int mine)
 {
     MuF4Panel p;
@@ -1703,6 +1756,14 @@ static void mu_f4_panel(const MuLobbyView* v, int doubles, unsigned hint, int no
         return;
     }
     mu_f4_panel_text(v, hint, noted, mu_lobby_partner_want(), note, &p);
+    {
+        /* This machine's pad (the one the select reads): its keyboard keys, if a keyboard feeds it. */
+        char b_key[16] = "", start_key[16] = "";
+        const int port = gm_801677F0() & 3;
+        mu_host_button_label(port, HSD_PAD_B, b_key, sizeof b_key);
+        mu_host_button_label(port, HSD_PAD_START, start_key, sizeof start_key);
+        mu_f4_panel_keys(&p, b_key, start_key);
+    }
     mu_f4_panel_put(MU_F4_ST_HEADER, "Doubles", &mu_f4_white);
     for (i = 0; i < 3; ++i) {
         const int sub = MU_F4_ST_LINE1 + 2 * i;

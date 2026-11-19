@@ -5898,8 +5898,11 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       }
     }
   }
+  // YouGame's box (Shift+Tab, signin_overlay.cpp) owns every key while it shows: Tab (and the
+  // controller's Practice chord) used to open the Practice menu over it in Training, the one mode with
+  // tab_available, and the menu then took A, Enter and Esc from the box (122.20).
   if (tab_pressed && !state.open && !state.menu_open && !state.fill_window && practice.tab_available &&
-      !replay_bar::active()) {   // while a replay plays, Tab is its fast forward
+      !signin_up && !replay_bar::active()) {   // while a replay plays, Tab is its fast forward
     const bool was_open = state.practice_open;
     state.practice_open = !state.practice_open;
     if (state.practice_open) state.practice_focus_code = practice.phase == slippi::native_practice::Phase::Idle;
@@ -6139,6 +6142,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     was_open = state.open;
   }
   if (state.menu_open) state.practice_open = false;
+  // The box opened over the Practice menu (Shift+Tab with it up): the box takes over, the menu shuts.
+  // The controllers stay with the box; when it closes, its own release hold keeps them from the game.
+  if (signin_up && !state.open && !state.menu_open) state.practice_open = false;
   if (!state.menu_open) state.menu_quit = false;
   if (!state.menu_open || !state.menu_quit) state.menu_quit_focus_pending = false;
 #ifdef YOUGAME_AGENT_TEST_HOOK

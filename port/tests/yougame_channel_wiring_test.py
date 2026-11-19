@@ -106,6 +106,13 @@ need(arrived.find("g_identity_again = true;") != -1 and arrived.find("g_identity
 need("run_identity_asks();" in now and "fetch_identity();" not in now, "fetch_identity_now uses the shared loop")
 need("std::thread(run_identity_asks).detach();" in refresh and "fetch_identity();" not in refresh, "refresh_identity uses the shared loop")
 
+# Only the probe's own hello says how long after the probe it came; a later hello (a row picked) logs its
+# own round trip alone, so a re-hello minutes after the probe never reads as a 3-minute answer.
+hello = link[link.find("json bridge_channel("):link.find("void start_player_wait() {")]
+probe_line = hello.find("ms after the probe (%s)")
+need(-1 < hello.find("if (probing)") < probe_line, "the 'after the probe' hello line is the probe's own hello only")
+need("yougame channel: hello again answered in %llu ms (%s)" in hello, "a later hello logs 'hello again answered in'")
+
 if failures:
     for f in failures:
         print("FAIL:", f)

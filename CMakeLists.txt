@@ -396,7 +396,7 @@ add_executable(port_ranked_setup_model_test port/tests/ranked_setup_model_test.c
   sourceport/game/shim/mu_ranked_setup_model.c)
 target_include_directories(port_ranked_setup_model_test PRIVATE sourceport/game/include port/runtime/abi port/runtime/hle)
 target_compile_features(port_ranked_setup_model_test PRIVATE cxx_std_17 c_std_11)
-foreach(group stages colors timers interleave disconnects tiebreak)
+foreach(group stages colors timers interleave disconnects tiebreak mirror_idle)
   add_test(NAME port_ranked_setup_${group} COMMAND port_ranked_setup_model_test ${group})
 endforeach()
 

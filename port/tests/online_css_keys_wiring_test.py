@@ -1,4 +1,7 @@
-"""122.19: the online character select's prompts name a keyboard player's own keys, and a closed Doubles
+"""122.20: the ranked setup's same-colour hint ("Same color selected. Press X/Y to change", disc art), the
+online select's "Press START to ..." and the Doubles panel's START/B lines name the keyboard's own keys too.
+
+122.19: the online character select's prompts name a keyboard player's own keys, and a closed Doubles
 home lets B out.
 
 - "Hold Z to disconnect" and the other Z (and B) prompts: Melee's Z is E on the keyboard by default, so the
@@ -11,6 +14,8 @@ home lets B out.
 """
 from pathlib import Path
 import re
+import subprocess
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -82,6 +87,99 @@ class KeyboardPromptTest(unittest.TestCase):
         self.assertIn("g_keyboard_port_mask.store(keyboard_mask", snap)
         self.assertIn("bool input_keyboard_button_label(int port, uint16_t pad_button, char* out, size_t n);",
                       read("port/runtime/host/host.h"))
+
+
+PANEL_KEYS_TEST = r"""
+#include <stdio.h>
+#include <string.h>
+#define MU_LOBBY_NOTE 48
+#define CHECK(x) do { if (!(x)) { printf("FAIL %d %s\n", __LINE__, #x); return 1; } } while (0)
+typedef struct {
+    char line[3][32]; unsigned char spin[3]; const char* gray; char error[MU_LOBBY_NOTE]; char gray_text[40];
+} MuF4Panel;
+@FUNCS@
+int main(void)
+{
+    MuF4Panel p;
+    memset(&p, 0, sizeof p);
+    strcpy(p.line[1], "Press START to search"); strcpy(p.error, "Lobby closed. Hold B to exit");
+    p.gray = "Press B to cancel";
+    mu_f4_panel_keys(&p, "X", "Enter");   /* the keyboard's default B and START */
+    CHECK(strcmp(p.line[1], "Press Enter to search") == 0);
+    CHECK(strcmp(p.error, "Lobby closed. Hold X to exit") == 0);
+    CHECK(strcmp(p.gray, "Press X to cancel") == 0);
+    memset(&p, 0, sizeof p);   /* a controller: no labels, the GameCube names stay */
+    strcpy(p.line[1], "Press START to invite"); p.gray = "Press B to cancel";
+    mu_f4_panel_keys(&p, "", "");
+    CHECK(strcmp(p.line[1], "Press START to invite") == 0 && strcmp(p.gray, "Press B to cancel") == 0);
+    memset(&p, 0, sizeof p);   /* a name too long for the line keeps the old word, never overruns */
+    strcpy(p.line[1], "Press START to search"); p.gray = "";
+    mu_f4_panel_keys(&p, "B", "Right Shift Key");
+    CHECK(strlen(p.line[1]) < sizeof p.line[1]);
+    printf("ok\n");
+    return 0;
+}
+"""
+
+
+class KeyboardKeysOnTheOnlineScreensTest(unittest.TestCase):
+    def setUp(self):
+        self.css = read("sourceport/game/shim/mu_slippi_css.c")
+        self.widgets = read("sourceport/game/shim/mu_ranked_widgets.c")
+        self.setup = read("sourceport/game/shim/mu_ranked_setup.c")
+        self.f4 = read("sourceport/game/include/mu_friends4_css.inc")
+
+    def test_ranked_same_colour_hint_names_the_keys(self):
+        keys = body(self.widgets, "void mu_ranked_widgets_keys(MuRankedWidgets* w, int port)")
+        for bit in ("0x100,w->key_a", "0x200,w->key_b", "0x400,x", "0x800,y"):
+            self.assertIn(bit, keys)
+        self.assertIn("w->keyboard_xy=kx || ky;", keys)   # a controller keeps "X/Y" and the disc's art
+        draw = body(self.widgets, "void mu_ranked_widgets_draw(MuRankedWidgets* w, const MuRankedSetupModel* m, const MuRankedSetupView* v)")
+        self.assertIn("s->type == MU_SETUP_COLOR", draw[draw.index("color_hint="):])
+        self.assertIn("visibility(&w->description,!color_hint &&", draw)
+        self.assertIn('"Same color selected. Press %s to change",w->key_xy', draw)
+        # The readable fallback lines name the keys too; no fixed "X/Y:" or "A:" left there.
+        for old in ('"Arrows: character  X/Y: costume  A: choose  B: cancel"', '"Arrows: move  A: select  B: clear  X/Y: costume"',
+                    '"OK   >Redo    A: confirm  B: redo"'):
+            self.assertNotIn(old, draw)
+        self.assertIn("void mu_ranked_widgets_keys(MuRankedWidgets*, int port);",
+                      read("sourceport/game/shim/mu_ranked_widgets.h"))
+        # The screen asks for its own pad's keys on load and every frame, before drawing.
+        think = body(self.setup, "void mu_ranked_setup_think(void)")
+        self.assertLess(think.index("mu_ranked_widgets_keys(widgets, port);"), think.rindex("mu_ranked_widgets_draw("))
+        self.assertIn("mu_ranked_widgets_keys(widgets, gm_801677F0());", body(self.setup, "void mu_ranked_setup_load(void* data)"))
+
+    def test_css_start_prompt_names_the_key(self):
+        think = body(self.css, "static void text_think(HSD_GObj* gobj)")
+        self.assertIn('start_key[16] = "START"', think)
+        self.assertIn("mu_host_button_label(*ctrl_port, HSD_PAD_START, start_key, sizeof start_key);", think)
+        self.assertIn('"Press %s to %s", start_key, action', think)
+        self.assertNotIn('"Press START to %s"', think)
+
+    def test_doubles_panel_names_the_keys(self):
+        panel = body(self.f4, "static void mu_f4_panel(const MuLobbyView* v, int doubles, unsigned hint, int noted, const char* note, int mine)")
+        at = panel.index("mu_f4_panel_text(v, hint, noted, mu_lobby_partner_want(), note, &p);")
+        keys = panel.index("mu_f4_panel_keys(&p, b_key, start_key);")
+        self.assertLess(at, keys)
+        self.assertLess(keys, panel.index('mu_f4_panel_put(MU_F4_ST_HEADER, "Doubles", &mu_f4_white);'))
+        self.assertIn("mu_host_button_label(port, HSD_PAD_B, b_key, sizeof b_key);", panel)
+        self.assertIn("mu_host_button_label(port, HSD_PAD_START, start_key, sizeof start_key);", panel)
+
+    def test_doubles_panel_keys_behave(self):
+        # The game build sees the decomp MSL string.h, which has no strstr: the search is our own.
+        self.assertNotIn("strstr(", self.f4)
+        funcs = (self.f4[self.f4.index("static char* mu_f4_find("):self.f4.index("static void mu_f4_panel(const MuLobbyView* v")])
+        source = PANEL_KEYS_TEST.replace("@FUNCS@", funcs)
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "t.c"
+            src.write_text(source)
+            exe = Path(tmp) / "t"
+            build = subprocess.run(["cc", "-std=c99", "-Wall", "-Werror", str(src), "-o", str(exe)],
+                                   capture_output=True, text=True)
+            self.assertEqual(build.returncode, 0, build.stderr)
+            run = subprocess.run([str(exe)], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertEqual(run.stdout.strip(), "ok")
 
 
 class ClosedHomeBackTest(unittest.TestCase):

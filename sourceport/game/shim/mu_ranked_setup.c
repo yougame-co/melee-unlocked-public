@@ -42,6 +42,7 @@ void mu_ranked_setup_load(void* data)
     widgets = model->set && model->set->tiebreak_num && model->status != MU_SETUP_DISCONNECTED ?
         NULL : mu_ranked_widgets_create(model);
     mu_ranked_view_sync(&view, model);
+    mu_ranked_widgets_keys(widgets, gm_801677F0());
     mu_ranked_widgets_draw(widgets, model, &view);
     disconnect_display(model,0);
     if (model->status == MU_SETUP_ACTIVE) lbAudioAx_80023F28(93);
@@ -78,6 +79,7 @@ void mu_ranked_setup_think(void)
     /* Tiebreaks ordinarily have no screen; a failed handshake still needs one. */
     if (!widgets && model->status == MU_SETUP_DISCONNECTED) widgets=mu_ranked_widgets_create(model);
     disconnect_display(model,down);
+    mu_ranked_widgets_keys(widgets, port);   /* rebinding keys mid-screen shows at once */
     mu_ranked_widgets_draw(widgets, model, &view);
 }
 

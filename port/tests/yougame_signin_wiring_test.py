@@ -90,6 +90,15 @@ need("signin_overlay::back()" in settings, "Esc is Back")
 need("ImGuiKey_GamepadFaceRight" in overlay, "B is Back")
 need("SetKeyboardFocusHere" in overlay, "the first button takes focus")
 need("qr_code::encode" in overlay and "quiet = 4" in overlay, "the QR with its quiet zone")
+# 122.20: the box owns every key while it shows, Training included (Tab used to open the Practice menu
+# over it there, and the menu took A, Enter and Esc).
+tab_gate = settings.split("if (tab_pressed && !state.open")[1].split("{")[0]
+need("!signin_up" in tab_gate, "Tab and the Practice chord do nothing while the box shows")
+need("if (signin_up && !state.open && !state.menu_open) state.practice_open = false;" in settings,
+     "the box opened over the Practice menu shuts the menu")
+need("if (appearing) ImGui::SetNextWindowFocus();" not in overlay and "  ImGui::SetNextWindowFocus();" in overlay,
+     "the box keeps the focus every frame it shows")
+need("practice_force_capture" in settings and "|| signin_up;" in settings, "the game gets no controllers while it shows")
 
 # qrcodegen, vendored with its licence and built through one TU in a globbed folder.
 qrdir = root / "port/third_party/qrcodegen"

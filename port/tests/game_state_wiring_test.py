@@ -80,7 +80,11 @@ class GameStateWiring(unittest.TestCase):
         self.assertIn('{{"type", "gameState"}, {"state", name}}', send)
         # The same narrow path as matchState: stdio or the local channel, never bridge()'s refusal policy.
         self.assertIn("bridge_stdio(body, 1000", send)
-        self.assertIn("if (g_channel_allowed && g_channel_up) bridge_channel(body, 1000);", send)
+        self.assertIn("} else if (g_channel_allowed && g_channel_up) {", send)
+        self.assertIn("bridge_channel(body, 1000);", send)
+        # 122.20: one log line per state actually sent (stdio and channel), none when nothing is sent.
+        self.assertEqual(send.count('host::log("yougame: gameState %s", name);'), 2)
+        self.assertLess(send.index('host::log("yougame: gameState %s", name);'), send.index("bridge_stdio(body, 1000"))
         self.assertNotIn("bridge(body", send)
         # Every connection that comes up (only after its hello answered) gets a new epoch.
         self.assertIn("if (up) { g_channel_epoch.fetch_add(1); g_channel_up = true;", link)
@@ -94,6 +98,14 @@ class GameStateWiring(unittest.TestCase):
         practice = source("port/runtime/hle/native_practice.cpp")
         tick = body(practice, "\nvoid tick() {")
         self.assertTrue(tick.lstrip().startswith("report_game_state();"), "before every early return")
+        # Every retrace in every mode: host::retrace() polls the Slippi options unconditionally, and the
+        # Source Port's branch of that poll (host::game_image, offline Training/VS/1P/menus included)
+        # ticks the practice bridge before it returns.
+        retrace = body(source("port/runtime/host/host.cpp"), "\nvoid retrace() {")
+        self.assertIn("slippi::poll_options();", retrace)
+        poll = body(source("port/runtime/hle/exi_slippi.cpp"), "void poll_options() {")
+        native = poll[poll.index("if (host::game_image) {"):poll.index("return;")]
+        self.assertIn("native_practice::tick();", native)
         report = body(practice, "static void report_game_state() {")
         self.assertIn("int32_t a[5] = {-1, 0, 0, 0, 0};", report)   # a query: never pauses or resumes
         self.assertIn("match = a[4] != 0; paused = a[0] > 0 || a[3] != 0;", report)
@@ -107,7 +119,7 @@ class GameStateWiring(unittest.TestCase):
         self.assertIn("yougame::game_state::overlay_menu_open.store(state.open || state.menu_open || state.practice_open ||", settings)
 
     def test_build_number(self):
-        self.assertEqual(source("YOUGAME_BUILD").strip(), "0.9.215-online-test.122.19")
+        self.assertEqual(source("YOUGAME_BUILD").strip(), "0.9.215-online-test.122.20")
 
     def test_worker_semantics(self):
         cxx = compiler()

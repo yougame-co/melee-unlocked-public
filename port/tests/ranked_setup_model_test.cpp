@@ -1,6 +1,8 @@
 // Direct C model tests; no game engine linked. GPL-3.0-or-later.
 #include "mu_ranked_setup_model.h"
 #include "yougame_ranked_policy.h"
+#include "mu_setup_hash.h"
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -180,6 +182,92 @@ static void tiebreak() {
   CHECK(mu_ranked_setup_record_game(&set,1,2,r.stage,0)==MU_SETUP_NEXT_GAME);
   CHECK(set.cur_game==2 && set.tiebreak_num==0 && set.score[1]==1);
 }
+// 11-18 field run on two Windows seats over the room relay: Ness (11) colour 0 on both, both idle, so
+// every step (both colour steps, all three strikes) was decided by its timer. Each seat runs its own
+// model; the owner of a timed-out step sends its automatic packet like a pressed one, and the other
+// seat applies it a relay hop later. Both must build the same overwrite (publish_result's 0xBF) and,
+// through the setup hash, agree on it. The field run died at step 4 on the slower seat: its setup
+// hash wait counted from its lock-in setup (two minutes earlier), so the faster seat's newer hash
+// read as "no matching hash after 8000 ms" before the last strike step had even been applied.
+struct Seat {
+  MuRankedSet set; MuRankedSetupModel m;
+  std::deque<std::pair<unsigned,std::array<MuYgU8,5>>> inbox;   // packets from the other seat, by arrival frame
+  MuSetupHash hash{}; uint64_t since=0; MuSetupHashWait wait{};   // the gate's state for this seat's setup
+  MuSetupHash peer{}; bool peer_received=false; std::deque<std::pair<unsigned,MuSetupHash>> hash_inbox;
+  bool built=false;
+};
+static std::array<MuYgU8,14> overwrite(const MuRankedSetupModel& m) {
+  // publish_result's 0xBF payload, game 1: stage, then (present, char, colour) per port.
+  std::array<MuYgU8,14> out{}; out[0]=(MuYgU8)(m.result.stage>>8); out[1]=(MuYgU8)m.result.stage;
+  for(unsigned i=0;i<2;++i) {out[2+3*i]=1; out[3+3*i]=m.result.fighters[i].character; out[4+3*i]=m.result.fighters[i].color;}
+  return out;
+}
+static MuSetupHash setup_of(unsigned port, const MuRankedSetupResult& r, bool overwritten) {
+  // Stand-in for setup_inputs_hash/setup_block_hash: the same function of the same data on both seats.
+  uint64_t h=mu_fnv64_u8(MU_FNV64_OFFSET,overwritten); h=mu_fnv64_u16(h,r.stage);
+  for(const auto& f:r.fighters) {h=mu_fnv64_u8(h,f.character); h=mu_fnv64_u8(h,f.color);}
+  return {(unsigned char)port,h,mu_fnv64_u8(h,0x5A)};
+}
+static void mirror_idle() {
+  const auto p=yougame::ranked_policy::slippi_v1();
+  MuRankedSetupResult css{}; css.stage=28; css.fighters[0]={11,0}; css.fighters[1]={11,0};
+  for(unsigned relay=1;relay<=30;relay+=29) {   // 1 frame, and a slow relay hop (half a second)
+    std::array<Seat,2> seat;
+    for(unsigned i=0;i<2;++i) {
+      seat[i].set=fresh(); CHECK(mu_ranked_setup_model_init(&seat[i].m,&p,&seat[i].set,i,&css));
+      CHECK(seat[i].m.step==0 && seat[i].set.color_ban.active);   // mirror colour: both colour steps run
+      // Lock-in: the CSS selections build the first setup on both seats, and they agree.
+      seat[i].hash=setup_of(i,css,false); seat[i].since=0;
+    }
+    for(unsigned i=0;i<2;++i) {seat[i].peer=seat[!i].hash; seat[i].peer_received=true;}
+    bool old_clock_would_drop=false;
+    for(unsigned frame=1;frame<60u*400;++frame) {
+      const uint64_t now=frame*1000ull/60;
+      for(unsigned i=0;i<2;++i) {
+        Seat& me=seat[i]; Seat& other=seat[!i];
+        while(!me.hash_inbox.empty() && me.hash_inbox.front().first<=frame) {
+          me.peer=me.hash_inbox.front().second; me.peer_received=true; me.hash_inbox.pop_front();
+        }
+        // The match-state poll runs first each frame (mu_ranked_setup_frame), then the step fetch.
+        const auto d=mu_setup_hash_decide(1,me.peer_received,&me.hash,&me.peer);
+        const bool over=mu_setup_hash_wait_over(&me.wait,me.since,me.peer_received,&me.peer,now,8000);
+        if(d==MU_SETUP_HASH_WAIT && now-me.since>=8000) old_clock_would_drop=true;
+        CHECK(d!=MU_SETUP_HASH_MISMATCH);
+        CHECK(!(d==MU_SETUP_HASH_WAIT && over));   // never "no matching hash" while both are here
+        const auto* s=mu_ranked_setup_current(&me.m);
+        if(s && s->player==i) {
+          if(mu_ranked_setup_tick(&me.m)==MU_SETUP_LOCAL_TIMEOUT) {
+            std::array<MuYgU8,5> b{}; CHECK(mu_ranked_setup_packet(&me.m,nullptr,1,b.data()));
+            CHECK(mu_ranked_setup_apply(&me.m,i,b.data())); other.inbox.push_back({frame+relay,b});
+          }
+        } else if(s) {
+          mu_ranked_setup_tick(&me.m);
+          if(!me.inbox.empty() && me.inbox.front().first<=frame) {
+            MuYgU8 response[6]={1,0,0,0,0,0}; std::memcpy(response+2,me.inbox.front().second.data()+1,4);
+            me.inbox.pop_front(); CHECK(mu_ranked_setup_remote(&me.m,response));
+          }
+        }
+        if(me.m.status==MU_SETUP_COMPLETE && !me.built) {
+          // publish_result's overwrite builds the real setup: a new hash, sent once, and a fresh wait.
+          me.built=true; me.hash=setup_of(i,me.m.result,true); me.since=now; me.wait=MuSetupHashWait{};
+          other.hash_inbox.push_back({frame+relay,me.hash});
+        }
+      }
+      if(seat[0].built && seat[1].built && seat[0].hash_inbox.empty() && seat[1].hash_inbox.empty()) break;
+    }
+    for(unsigned i=0;i<2;++i) {
+      CHECK(seat[i].m.status==MU_SETUP_COMPLETE && seat[i].built);
+      CHECK(mu_setup_hash_decide(1,1,&seat[i].hash,&seat[!i].hash)==MU_SETUP_HASH_AGREE);
+    }
+    CHECK(overwrite(seat[0].m)==overwrite(seat[1].m));
+    CHECK(!std::memcmp(&seat[0].m.result,&seat[1].m.result,sizeof seat[0].m.result));
+    // The field's final setup: the last starter after strikes, the mirror recoloured 1 and 2.
+    CHECK(seat[0].m.result.stage==31);
+    CHECK(seat[0].m.result.fighters[0].character==11 && seat[0].m.result.fighters[0].color==1);
+    CHECK(seat[0].m.result.fighters[1].character==11 && seat[0].m.result.fighters[1].color==2);
+    CHECK(old_clock_would_drop);   // the 122.19 clock (lock-in setup only) dropped this very sequence
+  }
+}
 int main(int argc,char** argv) {
   std::string group=argc>1?argv[1]:"all";
   if(group=="stages"||group=="all") stages();
@@ -188,5 +276,6 @@ int main(int argc,char** argv) {
   if(group=="interleave"||group=="all") interleave();
   if(group=="disconnects"||group=="all") disconnects();
   if(group=="tiebreak"||group=="all") tiebreak();
+  if(group=="mirror_idle"||group=="all") mirror_idle();
   std::printf("Ranked setup %s: %u checks passed\n",group.c_str(),checks);
 }

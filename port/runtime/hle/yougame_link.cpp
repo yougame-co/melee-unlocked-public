@@ -653,10 +653,14 @@ json bridge_channel(const json& body, int timeout_ms, const std::function<bool()
     const json result = j.count("result") ? j["result"] : json::object();
     const bool pending = channel::hello_pending(result), player = channel::hello_player(result);
     g_channel_signed_out = signin::hello_signed_out(result);
-    // This hello's own round trip, then the time since the probe began (a later hello, after sign-in or a
-    // reconnect, is minutes after the probe: that is not a slow answer).
-    host::log("yougame channel: hello answered in %llu ms, %llu ms after the probe (%s)", (unsigned long long)(now_ms() - sent_at),
-              (unsigned long long)since_probe(), player ? "player" : pending ? "pending" : "no player");
+    // This hello's own round trip. Only the probe's own hello adds the time since the probe began: a later
+    // hello (a row picked, after sign-in, a reconnect) is minutes after the probe, which read as a delay.
+    const char* who = player ? "player" : pending ? "pending" : "no player";
+    if (probing)
+      host::log("yougame channel: hello answered in %llu ms, %llu ms after the probe (%s)", (unsigned long long)(now_ms() - sent_at),
+                (unsigned long long)since_probe(), who);
+    else
+      host::log("yougame channel: hello again answered in %llu ms (%s)", (unsigned long long)(now_ms() - sent_at), who);
     bool tell = false;
     {
       std::lock_guard<std::mutex> lock(g_channel_mutex);
@@ -884,8 +888,15 @@ void yg_game_state(int state) {
   const char* name = game_state::name(state);
   if (!name) return;
   const json body = {{"type", "gameState"}, {"state", name}};
-  if (g_stdio) bridge_stdio(body, 1000, {}, tourney::DeliveryClock::now() + std::chrono::seconds(1));
-  else if (g_channel_allowed && g_channel_up) bridge_channel(body, 1000);
+  // One line per state actually sent: the worker sends only on a change (and once per new
+  // connection), so a log shows every playing / paused / menu the app heard, offline modes included.
+  if (g_stdio) {
+    host::log("yougame: gameState %s", name);
+    bridge_stdio(body, 1000, {}, tourney::DeliveryClock::now() + std::chrono::seconds(1));
+  } else if (g_channel_allowed && g_channel_up) {
+    host::log("yougame: gameState %s", name);
+    bridge_channel(body, 1000);
+  }
 }
 uint64_t game_state_epoch() {
   if (g_stdio) return 1;   // one app for the process's life

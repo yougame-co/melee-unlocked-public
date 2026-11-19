@@ -326,6 +326,7 @@ struct SetupHashState {
   int logged[REMOTE_PLAYER_MAX] = {-1, -1, -1};   // the last decision logged per peer
   uint64_t logged_setup[REMOTE_PLAYER_MAX] = {};
   MuSetupHashPending pending[REMOTE_PLAYER_MAX] = {};   // a mismatch that has not stood long enough yet
+  MuSetupHashWait wait[REMOTE_PLAYER_MAX] = {};         // each peer's latest hash: the wait counts from it too
 };
 SetupHashState g_setup_hash;
 bool g_play_session_active = false;
@@ -1518,11 +1519,16 @@ int setup_hash_gate(uint8_t remote_count, uint64_t inputs, uint64_t setup, std::
     host::log("setup hash %016llx local (inputs %016llx), sent", (unsigned long long)setup,
               (unsigned long long)inputs);
   }
-  bool waiting = false;
+  bool waiting = false, wait_over = false;
+  const uint64_t now = time_ms();
   for (int i = 0; i < remote_count && i < REMOTE_PLAYER_MAX; ++i) {
     const auto build = g_netplay->GetRemoteBuild(i);
     const auto peer = g_netplay->GetSetupHash(i);
     const auto decision = mu_setup_hash_decide(build.setup_hash, peer.received, &g_setup_hash.local, &peer.value);
+    // Noted on every call, agreed or not: a peer's newer hash restarts its wait from when it arrived
+    // (mu_setup_hash_wait_over). A ranked seat one strike step ahead is not a lost peer.
+    const bool over = mu_setup_hash_wait_over(&g_setup_hash.wait[i], g_setup_hash.since_ms, peer.received,
+                                              &peer.value, now, kConnectTimeoutMs);
     if (g_setup_hash.logged[i] != (int)decision || g_setup_hash.logged_setup[i] != peer.value.setup) {
       g_setup_hash.logged[i] = (int)decision;
       g_setup_hash.logged_setup[i] = peer.value.setup;
@@ -1543,14 +1549,17 @@ int setup_hash_gate(uint8_t remote_count, uint64_t inputs, uint64_t setup, std::
       *why = MU_SETUP_HASH_TEXT;
       return -1;
     }
-    if (decision == MU_SETUP_HASH_WAIT || decision == MU_SETUP_HASH_MISMATCH) waiting = true;
+    if (decision == MU_SETUP_HASH_WAIT || decision == MU_SETUP_HASH_MISMATCH) {
+      waiting = true;
+      wait_over = wait_over || over;
+    }
   }
   if (!waiting) {
     if (!g_setup_hash.agreed) host::log("setup hash %016llx: every peer that checks agrees", (unsigned long long)g_setup_hash.local.setup);
     g_setup_hash.agreed = true;
     return 1;
   }
-  if (time_ms() - g_setup_hash.since_ms >= kConnectTimeoutMs) {
+  if (wait_over) {
     bool differs = false;
     for (int i = 0; i < remote_count && i < REMOTE_PLAYER_MAX; ++i) differs = differs || g_setup_hash.pending[i].open;
     if (differs) {

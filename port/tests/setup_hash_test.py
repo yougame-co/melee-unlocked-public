@@ -187,6 +187,45 @@ int main(void)
 '''
 
 
+# 11-18 ranked: both seats agreed on the lock-in setup, struck stages for two minutes, then the seat
+# that finished first sent its overwrite's hash. The other seat, one step behind, counted its wait
+# from its lock-in setup and dropped the peer on the spot. A peer's newer hash restarts the wait.
+WAIT_TEST = r'''
+#include "mu_setup_hash.h"
+#include <stdio.h>
+#define CHECK(x) do { if (!(x)) { printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #x); return 1; } } while (0)
+int main(void)
+{
+    const uint64_t T = 8000;
+    MuSetupHash local = {1, 0x11, 0xA1}, peer = {0, 0x11, 0xA1};
+    MuSetupHashWait wait = {0, 0, 0, 0};
+    /* Lock-in: both built the same setup and agree (the gate only reads the clock while waiting). */
+    mu_setup_hash_wait_over(&wait, 0, 1, &peer, 50, T);
+    CHECK(mu_setup_hash_decide(1, 1, &local, &peer) == MU_SETUP_HASH_AGREE);
+    mu_setup_hash_wait_over(&wait, 0, 1, &peer, 60000, T);   /* noted on every call, agreed or not */
+    /* Two minutes of strikes later the faster seat's overwrite hash arrives: other inputs, a wait. */
+    peer.inputs = 0x22; peer.setup = 0xB2;
+    CHECK(mu_setup_hash_decide(1, 1, &local, &peer) == MU_SETUP_HASH_WAIT);
+    CHECK(120000 - 0 >= T);                                          /* 122.19's clock: dropped here */
+    CHECK(!mu_setup_hash_wait_over(&wait, 0, 1, &peer, 120000, T));   /* counted from its arrival */
+    CHECK(!mu_setup_hash_wait_over(&wait, 0, 1, &peer, 120000 + T - 1, T));
+    CHECK(mu_setup_hash_wait_over(&wait, 0, 1, &peer, 120000 + T, T));   /* a real stall still ends */
+    /* This side's own newer setup counts too: whichever came last. */
+    CHECK(!mu_setup_hash_wait_over(&wait, 125000, 1, &peer, 125000 + T - 1, T));
+    CHECK(mu_setup_hash_wait_over(&wait, 125000, 1, &peer, 125000 + T, T));
+    /* No hash ever from the peer: the local setup's clock alone, as before. */
+    {
+        MuSetupHashWait none = {0, 0, 0, 0};
+        CHECK(!mu_setup_hash_wait_over(&none, 1000, 0, &peer, 1000 + T - 1, T));
+        CHECK(mu_setup_hash_wait_over(&none, 1000, 0, &peer, 1000 + T, T));
+        CHECK(mu_setup_hash_wait_over(NULL, 1000, 1, &peer, 1000 + T, T));
+    }
+    printf("ok\n");
+    return 0;
+}
+'''
+
+
 def shipped_block():
     body = read(ONLINE).split('static std::vector<uint8_t> block = {', 1)[1].split('};', 1)[0]
     return ', '.join(re.findall(r'0x[0-9A-Fa-f]+', body))
@@ -213,6 +252,9 @@ class SetupIsAFunctionOfItsInputs(unittest.TestCase):
 
     def test_a_peer_hash_that_is_already_replaced_never_refuses(self):
         compile_and_run(self, SETTLE_TEST)
+
+    def test_a_peer_one_step_ahead_is_not_a_lost_peer(self):
+        compile_and_run(self, WAIT_TEST)
 
 
 class SetupHashWiring(unittest.TestCase):
@@ -293,7 +335,14 @@ class SetupHashWiring(unittest.TestCase):
         self.assertLess(gate.index('mu_setup_hash_mismatch_final(&g_setup_hash.pending[i]'), gate.index('*why = MU_SETUP_HASH_TEXT;'))
         self.assertIn('if (decision != MU_SETUP_HASH_MISMATCH) g_setup_hash.pending[i].open = 0;', gate)
         self.assertIn('decision == MU_SETUP_HASH_WAIT || decision == MU_SETUP_HASH_MISMATCH', gate)
-        timeout = gate[gate.index('kConnectTimeoutMs'):]
+        # The connect timeout counts from this side's setup or the peer's newest hash, whichever is later
+        # (mu_setup_hash_wait_over), noted for every peer on every call; never from the setup alone.
+        self.assertIn('mu_setup_hash_wait_over(&g_setup_hash.wait[i], g_setup_hash.since_ms, peer.received,', gate)
+        self.assertIn('MuSetupHashWait wait[REMOTE_PLAYER_MAX]', online)
+        self.assertNotIn('time_ms() - g_setup_hash.since_ms >= kConnectTimeoutMs', gate)
+        self.assertLess(gate.index('mu_setup_hash_wait_over('), gate.index('if (decision != MU_SETUP_HASH_MISMATCH)'))
+        self.assertIn('wait_over = wait_over || over;', gate)
+        timeout = gate[gate.index('if (wait_over) {'):]
         self.assertLess(timeout.index('*why = MU_SETUP_HASH_TEXT;'), timeout.index('why->clear();'))
         self.assertIn("Match setup didn't match your opponent's. Match not started.", read(ABI))
 

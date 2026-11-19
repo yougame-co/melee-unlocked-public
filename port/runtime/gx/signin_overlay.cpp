@@ -116,7 +116,9 @@ void draw(float x0, float y0, float x1, float y1) {
   const float card_w = std::min(gw * 0.86f, 360.0f * u);
   ImGui::SetNextWindowPos(ImVec2((x0 + x1) * 0.5f, (y0 + y1) * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
   ImGui::SetNextWindowSize(ImVec2(card_w, 0.0f), ImGuiCond_Always);
-  if (appearing) ImGui::SetNextWindowFocus();
+  // Focused every frame it shows, not only as it appears: the box owns the keyboard and the routed pad
+  // while it is up, so A and Enter press its buttons even after another window took the focus.
+  ImGui::SetNextWindowFocus();
   ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f * u);
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.0f * u, 14.0f * u));
   ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);

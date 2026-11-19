@@ -200,4 +200,34 @@ static inline int mu_setup_hash_mismatch_final(MuSetupHashPending* pending, cons
     }
     return now_ms - pending->since >= MU_SETUP_HASH_SETTLE_MS;
 }
+
+/* When the wait for one peer's matching hash began. The connect timeout counts from this side's own
+ * latest setup OR the peer's latest hash, whichever came last. A ranked set builds its first setup
+ * at lock-in, agrees on it, and then strikes for half a minute or more before the game's overwrite
+ * builds the real one. The seat that finishes first sends its new hash; on the other seat (still
+ * waiting for the last strike step, a relay hop behind) that hash has other inputs, a wait. Counted
+ * from that seat's lock-in setup, the wait was long over the moment the hash arrived, and it treated
+ * a peer one step ahead as gone (11-18, Ness vs Ness, ended at step 4). A peer's newer hash is proof
+ * it is there and moving: the wait counts from it. The caller keeps one per peer, reset with the
+ * rest of its state when its own setup changes. */
+typedef struct MuSetupHashWait {
+    int seen;                /* a peer hash has been noted since the last reset */
+    uint64_t inputs, setup;  /* that hash */
+    uint64_t since;          /* when it arrived (first seen) */
+} MuSetupHashWait;
+static inline int mu_setup_hash_wait_over(MuSetupHashWait* wait, uint64_t local_since, int peer_received,
+                                          const MuSetupHash* peer, uint64_t now_ms, uint64_t timeout_ms)
+{
+    uint64_t start = local_since;
+    if (!wait) return now_ms - local_since >= timeout_ms;
+    if (peer_received && peer &&
+        (!wait->seen || wait->inputs != peer->inputs || wait->setup != peer->setup)) {
+        wait->seen = 1;
+        wait->inputs = peer->inputs;
+        wait->setup = peer->setup;
+        wait->since = now_ms;
+    }
+    if (wait->seen && wait->since > start) start = wait->since;
+    return now_ms - start >= timeout_ms;
+}
 #endif

@@ -604,6 +604,15 @@ enum { MU_LOBBY_WANT_FIND = 0, MU_LOBBY_WANT_INVITE = 1, MU_LOBBY_WANT_P2 = 2, M
 static int curtain, want_v;
 static int mu_lobby_curtain(void) { return curtain; }
 static int mu_lobby_partner_want(void) { return want_v; }
+/* The panel names the player's own keys; here no keyboard is bound, so the controller words stay. */
+#ifndef HSD_PAD_B
+#define HSD_PAD_B 0x200
+#endif
+#ifndef HSD_PAD_START
+#define HSD_PAD_START 0x1000
+#endif
+static int gm_801677F0(void) { return 0; }
+static int mu_host_button_label(int port, unsigned mask, char* out, int n) { (void) port; (void) mask; (void) out; (void) n; return 0; }
 /* sislib: one text, each subtext's place, size, colour and words. */
 static HSD_Text panel_text;
 static int subs, made;

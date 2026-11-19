@@ -33,6 +33,8 @@ typedef struct MuRankedWidgets MuRankedWidgets;
 MuRankedWidgets* mu_ranked_widgets_create(const MuRankedSetupModel*);
 void mu_ranked_widgets_draw(MuRankedWidgets*, const MuRankedSetupModel*, const MuRankedSetupView*);
 void mu_ranked_widgets_free(MuRankedWidgets*);
+/* The controlling port's own keys for the prompts (a keyboard port's bound keys; a controller keeps A/B/X/Y). */
+void mu_ranked_widgets_keys(MuRankedWidgets*, int port);
 #ifdef __cplusplus
 }
 #endif
