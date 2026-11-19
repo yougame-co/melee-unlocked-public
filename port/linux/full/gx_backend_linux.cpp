@@ -96,7 +96,7 @@ Backend* create_render_backend(void* hwnd, int client_w, int client_h, const Ren
     if (std::string(e.what()).find("OpenGL context") != std::string::npos) {
       host::log("opengl: no OpenGL 4.5 context (%s); the game needs OpenGL 4.5 on Linux", e.what());
       host::log_flush();
-      if (!host::options.no_gc_adapter)   // set for hidden and headless runs: a test never waits on a dialog
+      if (!host::options.no_gc_adapter && !host::window_embedded())   // hidden/headless/boxed: never wait on a dialog
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Melee Unlocked",
             "Melee Unlocked cannot start OpenGL 4.5 on this graphics card or driver.\n\n"
             "Update the graphics driver (Mesa on most systems) and start the game again. Graphics cards older "
@@ -118,7 +118,9 @@ Backend* create_render_backend(void* hwnd, int client_w, int client_h, const Ren
     if (lower.find("llvmpipe") != std::string::npos || lower.find("softpipe") != std::string::npos ||
         lower.find("software rasterizer") != std::string::npos || lower.find("swrast") != std::string::npos) {
       host::log("opengl: WARNING software rendering (%s): no graphics driver for the GPU is in use", gl_renderer.c_str());
-      if (!host::options.no_gc_adapter)   // set for hidden and headless runs: a test never waits on a dialog
+      // Never inside the YouGame app's player box: SDL's X11 message box, shown from this render thread over a
+      // reparented child window, waits for a map that never comes (122.28, an Xvfb seat hung here for good).
+      if (!host::options.no_gc_adapter && !host::window_embedded())   // hidden/headless runs: never wait on a dialog
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Melee Unlocked",
             ("OpenGL is running in software on your processor (" + gl_renderer + "), so the game will run very slowly.\n\n"
              "Install or enable the graphics driver for your GPU (on Linux Mint: Driver Manager), then restart the game.").c_str(),
