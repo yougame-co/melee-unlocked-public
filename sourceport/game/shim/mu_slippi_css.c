@@ -723,6 +723,15 @@ static int update_words(const char* s)
                          strncmp(s, "Updating to the latest version", 30) == 0);
 }
 
+/* The host's Unranked note (MU_YG_SUB_UNRANKED_NOTE): the opponent's leave ended this side's session.
+ * An older host answers nothing, so no note. */
+static int unranked_opponent_left(void)
+{
+    MuYgU8 sub = MU_YG_SUB_UNRANKED_NOTE, left = 0;
+    unsigned int got = 0;
+    return mu_slippi_cmd(MU_YG_COMMAND, &sub, 1, &left, 1, &got) == 0 && got == 1 && left == 1;
+}
+
 static void set_text(int idx, const char* s)
 {
     HSD_SisLib_803A70A0(dt.text, idx, (char*) "%s", s);
@@ -1080,6 +1089,10 @@ static void text_think(HSD_GObj* gobj)
         snprintf(prompt, sizeof prompt, "Press %s to clear error", z_key);
     } else if (conn > MU_SLP_MM_IDLE) {
         snprintf(prompt, sizeof prompt, "Press %s to cancel", z_key);
+    } else if (conn == MU_SLP_MM_IDLE && st->mode == MU_SLP_MODE_UNRANKED && unranked_opponent_left()) {
+        /* Unranked: the opponent left mid-game or between games. Said where "Hold Z to disconnect"
+         * stood, until the next search (the host clears it on Start). */
+        strcpy(prompt, "Opponent left");
     }
     set_text(ST_PRESS_Z, prompt);
 

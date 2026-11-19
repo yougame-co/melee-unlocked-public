@@ -348,6 +348,9 @@ bool ranked_hold();
 bool ranked_set_over();
 // No ranked room is open or still finishing, and one was (the --online-test ranked harness).
 bool ranked_room_retired();
+// Game thread: this session's own room socket died (no close frame from the room, and not our own close).
+// A match link that dropped with it was most likely this side's connection, not the opponent leaving.
+bool own_room_dropped();
 // This client's games with unique room receipts (the --online-test quit-after harness).
 int ranked_games_received();
 // The Ranked character select's header ("Ranked Mode", "Ranked - Placements 2/5",

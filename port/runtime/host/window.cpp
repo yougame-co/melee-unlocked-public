@@ -1967,11 +1967,26 @@ static void read_devices(PadState out[4], InputDebugSnapshot& debug, bool side_e
     // In the player box the keys come from the window's messages only: the foreground window is
     // the app's, and a sandboxed program cannot read the keyboard while another program is in front.
     const bool live = focused && !yougame::embedded() && !(GetAsyncKeyState(VK_MENU) & 0x8000);
+    // Shift+Tab, Shift+Enter, Shift+Backspace and Shift+Escape belong to YouGame (its menu, chats and
+    // back), in the app and in its mini window. The mini takes them with a hotkey, which hides the
+    // key's message but not its state, so the state read below still saw Enter go down and the menu
+    // chose a row. A key pressed while Shift is held is not the game's until it is let go, even when
+    // Shift is let go first.
+    static bool s_chord_down[256], s_chord_held[256];
+    auto youGame_chord = [&](int vk) {
+      if (vk != VK_TAB && vk != VK_RETURN && vk != VK_BACK && vk != VK_ESCAPE) return false;
+      const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0 || g_keys[vk];
+      if (!down) s_chord_held[vk] = false;
+      else if (!s_chord_down[vk] && (GetAsyncKeyState(VK_SHIFT) & 0x8000)) s_chord_held[vk] = true;
+      s_chord_down[vk] = down;
+      return s_chord_held[vk];
+    };
     auto key = [&](int vk) {
       vk &= 0xFF;
       if (!focused) return false;
 #ifdef _WIN32
       if (shortcut_swallowed(vk)) return false;
+      if (youGame_chord(vk)) return false;
 #endif
       if (live && vk >= 8 && vk != VK_TAB) return (GetAsyncKeyState(vk) & 0x8000) != 0;
       return g_keys[vk];

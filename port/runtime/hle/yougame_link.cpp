@@ -6029,6 +6029,11 @@ bool ranked_room_retired() {
          (!g_retired.valid() || g_retired.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready);
 }
 
+bool own_room_dropped() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  return g_room && g_room->socket && (g_room->socket->own_dropped() || g_room->socket->recoverable());
+}
+
 void ranked_screen_enter() {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_rank_read.enter(g_room && g_room->ranked && g_room->set.started());

@@ -21,6 +21,9 @@ typedef char MuYgWidthCheck[(sizeof(MuYgU8) == 1 && sizeof(MuYgU16) == 2 && size
 #define MU_YG_SUB_PRACTICE_STATUS 3u
 /* One-byte request; one-byte boolean reply. Missing/old hosts deny practice. */
 #define MU_YG_SUB_PRACTICE_ALLOWED 4u
+/* One-byte request; one-byte boolean reply: 1 while the Unranked opponent's leave ended this
+ * side's session, until the next search. Missing/old hosts: no note. */
+#define MU_YG_SUB_UNRANKED_NOTE 5u
 enum { MU_YG_PRACTICE_STOP, MU_YG_PRACTICE_START,
        MU_YG_PRACTICE_WIN, MU_YG_PRACTICE_LOSS };
 #define MU_YG_RANK_VERSION 1u

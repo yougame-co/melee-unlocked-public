@@ -331,6 +331,9 @@ struct SetupHashState {
 };
 SetupHashState g_setup_hash;
 bool g_play_session_active = false;
+// The Unranked character select says "Opponent left" (MU_YG_SUB_UNRANKED_NOTE) until the next search or
+// any other cleanup. Set only where the opponent's link dropped (prepare_online_match_state). Game thread.
+bool g_unranked_opponent_left = false;
 uint8_t g_local_player_index = 0, g_remote_player_index = 1;
 uint32_t g_stall_frame_counts[REMOTE_PLAYER_MAX] = {};
 int g_frames_to_skip = 0, g_frames_to_advance = 0, g_fall_behind = 0, g_fall_far_behind = 0;
@@ -562,6 +565,7 @@ bool discord_join_pending() {
 // is the player leaving, the checks below drop a connection that broke or a match they refuse.
 void cleanup_connection(yougame::Leave why = yougame::Leave::Lost) {
   g_slippi_link.cancel([](const char* line) { host::log("%s", line); });
+  g_unranked_opponent_left = false;   // the one caller that sets it does so after this cleanup
   finish_summary(why == yougame::Leave::Quit ? "quit" : why == yougame::Leave::Next ? "completed" : "disconnected");
   // The Friends lobby: Next and Lost park its room for the next search (yougame_link.h Leave); any other
   // cleanup leaves the room, and the select can only go back.
@@ -1726,7 +1730,16 @@ void prepare_online_match_state(std::vector<uint8_t>& q) {
       // a silent return to the search, and play nothing (no match starts, so no result is sent).
       const bool squad_cancelled = g_last_search.squad && g_local_selections.is_character_selected && !g_in_online_match;
 #endif
+      // YouGame Unranked: the opponent left (or their game or connection went) mid-game or on the
+      // character select between games. Read before the cleanup forgets the session and its room.
+      const bool opponent_left = yougame::unranked::opponent_left(
+          yougame::session(), (int)g_last_search.mode, !g_last_search.friend_room.empty(),
+          g_play_session_active, yougame::session() && yougame::own_room_dropped());
       cleanup_connection();
+      if (opponent_left) {
+        g_unranked_opponent_left = true;
+        host::log("yougame: unranked: the opponent left; the character select says so until the next search");
+      }
 #if MU_SQUAD
       if (squad_cancelled) {
         host::log("squad: connection lost before the first frame, match cancelled");
@@ -3249,6 +3262,7 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
     case CMD_LOAD_SAVESTATE: handle_load_savestate(payload); return true;
     case CMD_GET_MATCH_STATE: prepare_online_match_state(q); return true;
     case CMD_FIND_OPPONENT:
+      g_unranked_opponent_left = false;   // a new search: the last opponent's leave is old news
 #ifdef MELEE_DOUBLES
       // The Doubles CSS's search (mu_slippi_css.c): no code, it joins the home's match room.
       if (payload[0] == Matchmaking::TEAMS && yougame::active()) {
@@ -3420,6 +3434,9 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
           q = yougame::ranked_policy::encode(policy);
           return true;
         }
+        case MU_YG_SUB_UNRANKED_NOTE:
+          q.assign(1, g_unranked_opponent_left ? 1 : 0);
+          return true;
         default: return false; // optional subcommand unknown to this host
       }
     case CMD_YOUGAME_RANKED:
