@@ -1001,6 +1001,10 @@ void handle_online_inputs(const uint8_t* payload, uint32_t size, std::vector<uin
     // YouGame Unranked: the opponent left mid-game (closed the game, or their connection went), not this
     // player (is_leaving). Read now, while the session and its room are still here; the game's cleanup
     // after DISCONNECTED makes it the character select's "Opponent left".
+    if (!g_unranked_left_in_game && g_summary.active && g_last_search.mode == Matchmaking::UNRANKED)
+      host::log("yougame: unranked: disconnect mid-game (session %d, leaving %d, friend room %d, connected %d, own drop %d)",
+                yougame::session() ? 1 : 0, is_leaving ? 1 : 0, g_last_search.friend_room.empty() ? 0 : 1, g_play_session_active ? 1 : 0,
+                yougame::own_room_dropped() ? 1 : 0);
     if (!is_leaving && !g_unranked_left_in_game && g_summary.active &&
         yougame::unranked::opponent_left(yougame::session(), (int)g_last_search.mode,
             !g_last_search.friend_room.empty(), g_play_session_active,
@@ -1747,6 +1751,10 @@ void prepare_online_match_state(std::vector<uint8_t>& q) {
 #endif
       // YouGame Unranked: the opponent left (or their game or connection went) mid-game or on the
       // character select between games. Read before the cleanup forgets the session and its room.
+      if (yougame::session() || g_last_search.mode == Matchmaking::UNRANKED)
+        host::log("yougame: unranked: link gone (session %d, mode %d, friend room %d, connected %d, own drop %d)",
+                  yougame::session() ? 1 : 0, (int)g_last_search.mode, g_last_search.friend_room.empty() ? 0 : 1,
+                  g_play_session_active ? 1 : 0, yougame::session() && yougame::own_room_dropped() ? 1 : 0);
       const bool opponent_left = yougame::unranked::opponent_left(
           yougame::session(), (int)g_last_search.mode, !g_last_search.friend_room.empty(),
           g_play_session_active, yougame::session() && yougame::own_room_dropped());

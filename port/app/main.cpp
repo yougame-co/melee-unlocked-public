@@ -1782,7 +1782,9 @@ static int melee_main(int argc, char** argv) {
 #else
   constexpr auto agent_engine = yougame::agent_test::Engine::Static;
 #endif
-  const auto agent_test = yougame::agent_test::load(yougame::active(), std::getenv("YOUGAME_DATA"), agent_engine);
+  // The app may start the game through Melee Unlocked's own launcher (launcher(), not active()); an AGENT TEST
+  // copy started that way reads its agent-test.json too. YOUGAME_AGENT_COPY=1 still gates it inside load().
+  const auto agent_test = yougame::agent_test::load(yougame::active() || yougame::launcher(), std::getenv("YOUGAME_DATA"), agent_engine);
   yougame::display_defaults::agent_test_run = agent_test.agent_file;   // the FPS counter's default (read with the settings)
   host::test_env::agent_run = agent_test.agent_file;   // Slippi Launcher search and refresh off
   yougame::ranked_cpu::practice_allowed = agent_test.agent_file;

@@ -719,10 +719,18 @@ inline Settings load(bool active, const char* data_dir, Engine engine = Engine::
   // Bound the actual read BEFORE parsing; the same handle is checked and read.
   std::array<char, 4097> bytes{};
 #ifdef YOUGAME_AGENT_TEST_HOOK
-  if (!agent_paths::session.load(std::filesystem::u8path(data_dir))) return out;
+  if (!agent_paths::session.load(std::filesystem::u8path(data_dir))) {
+    out.log = "agent-test.json ignored: the data folder is not a plain local folder";
+    return out;
+  }
   const auto& root = agent_paths::session.path;
   FILE* file = agent_paths::open(root, "agent-test.json", agent_paths::Mode::Read);
-  if (!file) return out;
+  if (!file) {
+    std::error_code missing;
+    if (std::filesystem::exists(std::filesystem::u8path(data_dir) / "agent-test.json", missing))
+      out.log = "agent-test.json ignored: could not open it";
+    return out;
+  }
   const auto size = std::fread(bytes.data(), 1, bytes.size(), file);
   const bool failed = std::ferror(file) != 0;
   std::fclose(file);

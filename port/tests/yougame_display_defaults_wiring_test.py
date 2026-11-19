@@ -51,7 +51,7 @@ class DisplayDefaultsWiringTest(unittest.TestCase):
 
     def test_agent_runs_are_detected_at_runtime_not_by_build_flag(self):
         main = (ROOT / "port/app/main.cpp").read_text(encoding="utf-8-sig")
-        load = main.index("yougame::agent_test::load(yougame::active()")
+        load = main.index("yougame::agent_test::load(yougame::active() || yougame::launcher()")
         flag = main.index("yougame::display_defaults::agent_test_run = agent_test.agent_file;")
         practice = main.index("yougame::ranked_cpu::practice_allowed = agent_test.agent_file;")
         self.assertLess(flag, practice)
