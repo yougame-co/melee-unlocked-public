@@ -493,6 +493,26 @@ int mu_ak_ckind_from_kind(int kind)
     return -1;
 }
 
+/* The kind a locked added fighter's icon carries (shim/mu_mex.c): its slot's own kind. Its
+ * mapping is empty, and no port can take it (a locked icon is never hovered nor drawn at
+ * random), so it never matches a port's kind. -1 outside the added slots. */
+int mu_ak_ckind_locked_from_mex(int ext)
+{
+#ifdef MU_AKANEIA_FIGHTERS
+    int kind;
+    if (!mu_mex_active() || ak_shift <= 0 || ext < CKind_Playable_Count) {
+        return -1;
+    }
+    kind = mu_ak_kind_from_mex(mu_mex_internal_of_external(ext));
+    if (MU_AK_KIND(kind)) {
+        return MU_AK_CKIND_BASE + kind - MU_AK_KIND_BASE;
+    }
+#else
+    (void) ext;
+#endif
+    return -1;
+}
+
 int mu_ak_ckind_from_mex(int ext)
 {
 #ifdef MU_AKANEIA_FIGHTERS

@@ -443,7 +443,16 @@ int mu_mex_css_icons(CSSIcon* out, int max)
         {
             const int native = mu_ak_ckind_from_mex(in[1]);
             out[i].char_kind = native >= 0 ? (u8) native : ChKind_None;
-            if (native < 0) out[i].state = 0;
+            if (native < 0) {
+                /* A locked added fighter keeps its slot's own kind, never "no character": a
+                 * port with no fighter yet would find this icon as its own on entering the
+                 * screen, put its coin there and start the match with no fighter. */
+                const int locked = mu_ak_ckind_locked_from_mex(in[1]);
+                if (locked >= 0) {
+                    out[i].char_kind = (u8) locked;
+                }
+                out[i].state = 0;
+            }
         }
 #endif
         out[i].anim_timer = 0;

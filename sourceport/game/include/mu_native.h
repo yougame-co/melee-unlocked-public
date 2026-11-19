@@ -412,6 +412,7 @@ struct StageCallbacks* mu_ground_added_callbacks(int map_id);
 #define MU_CK_KIND_CAP (MU_AK_CKIND_BASE + MU_AK_CKIND_SLOTS)
 #define MU_AK_CKIND(kind) ((unsigned) ((int) (kind) - MU_AK_CKIND_BASE) < (unsigned) MU_AK_CKIND_SLOTS)
 int mu_ak_ckind_from_mex(int ext);      /* native character kind, -1 if the disc slot is absent */
+int mu_ak_ckind_locked_from_mex(int ext); /* a locked added fighter's slot kind, -1 otherwise */
 int mu_ak_mex_external(int ckind);      /* disc / Slippi external id, -1 for an absent native slot */
 int mu_ak_mex_internal(int kind);       /* disc internal id for a native fighter kind */
 int mu_ak_ckind_from_kind(int kind);    /* added fighter kind -> native character kind, -1 otherwise */
