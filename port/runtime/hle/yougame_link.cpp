@@ -1584,6 +1584,9 @@ transport::RoomIO room_io(Room& r) {
     host::log("yougame: ranked set result: %s, %s", ranked::str(m, "disposition").c_str(),
               none ? "no winner" : won ? "this player won" : "the opponent won");
     if (g_rank.result(m, r.set.local_participant())) host::log("yougame: ranked standing: %s", g_rank.header().c_str());
+    // No standing in the final (unrated, or no ratings for this seat): the CSS read it before the room
+    // recorded the set, so the rank line reads it again now.
+    else g_rank_read.again();
   };
   return io;
 }

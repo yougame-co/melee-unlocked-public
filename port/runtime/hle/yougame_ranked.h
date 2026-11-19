@@ -740,6 +740,9 @@ struct RankRead {
   }
   // Only a closed room missing its final receipt schedules this bounded recovery read.
   void recover(uint64_t now) { recovery_at = now + 20000; recovery_tries = 0; }
+  // A set's final that brought no standing (unrated, or a leave the room gave after the CSS's
+  // read): one more read, the room has recorded it by now. The failure backoff still holds.
+  void again() { asked = false; }
   bool recovery_due(uint64_t now) const { return recovery_at && recovery_tries < 2 && now >= recovery_at; }
   bool begin(uint64_t now) {
     if (unsupported || in_flight || now < next_at) return false;
@@ -812,6 +815,8 @@ class ResultsPanel {
                 reason == "void" ? "Unrated: no winner" : "Unrated";
       record_ = {}; record_.status = MU_YG_RESULT_UNRATED;
       record_.reason = reason == "pack" ? MU_YG_REASON_PACK : reason == "void" ? MU_YG_REASON_VOID : MU_YG_REASON_OTHER;
+      // A leave the room gave unrated (a test build's set) still says who left.
+      if (const uint8_t left = forfeit_reason(event, participant)) record_.reason = left;
       state_ = State::Unrated;
       return true;
     }
@@ -835,9 +840,7 @@ class ResultsPanel {
     else change_ = label;
     record_ = after.result_record();
     // A set the room gave by a leave: the winner's setup screen says so (CTO 11-01).
-    if (str(event, "disposition") == "forfeit" && event.count("ranking") && event["ranking"].is_array() &&
-        !event["ranking"].empty())
-      record_.reason = event["ranking"][0] == participant ? MU_YG_REASON_FORFEIT_WON : MU_YG_REASON_FORFEIT_LOST;
+    if (const uint8_t left = forfeit_reason(event, participant)) record_.reason = left;
     state_ = State::Rated;
     return true;
   }
@@ -867,6 +870,12 @@ class ResultsPanel {
     }
   }
  private:
+  // Whom a set the room gave by a leave went to, or 0.
+  static uint8_t forfeit_reason(const json& event, const std::string& participant) {
+    if (str(event, "disposition") != "forfeit" || !event.count("ranking") || !event["ranking"].is_array() ||
+        event["ranking"].empty()) return 0;
+    return event["ranking"][0] == participant ? MU_YG_REASON_FORFEIT_WON : MU_YG_REASON_FORFEIT_LOST;
+  }
   MuYgResult record_{};
   State state_ = State::Empty;
   std::string match_, rating_, change_;

@@ -321,6 +321,20 @@ int main() {
   bounds(); // the longest score line still fits
   match.local_index = 0; set.score[0] = 2; mu_ranked_rank_frame();
   CHECK(panel.text->rows[SET_SCORE] == "Set won 2:0"); // a finished set wins over "ended early"
+  // 122.24: a set the room gave by a leave says so, game 1 included, rated or not, until a search.
+  set.cur_game = 1; set.score[0] = set.score[1] = 0;
+  ranks.result.status = MU_YG_RESULT_RECORDED; ranks.result.reason = MU_YG_REASON_FORFEIT_WON; tick();
+  CHECK(panel.text->rows[SET_SCORE] == "Opponent left: you win");
+  ranks.result.status = MU_YG_RESULT_UNRATED; tick(); CHECK(panel.text->rows[SET_SCORE] == "Opponent left: you win");
+  ranks.result.reason = MU_YG_REASON_FORFEIT_LOST; tick(); CHECK(panel.text->rows[SET_SCORE] == "You left the set");
+  ranks.result.status = MU_YG_RESULT_RECORDED; tick();
+  CHECK(panel.text->rows[SET_SCORE] == "You left: counted as a loss");
+  CHECK(panel.text->layout[SET_SCORE].sx < .4f); // shrunk to fit, checked by tick's bounds()
+  match.connection_state = MU_SLP_MM_MATCHMAKING; mu_ranked_rank_frame(); CHECK(panel.text->rows[SET_SCORE].empty());
+  match.connection_state = MU_SLP_MM_IDLE; ranks.result = {}; tick();
+  CHECK(panel.text->rows[SET_SCORE].empty() && panel.text->layout[SET_SCORE].sx == .4f);
+  set.cur_game = 2; set.score[0] = 2; set.score[1] = 0; mu_ranked_rank_frame();
+  CHECK(panel.text->rows[SET_SCORE] == "Set won 2:0");
   set.cur_game = 3; set.score[0] = set.score[1] = 1; mu_ranked_rank_frame();
   match.connection_state = MU_SLP_MM_ERROR; mu_ranked_rank_frame();
   CHECK(panel.text->rows[SET_SCORE].empty());

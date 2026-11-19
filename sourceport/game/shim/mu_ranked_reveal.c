@@ -64,6 +64,9 @@ static const char* reveal_reason(unsigned reason)
     case MU_YG_REASON_OTHER: return "Room marked this set unrated";
     case MU_YG_REASON_MALFORMED: return "Room result could not be read";
     case MU_YG_REASON_UNAVAILABLE: return "Room result is unavailable";
+    /* An unrated set the room gave by a leave (a test build's set). */
+    case MU_YG_REASON_FORFEIT_WON: return "Opponent left - set not rated";
+    case MU_YG_REASON_FORFEIT_LOST: return "You left - set not rated";
     default: return "No rated result supplied by the room";
     }
 }

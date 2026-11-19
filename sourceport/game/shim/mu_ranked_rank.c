@@ -25,6 +25,7 @@ static struct {
     char lines[LINE_COUNT][64];
     unsigned frames;
     int matched;
+    MuYgU8 left_status, left;   /* the room's final for a set it gave by a leave, else 0 */
 } panel;
 static const GXColor white = { 255, 255, 255, 255 };
 static const GXColor gray = { 160, 165, 175, 255 };
@@ -45,6 +46,16 @@ static void line(int id, const char* value)
     /* All callers supply bounded local strings, never a host format string. */
     strcpy(panel.lines[id], value);
     HSD_SisLib_803A70A0(panel.text, id, "%s", value);
+}
+
+/* A long note shrinks to stay clear of the opponent column at x 70. */
+static void score_line(const char* value)
+{
+    float width = (float) strlen(value) * 20.5f, scale = 0.4f;
+    if (strcmp(panel.lines[SET_SCORE], value) == 0) return;
+    if (width * scale > 180.0f) scale = 180.0f / width;
+    HSD_SisLib_803A7548(panel.text, SET_SCORE, scale, scale);
+    line(SET_SCORE, value);
 }
 
 static void free_panel(void* unused)
@@ -127,6 +138,9 @@ static void refresh(void)
     const MuMatchState* ms = mu_slippi_css_msrb();
     int matched = ms->connection_state == MU_SLP_MM_OPPONENT_CONNECTING ||
                   ms->connection_state == MU_SLP_MM_CONNECTION_SUCCESS;
+    panel.left = ok && (ranks.result.reason == MU_YG_REASON_FORFEIT_WON ||
+                        ranks.result.reason == MU_YG_REASON_FORFEIT_LOST) ? ranks.result.reason : 0;
+    panel.left_status = panel.left ? ranks.result.status : 0;
     if (!ok) status = 2;
     else {
         if (mu_slippi_cmd(0xE3, NULL, 0, e3, sizeof e3, &got) == 0 && got == sizeof e3)
@@ -206,7 +220,13 @@ void mu_ranked_rank_frame(void)
         refresh();
     }
     set = mu_ranked_set();
-    if (set->cur_game > 1 && set->max_games &&
+    if (panel.left && ms->connection_state == MU_SLP_MM_IDLE && !mu_ranked_practice()) {
+        /* The room gave the set by a leave. A leave in game 1 has no score line below, so this
+         * is the only word of it on the CSS; it stays until START, like the score. */
+        if (panel.left == MU_YG_REASON_FORFEIT_WON) strcpy(score, "Opponent left: you win");
+        else strcpy(score, panel.left_status == MU_YG_RESULT_RECORDED ?
+                    "You left: counted as a loss" : "You left the set");
+    } else if (set->cur_game > 1 && set->max_games &&
         (ms->connection_state == MU_SLP_MM_IDLE || matched)) {
         /* By port in the set; the local player's count first, as on the setup screen. */
         const unsigned me = (ms->local_index & 3) == 1, need = (set->max_games + 1u) / 2u;
@@ -222,5 +242,5 @@ void mu_ranked_rank_frame(void)
         else
             sprintf(score, "Game %u - %u:%u", (unsigned) set->cur_game, mine, theirs);
     }
-    line(SET_SCORE, score);
+    score_line(score);
 }
