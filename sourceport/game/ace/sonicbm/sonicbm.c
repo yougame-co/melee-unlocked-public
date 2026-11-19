@@ -239,7 +239,8 @@ void ftSc_SpinFx_Spawn(HSD_GObj* gobj)
 {
     Fighter* fp = GET_FIGHTER(gobj);
     ftSc_FighterVars* fv = ftSc_FV(fp);
-    EF_Effect* effect = efSync_Spawn(FTSC_EFFECT_SPIN, gobj, gobj->hsd_obj);
+    EF_Effect* effect = efSync_Spawn(ftSc_Is201(fp) ? FTSC_EFFECT_SPIN_201 : FTSC_EFFECT_SPIN, gobj,
+                                      gobj->hsd_obj);
     HSD_DObj* dobj;
     HSD_TObjTev* tev = NULL;
 
@@ -255,7 +256,8 @@ void ftSc_SpinFx_Spawn(HSD_GObj* gobj)
         if (!logged) {
             logged = 1;
             OSReport("[ak] Sonic BM: spin effect %d not painted (effect %p, tev %p, shoe %p)\n",
-                     FTSC_EFFECT_SPIN, (void*) effect, (void*) tev, (void*) fv->shoe_tev);
+                     ftSc_Is201(fp) ? FTSC_EFFECT_SPIN_201 : FTSC_EFFECT_SPIN, (void*) effect,
+                     (void*) tev, (void*) fv->shoe_tev);
         }
         return;
     }
@@ -361,6 +363,7 @@ static void ftSc_Init_OnFrame(HSD_GObj* gobj)
     Fighter* fp = GET_FIGHTER(gobj);
     FtMotionId msid;
 
+    mu_ak_test_motion(fp);
     if (fp->cur_anim_frame >= 2.0f) {
         ftSc_Appeal_CheckInput(gobj);
         return;
@@ -618,7 +621,7 @@ float ftSc_Distance(float x1, float y1, float x2, float y2)
     return sqrtf((float) __builtin_fma((double) dy, (double) dy, (double) dx * (double) dx));
 }
 
-/* +01D4 (slot 3, move_logic): 31 rows, numbered from 341. Every word is the file's
+/* +01D4 (slot 3, move_logic): 31 rows (33 in 2.0.1), numbered from 341. Every word is the file's
  * (tables.txt). Rows 0, 1 and 10, 11 have no camera callback. The retail callbacks are named by
  * the address in the row. */
 const MotionState ftSc_Init_MotionStateTable[FTSC_MS_COUNT] = {
@@ -712,6 +715,12 @@ const MotionState ftSc_Init_MotionStateTable[FTSC_MS_COUNT] = {
     /* 371 side taunt right */
     { 321, 0x00000000, 0x01000000, ftSc_AppealS_Anim, ftCo_AppealS_IASA, ftCo_AppealS_Phys,
       ftCo_AppealS_Coll, ftCamera_UpdateCameraBox },
+    /* 372 (2.0.1) ground roll turning round: the ground roll's callbacks (+05B4 in 2.0.1) */
+    { 322, 0x00000000, 0x15000000, ftSc_SpecialLwRoll_Anim, ftSc_SpecialLwRoll_IASA,
+      ftSc_SpecialLwRoll_Phys, ftSc_SpecialLw_Coll, ftCamera_UpdateCameraBox },
+    /* 373 (2.0.1) air roll off his spring: the air roll's callbacks */
+    { 323, 0x00000000, 0x15000000, ftSc_SpecialAirLwRoll_Anim, ftSc_SpecialAirLwRoll_IASA,
+      ftSc_SpecialAirLwRoll_Phys, ftSc_SpecialAirLw_Coll, ftCamera_UpdateCameraBox },
 };
 
 /* The 14 slots PlSc.dat exports. Every other field is NULL: the registry takes MxDt's default,

@@ -1042,7 +1042,21 @@ static void text_think(HSD_GObj* gobj)
                              conn == MU_SLP_MM_OPPONENT_CONNECTING ? "Found:" : "");
     set_text(ST_PLAYING_OPP, conn == MU_SLP_MM_CONNECTION_SUCCESS ||
                            conn == MU_SLP_MM_OPPONENT_CONNECTING ? opp_name : "");
-    set_text(ST_PRESS_D, conn == MU_SLP_MM_CONNECTION_SUCCESS && !p2p && !mu_ranked_practice() ? "Use D-Pad to Chat" : "");
+    if (conn == MU_SLP_MM_CONNECTION_SUCCESS && !p2p && !mu_ranked_practice()) {
+        /* A keyboard has no D-pad: name its four chat keys (up, left, right, down) instead. */
+        char du[16], dl[16], dr[16], dd[16], chat[80];
+        if (ctrl_port != NULL && mu_host_button_label(*ctrl_port, HSD_PAD_DPADUP, du, sizeof du) &&
+            mu_host_button_label(*ctrl_port, HSD_PAD_DPADLEFT, dl, sizeof dl) &&
+            mu_host_button_label(*ctrl_port, HSD_PAD_DPADRIGHT, dr, sizeof dr) &&
+            mu_host_button_label(*ctrl_port, HSD_PAD_DPADDOWN, dd, sizeof dd)) {
+            snprintf(chat, sizeof chat, "Chat: %s %s %s %s", du, dl, dr, dd);
+            set_text(ST_PRESS_D, chat);
+        } else {
+            set_text(ST_PRESS_D, "Use D-Pad to Chat");
+        }
+    } else {
+        set_text(ST_PRESS_D, "");
+    }
     if (st_opp_picks >= 0) {
         char picks[160];
         if (conn == MU_SLP_MM_CONNECTION_SUCCESS) opponent_picks_line(m, picks, sizeof picks);

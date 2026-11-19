@@ -43,7 +43,7 @@ bool offered_here(const CatalogMod& m) {
   return true;
 }
 // Built in; a newer list at kCatalogUrl (our GitHub, metadata only) can update versions and pins
-// without a launcher update. The same text is published as mods-catalog.json.
+// without a launcher update. The same text is published as mods-catalog-2.json.
 std::vector<CatalogMod> default_catalog() {
   std::vector<CatalogMod> mods; std::string error;
   catalog_core::parse(R"catalog({
@@ -113,19 +113,19 @@ std::vector<CatalogMod> default_catalog() {
       "name": "ACE Build",
       "credits": "By Team ACE",
       "license": "Shared by its authors",
-      "page": "https://github.com/Chri222k/ACE-BUILD-PUBLIC-/releases/tag/v2.0.0",
+      "page": "https://github.com/Chri222k/ACE-BUILD-PUBLIC-/releases/tag/v2.0.1",
       "repo": "Chri222k/ACE-BUILD-PUBLIC-",
-      "tag": "v2.0.0",
-      "asset_pattern": "ACE.2.0.patcher.zip",
+      "tag": "v2.0.1",
+      "asset_pattern": "ACE.Builder.2.0.1.zip",
       "kind": "xdelta_zip",
       "one_click": true,
-      "version": "2.0.0",
-      "url": "https://github.com/Chri222k/ACE-BUILD-PUBLIC-/releases/download/v2.0.0/ACE.2.0.patcher.zip",
-      "sha256": "1ac7caa5c80b93dbcf6071b208045a3e855ad8938cea87918b84d5c9afd14f75",
+      "version": "2.0.1",
+      "url": "https://github.com/Chri222k/ACE-BUILD-PUBLIC-/releases/download/v2.0.1/ACE.Builder.2.0.1.zip",
+      "sha256": "1560d157334ea7cd1e2ef4ed7720f3f8aba846f245482e05a6d1d21d744b18cf",
       "policy": "permission_granted",
       "tool_sha256": "d81f59b2fe5e8589c0ee9782e231c805084f4d23dfade413903a4cad63b4e342",
-      "patch_sha256": "a451bf67acd1333836847acead02191fa2122a254b6295e949620c49e3b8b984",
-      "output_sha256": "0d7ba36bef3505cdf6c0209d9ae34977e23cf6cae4d24366e8d405810f798993",
+      "patch_sha256": "8e7bdefa178462f0630982754ce9b35e1bc95f4ac88bc7cface84726f6bb206d",
+      "output_sha256": "34e3c3db4eceb4a4adbdfb904b88ec4a0b5717b5b732de465b9faf48d6a74f4e",
       "note": "Runs on the Static Recomp."
     },
     {
@@ -259,7 +259,7 @@ std::vector<CatalogMod> default_catalog() {
   return mods;
 }
 constexpr const wchar_t* kCatalogHost = L"raw.githubusercontent.com";
-constexpr const wchar_t* kCatalogPath = L"/Hero88go/melee-unlocked/main/mods-catalog.json";
+constexpr const wchar_t* kCatalogPath = L"/Hero88go/melee-unlocked/main/mods-catalog-2.json";   // -2: ACE 2.0.1, which builds before 0.9.217 cannot play; they keep reading mods-catalog.json
 constexpr const char* kVanillaMd5 = "0e63d4223b01d9aba596259dc155a174";
 // Tools shipped beside the launcher (tools\). xdelta3 3.0.11 (GPL) is byte-identical to the one the
 // mods ship; 7zr.exe is the official 7-Zip standalone (LGPL) for .7z downloads, which Windows' tar

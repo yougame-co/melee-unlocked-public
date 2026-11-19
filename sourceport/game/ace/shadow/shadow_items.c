@@ -1,5 +1,9 @@
 /* PlSh.dat article 0, offsets +0000..+04BC. The spring is registered by load but none of
- * this fighter's code creates it. Its callbacks are nevertheless translated in full. */
+ * this fighter's code creates it. Its callbacks are nevertheless translated in full.
+ *
+ * ACE 2.0.1's PlSh.dat has no itFunction block and no spring entry in ftData+0x48. Its load
+ * still hands entry 0 of that list (now the full charge overlay) to the item code as article 0,
+ * and nothing in its code creates an item, so this table is never reached on that disc. */
 #include "shadow.h"
 
 #include <melee/ft/ft_0881.h>

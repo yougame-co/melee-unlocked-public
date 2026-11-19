@@ -3,6 +3,8 @@
 // room never breaks its own rules.
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "arena_rules.h"
+#include "slippi_stage_pool.h"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -565,6 +567,36 @@ TEST(random_operations_keep_the_room_valid) {
       }
     }
   }
+}
+
+// A room that goes from singles to doubles keeps drawing from the same random stage bag: doubles
+// must never draw Fountain of Dreams, whether the bag is fresh or a singles game left it half drawn.
+TEST(doubles_never_draws_fountain) {
+  namespace sp = slippi::stage_pool;
+  const std::vector<uint16_t> six = {0x2, 0x3, 0x8, 0x1C, 0x1F, 0x20};
+  std::vector<uint16_t> bag = {0x2, 0x1F};            // what a singles game left
+  sp::prepare(bag, six, true);
+  CHECK(bag == std::vector<uint16_t>{0x1F});
+  bag = {0x2};                                        // only Fountain left: refilled without it
+  sp::prepare(bag, six, true);
+  CHECK(bag.size() == 5);
+  CHECK(std::find(bag.begin(), bag.end(), sp::kFountain) == bag.end());
+  bag.clear();
+  sp::prepare(bag, six, false);                       // singles keeps all six
+  CHECK(bag == six);
+  bag = {0x2};
+  sp::prepare(bag, six, false);
+  CHECK(bag == std::vector<uint16_t>{0x2});
+  bag.clear();
+  sp::prepare(bag, {0x2}, true);                      // a list with nothing else is used as it is
+  CHECK(bag == std::vector<uint16_t>{0x2});
+  bool fountain = false, all_singles = false;
+  for (uint32_t n = 0; n < 60; ++n) {
+    if (sp::agreed_stage(n, true) == sp::kFountain) fountain = true;
+    if (sp::agreed_stage(n, false) == sp::kFountain) all_singles = true;
+  }
+  CHECK(!fountain);
+  CHECK(all_singles);
 }
 
 int main() {

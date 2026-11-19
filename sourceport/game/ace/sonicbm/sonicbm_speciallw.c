@@ -76,7 +76,9 @@ void ftSc_SpecialLw_Anim(HSD_GObj* gobj)
     }
     Fighter_ChangeMotionState(gobj, ftSc_MS_SpecialLwCharge, Ft_MF_None, 0.0f, 1.0f, 0.0f,
                               NULL);
-    ft_800881D8(fp, FTSC_SFX_CHARGE, 0x7F, 0x43);
+    if (!ftSc_Is201(fp)) {
+        ft_800881D8(fp, FTSC_SFX_CHARGE, 0x7F, 0x43);
+    }
 }
 
 /* +381C: off the floor in 349, 354, 355 or 358. Into the air; a ground roll still at 0.5 or more
@@ -132,7 +134,9 @@ void ftSc_SpecialAirLw_Anim(HSD_GObj* gobj)
     }
     Fighter_ChangeMotionState(gobj, ftSc_MS_SpecialAirLwCharge, Ft_MF_None, 0.0f, 1.0f, 0.0f,
                               NULL);
-    ft_800881D8(fp, FTSC_SFX_CHARGE, 0x7F, 0x43);
+    if (!ftSc_Is201(fp)) {
+        ft_800881D8(fp, FTSC_SFX_CHARGE, 0x7F, 0x43);
+    }
 }
 
 /* +158C: states 350 and 356, physics: his gravity and his air friction. */
@@ -210,15 +214,19 @@ void ftSc_SpecialLwCharge_Anim(HSD_GObj* gobj)
         }
         Fighter_ChangeMotionState(gobj, ftSc_MS_SpecialLwCharge, Ft_MF_None, 0.0f, 1.0f, 0.0f,
                                   NULL);
-        ft_800881D8(fp, FTSC_SFX_CHARGE, 0x7F, 0x43);
+        if (!ftSc_Is201(fp)) {
+            ft_800881D8(fp, FTSC_SFX_CHARGE, 0x7F, 0x43);
+        }
     }
     if ((fp->input.held_buttons[0] & FTSC_PAD_STICK_DOWN) == 0) {
         /* +17BC */
         Fighter_ChangeMotionState(gobj, ftSc_MS_SpecialLwRoll, Ft_MF_None, 0.0f, 1.0f, 0.0f,
                                   NULL);
-        ft_800881D8(fp, FTSC_SFX_ROLL, 0x7F, 0x43);
+        if (!ftSc_Is201(fp)) {
+            ft_800881D8(fp, FTSC_SFX_ROLL, 0x7F, 0x43);
+        }
         ftSc_MV(fp)->flag = 0;
-        ftSc_MV(fp)->count = 60;
+        ftSc_MV(fp)->count = ftSc_RollFrames(fp);
         fp->self_vel.x = ftSc_SpecialLw_RollSpeed(fp);
     }
     if (ftAnim_IsFramesRemaining(gobj)) {
@@ -294,8 +302,14 @@ void ftSc_SpecialLwRoll_Anim(HSD_GObj* gobj)
             s32 count;
             ftCommon_UpdateFacing(fp);
             count = mv->count;
-            Fighter_ChangeMotionState(gobj, ftSc_MS_SpecialLwRoll, Ft_MF_SkipHit, 0.0f, 1.0f,
-                                      0.0f, NULL);
+            if (ftSc_Is201(fp)) {
+                /* 2.0.1 +1AEC: the turn state, its hit reset */
+                Fighter_ChangeMotionState(gobj, ftSc_MS_SpecialLwTurn, Ft_MF_None, 0.0f, 1.0f,
+                                          0.0f, NULL);
+            } else {
+                Fighter_ChangeMotionState(gobj, ftSc_MS_SpecialLwRoll, Ft_MF_SkipHit, 0.0f, 1.0f,
+                                          0.0f, NULL);
+            }
             mv->flag = 1;
             mv->count = count;
             if (fp->input.held_buttons[0] & ftSc_PAD_LRZ) {
@@ -427,6 +441,12 @@ reached:
     }
     fp->self_vel.x = target;
     mv->flag = 0;
+    if (ftSc_Is201(fp)) {
+        /* 2.0.1 +1D80: the turn done, back to the ground roll keeping its hit */
+        Fighter_ChangeMotionState(gobj, ftSc_MS_SpecialLwRoll, Ft_MF_SkipHit, 0.0f, 1.0f, 0.0f,
+                                  NULL);
+        return;
+    }
     ft_800881D8(fp, FTSC_SFX_ROLL, 0x7F, 0x43);
     return;
 
@@ -483,7 +503,14 @@ void ftSc_SpecialAirLwRoll_IASA(HSD_GObj* gobj)
 {
     Fighter* fp = GET_FIGHTER(gobj);
 
-    if (fp->input.pressed_buttons & HSD_PAD_XY) {
+    if (ftSc_Is201(fp)) {
+        /* 2.0.1 +1F68: from frame 10 on, a jump input takes the retail double jump */
+        if (!(fp->cur_anim_frame < 10.0f) && fp->cur_anim_frame == fp->cur_anim_frame &&
+            ftCo_Jump_GetInput(gobj) != JumpInput_None)
+        {
+            ftCo_800CB870(gobj);
+        }
+    } else if (fp->input.pressed_buttons & HSD_PAD_XY) {
         ftCo_800CB870(gobj);
     }
     if (fp->input.pressed_buttons & HSD_PAD_A) {

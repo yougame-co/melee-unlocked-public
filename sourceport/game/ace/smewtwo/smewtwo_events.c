@@ -169,9 +169,10 @@ void ftSm_ResetTransform(HSD_GObj* gobj)
     ftLib_SetScale(gobj,1);
     /* +20DC passes the GObj retained in r31 to the Fighter-only sound API.
      * A native cast would read and write beyond that smaller host object.
-     * Keep the invalid site visible until its reference behavior is judged. */
+     * Keep the invalid site visible until its reference behavior is judged. ACE 2.0.1 (its PlSm.dat
+     * is 288181 bytes) removed the call. */
     static bool logged;
-    if(!logged) {
+    if(!logged && mu_ak_file_size(fp->kind)!=288181) {
         logged=true;
         OSReport("[sm] invalid GObj sound call at PlSm +20E8 skipped\n");
     }

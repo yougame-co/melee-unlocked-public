@@ -84,11 +84,14 @@ enum ftSc_MotionState {
     ftSc_MS_SpecialAirSRelease,  /* 0x171: air spin dash let go after the charge was started */
     ftSc_MS_AppealSL,            /* 0x172: side taunt, facing left */
     ftSc_MS_AppealSR,            /* 0x173: side taunt, facing right */
+    ftSc_MS_SpecialLwTurn,       /* 0x174: (2.0.1) ground roll turning round */
+    ftSc_MS_SpecialAirLwSpring,  /* 0x175: (2.0.1) air roll off his spring */
     ftSc_MS_End
 };
 
+/* 2.0.0's PlSc.dat has 31 rows; 2.0.1's adds 372 and 373 (only its code enters them). */
 #define FTSC_MS_COUNT (ftSc_MS_End - ftSc_MS_Empty0)
-_Static_assert(FTSC_MS_COUNT == 31, "31 rows in PlSc.dat's move_logic");
+_Static_assert(FTSC_MS_COUNT == 33, "33 rows in 2.0.1 PlSc.dat's move_logic");
 _Static_assert(ftSc_MS_Empty0 == ftCo_MS_Count, "m-ex numbers a fighter's rows from 341");
 
 /* ---- Special attributes (ftData->ext_attr). The file does not copy them: [onload] points
@@ -191,6 +194,21 @@ typedef struct itSc_OwnerVars {
 /* m-ex ids of his own files (EfScData.dat, effect file 43, which his MxDt entry names; sound
  * bank 85, bmsonic.ssm). */
 #define FTSC_EFFECT_SPIN 5007 /* +3ADC: the spin ball, on his root joint */
+#define FTSC_EFFECT_SPIN_201 5011 /* 2.0.1's spin ball (0x1393) */
+
+/* ACE 2.0.1's PlSc.dat (374139 bytes; 2.0.0's is 554719). Its down special changes: no sounds
+ * from code (the charge, roll and spring sounds left the file's code), 100 roll frames instead of
+ * 60, a turn state (372) and a spring air roll state (373), the air roll's jump only from frame
+ * 10 on, and the spin ball is effect 5011. */
+#define FTSC_FILE_SIZE_201 374139u
+static inline int ftSc_Is201(Fighter* fp)
+{
+    return mu_ak_file_size(fp->kind) == FTSC_FILE_SIZE_201;
+}
+static inline s32 ftSc_RollFrames(Fighter* fp)
+{
+    return ftSc_Is201(fp) ? 100 : 60;
+}
 #define FTSC_SFX_CHARGE 5004  /* 0x138C: a charge step of the down special */
 #define FTSC_SFX_SPRING 5007  /* 0x138F: the spring */
 #define FTSC_SFX_ROLL 5010    /* 0x1392: the roll */

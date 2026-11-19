@@ -6,6 +6,7 @@
 #include "slippi_agent_lock.h"
 #include "test_env.h"
 #include "slippi_online.h"
+#include "slippi_stage_pool.h"
 #include "gecko_session.h"
 #include "yougame_net_test.h"
 #include "yougame_link.h"
@@ -430,7 +431,9 @@ uint16_t random_stage(int mode) {
   if (rules != g_stage_pool_uses_rules) g_stage_pool.clear();
   g_stage_pool_uses_rules = rules;
   const auto& stages = allowed_stages(mode);
-  if (g_stage_pool.empty()) g_stage_pool.insert(g_stage_pool.end(), stages.begin(), stages.end());
+  // Doubles: no Fountain of Dreams, also not one a singles game left in the bag (an arena room
+  // goes from singles to doubles with the bag half drawn).
+  stage_pool::prepare(g_stage_pool, stages, mode == Matchmaking::TEAMS && !rules);
   int i = (int)(g_rng() % g_stage_pool.size());
   uint16_t s = g_stage_pool[i];
   g_stage_pool.erase(g_stage_pool.begin() + i);
@@ -1848,9 +1851,8 @@ void prepare_online_match_state(std::vector<uint8_t>& q) {
     // load found no music for it and stopped at ground.c). Both games then take the same legal stage, chosen by the
     // rng offset both sides already agree on, instead of starting a match on nothing.
     if (stage_id == 0) {
-      static const uint16_t kLegal[] = {2, 3, 8, 28, 31, 32};   // FoD, Stadium, Yoshi's, Dream Land, Battlefield, FD
       const uint32_t agreed = decider ? lps.rng_offset : rps[0].rng_offset;
-      stage_id = kLegal[agreed % 6];
+      stage_id = stage_pool::agreed_stage(agreed, remote_count > 1);
       host::log("slippi: the selections named no stage (0); both games take stage %u", (unsigned)stage_id);
     }
     if (Matchmaking::IsFixedRulesMode(g_last_search.mode)) {

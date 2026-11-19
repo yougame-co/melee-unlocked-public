@@ -262,5 +262,17 @@ void ftCn_Empty(HSD_GObj* gobj);
 /* +325C */ void itCn_Shot_Spawn(HSD_GObj* owner_gobj, Vec3* pos, ItemKind kind,
                                  float facing_dir);
 extern ItemLogicTable* const itCn_ArticleTables[ftCn_Article_Count];
+/* Article 2's table (the neutral special's shot). */
+extern ItemLogicTable itCn_Shot_Logic;
+/* The shot's callbacks that ACE 2.0.1's Sub-Zero carries instruction for instruction in his
+ * second article (ace/subzero). */
+/* item 2 +0088 */ void itCn_Shot_Nothing(Item_GObj* gobj);
+/* item 2 +00A8 */ bool itCn_Shot_DmgDealt(Item_GObj* gobj);
+/* item 2 +00B0 */ bool itCn_Shot_DmgReceived(Item_GObj* gobj);
+/* item 2 +00F4 */ bool itCn_Shot_Clanked(Item_GObj* gobj);
+/* item 2 +0120 */ bool itCn_Shot_HitShield(Item_GObj* gobj);
+/* item 2 +0128 */ bool itCn_Shot_Anim(Item_GObj* gobj);
+/* item 2 +015C */ void itCn_Shot_Phys(Item_GObj* gobj);
+/* item 2 +0164 */ bool itCn_Shot_Coll(Item_GObj* gobj);
 
 #endif

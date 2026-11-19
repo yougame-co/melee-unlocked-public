@@ -70,6 +70,14 @@ class RankedFixWiringTest(unittest.TestCase):
         self.assertIn('pass = m["ticket"].get<std::string>();', block)
         self.assertLess(block.index('pass = m["ticket"]'), block.index("now_ms() - pass_at > 240000"))
 
+    def test_reopen_renews_an_old_ticket_first(self):
+        # A dropped queue or room socket past 4 minutes renews before it reopens, so no 401 comes first.
+        link = (ROOT / "port/runtime/hle/yougame_link.cpp").read_text(encoding="utf-8")
+        for opener in ("queue.open_session(url, pass, \"\", &error, (int)std::min", "room->socket->open_session(url, pass, room_code"):
+            at = link.index(opener)
+            before = link[link.rindex("const uint64_t until = now_ms() + 15000;", 0, at):at]
+            self.assertIn("if (now_ms() - pass_at > 240000) renew_ticket(until);", before)
+
 
     def test_own_udp_never_binds_a_listener_windows_asks_about(self):
         # An explicit all-interfaces bind() made Windows Firewall ask over the first match: the punch socket

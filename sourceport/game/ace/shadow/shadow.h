@@ -24,7 +24,20 @@
  * Offsets in the comments (+0B1C) are offsets into the ftFunction block, "it0 +5C" into the
  * itFunction block of article 0, as in run-source/rel09-ace-native/shadow/listing.txt. The
  * ftFunction block has no symbols: those names are this port's. "fp+" is a console offset of the
- * Fighter. FUNCTIONS.md in that folder lists every function of both blocks. */
+ * Fighter. FUNCTIONS.md in that folder lists every function of both blocks.
+ *
+ * ACE 2.0.1's PlSh.dat (347184 bytes; 2.0.0's is 381611) is the same source built again: its
+ * ftFunction block is 0x64C0 bytes with the same 25 exports and the same 36 state rows, and it
+ * has no itFunction block. "2.0.1 +XXXX" names an offset of that block. What its code does
+ * differently (every other routine does what 2.0.0's does, at a new offset):
+ *   load        fp+222C is not cleared; a match fighter gets a proc for the mouth and the worn
+ *               items (2.0.1 +0E44, priority 15), a result screen fighter one for the win voice
+ *               (2.0.1 +0F20, priority 9); both get m-ex's CPU helper (2.0.1 +0FC8, priority 2)
+ *   destroy     slot 2 is `blr` (2.0.1 +01DC): the spring left the file
+ *   state change the full charge overlay is entry 0 of ftData+0x48, not entry 1 (the list lost
+ *               the spring's entry)
+ *   debug draw  the circles' GX setup has no GXSetChanCtrl call (2.0.1 +5B14)
+ * The attributes differ in one value (+084, 2.08 to 2.03), read from the disc either way. */
 #ifndef MU_ACE_SHADOW_H
 #define MU_ACE_SHADOW_H
 
@@ -284,6 +297,18 @@ typedef DISC_PTR(void) ftSh_DiscSlot;
 #define FTSH_MF_SWAP_A ((MotionFlags) 0x0C4C508A)
 #define FTSH_MF_SWAP_B ((MotionFlags) 0x0C4C5080)
 
+/* ACE 2.0.1's PlSh.dat, told apart by the size of the file on the disc in use. */
+#define FTSH_FILE_SIZE_201 347184u
+static inline int ftSh_Is201(Fighter* fp)
+{
+    return mu_ak_file_size(fp->kind) == FTSH_FILE_SIZE_201;
+}
+
+/* 2.0.1 +1064: the kind m-ex's CPU helper poses as for the game's CPU step, the only value the
+ * word ever holds (stored by the load at 2.0.1 +015C). Read as a retail fighter kind, as the
+ * Sonic BM port reads the same value of its file. */
+#define FTSH_CPU_SPOOF_KIND Ft_Kind_CrezyH
+
 /* m-ex ids of his own files (EfShData.dat, index 54, which his MxDt entry names; bank 95). */
 enum {
     ftSh_Ef_Spin = 5000,       /* 0x1388: the spin ball on TransN */
@@ -301,7 +326,8 @@ enum {
 };
 
 /* ---- Articles: MxDt's item lookup has 351, 352, 353; [onload] registers only article 0 (the
- * file's ftData+0x48 list entry 0, the only one with code). ---- */
+ * file's ftData+0x48 list entry 0, the only one with code). On 2.0.1 the list's entry 0 is the
+ * full charge overlay (the spring's entry is gone) and the load hands it over the same way. ---- */
 enum {
     ftSh_Article_Spring = 0,
     ftSh_Article_Count = 1,

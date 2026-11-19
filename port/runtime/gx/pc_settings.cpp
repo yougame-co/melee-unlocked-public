@@ -5814,6 +5814,10 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         reset_settings_home("open at startup");
     }
   }
+  if (static bool esc_hook = false; !esc_hook) {   // screenshot hook: MELEE_TEST_ESC_MENU opens the Esc menu
+    esc_hook = true;
+    if (host::test_env::getenv("MELEE_TEST_ESC_MENU")) { state.menu_open = true; state.menu_quit = false; }
+  }
   if (g_guest_options_open_request.exchange(false, std::memory_order_acq_rel)) {
     state.open = true;
     state.practice_open = false;
@@ -11728,7 +11732,8 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   // Its background is near-opaque: the game showing through hurt reading it.
   if (state.menu_open && !state.open) {
     const ImVec2 screen = ImGui::GetIO().DisplaySize;
-    const float k = std::max(1.0f, std::min({screen.y / 720.0f, (screen.x - 24.0f) / 760.0f, 1.5f}));
+    // Upstream 0.9.217: the bar shrinks in a small window too (down to 0.6), as it grows in a big one.
+    const float k = std::max(0.6f, std::min({screen.y / 720.0f, (screen.x - 24.0f) / 760.0f, 1.5f}));
     // Whole pixels, as ImGui sizes the window: the background then fills it exactly.
     const float width = std::floor(std::min(760.0f * k, screen.x - 24.0f));
     const float height = std::floor(172.0f * k);
@@ -11738,6 +11743,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     ImGui::Begin("##esc_menu", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                                          ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings |
                                          ImGuiWindowFlags_NoBackground);
+    ImGui::SetWindowFontScale(k);
     const ImVec2 p = ImGui::GetWindowPos();
     ImDrawList* draw = ImGui::GetWindowDrawList();
     // Whole pixel sizes, so a window resize bakes few font sizes. Labels and the title use the

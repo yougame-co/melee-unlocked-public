@@ -61,7 +61,7 @@ typedef struct MuGrStage {
 
 /* The m-ex stage item kinds. */
 #define MU_GR_ITEM_FIRST 237
-#define MU_GR_ITEM_LAST 252
+#define MU_GR_ITEM_LAST 253 /* 253: ACE 2.0.1 (The Pit II); a fighter article on 2.0.0, where no stage row names it */
 
 /* Stage item data (shim/mu_mex_stage.c): it_8026B40C stores the articles of kinds past retail
  * here; Item_80267978 takes an article and logic table for them from mu_gr_stage_item. */

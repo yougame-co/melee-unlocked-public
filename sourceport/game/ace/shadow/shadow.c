@@ -7,8 +7,9 @@
  * default only (slot 3, Sandbag's table, which the export replaces): every other field below is
  * NULL because the slot is empty on the disc too (run-source/rel09-ace-native/shadow/mxdt.txt).
  *
- * The file carries no m-ex CPU helper (no MexCPU code, no spoof word: nothing in the block
- * installs a proc or writes fp->kind), so a CPU Shadow plays the game's generic CPU code. */
+ * 2.0.0's file carries no m-ex CPU helper (no MexCPU code, no spoof word: nothing in the block
+ * installs a proc or writes fp->kind), so a CPU Shadow plays the game's generic CPU code.
+ * 2.0.1's file carries it and two more procs (shadow.h lists what 2.0.1 changes). */
 #include "shadow.h"
 
 #include <dolphin/gx.h>
@@ -23,25 +24,32 @@
 #include <melee/ef/types.h>
 #include <melee/ft/fighter.h>
 #include <melee/ft/ft_084E.h>
+#include <melee/ft/ft_0881.h>
 #include <melee/ft/ftanim.h>
 #include <melee/ft/ftcamera.h>
 #include <melee/ft/ftcommon.h>
+#include <melee/ft/ftdata.h>
 #include <melee/ft/ftdrawcommon.h>
 #include <melee/ft/ftparts.h>
 #include <melee/ft/inlines.h>
+#include <melee/ft/kinds/ftCommon/ftCo_0A01.h>
 #include <melee/ft/kinds/ftCommon/ftCo_JumpAerial.h>
 #include <melee/ft/types.h>
+#include <melee/gm/gmresultplayer.static.h>
+#include <melee/it/inlines.h>
 #include <melee/it/it_26B1.h>
 #include <melee/it/item.h>
 #include <melee/lb/lb_00B0.h>
 #include <melee/lb/lb_013B.h>
 #include <melee/lb/types.h>
+#include <melee/pl/player.h>
 #include <sysdolphin/baselib/aobj.h>
 #include <sysdolphin/baselib/archive.h>
 #include <sysdolphin/baselib/cobj.h>
 #include <sysdolphin/baselib/dobj.h>
 #include <sysdolphin/baselib/gobj.h>
 #include <sysdolphin/baselib/gobjgxlink.h>
+#include <sysdolphin/baselib/gobjproc.h>
 #include <sysdolphin/baselib/jobj.h>
 #include <sysdolphin/baselib/mobj.h>
 #include <sysdolphin/baselib/object.h>
@@ -73,6 +81,123 @@ void ftSh_SpecialS_OnHit(HSD_GObj* gobj)
 /* +596C: `blr`, the spin dash's deal_dmg_cb (the hit does nothing). */
 void ftSh_Nothing(HSD_GObj* gobj) {}
 
+/* ---- the procs ACE 2.0.1's load installs ---------------------------------------------------- */
+
+/* CPU players. 2.0.1's file carries m-ex's "MexCPU" helper without symbols. Its custom data
+ * pointer (2.0.1 +0F1C) is a word of the file that is 0 and that nothing writes (every reference
+ * is a read: 2.0.1 +00E8, +0130, +1018, +4260, +5C4C, +5CB8), so the custom proc (2.0.1 +4208)
+ * is never installed and the custom branch of the step (2.0.1 +5C58 to +5CCC) is never taken:
+ * neither is carried over. The spoof word (2.0.1 +1064) only ever holds 0x1C. */
+_Static_assert(FTSH_CPU_SPOOF_KIND == 0x1C, "the kind PlSh.dat stores at 2.0.1 +1064");
+
+/* 2.0.1 +43C0 (proc, priority 2): Fighter_procCpu with fp->kind swapped for the step. The step
+ * at 2.0.1 +5C24 is ftCo_800B33B0, ftCo_800B2AFC, ftCo_800B2790, ftCo_800B3E04 and the counter
+ * at fp+1B04, which is mu_ak_cpu_process with no custom code. */
+static void ftSh_Cpu_ProcSpoof(HSD_GObj* gobj)
+{
+    Fighter* fp = GET_FIGHTER(gobj);
+    FighterKind saved;
+
+    if (fp->is_sleeping || !ftCo_IsCpuControlled(fp)) {
+        return;
+    }
+    saved = fp->kind;
+    fp->kind = FTSH_CPU_SPOOF_KIND;
+    mu_ak_cpu_process(gobj, NULL);
+    fp->kind = saved;
+}
+
+/* 2.0.1 +0FC8 (proc, priority 2): swap the fighter's Fighter_procCpu proc (0x8006ABA0) for the
+ * posing one. It stays installed and finds nothing to swap on later frames, as on the console. */
+static void ftSh_Cpu_InitProc(HSD_GObj* gobj)
+{
+    HSD_GObjProc* proc;
+
+    for (proc = gobj->proc; proc != NULL; proc = proc->child) {
+        if (proc->on_invoke == Fighter_procCpu) {
+            HSD_GObjProc_RemoveProc(proc);
+            /* 2.0.1 +1018: the custom data word is 0, so +43C0 (never +4208) */
+            HSD_GObj_SetupProc(gobj, ftSh_Cpu_ProcSpoof, 2);
+            return;
+        }
+    }
+}
+
+/* 2.0.1 +4114: true when some other present player placed below `slot` and is the fighter named
+ * `name` ("Sonic", the string at 2.0.1 +410C). The byte compared is the result screen's
+ * per-player byte at 0x8046E431 + i * 0xA8, match_end.player_standings[i] + 5; the name is m-ex's
+ * name table entry of the player's character (m-ex service at 0x803D7094 with 0xC), here
+ * mu_ak_fighter_name. The same test as the Metal Sonic port's, written again here (its copy is
+ * static). */
+static bool ftSh_DidHeLose(int slot, const char* name)
+{
+    u8 my_rank = lbl_8046E3AC.match_end.player_standings[slot].is_big_loser;
+    int i;
+
+    for (i = 0; i < 6; i++) {
+        const char* other;
+
+        if (i == slot) {
+            continue;
+        }
+        if (Player_GetPlayerSlotType(i) == Gm_PKind_NA) {
+            continue;
+        }
+        if (my_rank >= lbl_8046E3AC.match_end.player_standings[i].is_big_loser) {
+            continue;
+        }
+        other = mu_ak_fighter_name(Player_GetPlayerCharacter(i));
+        /* The console's strcmp reads the table entry without a check. */
+        if (other != NULL && strcmp(name, other) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* 2.0.1 +0F20 (proc, priority 9, result screen and demo fighters only): in demo motions 0, 2
+ * and 5 (the mask 0x25), a voice id the pose's script put in cmd_vars[0] is played, or the
+ * alternate in cmd_vars[1] when a Sonic placed below him; then cmd_vars[0] is cleared. */
+static void ftSh_CheckWinAudio(HSD_GObj* gobj)
+{
+    Fighter* fp = GET_FIGHTER(gobj);
+    u32 msid = (u32) fp->motion_id;
+
+    if (msid > 5) {
+        return;
+    }
+    if (((0x25u >> msid) & 1) == 0) {
+        return;
+    }
+    if (fp->cmd_vars[0] == 0) {
+        return;
+    }
+    if (ftSh_DidHeLose(fp->player_idx, "Sonic")) {
+        ft_800881D8(fp, fp->cmd_vars[1], 0x7F, 0x40);
+    } else {
+        ft_800881D8(fp, fp->cmd_vars[0], 0x7F, 0x40);
+    }
+    fp->cmd_vars[0] = 0;
+}
+
+static void ftSh_Mouth(Fighter* fp);
+
+/* 2.0.1 +0E44 (proc, priority 15, match fighters only): the worn items in fp+197C and fp+1980
+ * get the lowest bit of their byte item+DAA set when model group 0 is on model 0 and cleared
+ * when it is not, then the mouth as slot 26 sets it (the same instructions as 2.0.1 +0D08). */
+static void ftSh_ProcessMouth(HSD_GObj* gobj)
+{
+    Fighter* fp = GET_FIGHTER(gobj);
+
+    if (fp->x197C != NULL) {
+        GET_ITEM(fp->x197C)->xDAA_flag.b7 = fp->x5F4_arr[0].idx == 0;
+    }
+    if (fp->x1980 != NULL) {
+        GET_ITEM(fp->x1980)->xDAA_flag.b7 = fp->x5F4_arr[0].idx == 0;
+    }
+    ftSh_Mouth(fp);
+}
+
 /* ---- load, death, destroy, attributes ------------------------------------------------------ */
 
 static void ftSh_GXLink(HSD_GObj* gobj, intptr_t pass);
@@ -86,6 +211,16 @@ static void ftSh_GXLink(HSD_GObj* gobj, intptr_t pass);
  *   four fighter variables cleared (222C, 2234, 2230, 2248);
  *   "PlySonicColor" of the costume's file (MEX_GetData(8)[kind] runtime [costume] +0x14, the
  *     archive) into fp+2234 when the costume has an archive.
+ *
+ * ACE 2.0.1 (2.0.1 +0000) does the same with three differences:
+ *   fp+222C is not cleared (three variables: 2234, 2230, 2248);
+ *   after the color, a result screen or demo fighter (fp->x1C is ftData_803C52A0) gets the voice
+ *     proc 2.0.1 +0F20 at priority 9 and cmd_vars[0], [1] cleared; any other fighter gets the
+ *     mouth proc 2.0.1 +0E44 at priority 15;
+ *   then, with the custom CPU word 2.0.1 +0F1C zero (always), the spoof word 2.0.1 +1064 = 0x1C
+ *     and the proc 2.0.1 +0FC8 at priority 2.
+ * Its article call is the same (entry 0 of the list, index 0), but entry 0 is now the full
+ * charge overlay: the spring's entry left the list with the itFunction block.
  *
  * One native difference, not in the file: the wall jump bit from MxDt's byte for internal 56 (1),
  * as the Toad, Metal Mario and Sonic BM ports do (on the console m-ex code reads the byte). */
@@ -105,7 +240,9 @@ static void ftSh_Init_OnLoad(HSD_GObj* gobj)
     HSD_GObjGXLink_8039084C(gobj);
     GObj_SetupGXLink(gobj, ftSh_GXLink, 5, 0);
 
-    fv->spring_gobj = NULL;
+    if (!ftSh_Is201(fp)) {
+        fv->spring_gobj = NULL;
+    }
     fv->color = NULL;
     fv->specials_charge = 0;
     fv->run_shoes_spawned = 0;
@@ -113,6 +250,20 @@ static void ftSh_Init_OnLoad(HSD_GObj* gobj)
     archive = mu_ak_costume_archive(fp->kind, fp->costume_id);
     if (archive != NULL) {
         fv->color = (ftSh_ColorData*) HSD_ArchiveGetPublicAddress(archive, "PlySonicColor");
+    }
+
+    if (ftSh_Is201(fp)) {
+        /* 2.0.1 +00BC */
+        if (fp->x1C_actionStateList != ftData_803C52A0) {
+            HSD_GObj_SetupProc(gobj, ftSh_ProcessMouth, 15);
+        } else {
+            HSD_GObj_SetupProc(gobj, ftSh_CheckWinAudio, 9);
+            fp->cmd_vars[0] = 0;
+            fp->cmd_vars[1] = 0;
+        }
+        /* 2.0.1 +00E4 and +012C: *(+0F1C) == 0, always: +013C stores 0x1C at +1064 and
+         * installs the proc. */
+        HSD_GObj_SetupProc(gobj, ftSh_Cpu_InitProc, 2);
     }
 
     if (mu_mex_fighter_walljump(mu_ak_mex_internal(fp->kind)) > 0) {
@@ -145,12 +296,16 @@ static void ftSh_Init_OnDeath(HSD_GObj* gobj)
 }
 
 /* +0144 (slot 2, onunknown = OnDestroy): the item in fp+222C destroyed and forgotten. Nothing in
- * PlSh.dat ever writes that word (the spring is never spawned by his code), so it stays NULL. */
+ * PlSh.dat ever writes that word (the spring is never spawned by his code), so it stays NULL.
+ * On ACE 2.0.1 the slot is `blr` (2.0.1 +01DC). */
 static void ftSh_Init_OnDestroy(HSD_GObj* gobj)
 {
     Fighter* fp = GET_FIGHTER(gobj);
     ftSh_FighterVars* fv = ftSh_FV(fp);
 
+    if (ftSh_Is201(fp)) {
+        return;
+    }
     if (fv->spring_gobj != NULL) {
         Item_8026A8EC(fv->spring_gobj);
         fv->spring_gobj = NULL;
@@ -295,7 +450,8 @@ static void ftSh_Init_OnFrame(HSD_GObj* gobj)
 }
 
 /* +0C7C (slot 24, onactionstatechange): a stored full spin dash charge keeps its color overlay
- * (article list entry 1 of ftData+0x48, as the Akaneia Sonic's). */
+ * (article list entry 1 of ftData+0x48, as the Akaneia Sonic's). On ACE 2.0.1 (2.0.1 +0CBC) the
+ * overlay is entry 0: the list has no spring entry before it. */
 static void ftSh_Init_OnActionStateChange(HSD_GObj* gobj)
 {
     Fighter* fp = GET_FIGHTER(gobj);
@@ -305,19 +461,14 @@ static void ftSh_Init_OnActionStateChange(HSD_GObj* gobj)
     }
     {
         ftSh_DiscSlot* items = (ftSh_DiscSlot*) DISC_GET(void, fp->ft_data->x48_items);
-        lb_800144C8(&fp->x488, (struct Fighter_804D653C_t*) DP(items[1]), 0, 0);
+        lb_800144C8(&fp->x488, (struct Fighter_804D653C_t*) DP(items[ftSh_Is201(fp) ? 0 : 1]), 0,
+                    0);
     }
 }
 
-/* +0CC8 (slot 26, onmodelrender, called with the model matrix): the mouth is one of the model
- * groups 2 and 3, shown on the side that faces the camera; group 0 on model 1 hides both. Only
- * the gobj is read. */
-static void ftSh_Init_OnModelRender(HSD_GObj* gobj, int arg1, Mtx mtx)
+/* The body of +0CC8, which ACE 2.0.1 has twice (2.0.1 +0D08 and inside the proc 2.0.1 +0E44). */
+static void ftSh_Mouth(Fighter* fp)
 {
-    Fighter* fp = GET_FIGHTER(gobj);
-
-    (void) arg1;
-    (void) mtx;
     if (fp->x5F4_arr[0].idx == 1) {
         fp->x5F4_arr[2].idx = -1;
         fp->x5F4_arr[3].idx = -1;
@@ -336,6 +487,16 @@ static void ftSh_Init_OnModelRender(HSD_GObj* gobj, int arg1, Mtx mtx)
         fp->x5F4_arr[2].idx = fp->x5F4_arr[2].prev;
     }
     fp->x5F4_arr[3].idx = -1;
+}
+
+/* +0CC8 (slot 26, onmodelrender, called with the model matrix): the mouth is one of the model
+ * groups 2 and 3, shown on the side that faces the camera; group 0 on model 1 hides both. Only
+ * the gobj is read. */
+static void ftSh_Init_OnModelRender(HSD_GObj* gobj, int arg1, Mtx mtx)
+{
+    (void) arg1;
+    (void) mtx;
+    ftSh_Mouth(GET_FIGHTER(gobj));
 }
 
 /* +0D50 (slot 32, enterdoublejump): `b ftCo_JumpAerial_Enter_Basic`. */
@@ -506,8 +667,9 @@ void ftSh_SpawnTrailEffectAt(HSD_GObj* gobj, bool spawn, Vec3* trail_pos, float*
 
 /* ---- debug drawing (fighter debug display only) --------------------------------------------- */
 
-/* +5624: the GX state of both circles (the same calls and arguments as the Akaneia Sonic's). */
-static void ftSh_GXLink_Init(void)
+/* +5624: the GX state of both circles (the same calls and arguments as the Akaneia Sonic's).
+ * ACE 2.0.1's (2.0.1 +5B14) is the same list without the GXSetChanCtrl call. */
+static void ftSh_GXLink_Init(Fighter* fp)
 {
     GXSetColorUpdate(GX_TRUE);
     GXSetAlphaUpdate(GX_FALSE);
@@ -520,8 +682,10 @@ static void ftSh_GXLink_Init(void)
     GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD_NULL, GX_TEXMAP_NULL, GX_COLOR0A0);
     GXSetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
     GXSetNumChans(1);
-    GXSetChanCtrl(GX_COLOR0A0, GX_FALSE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE,
-                  GX_AF_NONE);
+    if (!ftSh_Is201(fp)) {
+        GXSetChanCtrl(GX_COLOR0A0, GX_FALSE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE,
+                      GX_AF_NONE);
+    }
     GXSetCullMode(GX_CULL_NONE);
     GXClearVtxDesc();
     GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
@@ -547,7 +711,7 @@ MU_NO_CONTRACT void ftSh_GXLink_DrawTarget(HSD_GObj* gobj)
     ftSh_SpecialNVars* mv = &ftSh_MV(fp)->specialn;
     int i;
 
-    ftSh_GXLink_Init();
+    ftSh_GXLink_Init(fp);
     GXBegin(GX_LINESTRIP, GX_VTXFMT0, 9);
     for (i = 0; i != 9; i++) {
         float angle = (float) ((double) (float) i * FTSH_TAU * (double) 0.125F);
@@ -567,7 +731,7 @@ MU_NO_CONTRACT void ftSh_GXLink_DrawRadius(HSD_GObj* gobj)
     float radius = (float) (s32) ftSh_DA(fp)->specialn_search_range;
     int i;
 
-    ftSh_GXLink_Init();
+    ftSh_GXLink_Init(fp);
     GXBegin(GX_LINESTRIP, GX_VTXFMT0, 33);
     for (i = 0; i != 33; i++) {
         float angle = (float) ((double) (float) i * FTSH_TAU * (double) 0.03125F);

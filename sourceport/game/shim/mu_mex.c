@@ -31,6 +31,7 @@
 extern Fighter_CostumeStrings* ftData_803C2360[FT_KIND_TABLE_MAX];
 
 /* The MxDt.dat layout types are in mu_mex_data.h (shared with mexstages/common/mu_gr_mex.c). */
+#include "mu_test_env.h"
 #include "mu_mex_data.h"
 
 /* ---- state, fixed after boot ---- */
@@ -455,6 +456,22 @@ int mu_mex_css_icons(CSSIcon* out, int max)
             }
         }
 #endif
+        {
+            /* MELEE_TEST_AK_SWAP=<a>=<b> (tests only): the icon of kind a picks kind b, so a
+             * hidden run reaches a fighter the disc keeps off the grid. */
+            const char* swap = mu_test_getenv("MELEE_TEST_AK_SWAP");
+            int a = 0, b = 0;
+            if (swap != NULL) {
+                while (*swap >= '0' && *swap <= '9') a = a * 10 + (*swap++ - '0');
+                if (*swap == '=') {
+                    ++swap;
+                    while (*swap >= '0' && *swap <= '9') b = b * 10 + (*swap++ - '0');
+                    if (out[i].char_kind == a && out[i].state == 2 && b < 0x7F) {
+                        out[i].char_kind = (u8) b;
+                    }
+                }
+            }
+        }
         out[i].anim_timer = 0;
         out[i].joint_id_vs = in[4];
         out[i].joint_id_1p = in[5];

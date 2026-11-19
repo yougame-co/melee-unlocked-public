@@ -86,7 +86,8 @@ void ftCn_SpecialAirN_Coll(HSD_GObj* gobj)
     ftCommon_8007D7FC(fp);
     Fighter_ChangeMotionState(gobj, ftCn_MS_SpecialN, Ft_MF_None, fp->cur_anim_frame, 1.0f, 0.0f,
                               NULL);
-    if (fp->cur_anim_frame < 15.0f) {
+    /* ACE 2.0.1 (its PlCn.dat is 366515 bytes) restores the accessory below frame 17. */
+    if (fp->cur_anim_frame < (mu_ak_file_size(fp->kind) == 366515 ? 17.0f : 15.0f)) {
         fp->accessory4_cb = ftCn_SpecialN_OnAccessory4;
     }
 }

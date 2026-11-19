@@ -156,6 +156,13 @@ class KeyboardKeysOnTheOnlineScreensTest(unittest.TestCase):
         self.assertIn('"Press %s to %s", start_key, action', think)
         self.assertNotIn('"Press START to %s"', think)
 
+    def test_chat_hint_names_keyboard_keys(self):
+        think = body(self.css, "static void text_think(HSD_GObj* gobj)")
+        for bit in ("HSD_PAD_DPADUP", "HSD_PAD_DPADLEFT", "HSD_PAD_DPADRIGHT", "HSD_PAD_DPADDOWN"):
+            self.assertIn("mu_host_button_label(*ctrl_port, %s," % bit, think)
+        self.assertIn('"Chat: %s %s %s %s", du, dl, dr, dd', think)
+        self.assertIn('set_text(ST_PRESS_D, "Use D-Pad to Chat");', think)
+
     def test_doubles_panel_names_the_keys(self):
         panel = body(self.f4, "static void mu_f4_panel(const MuLobbyView* v, int doubles, unsigned hint, int noted, const char* note, int mine)")
         at = panel.index("mu_f4_panel_text(v, hint, noted, mu_lobby_partner_want(), note, &p);")

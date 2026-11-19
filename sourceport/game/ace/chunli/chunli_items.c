@@ -121,20 +121,20 @@ static void itCn_Shot_Spawned(Item_GObj* gobj)
 /* item 2 +0088, +0090, +0098, +00A0, +00B8 (the same in item 3), [ondestroy], [onpickup],
  * [ondrop], [onthrow], [onenterair]: a return value only (1, 0, 0, 0, 0), which these
  * slots do not use. */
-static void itCn_Shot_Nothing(Item_GObj* gobj)
+void itCn_Shot_Nothing(Item_GObj* gobj)
 {
     (void) gobj;
 }
 
 /* item 2 +00A8 (item 3 +00A8), [ongivedamage]: used up. */
-static bool itCn_Shot_DmgDealt(Item_GObj* gobj)
+bool itCn_Shot_DmgDealt(Item_GObj* gobj)
 {
     (void) gobj;
     return true;
 }
 
 /* item 2 +00B0 (item 3 +00B0), [ontakedamage]: used up. */
-static bool itCn_Shot_DmgReceived(Item_GObj* gobj)
+bool itCn_Shot_DmgReceived(Item_GObj* gobj)
 {
     (void) gobj;
     return true;
@@ -152,7 +152,7 @@ static bool itCn_Shot_Reflected(Item_GObj* gobj)
 }
 
 /* item 2 +00F4 (item 3 +00F4), [onunk1] (the clank slot): used up. */
-static bool itCn_Shot_Clanked(Item_GObj* gobj)
+bool itCn_Shot_Clanked(Item_GObj* gobj)
 {
     (void) gobj;
     return true;
@@ -173,7 +173,7 @@ static bool itCn_ShotAlt_ShieldBounced(Item_GObj* gobj)
 }
 
 /* item 2 +0120 (item 3 +0104), [onhitshielddeterminedestroy]: used up. */
-static bool itCn_Shot_HitShield(Item_GObj* gobj)
+bool itCn_Shot_HitShield(Item_GObj* gobj)
 {
     (void) gobj;
     return true;
@@ -181,7 +181,7 @@ static bool itCn_Shot_HitShield(Item_GObj* gobj)
 
 /* item 2 +0128 (item 3 +010C), the animation callback of state 0: one frame of lifetime less,
  * gone at zero. */
-static bool itCn_Shot_Anim(Item_GObj* gobj)
+bool itCn_Shot_Anim(Item_GObj* gobj)
 {
     Item* ip = GET_ITEM(gobj);
     float lifetime = ip->xD44_lifeTimer - 1.0f;
@@ -191,7 +191,7 @@ static bool itCn_Shot_Anim(Item_GObj* gobj)
 }
 
 /* item 2 +015C (item 3 +0140), the physics callback of state 0: a return value only. */
-static void itCn_Shot_Phys(Item_GObj* gobj)
+void itCn_Shot_Phys(Item_GObj* gobj)
 {
     (void) gobj;
 }
@@ -200,7 +200,7 @@ static void itCn_Shot_Phys(Item_GObj* gobj)
  * BEFORE the common collision step runs (the load is ahead of the call on the console), so the
  * test sees last frame's contacts: the lifetime goes to zero one frame after a contact, and the
  * animation callback then ends the shot. Mod quirk, kept. */
-static bool itCn_Shot_Coll(Item_GObj* gobj)
+bool itCn_Shot_Coll(Item_GObj* gobj)
 {
     Item* ip = GET_ITEM(gobj);
     u32 env_flags = (u32) ip->x378_itemColl.env_flags;
@@ -222,7 +222,9 @@ static ItemStateTable itCn_ShotAlt_States[] = {
 };
 
 /* Article 2 (348): slots 0 to 10, 12 and 13 exported; 11 (absorbed) and 14 not. */
-static ItemLogicTable itCn_Shot_Logic = {
+/* Not static: ACE 2.0.1's Liu Kang and Sub-Zero carry this block byte for byte as their article 0
+ * (ace/liukang, ace/subzero). */
+ItemLogicTable itCn_Shot_Logic = {
     .states = itCn_Shot_States,
     .spawned = itCn_Shot_Spawned,          /* +0010 */
     .destroyed = itCn_Shot_Nothing,        /* +0088 */

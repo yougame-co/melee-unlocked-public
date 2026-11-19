@@ -413,6 +413,7 @@ const KnownDisc kMexSha256[] = {
   // ACE is built on Akaneia 1.0.0 and keeps that title in its disc header, so by the header alone
   // it was listed as "Akaneia 1.0.0". It is named by its own bytes.
   {"0d7ba36bef3505cdf6c0209d9ae34977e23cf6cae4d24366e8d405810f798993", "ACE", "2.0.0", "ace"},
+  {"34e3c3db4eceb4a4adbdfb904b88ec4a0b5717b5b732de465b9faf48d6a74f4e", "ACE", "2.0.1", "ace"},
 };
 const KnownDisc kMexFingerprint[] = {
   {"9a1a48b999a2f8f4deaee2554e5f177cb265666b95676a508406db80b181246b", "Akaneia", "1.0.1", "akaneia"},
@@ -968,7 +969,7 @@ Detected identify_disc(const fs::path& file, Detected d, const ScanOptions& opti
     }
     if (known) { d.name = known->name; d.version = known->version; d.catalog_id = known->id; }
     if (known && d.hash == known->hash && used_base) *used_base = false;   // a known build by its own bytes
-    // Akaneia 1.0.1 and ACE 2.0.0 have their fighters and stages in the Source Port's own C
+    // Akaneia 1.0.1 and ACE 2.0.0 and 2.0.1 have their fighters and stages in the Source Port's own C
     // (sourceport/game/akaneia, ace, mexstages), checked against those builds' files. Any other m-ex
     // build plays on both engines too: the Static Recomp runs its code, the Source Port loads its
     // files (costumes, stages, sounds, menus) over the native game and runs none of its code.
@@ -1108,7 +1109,7 @@ Detected identify(const fs::path& file, const ScanOptions& options, std::string*
 // The scan cache: Mods/.cache/scan.txt, one line per file keyed by path, size and time (and, for
 // discs, the retail disc they were compared with), so a boot never reads an unchanged disc again.
 namespace {
-constexpr const char kCacheHeader[] = "mu-scan 18";   // 18: copies of Melee (Detected::copy); 17: Chaos Eternal plays on the Static Recomp; 16: unknown m-ex builds and code mods play on either engine; 15: Training Mode CE v1.4 d2 and v1.4.1 discs play natively; 14: retail content identity independent of disc padding
+constexpr const char kCacheHeader[] = "mu-scan 19";   // 19: ACE 2.0.1 known; 18: copies of Melee (Detected::copy); 17: Chaos Eternal plays on the Static Recomp; 16: unknown m-ex builds and code mods play on either engine; 15: Training Mode CE v1.4 d2 and v1.4.1 discs play natively; 14: retail content identity independent of disc padding
 struct CacheEntry { std::string key, base; Detected d; };
 
 std::string cache_key(const fs::path& file) {

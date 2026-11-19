@@ -52,7 +52,7 @@
 /* 366, disc +04C0 */
 { 317, 0x00340113, 0x14000000, ftNs_SpecialAirHiRebound_Anim, ftNs_SpecialAirHiRebound_IASA, ftNs_SpecialAirHiRebound_Phys, ftNs_SpecialAirHiRebound_Coll, ftCamera_UpdateCameraBox },
 /* 367, disc +04E0 */
-{ 318, 0x00340014, 0x15000000, ftSd_CB_272C, ftSd_Empty, ft_80084F3C, ftSd_CB_2798, ftCamera_UpdateCameraBox },
+{ 318, 0x00340014, 0x15000000, ftSd_CB_272C, ftSd_LwIASA367, ft_80084F3C, ftSd_CB_2798, ftCamera_UpdateCameraBox },
 /* 368, disc +0500 */
 { 319, 0x003C0014, 0x15000000, ftSd_CB_2820, ftSd_CB_2894, ft_80084F3C, ftSd_CB_28AC, ftCamera_UpdateCameraBox },
 /* 369, disc +0520 */
@@ -62,7 +62,7 @@
 /* 371, disc +0560 */
 { 319, 0x00340014, 0x15000000, ftSd_CB_29D8, ftSd_Empty, ft_80084F3C, ftSd_CB_2A54, ftCamera_UpdateCameraBox },
 /* 372, disc +0580 */
-{ 322, 0x00340414, 0x15000000, ftSd_CB_2A58, ftSd_Empty, ftSd_CB_2ACC, ftSd_CB_2AD0, ftCamera_UpdateCameraBox },
+{ 322, 0x00340414, 0x15000000, ftSd_CB_2A58, ftSd_LwIASA372, ftSd_CB_2ACC, ftSd_CB_2AD0, ftCamera_UpdateCameraBox },
 /* 373, disc +05A0 */
 { 323, 0x003C0414, 0x15000000, ftSd_CB_2B54, ftSd_Empty, ft_80084DB0, ftSd_CB_2BD0, ftCamera_UpdateCameraBox },
 /* 374, disc +05C0 */

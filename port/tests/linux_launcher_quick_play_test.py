@@ -41,4 +41,16 @@ with tempfile.TemporaryDirectory(prefix='mu-quick-play-') as temporary:
     for tail in (['--iso'], ['--iso', str(root/'missing.iso')]):
         result = subprocess.run([str(exe), '--play', *tail], env=env, capture_output=True, text=True, timeout=20)
         assert result.returncode == 2 and result.stderr, (tail, result.returncode)
+    # --play --mod <name>: an installed mod disc by (part of) its file name, with its own card folder.
+    (root / 'Mods/Discs').mkdir(parents=True)
+    mod = root / 'Mods/Discs/Akaneia.iso'
+    mod.write_bytes(b'mod')
+    result = subprocess.run([str(exe), '--play', '--mod', 'akaneia', '--frames', '1'], env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 37, (result.returncode, result.stderr)
+    args = output.read_text().splitlines()
+    assert args[args.index('--mod-iso') + 1] == str(mod), args
+    assert args[len(args) - 1 - args[::-1].index('--card-dir') + 1] == str(root/'User/GC/Mods/Akaneia'), args
+    assert args[-2:] == ['--frames', '1']
+    result = subprocess.run([str(exe), '--play', '--mod', 'nothing'], env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 2 and 'Akaneia' in result.stderr, (result.returncode, result.stderr)
 print('PASS: --play launches without SDL/window setup, preserves saved paths and game exit status, and rejects invalid discs')

@@ -543,7 +543,7 @@ void mu_gr_stage_item_store(int kind, void* article)
     if (kind >= MU_GR_ITEM_FIRST && kind <= MU_GR_ITEM_LAST) {
         gr_item_article[kind - MU_GR_ITEM_FIRST] = article;
     } else {
-        OSReport("[mex] stage item kind %d is outside 237 to 252; not stored\n", kind);
+        OSReport("[mex] stage item kind %d is outside 237 to %d; not stored\n", kind, MU_GR_ITEM_LAST);
     }
 }
 

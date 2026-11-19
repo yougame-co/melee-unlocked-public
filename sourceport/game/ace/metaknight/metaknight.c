@@ -187,7 +187,7 @@ static void ftMk_Init_OnLoad(HSD_GObj* gobj)
  *   - leaving Run (fp+22F4 == 21): ft_80088A50
  *   - the new motion id is kept in fp+22F4
  *   - Dash, JumpAerialF, JumpAerialB, 347, 352: fp+22F8 = 1 and the two parts are set
- *   - Run: sound 5043 (100, 67)
+ *   - Run: sound 5043 (100, 67); 5040 on ACE 2.0.1
  *   - 360: fp+22F8 = 1, the parts are set, and set again (fp+22F8 is 1)
  *   - 356 to 358 and 361 to 363: the down special effect (+2E8C)
  *   - AttackS4S, AttackHi4, CliffCatch: fp+22F8 = 0 and return
@@ -250,7 +250,8 @@ static void ftMk_Init_OnActionStateChange(HSD_GObj* gobj)
     case ftCo_MS_JumpAerialB:
         goto parts_on;
     case ftCo_MS_Run: /* +3AA4 (+081C) */
-        ft_800881D8(fp, 5043, 100, 67);
+        /* ACE 2.0.1 (its PlMk.dat is 330050 bytes) plays sound 5040 here. */
+        ft_800881D8(fp, mu_ak_file_size(fp->kind) == 330050 ? 5040 : 5043, 100, 67);
         if (fv->parts_on == 1) {
             goto parts;
         }

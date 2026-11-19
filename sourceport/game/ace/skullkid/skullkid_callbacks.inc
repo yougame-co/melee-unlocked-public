@@ -36,6 +36,8 @@ void ftSd_CB_25CC(HSD_GObj*);
 void ftSd_CB_264C(HSD_GObj*);
 void ftSd_CB_272C(HSD_GObj*);
 void ftSd_CB_2798(HSD_GObj*);
+void ftSd_LwIASA367(HSD_GObj*);
+void ftSd_LwIASA372(HSD_GObj*);
 void ftSd_CB_2820(HSD_GObj*);
 void ftSd_CB_2894(HSD_GObj*);
 void ftSd_CB_28AC(HSD_GObj*);

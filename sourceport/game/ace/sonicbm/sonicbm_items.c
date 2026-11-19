@@ -187,6 +187,13 @@ static bool itSc_Trail_Anim(Item_GObj* gobj)
 
     /* +0114 */
     n = (u32) (owner->motion_id - ftSc_MS_SpecialN);
+    if (ftSc_Is201(owner)) {
+        /* 2.0.1: 372 and 373 kept too (the mask 0x6021A803) */
+        if (n > 0x1E) {
+            return true;
+        }
+        return (((0x6021A803u >> n) & 1) ^ 1) != 0;
+    }
     if (n > 0x15) {
         return true;
     }
@@ -319,7 +326,21 @@ static void itSc_Spring_BounceOwn(HSD_GObj* gobj)
     ftSc_FighterVars* fv = ftSc_FV(fp);
     int max_jumps;
 
-    if (fp->motion_id == ftSc_MS_SpecialAirLwCharge || fp->motion_id == ftSc_MS_SpecialAirLwRoll)
+    if (ftSc_Is201(fp)) {
+        /* 2.0.1 +3D64: the air charge or the spring air roll (373) goes on as 373, no sound,
+         * 100 frames */
+        if (fp->motion_id == ftSc_MS_SpecialAirLwCharge ||
+            fp->motion_id == ftSc_MS_SpecialAirLwSpring)
+        {
+            Fighter_ChangeMotionState(gobj, ftSc_MS_SpecialAirLwSpring, Ft_MF_None, 0.0f, 1.0f,
+                                      0.0f, NULL);
+            ftAnim_8006EBA4(gobj);
+            ftSc_MV(fp)->count = 100;
+            fp->self_vel.y = fp->self_vel.y + 4.0f;
+            return;
+        }
+    } else if (fp->motion_id == ftSc_MS_SpecialAirLwCharge ||
+               fp->motion_id == ftSc_MS_SpecialAirLwRoll)
     {
         ft_800881D8(fp, FTSC_SFX_SPRING, 0x7F, 0x40);
         Fighter_ChangeMotionState(gobj, ftSc_MS_SpecialAirLwRoll, Ft_MF_None, 0.0f, 1.0f, 0.0f,
@@ -362,7 +383,9 @@ static bool itSc_Spring_JumpedOn(Item_GObj* gobj)
         itSc_Spring_BounceOwn(jumper_gobj);
         return false;
     }
-    ft_800881D8(owner, FTSC_SFX_SPRING, 0x7F, 0x40);
+    if (!ftSc_Is201(owner)) {
+        ft_800881D8(owner, FTSC_SFX_SPRING, 0x7F, 0x40);
+    }
     x = jumper->input.lstick[0].x;
     if (x < 0.0f) {
         if (jumper->facing_dir <= 0.0f) {

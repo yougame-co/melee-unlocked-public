@@ -17,6 +17,24 @@ static void ftSd_LwStartAir(HSD_GObj* gobj)
     ftSd_Change(gobj,372,0,0,1,0);
     ftAnim_8006EBA4(gobj);
 }
+/* ACE 2.0.1 (its PlSd.dat is 445601 bytes): the IASA callbacks of 367 (+2790) and 372 (+2B0C),
+ * empty on 2.0.0, clear take_dmg_2_cb and, from frame 10 to 35, set it to switch to 369 or 374
+ * (+3F14, +3F38) when he is hit. */
+static void ftSd_LwHitTo369(HSD_GObj* gobj) { ftSd_Change(gobj,369,0,0,1,0); mu_ak_test_motion(GET_FIGHTER(gobj)); }
+static void ftSd_LwHitTo374(HSD_GObj* gobj) { ftSd_Change(gobj,374,0,0,1,0); mu_ak_test_motion(GET_FIGHTER(gobj)); }
+static void ftSd_LwHitWindow(HSD_GObj* gobj, HSD_GObjEvent cb)
+{
+    Fighter* fp = GET_FIGHTER(gobj);
+    float frame;
+    if (mu_ak_file_size(fp->kind) != 445601) return;
+    frame = fp->cur_anim_frame;
+    fp->take_dmg_2_cb = NULL;
+    if (!(frame >= 10.0f)) return;
+    if (!(frame <= 35.0f)) return;
+    fp->take_dmg_2_cb = cb;
+}
+void ftSd_LwIASA367(HSD_GObj* gobj) { ftSd_LwHitWindow(gobj, ftSd_LwHitTo369); }
+void ftSd_LwIASA372(HSD_GObj* gobj) { ftSd_LwHitWindow(gobj, ftSd_LwHitTo374); }
 void ftSd_SpecialLw_Enter(HSD_GObj* gobj)
 {
     GET_FIGHTER(gobj)->cmd_vars[0] = 0;

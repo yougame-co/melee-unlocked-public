@@ -4716,6 +4716,8 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
             return fail("Lost the connection to YouGame matchmaking");
           const uint64_t until = now_ms() + 15000;
           bool reopened = false;
+          // A ticket near its 5-minute life would only earn a 401 first: renew before reopening.
+          if (now_ms() - pass_at > 240000) renew_ticket(until);
           transport::TicketRetry retry;
           while (!cancelled() && !update_refused && now_ms() < until) {
             if (retry.attempt([&] { return !update_refused && now_ms() < until && queue.open_session(url, pass, "", &error, (int)std::min<uint64_t>(3000, until - now_ms()), cancelled); },
@@ -5256,6 +5258,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       if (!room->socket->recoverable()) return fail("Lost the connection to the YouGame room", !direct);
       const uint64_t until = now_ms() + 15000;
       bool reopened = false;
+      if (now_ms() - pass_at > 240000) renew_ticket(until);   // as the queue: no 401 on an old ticket first
       transport::TicketRetry retry;
       while (!cancelled() && !update_refused && now_ms() < until) {
         if (retry.attempt([&] { return !update_refused && now_ms() < until && room->socket->open_session(url, pass, room_code, &error, (int)std::min<uint64_t>(3000, until - now_ms()), cancelled); },
