@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-#define MU_HOST_API_VERSION 32
+#define MU_HOST_API_VERSION 33
 #define MU_GAME_API_VERSION 10
 #define MU_SLIPPI_RESPONSE_CAPACITY 4096u
 
@@ -437,6 +437,10 @@ typedef struct MuHostApi {
      * its materials, textures, lights, cameras and particle passes. Display only; zero means not one
      * byte is written. */
     int32_t (*native_rtx_semantics)(void);
+    /* Version 33 (upstream's version 26). Each drawn frame, per player slot 0..3: a pro AI's tag carries a small robot after
+     * the name. `dx` is the robot's centre right of the tag's x and `width` the room the name left for
+     * it, both in 640x480 units; width 0 when this tag has none. Display only. */
+    void (*hud_pro_tag)(int32_t slot, float dx, float width);
 } MuHostApi;
 
 /* Start each new sound in the sound frame being mixed now instead of the next one (5 ms sooner):

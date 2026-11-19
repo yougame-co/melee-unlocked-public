@@ -37,6 +37,13 @@ void mu_hud_extras_abi(int slot, int nana_damage, int team)
     }
 }
 
+void mu_hud_pro_tag_abi(int slot, float dx, float width)
+{
+    if (mu_host->version >= 33 && mu_host->hud_pro_tag != NULL) {
+        mu_host->hud_pro_tag(slot, dx, width);
+    }
+}
+
 void mu_hud_combo_abi(int slot, int link, float percent, int stunned)
 {
     if (mu_host->version >= 21 && mu_host->hud_combo != NULL) {

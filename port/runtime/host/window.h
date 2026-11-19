@@ -91,6 +91,9 @@ bool window_visible();
 #ifdef MELEE_LINUX_X11_EMBED
 // Successful X11 adoption (false after graceful standalone fallback).
 bool window_embedded();
+#elif defined(__APPLE__)
+// Mac: no X11 adoption, so the GL setup shared with Linux sees "not embedded" (122.31 message-box checks).
+inline bool window_embedded() { return false; }
 #endif
 #ifdef __APPLE__
 void window_prefer_simple_fullscreen();   // macOS: non-Spaces full screen; before window_create

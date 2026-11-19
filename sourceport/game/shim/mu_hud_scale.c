@@ -78,6 +78,8 @@ void mu_hud_player_abi(int slot, int present, int damage, int stocks, float tag_
                        int tag_visible);                   /* mu_online_abi.c */
 void mu_hud_combo_abi(int slot, int link, float percent, int stunned);   /* mu_online_abi.c */
 void mu_hud_extras_abi(int slot, int nana_damage, int team);             /* mu_online_abi.c */
+void mu_hud_pro_tag_abi(int slot, float dx, float width);                /* mu_online_abi.c */
+int mu_pro_tag_icon(int slot, float* dx, float* width);                  /* if/ifnametag.c */
 
 static int mu_combo_stun_action(unsigned int a)
 {
@@ -135,6 +137,12 @@ void mu_hud_report(void)
         {
             mu_hud_extras_abi(slot, present ? mu_nana_damage(slot) : -1,
                               present && gm_8016B168() ? Player_GetTeam(slot) : -1);
+        }
+        /* A pro AI's robot after its name, where the tag left room for it. */
+        {
+            float dx = 0.0f, width = 0.0f;
+            if (!(visible && mu_pro_tag_icon(slot, &dx, &width))) dx = width = 0.0f;
+            mu_hud_pro_tag_abi(slot, dx, width);
         }
     }
 }

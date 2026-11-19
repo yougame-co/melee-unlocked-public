@@ -415,6 +415,11 @@ void* window_create(int w, int h, const wchar_t* title, bool visible) {
   g_sdl_video_thread.claim();
   g_window_thread.store(std::this_thread::get_id(), std::memory_order_release);
 #ifdef MELEE_LINUX_X11_EMBED
+  // The render thread draws (GLX) on the same X display the main thread pumps (SDL events, the player box):
+  // Xlib needs its locks on before the first X call, or the two corrupt each other (122.31 aborted in a
+  // GLX swap with a heap-corruption message). Ask SDL too, in case its build reads the hint.
+  XInitThreads();
+  SDL_SetHintWithPriority("SDL_VIDEO_X11_XINITTHREADS", "1", SDL_HINT_OVERRIDE);
   const bool boxed = yougame::embedded();
   // The app and game must both use X11 (including XWayland), before video initialization.
   if (boxed) SDL_SetHintWithPriority("SDL_VIDEODRIVER", "x11", SDL_HINT_OVERRIDE);

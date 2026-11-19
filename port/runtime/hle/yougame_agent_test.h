@@ -705,7 +705,15 @@ inline Settings load(bool active, const char* data_dir, Engine engine = Engine::
     ~LoadScope() { if (!active) { agent_paths::policy = {}; agent_paths::session.reset(); } }
   } scope;
 #endif
-  if (!active || !data_dir || !*data_dir) return out;
+  if (!active || !data_dir || !*data_dir) {
+#ifdef YOUGAME_AGENT_TEST_HOOK
+    // Test builds say why nothing was read (a staging walk otherwise sees no line at all).
+    if (std::getenv("YOUGAME_AGENT_COPY"))
+      out.log = !active ? "agent-test.json not looked for: no YouGame bridge or launcher"
+                        : "agent-test.json not looked for: YOUGAME_DATA is empty";
+#endif
+    return out;
+  }
   // Only an AGENT TEST copy of the app passes YOUGAME_AGENT_COPY=1 (desktop native-policy agentGameEnv; an installed
   // app's game environment is an allowlist without it), so an agent-test.json copied into a player's data folder does
   // nothing.
@@ -729,6 +737,8 @@ inline Settings load(bool active, const char* data_dir, Engine engine = Engine::
     std::error_code missing;
     if (std::filesystem::exists(std::filesystem::u8path(data_dir) / "agent-test.json", missing))
       out.log = "agent-test.json ignored: could not open it";
+    else
+      out.log = "agent-test.json not found in the game's data folder (YOUGAME_DATA)";
     return out;
   }
   const auto size = std::fread(bytes.data(), 1, bytes.size(), file);

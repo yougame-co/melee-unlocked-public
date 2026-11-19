@@ -1369,6 +1369,14 @@ void set_native_hud_extras(int slot, int nana_damage, int team) {
   out.team = team >= 0 && team <= 3 ? team : -1;
 }
 
+void set_native_hud_pro_tag(int slot, float dx, float width) {
+  if (slot < 0 || slot >= 4) return;
+  auto& out = g_native_hud[slot];
+  const bool ok = std::isfinite(dx) && std::isfinite(width) && width > 0 && width < 60 && dx >= 0 && dx < 80;
+  out.pro_icon_dx = ok ? dx : 0;
+  out.pro_icon_width = ok ? width : 0;
+}
+
 void set_native_hud_combo(int slot, int link, float percent, bool stunned) {
   if (slot < 0 || slot >= 4) return;
   auto& out = g_native_hud[slot];

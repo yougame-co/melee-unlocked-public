@@ -90,6 +90,12 @@ class UnrankedOpponentLeftTest(unittest.TestCase):
         body = body[:body.index('\n}\n')]
         self.assertIn('std::lock_guard<std::mutex> lock(g_mutex);', body)
         self.assertIn('own_dropped() || g_room->socket->recoverable()', body)
+        # An open connection reads 1006 too: only a closed one counts as our own drop.
+        self.assertIn('g_room->socket->connection_closed() &&', body)
+        sock = link[link.index('bool connection_closed() const {'):]
+        sock = sock[:sock.index('\n  }\n')]
+        self.assertIn('if (broker_) return broker_->closed();', sock)
+        self.assertIn('return closed_.load();', sock)
         self.assertIn('bool own_room_dropped();', source('port/runtime/hle/yougame_link.h'))
 
     def test_wire_subcommand(self):

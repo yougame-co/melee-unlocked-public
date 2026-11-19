@@ -219,7 +219,7 @@ static int yg__start_raised_rule(int full, int elevated, int shell_peer) {
 
 /* Every text the small window shows, on every system. Plain ASCII only. The game's name (`name`)
    goes where the mock says "Melee Unlocked"; without one (or one that isn't plain text) the window
-   says "this game". Never "the free app": YouGame is "a free app" at most. */
+   says "this game". Never "the free app" (the owner, 11-17): YouGame is "a free app" at most. */
 #define YG__START_TEXT_MISSING 0     /* not installed */
 #define YG__START_TEXT_DIDNT_OPEN 1  /* started in the tray, but not running within open_wait_ms */
 #define YG__START_TEXT_UPDATE 2      /* installed, older than tray_from (or its version unreadable) */
@@ -1965,7 +1965,7 @@ static void yg__start_front(HWND w) {
   }
 }
 
-/* YouGame's own window (the approved C3 look): a red logo panel on the left, the words
+/* YouGame's own window (the approved C3 look, the owner 11-17): a red logo panel on the left, the words
    and buttons on the right, on YouGame's dark surface. Everything is drawn here, with no image file
    and no new library: shapes are anti-aliased by distance (yg__start_cover), text is the system's
    Segoe UI. Mouse, keyboard (Tab, arrows, Enter, Space, Escape) and an Xbox-style controller (D-pad
@@ -2028,7 +2028,7 @@ typedef struct yg__start_ui {
 } yg__start_ui;
 static yg__start_ui yg__start_u;
 
-/* Get YouGame, in the window: approve it once, it downloads, and the player
+/* Get YouGame, in the window (the owner, 11-17: "I should just approve it, and it should download it, and I
    stays within the same flow. The main button becomes a progress bar while a worker
    thread downloads the site's Windows installer over HTTPS (winhttp.dll from the system directory)
    into %LOCALAPPDATA%\YouGame Start, holds it so it cannot be changed, checks it came whole and is
@@ -3681,7 +3681,7 @@ static int yg__start_offline(int staging, const char *game, int note) {
 }
 
 /* The system's own box (macOS alert; Linux zenity or kdialog) with the window's words. YouGame's
-   own drawn window is Windows only for now (Windows first). 1: the main button, 0: the
+   own drawn window is Windows only for now (Windows first, the owner 11-15). 1: the main button, 0: the
    other, -1: nothing was shown or no answer came. */
 static int yg__start_show(const yg__start_win *w) {
 #ifdef __APPLE__
@@ -3949,7 +3949,7 @@ yg_start_result yg_start(const yg_start_options *o) {
   if (installed && YG__START_UPDATE_SYSTEM && yg__start_raised()) text = YG__START_TEXT_RAISED;
 #endif
   /* An at-start game whose player already pressed Play offline once: from then on it starts like a
-     game that asks on first use ("once, then at the button"). Not for a game that needs
+     game that asks on first use (the owner, 11-17: "once, then at the button"). Not for a game that needs
      YouGame to run: that one asks at every start. */
   at_start = ask != YG_START_ASK_LATER && ask != YG_START_ASK_ON_USE;
   if (at_start && !o->needs && yg__start_offline(staging, o->game, 0)) ask = YG_START_ASK_LATER;

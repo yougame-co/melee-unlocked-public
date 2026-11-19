@@ -65,7 +65,7 @@ constexpr const char* kAdmin = "Melee Unlocked was started as administrator, so 
 constexpr const char* kOpening = "Opening YouGame...";
 constexpr const char* kOpenApp = "Open YouGame";
 constexpr const char* kGetApp = "Get YouGame";
-constexpr const char* kPlayOffline = "Play offline";   // the panel's dismiss, as YouGame's own window says it
+constexpr const char* kPlayOffline = "Play offline";   // the panel's dismiss, as YouGame's own window says it (the owner, 11-17)
 constexpr const char* kDidntOpen = "YouGame didn't open.";
 constexpr const char* kPageOpen = "The download page is open in your browser. Install YouGame, open it, then pick this again.";
 // "Update to play online" (Update below): a search refused because this copy is out of date.
@@ -491,7 +491,7 @@ class Home {
 // "Update to play online": a copy of Melee started on its own, connected to YouGame over the local channel,
 // whose search was refused as out of date (old_build or build_replaced; never unknown_build, which follows an
 // upload for a moment). The same panel offers Update; the app downloads the latest build for a copy it
-// installed and relaunches it in its own window after Restart now (no website, no app window).
+// installed and relaunches it in its own window after Restart now (no website, no app window: the owner, 11-13).
 //
 //   ask      updateGame   -> ok {state:"ready",version} | ok {state:"downloading"}
 //                            | not_app_copy | up_to_date | not_checked (+retryAfter: ask again, twice at most)

@@ -83,7 +83,7 @@ class Build106Fixes(unittest.TestCase):
     def test_online_rows_open_the_reach_panel(self):
         link = source("port/runtime/hle/yougame_link.cpp")
         picked = body(link, "void first_row_picked() {")
-        # Asked on first use: Windows and Mac ask through YouGame's own window at the press;
+        # Asked on first use (the owner, 11-17): Windows and Mac ask through YouGame's own window at the press;
         # Linux (no window in the hook) keeps the Reach panel.
         win_mac = picked.split("#if defined(_WIN32) || defined(__APPLE__)", 1)[1].split("#else", 1)
         self.assertIn("reach_ask_on_use();", win_mac[0])

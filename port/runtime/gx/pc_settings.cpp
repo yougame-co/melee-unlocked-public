@@ -480,6 +480,8 @@ static void draw_community_code_overlays() {
   draw->PopClipRect();
 }
 
+// Where the pro tag's robot sits: its centre below the tag's point (480 units) and its height.
+static float kProTagRobotDy = -29.5f, kProTagRobotHeight = 15.0f;
 static void draw_player_nicknames() {
   if (!g_hud_match) return;
   const OverlayBounds bounds = overlay_bounds();
@@ -506,6 +508,43 @@ static void draw_player_nicknames() {
     draw->AddRect(ImVec2(x - 5, y - 3), ImVec2(x + text_size.x + 5, y + font_size + 4),
                   colors[slot], 5.0f, 0, 1.5f);
     draw->AddText(ImGui::GetFont(), font_size, ImVec2(x, y), IM_COL32(255, 255, 255, 255), label.c_str());
+  }
+  draw->PopClipRect();
+}
+
+// A pro AI's tag (owner 11-19): a small white robot after the name, inside the tag's plate, in the
+// letters' white. The game leaves the room (ifnametag.c, mu_pro_tag_icon) and says where.
+static void draw_pro_tag_robots() {
+  if (!g_hud_match) return;
+  const OverlayBounds bounds = overlay_bounds();
+  const float width = bounds.right - bounds.left, height = bounds.bottom - bounds.top;
+  ImDrawList* draw = ImGui::GetForegroundDrawList();
+  draw->PushClipRect(ImVec2(bounds.left, bounds.top), ImVec2(bounds.right, bounds.bottom), true);
+  const ImU32 white = IM_COL32(255, 255, 255, 255), dark = IM_COL32(24, 24, 34, 255);
+  for (int slot = 0; slot < 4; ++slot) {
+    const HudPlayerSnapshot& p = g_hud_players[slot];
+    if (!p.tag_visible || p.pro_icon_width <= 0) continue;
+    const float x640 = p.tag_x + p.pro_icon_dx;
+    const float sx = true_widescreen_active() ? 320.0f + (x640 - 320.0f) * true_widescreen_factor() : x640;
+    const float cx = bounds.left + sx / 640.0f * width;
+    const float cy = bounds.top + (p.tag_y + kProTagRobotDy) / 480.0f * height;
+    // The robot's height follows the letters' (cap height in 480 units), its width the room left.
+    const float room = p.pro_icon_width / 640.0f * width * (true_widescreen_active() ? true_widescreen_factor() : 1.0f);
+    const float u = std::min(kProTagRobotHeight / 480.0f * height / 10.0f, room * 0.9f / 11.2f);
+    if (u < 0.4f) continue;
+    const auto R = [&](float x0, float y0, float x1, float y1, ImU32 c, float r) {
+      draw->AddRectFilled(ImVec2(cx + x0 * u, cy + y0 * u), ImVec2(cx + x1 * u, cy + y1 * u), c, r * u);
+    };
+    draw->AddCircleFilled(ImVec2(cx, cy - 4.3f * u), 1.05f * u, white, 12);   // antenna ball
+    R(-0.35f, -3.6f, 0.35f, -2.4f, white, 0.0f);                                // antenna
+    R(-5.6f, -0.9f, -4.0f, 1.9f, white, 0.6f);                                  // ears
+    R(4.0f, -0.9f, 5.6f, 1.9f, white, 0.6f);
+    R(-4.4f, -2.9f, 4.4f, 4.7f, white, 1.6f);                                   // head
+    draw->AddCircleFilled(ImVec2(cx - 1.75f * u, cy + 0.2f * u), 1.2f * u, dark, 12);   // eyes
+    draw->AddCircleFilled(ImVec2(cx + 1.75f * u, cy + 0.2f * u), 1.2f * u, dark, 12);
+    R(-2.3f, 2.3f, 2.3f, 3.6f, dark, 0.5f);                                     // mouth
+    R(-0.95f, 2.5f, -0.55f, 3.4f, white, 0.0f);
+    R(0.55f, 2.5f, 0.95f, 3.4f, white, 0.0f);
   }
   draw->PopClipRect();
 }
@@ -6683,6 +6722,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     const float gd_list_height =
         std::floor((kGdHintTop - kGdHintGap - kGdListTop + kGdRowSpacing) / kGdRowPitch) * kGdRowPitch - kGdRowSpacing;
     ImVec2 settings_content_size = gd_page ? ImVec2(532.0f * gd_scale, gd_list_height * gd_scale) : ImVec2(0, -48);
+    // Clean puts its Quit game button above the Back and Return chips (settings_page_footer, 44 px
+    // over them): the page ends above it, or a long page drew over the button and hid it.
+    if (options.overlay_style == 0 && !gd_page && !state.fill_window) settings_content_size.y = -84.0f;
     if (options.overlay_style == 3) {
       const ImVec2 window_pos = ImGui::GetWindowPos(), window_size = ImGui::GetWindowSize();
       constexpr float kRadialDetailSideInset = 64.0f;
@@ -12112,6 +12154,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   if (!state.fill_window && !state.open && !state.menu_open && !g_hud_match && yougame::stdio_bridge())
     draw_back_to_yougame_hint();
   if (!state.fill_window && !state.open && !state.menu_open) draw_combo_counter();
+  if (!state.fill_window && !state.open && !state.menu_open) draw_pro_tag_robots();
   if (!state.fill_window && !state.open && !state.menu_open) draw_community_code_overlays();
   {   // YouGame's Sign in by code panel, over the online menu's game picture (settings stay on top)
     static bool signin_was = false;

@@ -206,6 +206,8 @@ struct HudPlayerSnapshot {
   bool stunned = false;
   // The community codes' overlays: Nana's damage (-1 no Nana in play) and the team (-1 not teams).
   int nana_damage = -1, team = -1;
+  // A pro AI's tag: the robot's centre right of tag_x and the room for it (640x480 units, 0 none).
+  float pro_icon_dx = 0, pro_icon_width = 0;
 };
 
 // The frame's vertex storage leaves new elements uninitialised on resize (Vertex is plain data):
@@ -352,6 +354,7 @@ void set_native_hud_player(int slot, bool present, int damage, int stocks, float
 void set_native_hud_combo(int slot, int link, float percent, bool stunned);   // MuHostApi.hud_combo, simulation thread
 // Since host API 31 (upstream's 24): Nana's damage and the player's team, for the community codes' overlays.
 void set_native_hud_extras(int slot, int nana_damage, int team);
+void set_native_hud_pro_tag(int slot, float dx, float width);
 // The actions in which a fighter cannot act for the combo counter: damage and tumble, down and tech,
 // grabbed, thrown and carried (ftCo_MS_* ids; the game's mu_combo_stun_action is the same list).
 inline bool combo_stun_action(uint32_t a) {

@@ -72,7 +72,7 @@ int main() {
   }
   answer = YG__START_ANSWER_GET;
   CHECK(yg_start(&options) == YG_START_OFFERED && opened_page == 2);
-  // Asked on first use: at launch ASK_LATER never shows the window; the row press
+  // Asked on first use (the owner, 11-17): at launch ASK_LATER never shows the window; the row press
   // (ASK_ON_USE) shows it, and Play offline is a plain DECLINED, never remembered.
   const int offers_before = offers;
   options.ask = YG_START_ASK_LATER;

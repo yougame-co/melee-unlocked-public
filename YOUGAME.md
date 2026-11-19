@@ -1,7 +1,7 @@
 # Melee Unlocked: YouGame's version
 
-Source candidate for YouGame build 122.31, Melee Unlocked 0.9.218,
-row `0.9.218-online-test.122.31` (main configuration with Friends 4-seat, Doubles and Squad Strike; see BUILDING.md). This is a proposed build ("Not tested yet"), not the main listing build. Original project:
+Source candidate for YouGame build 122.34, Melee Unlocked 0.9.219,
+row `0.9.219-online-test.122.34` (main configuration with Friends 4-seat, Doubles and Squad Strike; see BUILDING.md). This is a proposed build ("Not tested yet"), not the main listing build. Original project:
 https://github.com/Hero88go/melee-unlocked (GPL-3.0-or-later).
 Retain LICENSE, NOTICE and third-party notices.
 
@@ -11,7 +11,7 @@ files present in an unstaged candidate require a separate provenance review
 and block publication until approved. The pinned decomp and aurora dependencies
 are gitlinks, without bundled submodule contents.
 
-See BUILDING.md for build-122.31 prerequisites, platform commands and limitations.
+See BUILDING.md for build-122.34 prerequisites, platform commands and limitations.
 Older CI documentation and patch-based recipes are historical and cannot be
 used unchanged for this revision. Both game and host use
 `YOUGAME_RANKED_BRANCH=ON`.
