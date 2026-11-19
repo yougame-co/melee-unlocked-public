@@ -202,6 +202,13 @@ void handle_event(const SDL_Event& e) {
   if (g_x11_embed && (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) &&
       (!g_embed_focus_requested || !linux_compat::window_focused())) return;
 #endif
+  // Esc with the game's YouGame box on screen is its Back, as on Windows (wnd_proc): before the
+  // embedded route, full screen, the Esc menu, ImGui and the game's bindings.
+  if ((e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) && e.key.keysym.scancode == SDL_SCANCODE_ESCAPE &&
+      g_box_escape.key(e.type == SDL_KEYDOWN, e.key.repeat != 0, [] { return yougame::sign_in_escape(); })) {
+    std::lock_guard<std::mutex> lock(g_keys_mutex); set_key(VK_ESCAPE, false);
+    return;
+  }
   // Embedded Escape bypasses native fullscreen handling, ImGui NavCancel and pad bindings.
   // SDL's KMOD_SHIFT includes either Shift, just as the overlay Tab path below does.
   if ((yougame::stdio_bridge()

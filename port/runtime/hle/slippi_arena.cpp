@@ -1778,6 +1778,13 @@ bool css_hand(float* x, float* y) {
   return true;
 }
 
+std::atomic<int> g_css_mode{-1};
+void set_css_mode(int mode) { g_css_mode.store(mode); }
+bool css_ranked_or_unranked() {
+  const int mode = g_css_mode.load();
+  return mode == Matchmaking::RANKED || mode == Matchmaking::UNRANKED;
+}
+
 void set_css_pick(uint8_t character, uint8_t costume) {
   g_css_pick.store((uint16_t)(character << 8 | costume));
 }

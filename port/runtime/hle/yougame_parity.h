@@ -56,6 +56,21 @@ bool embedded_escape(bool down, bool shift, bool repeat, bool capturing, Relay r
   return false;
 }
 
+// Esc while the game's YouGame box shows (signin_overlay.cpp), before every other Esc owner. `take`
+// presses the box's Back and says whether it did (yougame::sign_in_escape); a taken press keeps its
+// repeats and its release too, so neither the game, the Esc menu nor ImGui sees that Esc. Window thread only.
+class BoxEscape {
+ public:
+  template <class Take>
+  bool key(bool down, bool repeat, Take take) {
+    if (down && !repeat) held_ = take();
+    else if (!down && held_) { held_ = false; return true; }
+    return held_;
+  }
+ private:
+  bool held_ = false;
+};
+
 class Signals {
  public:
   using Writer = void (*)(const char*);

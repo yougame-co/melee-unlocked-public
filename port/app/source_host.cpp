@@ -2890,8 +2890,9 @@ int32_t h_slippi_command(uint8_t command, const uint8_t* payload, uint32_t paylo
             for (const char* q = name; *q; ++q) reply.push_back((uint8_t)*q);
           return true;
         }
-        if (c == CMD_ARENA_HAND && n == 4) {   // shim/mu_slippi_css.c: the CSS hand, in tenths
+        if (c == CMD_ARENA_HAND && (n == 4 || n == 5)) {   // shim/mu_slippi_css.c: the CSS hand, in tenths, and the select's mode
           slippi::arena::set_css_hand((int16_t)(p[0] << 8 | p[1]), (int16_t)(p[2] << 8 | p[3]));
+          slippi::arena::set_css_mode(n == 5 ? p[4] : -1);
           return true;
         }
         if (c == CMD_ARENA_PICK && n == 3) {   // shim/mu_slippi_sss.c: the character select's pick

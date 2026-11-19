@@ -102,6 +102,11 @@ void sign_in_open();
 bool sign_in_showing();
 void sign_in_view(signin::View& out);
 void sign_in_press(signin::Button button);
+// The box as drawn this frame (pc_settings.cpp): under the settings or the Esc menu it takes no keys.
+void sign_in_drawn(bool drawn);
+// Esc with the box on screen: Back, as Shift+Tab is (channel_menu_key), from the window procedure. True
+// when it took the press; the window then keeps that Esc from the menus, ImGui and the game.
+bool sign_in_escape();
 // The current search or match is a YouGame one: always in the app, and under the launcher from the
 // moment a YouGame row is picked until a Slippi row is picked.
 bool session();

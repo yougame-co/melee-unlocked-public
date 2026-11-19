@@ -329,12 +329,15 @@ int mu_host_button_label(int port, unsigned button_mask, char* out, int n)
 #define CMD_ARENA_HAND 0xDB /* upstream 0xEF: CMD_YOUGAME_MENU in this build */
 /* mnCharSel_CursorThink, after the hand moved: the online CSS's own player's hand goes to the host
  * (x, y as the screen's units, 0.1 steps) when it moved, for an arena room's side panels: a hand
- * pushed against the left or right edge goes into that panel. */
+ * pushed against the left or right edge goes into that panel. The fifth byte is the select's mode
+ * (MU_SLP_MODE_*): Ranked and Unranked show no rooms panel. */
 void mu_slippi_css_hand(int port, float x, float y)
 {
     static int last = 0x7FFFFFFF;
+    static int last_mode = -1;
     static unsigned char reply[4096];
-    unsigned char payload[4];
+    unsigned char payload[5];
+    int mode;
     unsigned int got = 0;
     int ix, iy, packed, moved;
 
@@ -366,14 +369,17 @@ void mu_slippi_css_hand(int port, float x, float y)
     if (!mu_slippi_css_online() || ctrl_port == NULL || (port != *ctrl_port && !moved)) {
         return;
     }
-    if (packed == last) {
+    mode = mu_slippi_state()->mode;
+    if (packed == last && mode == last_mode) {   /* a new select's mode goes out even where the hand stayed */
         return;
     }
     last = packed;
+    last_mode = mode;
     payload[0] = (unsigned char) (ix >> 8);
     payload[1] = (unsigned char) ix;
     payload[2] = (unsigned char) (iy >> 8);
     payload[3] = (unsigned char) iy;
+    payload[4] = (unsigned char) mode;
     mu_online_abi_command(CMD_ARENA_HAND, payload, sizeof payload, reply, sizeof reply, &got);
 }
 

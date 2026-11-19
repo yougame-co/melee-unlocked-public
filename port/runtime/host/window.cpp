@@ -101,6 +101,7 @@ std::atomic<int> g_trace_mark{0};   // 0 none, else the kind of the last mark ke
 std::atomic<int> g_settings_controller_port{-1};
 std::atomic<bool> g_practice_toggle{false};
 std::atomic<bool> g_escape_press{false};
+yougame::parity::BoxEscape g_box_escape;   // window thread: an Esc the game's YouGame box took
 std::atomic<bool> g_capturing{false};   // a control rebind is waiting for its key (input_begin_capture)
 MessageCallback g_on_message;
 std::atomic<bool> g_ui_capture{false};
@@ -399,6 +400,15 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
   // the screen for the rest of the match. It comes back the moment the panel opens or focus leaves.
   // Before the ImGui handler, which would otherwise set the arrow itself.
   if (m == WM_SETCURSOR && LOWORD(l) == HTCLIENT && !g_ui_capture.load() && window_focused(h)) { SetCursor(nullptr); return TRUE; }
+  // Esc with the game's YouGame box on screen is its Back, the same as Shift+Tab, taken here before
+  // the embedded route, the Esc menu, ImGui and the game's bindings. It used to go through the next
+  // drawn frame's shared Esc check (pc_settings.cpp), and on Windows Esc left the box up.
+  if (w == VK_ESCAPE && (m == WM_KEYDOWN || m == WM_KEYUP || m == WM_SYSKEYDOWN || m == WM_SYSKEYUP) &&
+      g_box_escape.key(m == WM_KEYDOWN || m == WM_SYSKEYDOWN, (l & (1LL << 30)) != 0,
+                       [] { return yougame::sign_in_escape(); })) {
+    std::lock_guard<std::mutex> lock(g_keys_mutex); g_keys[VK_ESCAPE] = false;
+    return 0;
+  }
   // One embedded Escape press has one game owner: bypass ImGui's NavCancel and pad bindings.
   if (yougame::stdio_bridge() && w == VK_ESCAPE &&
       (m == WM_KEYDOWN || m == WM_KEYUP || m == WM_SYSKEYDOWN || m == WM_SYSKEYUP)) {

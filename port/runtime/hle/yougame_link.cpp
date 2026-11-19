@@ -3853,6 +3853,17 @@ void sign_in_press(signin::Button button) {
   if (button == signin::Button::Back) host::log("yougame sign-in: Back");
   sign_in_send(ask);
 }
+namespace {
+std::atomic<bool> g_signin_drawn{false};
+}  // namespace
+void sign_in_drawn(bool drawn) { g_signin_drawn.store(drawn); }
+bool sign_in_escape() {
+  if (!g_signin_drawn.load() || !sign_in_showing()) return false;
+  g_signin_drawn.store(false);   // drawn again by the next frame if another box is still up
+  host::log("yougame: Esc, box Back");
+  sign_in_press(signin::Button::Back);
+  return true;
+}
 
 void refresh_identity() {
   if (g_identity_fetching.exchange(true)) return;

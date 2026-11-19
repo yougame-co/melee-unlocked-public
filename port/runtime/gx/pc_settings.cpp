@@ -4769,7 +4769,9 @@ static void draw_arena_panel(RenderOptions& options, const host::PadState* pads,
   // Rooms ride on the Source Port's character select, whose game library reports the hand (cmd
   // 0xEF). The Static Recomp's select never does: it drew an ARENA tab there that nothing opens.
   float hand_x = 0, hand_y = 0;
-  f.on_online_menus = (slippi::online::in_online_menus() && slippi::arena::css_hand(&hand_x, &hand_y)) ||
+  // Ranked and Unranked have no rooms: no ARENA tab or "Push the hand here" box on their selects.
+  f.on_online_menus = (slippi::online::in_online_menus() && slippi::arena::css_hand(&hand_x, &hand_y) &&
+                       !slippi::arena::css_ranked_or_unranked()) ||
                       slippi::arena::test_fixture_active();
   arena_panel::frame(f);
 }
@@ -12092,7 +12094,9 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
   if (!state.fill_window && !state.open && !state.menu_open) draw_community_code_overlays();
   {   // YouGame's Sign in by code panel, over the online menu's game picture (settings stay on top)
     static bool signin_was = false;
-    if (!state.fill_window && !state.open && !state.menu_open && signin_overlay::open()) {
+    const bool signin_drawn = !state.fill_window && !state.open && !state.menu_open && signin_overlay::open();
+    yougame::sign_in_drawn(signin_drawn);   // Esc goes to the box only while it is on screen (window.cpp)
+    if (signin_drawn) {
       const ImVec2 screen = ImGui::GetIO().DisplaySize;
       const float aspect = presented_aspect(options, (int)screen.x, (int)screen.y, true);
       float gw = screen.x, gh = gw / std::max(aspect, 0.1f);

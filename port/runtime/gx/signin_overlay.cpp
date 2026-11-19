@@ -205,7 +205,7 @@ void draw(float x0, float y0, float x1, float y1) {
       first = false;
     }
     ImGui::PopFont();
-    // B on the controller is Back (Esc comes through back(), from pc_settings.cpp).
+    // B on the controller is Back (Esc is Back from the window procedure: yougame::sign_in_escape).
     if (pressed == Button::None && !appearing && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) pressed = Button::Back;
   }
   ImGui::End();
