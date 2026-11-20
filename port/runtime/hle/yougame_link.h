@@ -112,6 +112,11 @@ bool sign_in_escape();
 bool session();
 // The online menu's choice, before its character select: true for a YouGame row. Ignored in the app.
 void set_launcher_session(bool yougame);
+// YouGame's friend flow can run in this game: the Friends row holds a room and opens YouGame's friend
+// picker and the Friends lobby, and an invite's join push takes the player into the friend's room. Always
+// in the app (active()); for a game started on its own, while the local channel to a running YouGame app
+// is up (launcher() with channel_connected()). The old launcher bridge keeps Slippi-style Direct.
+bool friends_flow();
 // Launcher only: YouGame is on another (older) release than this build. Asks the launcher again
 // (a local answer, under 2 s). Empty when this build is allowed or nothing is known.
 std::string behind_version_now();

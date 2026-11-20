@@ -220,6 +220,7 @@ static int agent_lock_logged, friends_css_host, tournament_visible, slippi_subme
 void mu_mnmain_install_online_menu() { ++installs; }
 void mu_content_mode(int mode) { content = mode; }
 static int split_layout() { return 0; }
+enum { SPLIT_FRIENDS = 2 };
 static int split_start_page() { return 0; }
 static int cursor_stops(int) { return 1; }
 int mu_slippi_first_unlocked() { return 0; }

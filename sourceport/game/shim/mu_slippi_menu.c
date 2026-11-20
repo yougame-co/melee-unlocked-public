@@ -136,7 +136,7 @@ static int yg_flags;
 static int yg_pick;           /* the last row picked was a YouGame row (split layout) */
 static int last_slot = -1;    /* the last row picked (split layout): the cursor goes back to it */
 enum { YG_APP_RANKED = 1, YG_SPLIT = 2, YG_ROWS_OPEN = 4, YG_HEADER = 8, YG_OPEN_RANKED = 16, YG_OPEN_DIRECT = 32,
-       YG_COMING_SOON = 64 };
+       YG_COMING_SOON = 64, YG_FRIENDS_FLOW = 128 };
 /* Started for a YouGame mode (--online-mode): the boot menu confirms that row by itself, like the
  * P2P session's Direct (set at the boot entry, cleared by the menu's think before any match). */
 static int auto_slot = -1;
@@ -154,6 +154,22 @@ static const signed char split_mode[8] = { MU_SLP_MODE_RANKED, MU_SLP_MODE_UNRAN
                                            MU_SLP_MODE_PARTY };
 static int split_page;        /* 0: Ranked, Unranked, Friends, Slippi; 1: Slippi's four */
 static int split_layout(void) { return !ranked_supported && (yg_flags & YG_SPLIT) != 0; }
+/* The split layout's Friends row (first page). With YouGame's rows open over the local channel
+ * (YG_FRIENDS_FLOW) it opens YouGame's friend flow, as the app's Friends row does: the host holds a
+ * Friends room and opens YouGame's friend picker and the Friends lobby. Otherwise (the old launcher
+ * bridge) it stays Direct's connect code. */
+enum { SPLIT_FRIENDS = 2 };
+static int split_friends(void)
+{
+    return split_layout() && split_page == 0 && (yg_flags & YG_FRIENDS_FLOW) != 0;
+}
+/* The cursor is on the row that opens YouGame's friend flow: the app's Friends row, or the split
+ * layout's under split_friends(). */
+static int on_friends_row(int sel)
+{
+    return split_layout() ? split_friends() && sel == SPLIT_FRIENDS
+                          : mu_slippi_menu_option(sel) == MU_SLP_OPT_FRIENDS;
+}
 /* The page the online menu opens on: Slippi's own when YouGame's rows are closed and Slippi is signed
  * in (one press less for a player without YouGame), else the first page. */
 static int split_start_page(void)
@@ -848,7 +864,13 @@ int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned c
         slippi_submenu = 0;
         mu_mnmain_install_online_menu();
         *menu_kind = MENU_KIND_8;
-        *hovered = (u8) mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_FRIENDS);
+        if (split_layout()) {
+            /* The split layout's Friends row, on YouGame's page (the local channel's friend flow). */
+            split_page = 0;
+            *hovered = cursor_stops(SPLIT_FRIENDS) ? (u8) SPLIT_FRIENDS : (u8) mu_slippi_first_unlocked();
+        } else {
+            *hovered = (u8) mu_online_menu_row(ranked_supported, 0, MU_SLP_OPT_FRIENDS);
+        }
         return 1;
     }
     if (previous_mode == GM_HANYU_CSS) {
@@ -866,6 +888,12 @@ int mu_slippi_menu_enter(int previous_mode, unsigned char* menu_kind, unsigned c
                              slp.mode == MU_SLP_MODE_PARTY;
             mu_mnmain_install_online_menu();
             *hovered = (u8) mu_online_menu_row(1, slippi_submenu, slp.mode);
+        } else if (split_layout() && from_friends_online) {
+            /* A friend room (an invite accepted over the local channel): back on YouGame's Friends row. */
+            OSReport("friends: left the friend room's character select; online menu on Friends\n");
+            split_page = 0;
+            last_slot = SPLIT_FRIENDS;
+            *hovered = cursor_stops(SPLIT_FRIENDS) ? (u8) SPLIT_FRIENDS : (u8) mu_slippi_first_unlocked();
         } else if (split_layout()) {
             /* Back from a match: the page and row it was started from. */
             split_page = last_slot >= SPLIT_FIRST_SLIPPI ? 1 : last_slot >= 0 ? 0 : split_start_page();
@@ -1040,7 +1068,9 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
     MenuExitData* data;
     int auto_direct = 0;
     int selected_row, selected_option, steps;
-    int friends_visible = ranked_supported && !slippi_submenu;
+    /* The app's Friends row, or the split layout's over the local channel (split_friends). */
+    int friends_visible = (ranked_supported && !slippi_submenu) || split_friends();
+    int split_friends_press = 0;   /* the split layout's Friends row was confirmed this frame (E6 17 below) */
     int online_visible = 1;
     /* The menu takes no input while its entry cooldown runs (mn_80229624 answers 0 and counts it
      * down), so the frame it reaches 0 is the first one a player's own press could confirm on. */
@@ -1141,7 +1171,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
 #ifdef MELEE_DOUBLES
     /* A join opens the Doubles home over this menu with no press here: put the cursor on Doubles
      * once per opening, so the highlighted row and its description match the home. */
-    if (friends_visible && mn_804A04F0.cur_menu == MENU_KIND_8) {
+    if (ranked_supported && friends_visible && mn_804A04F0.cur_menu == MENU_KIND_8) {
         u8 home_query = 13, home_open = 0;
         unsigned int got = 0;
         const int home = mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &home_query, 1, &home_open, 1, &got) == 0 &&
@@ -1152,7 +1182,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
     }
     /* The home found a match on the 4-peer route: each seat picks on its own Teams character select
      * (E6 value 14 answers once, with this seat's team from the room). */
-    if (friends_visible && mn_804A04F0.cur_menu == MENU_KIND_8) {
+    if (ranked_supported && friends_visible && mn_804A04F0.cur_menu == MENU_KIND_8) {
         u8 teams_query = 14, teams[2] = { 0, 0xFF };
         unsigned int teams_got = 0;
         if (mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &teams_query, 1, teams, 2, &teams_got) == 0 &&
@@ -1226,12 +1256,23 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         sfxForward();
 #endif
     } else if ((buttons & MenuInput_Confirm) && friends_visible &&
-        mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_FRIENDS)
+        on_friends_row(mn_804A04F0.hovered_selection))
     {
         /* A and START both confirm Friends. The host keeps the menu here until the
          * picker returns; still apply the ordinary confirm cooldown. */
         mn_804D6BC8.cooldown = 5;
         friends_confirm_hold = 1;
+        if (split_layout()) {
+            /* Over the local channel: a YouGame row (the host's launcher session), the cursor comes back
+             * here, and the host is asked for the friend flow below, after this frame's publish. The app
+             * opens it from the pad press instead; a confirm the menu made itself (auto_slot) has none. */
+            yg_pick = 1;
+            last_slot = SPLIT_FRIENDS;
+            yougame_query(1, NULL, 0);
+            split_friends_press = 1;
+            sfxForward();
+            OSReport("online menu: Friends (YouGame) confirmed; asking for YouGame's friend flow\n");
+        }
     } else if ((buttons & MenuInput_Confirm) && ranked_supported &&
                mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_SLIPPI) {
         slippi_submenu = 1;
@@ -1395,8 +1436,7 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
     {
         /* The entry cooldown still hides the row's selection (a press carried in from the main
          * menu must not open the picker); only the cooldown after a Friends confirm keeps it. */
-        const int friends_hovered =
-            mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_FRIENDS;
+        const int friends_hovered = on_friends_row(mn_804A04F0.hovered_selection);
         u8 friends_menu;
         /* Released on the first frame that takes input with no cooldown pending (not the confirm
          * frame itself, which sets the cooldown above), so there is no frame without selection. */
@@ -1407,6 +1447,11 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
         /* Track Online even with the Friends row hidden; bit 2 is status-area visibility. */
         if (online_visible) friends_menu |= 4;
         mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &friends_menu, 1, NULL, 0, NULL);
+        if (split_friends_press) {
+            /* After the publish, so the host already sees Friends selected (slippi_online.cpp, E6 17). */
+            u8 press = 17;
+            mu_slippi_cmd(CMD_YOUGAME_FRIENDS_MENU, &press, 1, NULL, 0, NULL);
+        }
 #if MU_SQUAD
         /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
         if (gmSquad_OnlineFriend() && (!friends_visible || !friends_hovered)) {

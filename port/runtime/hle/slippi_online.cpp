@@ -2583,7 +2583,8 @@ bool native_start_match(int mode, const std::string& connect_code, uint8_t chara
   // random legal stage and carries the practice character/costume into the normal online flow.
   uint8_t selections[9] = {0, character, color, 1, 0, 0, 3, (uint8_t)mode, 0};
   // Friends joins the room immediately, but the player still picks and locks in a fighter on CSS.
-  selections[3] = yougame::friends::native_ready(yougame::active(), mode, connect_code, friend_room) ? 1 : 0;
+  // session(): a friend room joined over the local channel waits on CSS as in the app (active() there).
+  selections[3] = yougame::friends::native_ready(yougame::session(), mode, connect_code, friend_room) ? 1 : 0;
   set_match_selections(selections);
   uint8_t find[19] = {};
   find[0] = (uint8_t)mode;
@@ -3438,9 +3439,24 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
         q.assign(1, g_friends_css.exchange(false) ? 1 : 0);
         return true;
       }
+      if (payload[0] == 17) {
+        // The split layout's Friends row was confirmed in a game started on its own, with the local channel
+        // up (the menu sends this only then; never in the app, whose pad press opens the flow). The same
+        // request a Friends press makes in the app: the next safe menu tick holds a Friends room and opens
+        // YouGame's friend picker and lobby (native_practice). A confirm the menu made by itself (a row picked
+        // before YouGame was connected, or --online-mode) has no pad press, so it comes this way too.
+        if (!yougame::active() && yougame::friends_flow()) {
+          yougame::friends::events.online_menu(true, true);
+          yougame::friends::events.request_host();
+          host::log("friends: the Friends row was confirmed (local channel)");
+        }
+        return true;
+      }
       // Bit 2 tracks the Online submenu independently of the hidden Friends row.
       g_online_menu_visible = (payload[0] & 4) != 0;
-      yougame::friends::events.online_menu(yougame::active() && (payload[0] & 3) != 0, (payload[0] & 3) == 2);
+      // friends_flow(): the app, or a game started on its own with the local channel up (the split layout's
+      // Friends row). Under the app it is active(), as before.
+      yougame::friends::events.online_menu(yougame::friends_flow() && (payload[0] & 3) != 0, (payload[0] & 3) == 2);
       return true;
     case CMD_YOUGAME_DATA:
       switch (payload[0]) {
@@ -3537,6 +3553,10 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
       // The local channel never holds a frame: its identity is asked on the probe's thread, and the
       // rows open on the first visit after it is in.
       if (yougame::launcher() && (yougame::channel_connected() ? yougame::identity().ok : yougame::wait_identity(500).ok)) q[0] |= 4;
+      // Bit 7: the YouGame rows are open over the local channel, so the split layout's Friends row opens
+      // YouGame's friend flow (friends_flow(): a Friends room, its picker and the lobby) instead of Direct's
+      // connect code. The old launcher bridge leaves it clear and keeps Direct.
+      if ((q[0] & 4) && yougame::channel_connected() && yougame::friends_flow()) q[0] |= 128;
       // Bit 6: YouGame is not ready for the rows yet: not open (picking a row starts it), or open and signed
       // out (picking a row opens Sign in by code). Either way the menu then carries on into that row.
       if ((yougame::coming_soon() || yougame::sign_in_needed()) && !yougame::active() && (q[0] & 2)) q[0] |= 64;

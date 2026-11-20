@@ -30,7 +30,7 @@ class FriendsMenuWiringTest(unittest.TestCase):
         native = source("port/runtime/hle/native_practice.cpp")
         tick = native[native.index("void tick() {"):]
         clear = tick.index("if (major != 1) yougame::friends::events.online_menu(false);")
-        self.assertLess(clear, tick.index("if (yougame::active() && !slippi::playback::enabled())"))
+        self.assertLess(clear, tick.index("if (yougame::friends_flow() && !slippi::playback::enabled())"))
         self.assertLess(clear, tick.index("events.take_host()"))
         # Build 12: Direct no longer owns a YouGame picker.
         self.assertIn("const bool picker_scene = major == 1;", tick)
@@ -130,7 +130,8 @@ class FriendsMenuWiringTest(unittest.TestCase):
         self.assertEqual(think.count('while (!mn_80229938(MENU_KIND_8, mn_804A04F0.hovered_selection) && --steps > 0)'), 2)
         self.assertEqual(think.count('steps = mu_slippi_menu_count();'), 2)
         self.assertIn('if ((buttons & MenuInput_Confirm) && friends_visible &&', think)
-        self.assertIn('mu_slippi_menu_option(mn_804A04F0.hovered_selection) == MU_SLP_OPT_FRIENDS)', think)
+        self.assertIn('on_friends_row(mn_804A04F0.hovered_selection))', think)
+        self.assertIn(': mu_slippi_menu_option(sel) == MU_SLP_OPT_FRIENDS;', menu)
 
     def test_native_rows_map_to_existing_mode_ids_and_use_yougame_flag(self):
         api = source("sourceport/game/include/mu_native.h")
@@ -144,7 +145,7 @@ class FriendsMenuWiringTest(unittest.TestCase):
         host = source("port/runtime/hle/slippi_online.cpp")
         self.assertIn("friends_offered(yougame::active()) ? 2 : 0", host)
         self.assertIn("#define YOUGAME_FRIENDS_ROW 1", source("port/runtime/hle/yougame_mode_policy.h"))
-        self.assertIn("events.online_menu(yougame::active() && (payload[0] & 3) != 0, (payload[0] & 3) == 2)", host)
+        self.assertIn("events.online_menu(yougame::friends_flow() && (payload[0] & 3) != 0, (payload[0] & 3) == 2)", host)
 
     def test_custom_texture_swap_uses_native_and_baked_art(self):
         label = source("sourceport/game/shim/mu_menu_label.c")

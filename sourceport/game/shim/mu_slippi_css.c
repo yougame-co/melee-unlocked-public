@@ -551,9 +551,10 @@ int mu_slippi_css_inputs(unsigned int trigger)
     case MU_SLP_MM_OPPONENT_CONNECTING:
     case MU_SLP_MM_ERROR:
         /* An error also clears on A or B: the keyboard's Z key is the pad's A (E is Z), so a keyboard
-         * player pressing the "Z" the screen names was stuck there until the game was killed (11-17). */
+         * player pressing the "Z" the screen names was stuck there until the game was killed (11-17).
+         * And on START, the button the screen names: Find Match again is then one more START. */
         if ((trigger & HSD_PAD_Z) ||
-            (m->connection_state == MU_SLP_MM_ERROR && (trigger & (HSD_PAD_A | HSD_PAD_B)))) {
+            (m->connection_state == MU_SLP_MM_ERROR && (trigger & (HSD_PAD_A | HSD_PAD_B | HSD_PAD_START)))) {
             mu_slippi_cleanup_connections();
         }
         /* A YouGame row while YouGame is on an older release: Start restarts in that release (the
@@ -1086,7 +1087,9 @@ static void text_think(HSD_GObj* gobj)
     } else if (updating) {
         snprintf(prompt, sizeof prompt, "Press %s, then hold %s to update", z_key, b_key);
     } else if (conn == MU_SLP_MM_ERROR) {
-        snprintf(prompt, sizeof prompt, "Press %s to clear error", z_key);
+        /* START: the button a player just pressed for Find Match, on a pad and on a keyboard alike
+         * (A, B and Z clear it too). Naming Z left a pad player looking for the keyboard's E. */
+        snprintf(prompt, sizeof prompt, "Press %s to clear error", start_key);
     } else if (conn > MU_SLP_MM_IDLE) {
         snprintf(prompt, sizeof prompt, "Press %s to cancel", z_key);
     } else if (conn == MU_SLP_MM_IDLE && st->mode == MU_SLP_MODE_UNRANKED && unranked_opponent_left()) {

@@ -3304,6 +3304,7 @@ bool coming_soon_build() {
 }
 bool available() { return active() || launcher(); }
 bool session() { return active() || (launcher() && g_launcher_session.load()); }
+bool friends_flow() { return active() || (launcher() && g_channel_up.load()); }
 std::string build_version() {
 #ifdef MELEE_PORT_VERSION
   return MELEE_PORT_VERSION;

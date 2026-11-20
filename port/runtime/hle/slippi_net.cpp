@@ -2596,8 +2596,10 @@ void Matchmaking::startMatchmaking() {
     }
   }
   // The Friends lobby is YouGame's own room: no Slippi account, blend or Direct code.
+  // session(): the app, or a game started on its own whose Friends row or accepted invite went through the
+  // local channel (native_practice sets the launcher session before it arms the lobby).
   if (search_settings_.friends_lobby && !local_peer.enabled) {
-    if (!yougame::active()) { fail("The Friends lobby needs YouGame"); return; }
+    if (!yougame::session()) { fail("The Friends lobby needs YouGame"); return; }
     startYouGameMatchmaking();
     return;
   }

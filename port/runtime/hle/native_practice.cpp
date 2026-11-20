@@ -1508,7 +1508,11 @@ void tick() {
   slippi::online::slippi_link_tick(major, minor, online_mode());
   if (major != 1) yougame::friends::events.online_menu(false);
   yougame::friends::events.menu_scene(yougame::friends::menu_safe(major, minor));
-  if (yougame::active() && !slippi::playback::enabled()) {
+  // friends_flow(): the app (active(), as before), or a game started on its own with the local channel up,
+  // whose split-layout Friends row and accepted invites take this same path. The YouGame tournament stays the
+  // app's (below).
+  const bool via_channel = !yougame::active();
+  if (yougame::friends_flow() && !slippi::playback::enabled()) {
     if (major == kOnlineMajor) g_friend_handoff = false;
     // Wait for the main menu's initialization/cleanup. Never interrupt a local or online match.
     if (major == 1) ++g_friend_menu_ticks;
@@ -1517,7 +1521,7 @@ void tick() {
                       (major != 1 || g_friend_menu_ticks >= 120);
     // The ordinary menu path requests identity as before. Only its validated first hello
     // can schedule a bracket game; boot never waits or consumes the identity wait budget.
-    if (g_bridge && major == 1 && safe && yougame::tournament_pending()) {
+    if (!via_channel && g_bridge && major == 1 && safe && yougame::tournament_pending()) {
       g_bridge(MU_TOURNEY_BOOT_OP, nullptr, 0);
       return;
     }
@@ -1594,6 +1598,8 @@ void tick() {
         if (doubles || lobby_host || lobby_guest) {
           host::log("%s: %s (%s)", doubles ? "doubles" : "friends lobby",
                     doubles_host || lobby_host ? "entry opened" : "invite accepted", yougame::friends::events.trigger().c_str());
+          // Over the local channel the lobby is a YouGame search like a YouGame row's (session()); a no-op in the app.
+          if (via_channel) yougame::set_launcher_session(true);
           yougame::friends::events.online_menu(false);
           slippi::online::native_cleanup_match();
           g_lifecycle = Lifecycle{};
@@ -1644,6 +1650,7 @@ void tick() {
       yougame::friends::events.picker_open(g_friend_picker.valid());
       if (!room.empty()) {
         slippi::online::squad_friend_room(room, picked);
+        if (via_channel) yougame::set_launcher_session(true);   // the friend room is a YouGame search (session())
         yougame::friends::events.online_menu(false);
         // An armed Friends lobby (this invite accepted on its select) is let go first: its select's unload
         // then sends no LEAVE into the new 1v1 connection (mu_slippi_menu.c lobby_close, view.arm).

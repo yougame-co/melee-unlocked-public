@@ -56,7 +56,7 @@ class KeyboardPromptTest(unittest.TestCase):
         self.assertIn("mu_host_button_label(*ctrl_port, HSD_PAD_Z, z_key, sizeof z_key);", think)
         self.assertIn("mu_host_button_label(*ctrl_port, HSD_PAD_B, b_key, sizeof b_key);", think)
         for line in ('"Hold %s to disconnect", z_key', '"Press %s, then hold %s to update", z_key, b_key',
-                     '"Press %s to clear error", z_key', '"Press %s to cancel", z_key',
+                     '"Press %s to clear error", start_key', '"Press %s to cancel", z_key',
                      '"%s: Practice vs CPU", z_key', '"Match closed. Hold %s to exit", b_key'):
             self.assertIn(line, think)
         for old in ('"Hold Z to %s"', '"Press Z, then hold B to update"', '"Press Z to %s"',
@@ -68,6 +68,11 @@ class KeyboardPromptTest(unittest.TestCase):
         inputs = body(self.css, "int mu_slippi_css_inputs(unsigned int trigger)")
         self.assertIn("gm_GetButtonsPressed((u8) *ctrl_port) & HSD_PAD_Z", inputs)
         self.assertNotIn("mu_host_button_label", inputs)
+
+    def test_start_clears_an_error(self):
+        # The error prompt names START, so START must clear it (A, B and Z still do).
+        inputs = body(self.css, "int mu_slippi_css_inputs(unsigned int trigger)")
+        self.assertIn("(trigger & (HSD_PAD_A | HSD_PAD_B | HSD_PAD_START))", inputs)
 
     def test_host_answers_keyboard_ports_only(self):
         self.assertIn("constexpr uint8_t CMD_BUTTON_LABEL = 0xDF;", self.host)
