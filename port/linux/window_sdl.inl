@@ -400,6 +400,31 @@ void title_from_another_thread(std::string title) {
   g_title_for_window = std::move(title);
   g_title_for_window_pending = true;
 }
+#ifdef MELEE_LINUX_X11_EMBED
+// Xlib's default handlers exit() from whichever thread hits the error. A GLX swap on the render thread did that
+// (122.31 and 122.34 seats aborted in static destructors with no reason logged), so log the error and carry on.
+// The player box's own traps chain to this as their previous handler. Only reads the event and Xlib's local
+// error text: no request is made from here.
+std::atomic<int> g_x_errors{0};
+int x_error_logged(Display* dpy, XErrorEvent* ev) {
+  const int n = g_x_errors.fetch_add(1, std::memory_order_relaxed);
+  if (n < 20 || (n & 1023) == 0) {
+    char text[160] = {};
+    XGetErrorText(dpy, ev->error_code, text, sizeof text - 1);
+    host::log("window: X error %d (%s), request %d.%d, resource 0x%lx, serial %lu (%d so far); carrying on",
+              (int)ev->error_code, text, (int)ev->request_code, (int)ev->minor_code,
+              (unsigned long)ev->resourceid, (unsigned long)ev->serial, n + 1);
+  }
+  return 0;
+}
+// A lost X connection cannot be survived (Xlib exits when this returns), but say so and leave without running
+// static destructors from this thread.
+int x_io_error_logged(Display*) {
+  host::log("window: lost the connection to the X server; closing");
+  std::fflush(nullptr);
+  std::_Exit(1);
+}
+#endif
 }  // namespace
 
 void window_prefer_background(bool on) {
@@ -433,6 +458,12 @@ void* window_create(int w, int h, const wchar_t* title, bool visible) {
 #endif
   if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0)
     die("cannot start SDL video: %s", SDL_GetError());
+#ifdef MELEE_LINUX_X11_EMBED
+  if (const char* driver = SDL_GetCurrentVideoDriver(); driver && std::strcmp(driver, "x11") == 0) {
+    XSetErrorHandler(x_error_logged);   // after SDL's own safety-net handler, which exits
+    XSetIOErrorHandler(x_io_error_logged);
+  }
+#endif
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
 #ifdef __APPLE__
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);

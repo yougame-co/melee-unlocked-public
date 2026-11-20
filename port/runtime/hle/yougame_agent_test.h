@@ -707,10 +707,12 @@ inline Settings load(bool active, const char* data_dir, Engine engine = Engine::
 #endif
   if (!active || !data_dir || !*data_dir) {
 #ifdef YOUGAME_AGENT_TEST_HOOK
-    // Test builds say why nothing was read (a staging walk otherwise sees no line at all).
-    if (std::getenv("YOUGAME_AGENT_COPY"))
-      out.log = !active ? "agent-test.json not looked for: no YouGame bridge or launcher"
-                        : "agent-test.json not looked for: YOUGAME_DATA is empty";
+    // Test builds always say why nothing was read: gating this on YOUGAME_AGENT_COPY hid the most likely case
+    // (an app copy that passes neither the bridge nor that variable) and a staging walk saw no line at all.
+    const char* copy = std::getenv("YOUGAME_AGENT_COPY");
+    out.log = std::string(!active ? "agent-test.json not looked for: no YouGame bridge or launcher"
+                                  : "agent-test.json not looked for: YOUGAME_DATA is empty") +
+              (copy && *copy ? " (YOUGAME_AGENT_COPY set)" : " (YOUGAME_AGENT_COPY not set)");
 #endif
     return out;
   }

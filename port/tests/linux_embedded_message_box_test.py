@@ -19,12 +19,21 @@ class LinuxEmbeddedMessageBoxTest(unittest.TestCase):
         body = win[win.index("void* window_create("):]
         self.assertLess(body.index("XInitThreads();"), body.index("SDL_InitSubSystem("))
 
+    def test_x_errors_are_logged_not_fatal(self):
+        win = (ROOT / "port/linux/window_sdl.inl").read_text(encoding="utf-8-sig")
+        body = win[win.index("void* window_create("):]
+        video = body.index("SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER")
+        self.assertLess(video, body.index("XSetErrorHandler(x_error_logged);"))
+        self.assertIn("XSetIOErrorHandler(x_io_error_logged);", body)
+        self.assertIn("return 0;", win[win.index("int x_error_logged("):win.index("int x_io_error_logged(")])
+
 
 class AgentTestSaysWhyItReadNothingTest(unittest.TestCase):
     def test_hook_builds_log_the_silent_cases(self):
         src = (ROOT / "port/runtime/hle/yougame_agent_test.h").read_text(encoding="utf-8-sig")
         self.assertIn('"agent-test.json not looked for: no YouGame bridge or launcher"', src)
         self.assertIn('"agent-test.json not looked for: YOUGAME_DATA is empty"', src)
+        self.assertNotIn('if (std::getenv("YOUGAME_AGENT_COPY"))\n      out.log = !active', src)
         self.assertIn('"agent-test.json not found in the game\'s data folder (YOUGAME_DATA)"', src)
 
 

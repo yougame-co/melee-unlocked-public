@@ -211,26 +211,59 @@ static bool has_nvidia_adapter() {
   return found;
 }
 
-// The note that Streamline faulted on this PC, beside the game: it holds the game version it happened
-// on, and a start of that version leaves Streamline out. A new version tries it again.
-static std::wstring g_fault_note;
-static bool fault_noted() {
-  FILE* f = _wfopen(g_fault_note.c_str(), L"rb");
+// The note that Streamline faulted on this PC: it holds the game version it happened on, and a start of that
+// version leaves Streamline out. A new version tries it again. It lives in the game's data folder when the app
+// gives one (YOUGAME_DATA): the app starts the game in an AppContainer, where the game's own folder is read-only,
+// so a note beside the game could not be written and the fallback never took. A note beside the game (older
+// versions, or a game started on its own) still counts.
+static std::wstring g_fault_note, g_fault_note_beside_game;
+static bool fault_note_says_this_version(const std::wstring& path) {
+  if (path.empty()) return false;
+  FILE* f = _wfopen(path.c_str(), L"rb");
   if (!f) return false;
   char text[64] = {};
   const size_t n = std::fread(text, 1, sizeof text - 1, f);
   std::fclose(f);
   return std::string(text, n).rfind(MELEE_PORT_VERSION, 0) == 0;
 }
-bool restart_without_streamline() {
-  if (g_fault_note.empty()) return false;
+static bool fault_noted() {
+  return fault_note_says_this_version(g_fault_note) || fault_note_says_this_version(g_fault_note_beside_game);
+}
+static void write_fault_note(const char* what) {
+  if (g_fault_note.empty()) return;
   if (FILE* f = _wfopen(g_fault_note.c_str(), L"wb")) {
     std::fputs(MELEE_PORT_VERSION, f);
     std::fputc('\n', f);
-    std::fputs("Streamline faulted while taking the graphics device on this PC; this version starts without it.", f);
+    std::fputs(what, f);
     std::fputc('\n', f);
     std::fclose(f);
   }
+}
+// A folder the game may write to: the app's data folder for this game, else the game's own folder.
+static std::wstring writable_dir(const std::wstring& exe_dir) {
+  const wchar_t* data = _wgetenv(L"YOUGAME_DATA");
+  if (data && *data) {
+    const DWORD attrs = GetFileAttributesW(data);
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) return data;
+  }
+  return exe_dir;
+}
+// slInit with structured exception handling around it: no C++ objects here. An access violation inside
+// Streamline's own start (a player's PC, 122.34, in the app's AppContainer) used to end the game; now the game
+// starts without Streamline.
+static sl::Result seh_sl_init(const sl::Preferences* pref, bool* faulted) {
+  __try {
+    const char* force = std::getenv("MELEE_SL_TEST_INIT_FAULT");
+    if (force && *force == '1') RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+    return slInit(*pref, sl::kSDKVersion);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    *faulted = true;
+    return sl::Result::eErrorExceptionHandler;
+  }
+}
+bool restart_without_streamline() {
+  if (g_fault_note.empty()) return false;
+  write_fault_note("Streamline faulted while taking the graphics device on this PC; this version starts without it.");
   if (!fault_noted()) { host::log("dlss: could not write the Streamline fault note"); return false; }
   host::log("dlss: starting the game again without Streamline");
   host::request_restart();
@@ -240,7 +273,9 @@ bool restart_without_streamline() {
 
 bool init(const std::wstring& exe_dir, bool load_frame_generation) {
   const char* force_fault = std::getenv("MELEE_SL_TEST_DEVICE_FAULT");   // tests the fallback below
-  g_fault_note = exe_dir + L"/streamline-faulted.txt";
+  const std::wstring writable = writable_dir(exe_dir);
+  g_fault_note = writable + L"/streamline-faulted.txt";
+  g_fault_note_beside_game = writable == exe_dir ? std::wstring() : exe_dir + L"/streamline-faulted.txt";
   if (fault_noted()) {
     host::log("dlss: Streamline faulted on this PC with this version; not loaded (DLSS, Reflex and frame generation unavailable; delete streamline-faulted.txt to try again)");
     return false;
@@ -285,8 +320,11 @@ bool init(const std::wstring& exe_dir, bool load_frame_generation) {
   pref.logLevel = host::test_env::getenv("MELEE_TEST_SL_VERBOSE") ? sl::LogLevel::eVerbose : sl::LogLevel::eDefault;
   pref.pathsToPlugins = plugin_dirs;
   pref.numPathsToPlugins = 1;
-  static std::wstring logs; logs = exe_dir + L"\\streamline-logs"; CreateDirectoryW(logs.c_str(), nullptr);
-  pref.pathToLogsAndData = logs.c_str();
+  // Streamline's logs go where the game may write (see writable_dir), or nowhere: a folder it cannot create is
+  // not handed to it.
+  static std::wstring logs; logs = writable + L"\\streamline-logs";
+  const bool logs_ok = CreateDirectoryW(logs.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
+  pref.pathToLogsAndData = logs_ok ? logs.c_str() : nullptr;
   pref.logMessageCallback = log_callback;
   pref.flags = sl::PreferenceFlags::eDisableCLStateTracking | sl::PreferenceFlags::eUseFrameBasedResourceTagging;
   pref.featuresToLoad = features.data();
@@ -296,7 +334,15 @@ bool init(const std::wstring& exe_dir, bool load_frame_generation) {
   pref.applicationId = 231313132;   // NVIDIA sample application id: valid for development builds of non-registered titles
   pref.projectId = "5d3d9a7e-1c2b-4c9e-9a0e-2f6b8c1d4e70";
   pref.renderAPI = sl::RenderAPI::eD3D12;
-  sl::Result res = driver_call([&] { return slInit(pref, sl::kSDKVersion); });
+  bool init_faulted = false;
+  sl::Result res = driver_call([&] { return seh_sl_init(&pref, &init_faulted); });
+  if (init_faulted) {
+    // No device exists yet, so nothing needs a restart: this start goes on with plain DirectX 12, and the note
+    // keeps this version from loading Streamline again on this PC.
+    write_fault_note("Streamline faulted while starting on this PC; this version starts without it.");
+    host::log("dlss: Streamline faulted while starting; starting without DLSS, Reflex and frame generation");
+    return false;
+  }
   if (res != sl::Result::eOk) { host::log("dlss: slInit failed (%d); DLSS unavailable", (int)res); return false; }
   g_ready = true;
   host::log("dlss: Streamline initialised (SDK %llu)", (unsigned long long)sl::kSDKVersion);
