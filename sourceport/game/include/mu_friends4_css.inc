@@ -116,6 +116,7 @@ static struct {
     unsigned char stopped_seen;     /* last frame's block_hint was SEARCH_STOPPED: its 2 s note shows once */
     unsigned char route_logged[4];  /* Doubles: each seat's link route + 1 as last logged, 0: not yet */
     unsigned char invite_door;      /* the door whose card opened the invite picker + 1, 0: none */
+    unsigned char own_drawn;        /* this player's door + 1 once drawn as HMN this visit, 0: not yet */
 } mu_f4;
 
 static void mu_f4_marks_off(int freed);
@@ -738,6 +739,18 @@ static unsigned char mu_f4_door_color(int i, unsigned ch, unsigned costume)
     if (costume > MU_LOBBY_COLOR_MAX && costume == n && mu_f4.door_color[i] == n - 1) c = 0;
     mu_f4.door_color[i] = c;
     return c;
+}
+
+/* This player's own door turns HMN in the first frames, before the screen can draw it, so it already says HMN
+ * when drawing is possible and nothing draws it again: Melee's N/A stayed on it. Draw it once, when it can be. */
+static void mu_f4_own_drawn(int mine)
+{
+    if (mu_friends_css_frames < 2 || mine < 0 || mine > 3 || mu_f4.own_drawn == mine + 1 ||
+        mnCharSel_803F0DFC.doors[mine].p_kind != Gm_PKind_Human)
+        return;
+    mu_f4.own_drawn = (unsigned char) (mine + 1);
+    OSReport("friends lobby: own door %d drawn as HMN\n", mine);
+    mnCharSel_8025DB34((u8) mine);
 }
 
 /* This player's own door: a person, and its hover / pick / unpick go to the room when they change. */
@@ -2264,6 +2277,7 @@ static void mu_friends4_css_frame(void)
             if (mu_friends_css_frames >= 2) mnCharSel_8025DB34((u8) mine);
         }
     }
+    mu_f4_own_drawn(mine);
     if (mu_friends_css_frames >= 1) mu_f4_texts(mine);
     if (mu_friends_css_frames >= 1) mu_f4_partner_marks(mine);   /* after the portrait (mu_f4.art) */
     {

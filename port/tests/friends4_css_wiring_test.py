@@ -251,6 +251,14 @@ class Screen(unittest.TestCase):
         self.assertIn('if (!v || !(v->flags & MU_LOBBY_F_INVITING)) return -1;', door)
         self.assertIn("if (d >= 0 && d < 4 && d != mine && v->seats[d].kind == MU_LOBBY_KIND_OPEN) return d;", door)
 
+    def test_own_door_is_drawn_hmn_once_it_can_be(self):
+        # 122.45: the host's own door turned HMN before the screen could draw it and kept Melee's N/A.
+        own = body(self.inc, 'static void mu_f4_own_drawn(int mine)')
+        self.assertIn('if (mu_friends_css_frames < 2 || mine < 0 || mine > 3 || mu_f4.own_drawn == mine + 1 ||', own)
+        self.assertIn('mnCharSel_8025DB34((u8) mine);', own)
+        frame = self.inc[self.inc.index('mu_f4_own_drawn(mine);\n'):]
+        self.assertLess(frame.index('mu_f4_own_drawn(mine);'), frame.index('mu_f4_texts(mine);'))
+
     def test_the_whole_card_but_its_switch_invites(self):
         # 122.43: a tester's presses on the card's tab (y -4.6..0.2) beside the switch did nothing. The switch
         # keeps Melee's own box (its x bounds, y -4.6..0.2); the rest of the column down past the label invites.
