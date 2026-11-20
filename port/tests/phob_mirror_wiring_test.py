@@ -35,6 +35,16 @@ class PhobMirrorWiringTest(unittest.TestCase):
         self.assertIn('read_mirror(rep)', poll)
         self.assertIn('mirror_live(rep)', source('port/runtime/host/gc_adapter_mirror_mac.h'))
         self.assertIn('bool gcadapter_phob_raw(int, phob::HardwareInput&) { return false; }', raw)
+    def test_bridge_poll_applies_phob_settings(self):
+        raw = source('port/runtime/host/gc_adapter.cpp')
+        poll = function(raw[raw.index('uint32_t gcadapter_poll('):], 'gcadapter_poll')
+        bridge = poll[poll.index('if (yougame::stdio_bridge())'):poll.index('} else {')]
+        self.assertIn('phob_process(rep, std::chrono::steady_clock::now());', bridge)
+        self.assertLess(bridge.index('read_mirror(rep)'), bridge.index('phob_process('))
+        self.assertIn('if (g_phob_live[port] && g_phob[port].s.enabled)', poll)
+        start = raw.index('int gcadapter_scope(', raw.index('#else'))
+        scope = function(raw[start:], 'gcadapter_scope')
+        self.assertLess(scope.index('< 200000u'), scope.index('gcadapter_phob_raw(port, in)'))
     def test_mirror_live_sample_and_direct_history(self):
         raw = source('port/runtime/host/gc_adapter.cpp')
         start = raw.index('int gcadapter_scope(', raw.index('#else'))

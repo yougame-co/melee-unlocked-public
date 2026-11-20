@@ -838,6 +838,9 @@ uint32_t gcadapter_poll(PadState out[4]) {
 #else
     if (!read_mirror(rep)) return 0;
 #endif
+    // The PhobGCC settings (calibration, trigger modes, filters) run on every report, as they do on
+    // the adapter's own reports below; without this a YouGame launch ignored the whole PhobGCC menu.
+    phob_process(rep, std::chrono::steady_clock::now());
   } else {
     ensure_scanner_started();
     auto now = std::chrono::steady_clock::now();
@@ -1046,6 +1049,18 @@ bool gcadapter_phob_raw(int port, phob::HardwareInput& in) {
 int gcadapter_scope(int port, GCScopeSample* out, int max) {
   if (port < 0 || port > 3 || max <= 0) return 0;
   if (yougame::stdio_bridge()) {
+    {
+      // The game's own polls fill the scope through phob_process; use them while they are fresh, so
+      // the menu shows the stick after the PhobGCC settings, as the adapter's own path does.
+      std::lock_guard<std::mutex> lk(g_mutex);
+      const uint32_t head = g_scope_head[port];
+      const auto now_us = (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+      if (head > 0 && g_origin[port].set && now_us - g_scope[port][(head - 1) % kScopeLen].time_us < 200000u) {
+        const int n = (int)std::min<uint32_t>((uint32_t)std::min(max, kScopeLen), head);
+        for (int i = 0; i < n; ++i) out[i] = g_scope[port][(head - (uint32_t)n + (uint32_t)i) % kScopeLen];
+        return n;
+      }
+    }
     phob::HardwareInput in;
     if (!gcadapter_phob_raw(port, in)) return 0;
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
