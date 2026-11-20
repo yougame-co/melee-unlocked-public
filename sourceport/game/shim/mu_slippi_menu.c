@@ -145,6 +145,7 @@ static int auto_slot = -1;
  * Menu-only, like auto_slot. -1: none. */
 static int yg_wait_slot = -1;
 static unsigned yg_wait_frames;
+static unsigned yg_closed_frames;  /* frames on the Online menu with YouGame's rows still closed */
 static int yg_open;           /* YG_OPEN_* from the first answer that carried it (the host answers it once) */
 enum { SPLIT_SLIPPI = 3, SPLIT_FIRST_SLIPPI = 4 };
 /* The split layout's rows as Slippi mode ids; rows 0-2 are YouGame's, row 3 opens Slippi's page. */
@@ -1067,6 +1068,19 @@ void mu_slippi_online_menu_think(HSD_GObj* gp)
                 auto_slot = yg_wait_slot;
                 yg_wait_slot = -1;
                 OSReport("online menu: YouGame is connected; continuing into row %d\n", auto_slot);
+            }
+        }
+    } else if (mn_804A04F0.cur_menu == MENU_KIND_8 && split_layout() &&
+               !(yg_flags & (YG_ROWS_OPEN | YG_COMING_SOON))) {
+        /* The menu opened before YouGame knew the player (its first answer can come a second after the
+         * launcher's restart): look again about once a second and open the rows as soon as it does,
+         * rather than only on the next visit to this menu. */
+        if (++yg_closed_frames % 60u == 0) {
+            int flags = yougame_query(-1, NULL, 0);
+            if (flags & YG_ROWS_OPEN) {
+                yg_flags = flags;
+                yg_open |= flags & (YG_OPEN_RANKED | YG_OPEN_DIRECT);
+                OSReport("online menu: YouGame is connected; its rows open\n");
             }
         }
     }
