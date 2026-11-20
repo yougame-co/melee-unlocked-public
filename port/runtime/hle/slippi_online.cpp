@@ -3531,7 +3531,12 @@ bool handle_command(uint8_t cmd, const uint8_t* payload, uint32_t payload_len, s
       // 0x20: the first row picked while YouGame is Coming soon: open the installed app, else the download page.
       // 0x10: older menus' Coming soon stickers; none are drawn since build 98.2 (the rows look the same
       // connected or not).
+      // 0x21: the menu was left (Back to 1-P Mode, or into a character select) after a 0x20 asked for YouGame:
+      // YouGame's small window, still up from that ask, closes with it (yougame::withdraw_ask).
       if (payload_len == 1 && (payload[0] & 0xF0) == 0x10) {
+      } else if (payload_len == 1 && payload[0] == 0x21) {
+        s_yg_pick = 0;
+        yougame::withdraw_ask("Online menu left");
       } else if (payload_len == 1 && payload[0] == 0x20) {
         if (yougame::coming_soon()) yougame::first_row_picked();
         // YouGame is open but signed out (local channel): the sign-in panel, then the menu carries on.

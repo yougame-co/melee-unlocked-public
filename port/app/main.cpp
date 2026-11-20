@@ -2653,17 +2653,8 @@ static int melee_main(int argc, char** argv) {
     }
   }
 #endif
-#if defined(_WIN32) && defined(MELEE_SOURCE_PORT)
-  // Started with some arguments but no --user-dir (say, --iso alone): generate the two managed Sys
-  // files into the same AppData folder a double-click uses, instead of failing the whole start.
-  if (sysgen_user_dir.empty() && sysgen_data_dir.empty()) {
-    const auto fallback = standalone_launch::data_dir();
-    if (!fallback.empty()) {
-      sysgen_data_dir = (fallback / L"User").u8string();
-      host::log("sys: no --user-dir given; generating into %s", sysgen_data_dir.c_str());
-    }
-  }
-#endif
+  // No --user-dir (say, --iso alone), or one inside the game folder: prepare_sys_assets generates the two
+  // managed Sys files into the player's own data folder (sysgen::user_data_dir), on every system.
   host::prepare_sys_assets(sysgen_user_dir, sysgen_data_dir);
 #ifdef MELEE_SOURCE_PORT
   // The profile picked in the settings panel, unless the command line gave its own mod layers. A

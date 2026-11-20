@@ -99,8 +99,12 @@ class YouGameInGameWiringTest(unittest.TestCase):
     # --- the Online menu: never a dead end ---
     def test_online_menu_row_turns_it_on_and_starts_the_channel(self):
         picked = body(self.link, "void first_row_picked() {")
-        enable = picked.find('if (!in_game_on()) in_game::set(true, "Online menu");')
+        enable = picked.find('if (g_channel_allowed && !in_game_on()) in_game::set(true, "Online menu");')
         self.assertGreater(enable, -1)
+        # A game the launcher or the app started (or a test run) never turns the setting on from its Online
+        # press: the only set in first_row_picked is gated on g_channel_allowed.
+        self.assertEqual(picked.count("in_game::set("), 1)
+        self.assertNotIn('if (!in_game_on()) in_game::set(true', picked)
         self.assertLess(enable, picked.find("if (g_channel_up.load()) return;"))
         self.assertLess(enable, picked.find("reach_ask_on_use();"))
         # The menu's YouGame row (0x20) still reaches first_row_picked while YouGame is not connected.

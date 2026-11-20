@@ -2617,10 +2617,11 @@ void Matchmaking::startMatchmaking() {
     yougame::first_row_picked();
     const uint64_t until = time_ms() + 30000;
     while (!yougame::channel_connected() && time_ms() < until) {
-      if (is_mm_terminated_ || state_ != INITIALIZING) return;
+      // The search was cancelled (the player left the character select): YouGame's window goes with it.
+      if (is_mm_terminated_ || state_ != INITIALIZING) { yougame::withdraw_ask("YouGame search cancelled"); return; }
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    if (is_mm_terminated_ || state_ != INITIALIZING) return;
+    if (is_mm_terminated_ || state_ != INITIALIZING) { yougame::withdraw_ask("YouGame search cancelled"); return; }
     if (yougame::channel_connected()) yougame::set_launcher_session(true);   // the row was a YouGame one
     if (!yougame::session()) {
       host::log("yougame: YouGame did not answer in 30 s; search not started");

@@ -18,13 +18,11 @@ void prepare_sys_assets(const std::string& user_dir, const std::string& data_dir
     if (config.sys_dir.filename().empty()) config.sys_dir = config.sys_dir.parent_path();
     config.build_dir = config.sys_dir.parent_path();
     if (config.build_dir.empty()) config.build_dir = ".";
-    if (!data_dir.empty()) config.data_dir = std::filesystem::u8path(data_dir);
-    else if (!user_dir.empty()) {
-      auto user = std::filesystem::u8path(user_dir).lexically_normal();
-      if (user.filename().empty()) user = user.parent_path();
-      config.data_dir = user.parent_path();
-      if (config.data_dir.empty()) config.data_dir = ".";
-    }
+    // A launcher that ships User/ in the game folder (the Linux zip's launcher, or anyone's) still starts:
+    // derived folders inside it move to the player's own data folder. An explicit one is never moved.
+    std::string note;
+    config.data_dir = sysgen::choose_data_dir(config.build_dir, user_dir, data_dir, sysgen::user_data_dir(), note);
+    if (!note.empty()) host::log("%s", note.c_str());
     sysgen::Disc disc;
     disc.verify_retail = [] { return disc_has_vanilla_dol(); };
     disc.read = [](const std::string& name, size_t expected, std::vector<uint8_t>& out) {

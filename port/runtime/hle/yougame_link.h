@@ -100,6 +100,12 @@ void online_menu_opened();
 // MELEE_TEST_YOUGAME_GET_PAGE=1. Never waits on the game's frame.
 void open_get_page();
 void first_row_picked();
+// The place that asked for YouGame was left (the Online menu backed out of or left for a character
+// select, CMD_YOUGAME_MENU 0x21; a YouGame search cancelled while it waited): YouGame's small window
+// (Windows), still up from that ask, closes as Play offline (never remembered for an ask on use), and
+// one still being looked for closes as soon as it shows. Get YouGame already downloading in it carries
+// on. Never waits.
+void withdraw_ask(const char* why);
 // Game start (main, after start_channel): YouGame's start hook (yougame_start.h) for a game nothing
 // started. YouGame running: nothing. Not on this computer: YouGame's own small window, before the game
 // window. Installed but not running: that window too, never the client window. Quiet in agent, hidden and test runs.

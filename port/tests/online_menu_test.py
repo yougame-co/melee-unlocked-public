@@ -102,6 +102,7 @@ void mn_80229894(int menu, int row, int) {
     switched_menu = menu; switched_row = row;
     mn_804A04F0.cur_menu = menu; mn_804A04F0.hovered_selection = row;
 }
+static std::vector<int> yg_menu_picks;
 static int friends_css_answer, friends_css_queries;   // the host's one-shot "a Friends room opened the CSS"
 int mu_slippi_cmd(unsigned cmd, const void* p, unsigned, void* out, unsigned, unsigned* got) {
     if (cmd == CMD_YOUGAME_FRIENDS_MENU && *(const u8*)p == 14) {
@@ -121,6 +122,7 @@ int mu_slippi_cmd(unsigned cmd, const void* p, unsigned, void* out, unsigned, un
         if (*(const u8*)p == 4) ++link_leaves;
     }
     if (cmd == CMD_YOUGAME_FRIENDS_MENU) published = *(const u8*)p;
+    if (cmd == 0xEF && p) yg_menu_picks.push_back(*(const u8*)p);   // CMD_YOUGAME_MENU's one-byte picks
     return 0;
 }
 static int checks;
@@ -386,6 +388,35 @@ int main() {
     CHECK(row_lines == std::vector<std::string>{"online menu: rows offered Ranked,Unranked,Friends,Slippi tournament=0\n"});
     CHECK(mu_slippi_menu_count() == 4 && mu_slippi_menu_option(3) == MU_SLP_OPT_SLIPPI);
     for (int r=0;r<mu_slippi_menu_count();++r) CHECK(mu_slippi_menu_option(r)!=MU_SLP_OPT_TOURNAMENT);
+    // Build 122.42: the GitHub build's split layout with YouGame not connected. A YouGame row pressed asks
+    // the host (EF 0x20: YouGame's own small window, topmost, while the game keeps reading the pads).
+    // Backing out to 1-P Mode withdraws that ask (0x21) so the window closes with the menu instead of
+    // staying drawn over 1-P Mode and the Main Menu.
+    ranked_supported = 0; slippi_submenu = 0; split_page = 0; yg_flags = YG_SPLIT | YG_COMING_SOON;
+    mu_mnmain_install_online_menu(); mn_804A04F0.cur_menu = MENU_KIND_8; mn_804A04F0.hovered_selection = 0;
+    yg_menu_picks.clear(); entered = 0;
+    press(MenuInput_Confirm);
+    CHECK(yg_menu_picks == std::vector<int>{0x20} && yg_asked && yg_wait_slot == 0);
+    CHECK(mn_804A04F0.cur_menu == MENU_KIND_8 && entered == 0);
+    press(MenuInput_Back);
+    CHECK(switched_menu == MENU_KIND_1P && switched_row == SEL_1P_2);
+    CHECK(yg_menu_picks == (std::vector<int>{0x20, 0x21}) && !yg_asked && yg_wait_slot == -1);
+    // No ask on this visit: Back sends nothing more.
+    mn_804A04F0.cur_menu = MENU_KIND_8; mn_804A04F0.hovered_selection = 0; press(MenuInput_Back);
+    CHECK(yg_menu_picks.size() == 2 && switched_menu == MENU_KIND_1P);
+    // Asked, then B on Slippi's page stays on the Online menu: the ask stands.
+    mn_804A04F0.cur_menu = MENU_KIND_8; mn_804A04F0.hovered_selection = 1; press(MenuInput_Confirm);
+    CHECK(yg_menu_picks == (std::vector<int>{0x20, 0x21, 0x20}) && yg_asked);
+    mn_804A04F0.hovered_selection = SPLIT_SLIPPI; press(MenuInput_Confirm);
+    CHECK(split_page == 1 && mn_804A04F0.cur_menu == MENU_KIND_8 && yg_asked && entered == 0);
+    press(MenuInput_Back);
+    CHECK(split_page == 0 && mn_804A04F0.cur_menu == MENU_KIND_8 && yg_asked);
+    CHECK(yg_menu_picks.size() == 3);
+    // Into a Slippi character select from its page: the menu is left, so the ask is withdrawn first.
+    mn_804A04F0.hovered_selection = SPLIT_SLIPPI; press(MenuInput_Confirm);
+    mn_804A04F0.hovered_selection = SPLIT_FIRST_SLIPPI; press(MenuInput_Confirm);
+    CHECK(entered == 1 && exit_data.pending_mode == GM_HANYU_CSS);
+    CHECK(yg_menu_picks == (std::vector<int>{0x20, 0x21, 0x20, 0, 0x21}) && !yg_asked);
     std::printf("online menu: %d checks passed\n", checks);
 }
 '''
@@ -811,7 +842,7 @@ int main() {
         names = ['mu_slippi_log_online_rows', 'tournament_query', 'tournament_menu_think', 'mu_slippi_menu_count', 'mu_slippi_menu_option',
                  'mu_slippi_menu_label_kind', 'mu_slippi_option_unlocked', 'mu_slippi_first_unlocked',
                  'mu_slippi_menu_enter', 'mu_slippi_switch_to_online_menu', 'upstream_slippi_available', 'confirm_port',
-                 'log_online_highlight', 'mu_slippi_online_menu_think']
+                 'log_online_highlight', 'yougame_ask_withdraw', 'mu_slippi_online_menu_think']
         patch = (ROOT / 'sourceport/patches/melee-native.patch').read_text()
         added = '\n'.join(line[1:] for line in patch.splitlines() if line.startswith('+'))
         installer = fixture.extract(added, 'mu_mnmain_install_online_menu')

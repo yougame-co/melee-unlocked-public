@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <set>
 #include <stdexcept>
@@ -186,6 +187,47 @@ std::string sha1(const std::vector<uint8_t>& input) {
     out += digits[byte >> 4]; out += digits[byte & 15];
   }
   return out;
+}
+
+std::filesystem::path user_data_dir() {
+#ifdef _WIN32
+  wchar_t local[MAX_PATH] = {};
+  const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return {};
+  return std::filesystem::path(local) / L"MeleeUnlocked-YouGame" / L"User";
+#else
+  const char* xdg = std::getenv("XDG_DATA_HOME");
+  const char* home = std::getenv("HOME");
+  std::filesystem::path base;
+  if (xdg && xdg[0] == '/') base = xdg;
+  else if (home && *home) base = std::filesystem::path(home) / ".local" / "share";
+  else return {};
+#ifdef __APPLE__
+  return base / "melee-unlocked" / "User";
+#else
+  return base / "MeleeUnlocked-YouGame" / "User";
+#endif
+#endif
+}
+
+std::filesystem::path choose_data_dir(const std::filesystem::path& build_dir, const std::string& user_dir,
+                                      const std::string& data_dir, const std::filesystem::path& fallback,
+                                      std::string& note) {
+  note.clear();
+  if (!data_dir.empty()) return std::filesystem::u8path(data_dir);
+  if (user_dir.empty()) {
+    if (!fallback.empty()) note = "sys: no --user-dir given; generating into " + fallback.u8string();
+    return fallback;
+  }
+  auto user = std::filesystem::u8path(user_dir).lexically_normal();
+  if (user.filename().empty()) user = user.parent_path();
+  auto derived = user.parent_path();
+  if (derived.empty()) derived = ".";
+  std::error_code ec;
+  // The same test prepare's guard makes: whatever it would refuse goes to the player's own folder.
+  if (fallback.empty() || outside_build(build_dir, derived, ec)) return derived;
+  note = "sys: " + derived.u8string() + " is inside the game folder; generating into " + fallback.u8string();
+  return fallback;
 }
 
 bool Assets::prepare(const Config& config, const Disc& disc, std::string& error) {
