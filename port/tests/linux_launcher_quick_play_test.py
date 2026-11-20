@@ -53,4 +53,10 @@ with tempfile.TemporaryDirectory(prefix='mu-quick-play-') as temporary:
     assert args[-2:] == ['--frames', '1']
     result = subprocess.run([str(exe), '--play', '--mod', 'nothing'], env=env, capture_output=True, text=True, timeout=20)
     assert result.returncode == 2 and 'Akaneia' in result.stderr, (result.returncode, result.stderr)
+    # An unzip tool that drops file modes: the launcher gives the game back its exec bit and starts it.
+    for name in ('melee_source', 'melee_source_compat'):
+        (root / name).chmod(0o644)
+    result = subprocess.run([str(exe), '--play', '--frames', '1'], env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 37, (result.returncode, result.stderr)
+    assert 'had no exec permission (unzipped without file modes); made it executable' in result.stderr, result.stderr
 print('PASS: --play launches without SDL/window setup, preserves saved paths and game exit status, and rejects invalid discs')

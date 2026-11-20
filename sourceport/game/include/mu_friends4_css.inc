@@ -115,6 +115,7 @@ static struct {
     float caption_box[4];           /* the plate: left, top, right, bottom, in world units (mu_f4_caption_draw) */
     unsigned char stopped_seen;     /* last frame's block_hint was SEARCH_STOPPED: its 2 s note shows once */
     unsigned char route_logged[4];  /* Doubles: each seat's link route + 1 as last logged, 0: not yet */
+    unsigned char invite_door;      /* the door whose card opened the invite picker + 1, 0: none */
 } mu_f4;
 
 static void mu_f4_marks_off(int freed);
@@ -181,6 +182,15 @@ static void mu_f4_note(unsigned hint)
 {
     mu_f4.note = (unsigned char) hint;
     mu_f4.note_frames = MU_F4_NOTE;
+}
+/* A press that did nothing, in words on the hint line for a moment (the log line says it too). */
+static void mu_f4_say(const char* text)
+{
+    size_t n = strlen(text);
+    if (n >= sizeof mu_f4.note_text) n = sizeof mu_f4.note_text - 1;
+    memcpy(mu_f4.note_text, text, n);
+    mu_f4.note_text[n] = 0;
+    mu_f4.note_text_frames = MU_F4_NOTE;
 }
 /* The Doubles home (2 doors), and its search (the select locked, B cancels). */
 static int mu_f4_doubles(void) { return mu_f4.view_ok && (mu_f4.view.mode & MU_LOBBY_M_DOUBLES); }
@@ -1237,6 +1247,19 @@ static void mu_f4_log_a(int mine)
     }
 }
 
+/* While the invite picker is open, the one door that says "Inviting...": the door whose card opened it,
+ * while it is still open, else the first open door (the picker opened another way, or that door filled).
+ * The other open doors keep "Invite". -1: none. */
+static int mu_f4_inviting_door(const MuLobbyView* v, int mine)
+{
+    int i, d = (int) mu_f4.invite_door - 1;
+    if (!v || !(v->flags & MU_LOBBY_F_INVITING)) return -1;
+    if (d >= 0 && d < 4 && d != mine && v->seats[d].kind == MU_LOBBY_KIND_OPEN) return d;
+    for (i = 0; i < 4; ++i)
+        if (i != mine && v->seats[i].kind == MU_LOBBY_KIND_OPEN) return i;
+    return -1;
+}
+
 /* A on an open door's card (anywhere but its switch) opens YouGame's multi-invite picker for this room;
  * seats fill as friends accept. A coin in the hand doesn't stop it (nothing takes a coin down there); a
  * level slider does (A lets go of it). Not in Doubles: there the partner tab's Invite does it. A press on
@@ -1259,6 +1282,9 @@ static void mu_f4_invite(int mine)
         if (!hit) continue;
         if (why) {
             OSReport("friends lobby: no invite from door %d: %s\n", i + 1, why);
+            if (mu_f4.view.flags & MU_LOBBY_F_STARTED) mu_f4_say("A match is being set up.");
+            else if (mu_f4.view.flags & MU_LOBBY_F_INVITING) mu_f4_say("An invite is already out: B takes it back.");
+            if (!(hand->x5 == 1 && hand->x6 >= 4)) lbAudioAx_80024030(3);
             return;
         }
         if (i == mine) {
@@ -1275,6 +1301,7 @@ static void mu_f4_invite(int mine)
             return;
         }
         if (mu_f4_send(&req, 1)) {
+            mu_f4.invite_door = (unsigned char) (i + 1);
             OSReport("friends lobby: invite picker for door %d\n", i + 1);
             sfxForward();
         } else {
@@ -1937,7 +1964,7 @@ static void mu_f4_texts(int mine)
         }
         if (s && i != mine && (v->flags & MU_LOBBY_F_KNOWN) && !doubles) {
             if (s->kind == MU_LOBBY_KIND_OPEN)
-                sprintf(buf, "%s", (v->flags & MU_LOBBY_F_INVITING) ? "Inviting..." : "Invite");
+                sprintf(buf, "%s", i == mu_f4_inviting_door(v, mine) ? "Inviting..." : "Invite");
             else if (s->kind == MU_LOBBY_KIND_CPU)
                 sprintf(buf, "CPU Lv %u", (unsigned) s->level);
             else if (s->route != MU_LOBBY_ROUTE_NONE)   /* a person's link, only once it is up */

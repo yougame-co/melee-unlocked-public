@@ -16,6 +16,7 @@
 #include "updater.h"
 #include "launcher_yougame.h"
 #include "disc_rvz.h"
+#include "helper_exec.h"
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <spawn.h>
@@ -208,7 +209,18 @@ bool g_replay_active = false;
 
 bool playing() { return g_game_pid.load() != 0; }
 
+// The game executable needs its exec bit too: an unzip tool that drops file modes leaves melee_source
+// without it, and the start then failed with "Permission denied" before the game could fix its own
+// helpers. Give it back (logged on stderr), or return what to do. "" when it can run.
+std::string game_runnable(const std::string& exe) {
+  const std::string shown = exe.rfind(g_dir + "/", 0) == 0 ? exe.substr(g_dir.size() + 1) : exe;
+  std::string note;
+  const std::string why = helper_exec::ensure_executable(exe, shown, &note);
+  if (!note.empty()) std::fprintf(stderr, "%s\n", note.c_str());
+  return why;
+}
 bool start_process(const std::vector<std::string>& argv) {
+  if (const std::string why = game_runnable(argv[0]); !why.empty()) { status(why); return false; }
   std::vector<char*> args;
   for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
   args.push_back(nullptr);
@@ -930,6 +942,7 @@ int main(int argc, char** argv) {
     for (auto& arg : args) command.push_back(arg.data());
     command.push_back(nullptr);
     if (chdir(g_dir.c_str()) != 0) { std::perror("game folder"); return 1; }
+    if (const std::string why = game_runnable(args[0]); !why.empty()) { std::fprintf(stderr, "%s\n", why.c_str()); return 1; }
     // Replacing this process lets Steam track the game and receive its real exit status.
     execv(command[0], command.data());
     std::perror("Melee Unlocked could not start");

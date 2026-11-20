@@ -241,6 +241,15 @@ class Screen(unittest.TestCase):
         for reason in ('your own door', 'on the switch, not the card', 'not open: press its switch first'):
             self.assertIn(reason, invite)
         self.assertLess(invite.index('if (why) {'), invite.index('if (mu_f4_send(&req, 1)) {'))
+        # 122.44: only the door whose card opened the picker says "Inviting..."; the other open doors keep "Invite".
+        self.assertIn('mu_f4.invite_door = (unsigned char) (i + 1);', invite)
+        self.assertIn('i == mu_f4_inviting_door(v, mine) ? "Inviting..." : "Invite"', texts)
+        # 122.44: a press refused because an invite is out (or a match is being set up) says so on screen.
+        self.assertIn('mu_f4_say("An invite is already out: B takes it back.");', invite)
+        self.assertIn('mu_f4_say("A match is being set up.");', invite)
+        door = body(self.inc, 'static int mu_f4_inviting_door(const MuLobbyView* v, int mine)')
+        self.assertIn('if (!v || !(v->flags & MU_LOBBY_F_INVITING)) return -1;', door)
+        self.assertIn("if (d >= 0 && d < 4 && d != mine && v->seats[d].kind == MU_LOBBY_KIND_OPEN) return d;", door)
 
     def test_the_whole_card_but_its_switch_invites(self):
         # 122.43: a tester's presses on the card's tab (y -4.6..0.2) beside the switch did nothing. The switch
