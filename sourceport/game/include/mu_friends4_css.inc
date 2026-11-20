@@ -1201,8 +1201,13 @@ static void mu_f4_rules(CSSData* css)
     }
 }
 
-/* Where a door's body is, below its HMN/CPU switch: the switch's left edge to the next door's, from
- * Melee's bounds. 2: on the door's tab (its switch, above). */
+/* Where a door is: its column runs from the switch's left edge to the next door's (Melee's bounds).
+ * 2: on the HMN/CPU switch itself, Melee's own box for it (x inside the switch's bounds, y -4.6..0.2,
+ * mnCharSel's toggle test), so A there does what it always did. 1: anywhere else on the card, from the
+ * tab's top (y 0.2) down past the door's label: that line ("Invite", "CPU Lv N") draws at SIS y 196 with
+ * the text's 0.1 font (world y -19.6) and 0.4 glyphs 32 units tall (1.28), so it ends near -20.9, above
+ * the hint band (SIS y 218, world -21.8). Until 122.43 only y -22..-4.6 counted as the card, and A on
+ * the tab beside the switch did nothing. */
 static int mu_f4_over_door(int i, float x, float y)
 {
     float left = mu_f4.toggle[i][0], width = 0;
@@ -1211,7 +1216,8 @@ static int mu_f4_over_door(int i, float x, float y)
     else if (i > 0 && mu_f4.toggle[i - 1][0] != mu_f4.toggle[i - 1][1]) width = mu_f4.toggle[i][0] - mu_f4.toggle[i - 1][0];
     if (width <= 0) width = 15.0f;
     if (!(x > left - 1.0f && x < left + width - 2.0f)) return 0;
-    return y > -22.0f && y < -4.6f ? 1 : y >= -4.6f && y < 0.2f ? 2 : 0;
+    if (y > -4.6f && y < 0.2f && x > mu_f4.toggle[i][0] && x < mu_f4.toggle[i][1]) return 2;
+    return y > -22.0f && y < 0.2f ? 1 : 0;
 }
 
 /* A pressed on any port in the lobby: what the invite needs, so a press that does nothing says why.
@@ -1231,9 +1237,10 @@ static void mu_f4_log_a(int mine)
     }
 }
 
-/* A on an open door's body opens YouGame's multi-invite picker for this room; seats fill as friends
- * accept. A coin in the hand doesn't stop it (nothing takes a coin down there); a level slider does (A
- * lets go of it). Not in Doubles: there the partner tab's Invite does it. */
+/* A on an open door's card (anywhere but its switch) opens YouGame's multi-invite picker for this room;
+ * seats fill as friends accept. A coin in the hand doesn't stop it (nothing takes a coin down there); a
+ * level slider does (A lets go of it). Not in Doubles: there the partner tab's Invite does it. A press on
+ * a door that sends nothing logs one line saying why. */
 static void mu_f4_invite(int mine)
 {
     struct CSSCursorData* hand = mnCharSel_804A0BC0[mine];
@@ -1244,10 +1251,29 @@ static void mu_f4_invite(int mine)
     if (hand->x5 == 1 && hand->x6 >= 4) why = "holding a level slider";
     else if (mu_f4.view.flags & MU_LOBBY_F_STARTED) why = "a match is being set up";
     else if (mu_f4.view.flags & MU_LOBBY_F_INVITING) why = "the invite picker is already open";
-    for (i = 0; why == NULL && i < MU_LOBBY_SEATS; ++i) {
+    for (i = 0; i < MU_LOBBY_SEATS; ++i) {
+        static const char* const kinds[4] = { "open", "a player", "CPU", "Player 2" };
+        const unsigned kind = mu_f4.view.seats[i].kind;
+        const int hit = mu_f4_over_door(i, hand->xC, hand->x10);
         unsigned char req = MU_LOBBY_OP_INVITE;
-        if (i == mine || mu_f4.view.seats[i].kind != MU_LOBBY_KIND_OPEN || mu_f4_over_door(i, hand->xC, hand->x10) != 1)
-            continue;
+        if (!hit) continue;
+        if (why) {
+            OSReport("friends lobby: no invite from door %d: %s\n", i + 1, why);
+            return;
+        }
+        if (i == mine) {
+            OSReport("friends lobby: no invite from door %d: your own door\n", i + 1);
+            return;
+        }
+        if (hit == 2) {
+            OSReport("friends lobby: no invite from door %d: on the switch, not the card\n", i + 1);
+            return;
+        }
+        if (kind != MU_LOBBY_KIND_OPEN) {
+            OSReport("friends lobby: no invite from door %d: door %d is %s, not open: press its switch first\n", i + 1,
+                     i + 1, kind < 4 ? kinds[kind] : "unknown");
+            return;
+        }
         if (mu_f4_send(&req, 1)) {
             OSReport("friends lobby: invite picker for door %d\n", i + 1);
             sfxForward();
@@ -1426,7 +1452,8 @@ static void mu_f4_line(int line, const char* s)
     if (mu_lobby_curtain()) s = "";
     for (i = 0; i + 1 < sizeof out && s[i]; ++i) {
         const char c = s[i];
-        out[i] = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || (((mu_f4.view.mode & MU_LOBBY_M_SQUAD) || mu_f4.note >= MU_LOBBY_HINT_SQUAD_TWO) &&
+        out[i] = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || (((mu_f4.view.mode & MU_LOBBY_M_SQUAD) || mu_f4.note >= MU_LOBBY_HINT_SQUAD_TWO ||
+                 mu_f4.view.block_hint == MU_LOBBY_HINT_CLOSED) &&
                  (c == '\'' || c == '(' || c == ')' || c == '/')) ? c : ' ';
     }
     out[i] = 0;
@@ -1876,6 +1903,9 @@ static void mu_f4_texts(int mine)
     if (mu_f4.note_text_frames > 0) {
         if (!mu_lobby_curtain()) --mu_f4.note_text_frames;
         mu_f4_line(0, mu_f4.note_text);
+    } else if (v && v->block_hint == MU_LOBBY_HINT_CLOSED && v->closed_why != MU_LOBBY_WHY_NONE) {
+        /* Why the lobby closed (the ticket's refusal, or the site's words), with what to do on the next line. */
+        mu_f4_line(0, v->closed_why == MU_LOBBY_WHY_OTHER ? v->note : mu_lobby_why_text(v->closed_why));
     } else {
         /* The host knows START goes on; the line only says what is in the way. */
         if (v && (v->mode & MU_LOBBY_M_SQUAD) && hint == MU_LOBBY_HINT_PICK) {
@@ -1889,6 +1919,8 @@ static void mu_f4_texts(int mine)
     if (!doubles) mu_f4_panel(v, 0, hint, noted, "", mine);
     if (doubles) {
         mu_f4_line(1, "");   /* Doubles' rules are fixed, so nothing to say here */
+    } else if (v && v->block_hint == MU_LOBBY_HINT_CLOSED && v->closed_why != MU_LOBBY_WHY_NONE) {
+        mu_f4_line(1, mu_lobby_why_step(v->closed_why));   /* what to do: the YouGame page, or B */
     } else if (mu_f4_host() && gmMainLib_GetGameRules()->mode >= 2) {
         mu_f4_line(1, "Coin and Bonus play as Stock");
     } else {

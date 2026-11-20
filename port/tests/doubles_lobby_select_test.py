@@ -519,7 +519,7 @@ class TwoDoorsOnTheLeft(unittest.TestCase):
         invite = body(self.inc, 'static void mu_f4_invite(int mine)')
         self.assertLess(invite.index('if (mu_f4_doubles()) return;'), invite.index('MU_LOBBY_OP_INVITE'))
         self.assertNotIn('opened no invite', self.inc)
-        self.assertIn('for (i = 0; why == NULL && i < MU_LOBBY_SEATS; ++i) {', invite)
+        self.assertIn('for (i = 0; i < MU_LOBBY_SEATS; ++i) {', invite)
 
 
 class TwoPortraitsHarness(unittest.TestCase):

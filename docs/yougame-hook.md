@@ -26,7 +26,8 @@ time), starts looking for the app right away, and carries on the way that row al
 
 "YouGame in game" is a player setting, kept in the game's `settings.ini` as
 `yougame_in_game 1` (on) or `yougame_in_game 0` (off). It can also be switched in
-Settings > Online. When the file has no such line, the build's default applies. Once the player
+Settings (F1) > Game, in its Online section. It is not shown in a game the YouGame app or the
+launcher started, which is connected either way. When the file has no such line, the build's default applies. Once the player
 sets it, their choice wins over the build default.
 
 The game's log says at start which value is in effect and where it came from, for example

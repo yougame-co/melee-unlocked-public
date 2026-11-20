@@ -11,6 +11,7 @@
 #include "yougame_tourney_delivery.h"
 #include "yougame_embed_toplevel.h"
 #include "yougame_embed_fullscreen.h"
+#include "yougame_app_line_log.h"
 #include "opponent_display.h"
 #include "yougame_parity.h"
 #include "yougame_shortcuts.h"
@@ -568,6 +569,16 @@ void handle_app_line(const std::string& line) {
   }
 }
 
+// Which line, and why, redacted (yougame_app_line_log.h: credentials and long token runs never reach
+// the log), at most 80 characters of each. The first 8 only: a broken stream does not fill the log.
+void log_bad_app_line(const std::string& line, const std::exception& e) {
+  static int logged = 0;
+  if (logged >= 8) return;
+  ++logged;
+  host::log("yougame: bad line from the app: \"%s\" (%s)", app_line_log::head(line).c_str(),
+            app_line_log::head(e.what()).c_str());
+}
+
 void read_stdin() {
   HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
   std::string pending;
@@ -593,7 +604,7 @@ void read_stdin() {
           if (!discard) {
             if (!pending.empty() && pending.back() == '\r') pending.pop_back();
             try { handle_app_line(pending); }
-            catch (const std::exception&) { host::log("yougame: bad line from the app"); }
+            catch (const std::exception& e) { log_bad_app_line(pending, e); }
           }
           pending.clear(); discard = false;
         } else if (!discard) {
@@ -614,7 +625,7 @@ void read_stdin() {
       try {
         handle_app_line(line);
       } catch (const std::exception& e) {
-        host::log("yougame: bad line from the app");
+        log_bad_app_line(line, e);
       }
     }
     if (pending.size() > (1u << 20)) pending.clear();
@@ -4469,6 +4480,18 @@ bool lobby_parked() {
   return g_parked_lobby != nullptr;
 }
 
+// The lobby's last ticket refusal (lobby_refusal), its own lock: find_match's catch sets it on the search thread.
+std::mutex g_lobby_refusal_mutex;
+std::string g_lobby_refusal;
+void set_lobby_refusal(const std::string& code) {
+  std::lock_guard<std::mutex> lock(g_lobby_refusal_mutex);
+  g_lobby_refusal = code;
+}
+std::string lobby_refusal() {
+  std::lock_guard<std::mutex> lock(g_lobby_refusal_mutex);
+  return g_lobby_refusal;
+}
+
 uint64_t begin_search(bool keep_lobby) {
   const auto epoch = close_room(keep_lobby ? Leave::Next : Leave::Quit);
   std::lock_guard<std::mutex> lock(g_mutex);
@@ -4725,6 +4748,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
   }
   json ticket;
   g_bridge_refusal.clear();   // read in the catch below: only this ticket's refusal counts
+  if (lobby_route) set_lobby_refusal("");
   try {
     if (lobby_route && parked) {
       ticket = {{"url", parked->url}, {"ticket", parked->ticket}, {"room", parked->code}};
@@ -4778,6 +4802,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
       ticket = bridge(request, 30000, cancelled);
     }
   } catch (const update::Required&) {
+    if (lobby_route && !cancelled()) set_lobby_refusal("update_required");
     // update_required: the answer's own words as the app gave them (it may say it is getting the update), else ours.
     return fail(g_bridge_update_text.empty() ? std::string(update::kMessage) : g_bridge_update_text, false, true);
   } catch (const std::exception& e) {
@@ -4786,6 +4811,7 @@ Match find_match(const Search& search, const std::function<bool()>& cancel_reque
     // room as another kind (1v1, Friends lobby, Doubles home, Teams): only the room's own kind refusal over the
     // socket may, below, within the room's tries.
     if (!cancelled()) host::log("yougame: ticket refused (%s)", g_bridge_refusal.empty() ? "no code" : g_bridge_refusal.c_str());
+    if (lobby_route && !cancelled()) set_lobby_refusal(g_bridge_refusal);   // the lobby's closed line says why
     // The player's own search was refused as out of date: offer the app's update (a blend: once it is over).
     if (!cancelled() && !g_ticket_out_of_date.is_null()) update_offer(g_ticket_out_of_date, epoch, blend);
     return fail(e.what());

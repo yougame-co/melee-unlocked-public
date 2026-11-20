@@ -57,6 +57,7 @@ void vulkan_forget_failed_starts() {}
 // readout (Linux and macOS: port/linux/full/gpu_features_linux.cpp).
 #include "gx_streamline.h"
 #include "host.h"
+#include "helper_exec.h"
 #include "pipeline_cache_store.h"
 #include "progress_frame.h"
 #ifdef MELEE_NO_SLIPPI
@@ -292,6 +293,7 @@ std::vector<uint32_t> compile_hlsl(const std::string& hlsl, bool vertex, std::st
   { std::ofstream f(in, std::ios::binary); f << hlsl; }
   // The release ships glslangValidator in bin/ beside the program (as the OpenGL renderer uses it);
   // a system copy is the fallback. Run by name alone, a system without glslang could not start Vulkan.
+  static std::string not_runnable;   // the shipped copy lost its exec bit and could not get it back
   static const std::string tool = [] {
     std::error_code ec;
 #ifdef __APPLE__
@@ -305,8 +307,19 @@ std::vector<uint32_t> compile_hlsl(const std::string& hlsl, bool vertex, std::st
     if (!ec)   // bin/ beside the program (Linux), or the app bundle's Resources/bin (Mac)
       for (const auto& candidate : {exe.parent_path() / "bin" / "glslangValidator", exe.parent_path().parent_path() / "Resources" / "bin" / "glslangValidator"})
         if (std::filesystem::is_regular_file(candidate, ec)) { shipped = candidate; break; }
+    if (!shipped.empty()) {
+      std::string note;
+#ifdef __APPLE__
+      const std::string shown = shipped.string();
+#else
+      const std::string shown = "bin/glslangValidator";
+#endif
+      not_runnable = helper_exec::ensure_executable(shipped, shown, &note);
+      if (!note.empty()) host::log("vulkan: %s", note.c_str());
+    }
     return !shipped.empty() ? "'" + shipped.string() + "'" : std::string("glslangValidator");
   }();
+  if (!not_runnable.empty()) { *error = not_runnable; return {}; }
   const std::string command = tool + " -D -V -e " + entry + " -S " + (vertex ? "vert" : "frag") +
       " --target-env vulkan1.3 --auto-map-locations --shift-UBO-binding 0 --shift-texture-binding " + (present ? "1" : "2") +
       " --shift-sampler-binding " + (present ? "5" : "3") + (present && vertex ? " --invert-y" : "") + " -o '" +

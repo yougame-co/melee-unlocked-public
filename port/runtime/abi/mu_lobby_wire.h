@@ -39,6 +39,7 @@
  *   u8 refusal_hint, u8 refusal_seq (bumps once per refusal Rooms sent this player),
  *   u8 arm (bumps each time a lobby is armed: the select that saw another one never leaves it),
  *   u8 note_seq (bumps once per drop recorded: the select shows each drop's note once, same text or not),
+ *   u8 closed_why (MU_LOBBY_WHY_*: why a closed lobby closed, with block_hint CLOSED; NONE otherwise),
  *   rules: u8 teams, u8 ff, u8 time, u8 stocks, u8 minutes, u8 pause,
  *   char note[MU_LOBBY_NOTE] (why the last match setup fell through, printable ASCII, NUL padded),
  *   4 seats * {u8 kind (MU_LOBBY_KIND_*), u8 level, u8 seat_flags (MU_LOBBY_S_*),
@@ -52,7 +53,7 @@
 #include <string.h>
 
 #define MU_LOBBY_COMMAND 0xD9u          /* free on slippi_command: D0-D8 are Slippi's, E8-EF taken */
-#define MU_LOBBY_VERSION 6
+#define MU_LOBBY_VERSION 7
 
 #define MU_LOBBY_OP_ENTER 0
 #define MU_LOBBY_OP_READ 1
@@ -158,9 +159,17 @@
 #define MU_LOBBY_HINT_SQUAD_UNAVAILABLE 30
 #define MU_LOBBY_HINT_COUNT 31
 
+/* why a closed lobby closed (closed_why): the hint line says why, the line under it what to do */
+#define MU_LOBBY_WHY_NONE 0          /* nothing known: the CLOSED hint alone */
+#define MU_LOBBY_WHY_TEST_BUILD 1    /* the ticket's test_build or consent: the player's OK on the build's page */
+#define MU_LOBBY_WHY_OFFLINE 2       /* build_offline, branch_offline */
+#define MU_LOBBY_WHY_SIGNED_OUT 3    /* signed_out */
+#define MU_LOBBY_WHY_OTHER 4         /* any other refusal: the view's note says it (the site's words, or the code) */
+#define MU_LOBBY_WHY_COUNT 5
+
 #define MU_LOBBY_RULES_SIZE 6
 #define MU_LOBBY_SEAT_SIZE (3 + 3 + 3 + 3 + MU_LOBBY_NAME + 9)
-#define MU_LOBBY_VIEW_HEAD 10
+#define MU_LOBBY_VIEW_HEAD 11
 #define MU_LOBBY_VIEW_SIZE \
     (MU_LOBBY_VIEW_HEAD + MU_LOBBY_RULES_SIZE + MU_LOBBY_NOTE + MU_LOBBY_SEATS * MU_LOBBY_SEAT_SIZE)
 
@@ -179,7 +188,7 @@ typedef struct MuLobbySeat {
 } MuLobbySeat;
 
 typedef struct MuLobbyView {
-    unsigned char flags, mode, my_seat, host_seat, block_hint, refusal_hint, refusal_seq, arm, note_seq;
+    unsigned char flags, mode, my_seat, host_seat, block_hint, refusal_hint, refusal_seq, arm, note_seq, closed_why;
     MuLobbyRules rules;
     char note[MU_LOBBY_NOTE];
     MuLobbySeat seats[MU_LOBBY_SEATS];
@@ -210,7 +219,7 @@ static inline const char* mu_lobby_hint_text(unsigned hint)
     case MU_LOBBY_HINT_PRESS_START: return "Press START to pick a stage";
     case MU_LOBBY_HINT_WAIT_HOST: return "Waiting for the host to start";
     case MU_LOBBY_HINT_PICK: return "Everyone needs to pick a fighter";
-    case MU_LOBBY_HINT_PLAYERS: return "Press A on an open door to invite a friend";
+    case MU_LOBBY_HINT_PLAYERS: return "Set a door to open then press A on it to invite";
     case MU_LOBBY_HINT_HUMANS: return "Needs 2 people. A on an open door invites";
     case MU_LOBBY_HINT_TEAMS: return "Put players on two teams";
     case MU_LOBBY_HINT_NOT_READY: return "Waiting for every game to be ready";
@@ -232,6 +241,26 @@ static inline const char* mu_lobby_hint_text(unsigned hint)
     case MU_LOBBY_HINT_TEAM_MISMATCH: return "The other team has a different version";
     case MU_LOBBY_HINT_SEARCH_STOPPED: return "Search stopped. Press START to retry";
     default: return "";
+    }
+}
+
+/* A closed lobby's two lines (closed_why): why (OTHER's is the view's note, "" here) and what to do next. Same
+ * font and length as the hints; NONE keeps the CLOSED hint's one line. */
+static inline const char* mu_lobby_why_text(unsigned why)
+{
+    switch (why) {
+    case MU_LOBBY_WHY_TEST_BUILD: return "This test build needs your OK first.";
+    case MU_LOBBY_WHY_OFFLINE: return "Online play is off for this build right now.";
+    case MU_LOBBY_WHY_SIGNED_OUT: return "Sign in to YouGame first.";
+    default: return "";
+    }
+}
+static inline const char* mu_lobby_why_step(unsigned why)
+{
+    switch (why) {
+    case MU_LOBBY_WHY_NONE: return "";
+    case MU_LOBBY_WHY_TEST_BUILD: return "Open it on its YouGame page. Press B to go back";
+    default: return "Press B to go back";
     }
 }
 
@@ -332,7 +361,7 @@ static inline size_t mu_lobby_view_encode(const MuLobbyView* v, unsigned char* o
     out[at++] = MU_LOBBY_VERSION;
     out[at++] = v->flags; out[at++] = v->mode; out[at++] = v->my_seat; out[at++] = v->host_seat;
     out[at++] = v->block_hint; out[at++] = v->refusal_hint; out[at++] = v->refusal_seq; out[at++] = v->arm;
-    out[at++] = v->note_seq;
+    out[at++] = v->note_seq; out[at++] = v->closed_why;
     out[at++] = v->rules.teams; out[at++] = v->rules.ff; out[at++] = v->rules.time;
     out[at++] = v->rules.stocks; out[at++] = v->rules.minutes; out[at++] = v->rules.pause;
     for (i = 0; i < MU_LOBBY_NOTE; ++i) {
@@ -368,14 +397,14 @@ static inline int mu_lobby_view_decode(const unsigned char* b, size_t n, MuLobby
     memset(v, 0, sizeof *v);
     v->flags = b[at++]; v->mode = b[at++]; v->my_seat = b[at++]; v->host_seat = b[at++];
     v->block_hint = b[at++]; v->refusal_hint = b[at++]; v->refusal_seq = b[at++]; v->arm = b[at++];
-    v->note_seq = b[at++];
+    v->note_seq = b[at++]; v->closed_why = b[at++];
     v->rules.teams = b[at++]; v->rules.ff = b[at++]; v->rules.time = b[at++];
     v->rules.stocks = b[at++]; v->rules.minutes = b[at++]; v->rules.pause = b[at++];
     memcpy(v->note, b + at, MU_LOBBY_NOTE); at += MU_LOBBY_NOTE;
     v->note[MU_LOBBY_NOTE - 1] = 0;
     if ((v->my_seat >= MU_LOBBY_SEATS && v->my_seat != MU_LOBBY_NONE) ||
         (v->host_seat >= MU_LOBBY_SEATS && v->host_seat != MU_LOBBY_NONE) ||
-        v->block_hint >= MU_LOBBY_HINT_COUNT || v->refusal_hint >= MU_LOBBY_HINT_COUNT ||
+        v->block_hint >= MU_LOBBY_HINT_COUNT || v->refusal_hint >= MU_LOBBY_HINT_COUNT || v->closed_why >= MU_LOBBY_WHY_COUNT ||
         (v->mode & ~(MU_LOBBY_M_DOUBLES | MU_LOBBY_M_SEARCHING | MU_LOBBY_M_STAGE_SELECT | MU_LOBBY_M_LOCAL_OWNER | MU_LOBBY_M_SQUAD | MU_LOBBY_M_SQUAD_AVAILABLE)) ||
         ((v->mode & MU_LOBBY_M_LOCAL_OWNER) && (!(v->mode & MU_LOBBY_M_DOUBLES) || v->my_seat != 0)) ||
         ((v->mode & MU_LOBBY_M_STAGE_SELECT) && (v->mode & MU_LOBBY_M_DOUBLES)) ||

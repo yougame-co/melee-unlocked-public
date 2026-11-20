@@ -107,12 +107,36 @@ inline void screen_text(const std::string& in, char (&out)[N]) {
 }
 inline void screen_name(const std::string& in, char (&out)[MU_LOBBY_NAME]) { screen_text(in, out); }
 
+// Why the lobby closed (MU_LOBBY_WHY_*), from its ticket's refusal code (the site's or the app's, "" for none)
+// and the search's own words (`text`, the site's when it refused): a known code in our words
+// (mu_lobby_why_text), any other as the site's words cut to the note, else the code. `note` gets OTHER's
+// line. NONE when nothing was refused and nothing said why.
+inline unsigned closed_why(const std::string& code, const std::string& text, std::string* note) {
+  note->clear();
+  if (code == "test_build" || code == "consent") return MU_LOBBY_WHY_TEST_BUILD;
+  if (code == "build_offline" || code == "branch_offline") return MU_LOBBY_WHY_OFFLINE;
+  if (code == "signed_out") return MU_LOBBY_WHY_SIGNED_OUT;
+  const bool said = !text.empty() && text != "Cancelled";
+  if (code.empty() && !said) return MU_LOBBY_WHY_NONE;
+  std::string line = said ? text : "YouGame couldn't open the lobby (" + code + ").";
+  if (line.size() > MU_LOBBY_NOTE - 1) {   // cut on a space, with "..." (the note holds MU_LOBBY_NOTE - 1)
+    size_t cut = MU_LOBBY_NOTE - 4;
+    while (cut > 0 && line[cut] != ' ') --cut;
+    if (cut == 0) cut = MU_LOBBY_NOTE - 4;
+    while (cut > 0 && (line[cut - 1] == ' ' || line[cut - 1] == ',' || line[cut - 1] == ':' || line[cut - 1] == '.')) --cut;
+    line = line.substr(0, cut) + "...";
+  }
+  *note = line;
+  return MU_LOBBY_WHY_OTHER;
+}
+
 struct ScreenFlags {
   bool armed = false, guest = false, inviting = false;
   bool closed = false;   // the lobby's search failed or its room closed: only B (leave) is left
   unsigned char arm = 0;   // which arming this is (slippi_online.cpp): a select from an older one never leaves it
   std::string note;        // why the last match setup fell through, until the next match starts
   unsigned char note_seq = 0;   // bumps once per drop recorded (slippi_online.cpp): each drop's note shows once
+  unsigned char closed_why = MU_LOBBY_WHY_NONE;   // with closed: why (closed_why above); OTHER's words are `note`
 };
 
 inline MuLobbyView screen_view(const Control::View& v, const ScreenFlags& f) {
@@ -140,6 +164,7 @@ inline MuLobbyView screen_view(const Control::View& v, const ScreenFlags& f) {
   out.refusal_seq = (unsigned char)(v.refusal_count & 0xFF);
   out.arm = f.arm;
   out.note_seq = f.note_seq;
+  out.closed_why = f.armed && f.closed && f.closed_why < MU_LOBBY_WHY_COUNT ? f.closed_why : MU_LOBBY_WHY_NONE;
   if (f.armed && !v.started) screen_text(f.note, out.note);
   if (doubles && v.owns_local) out.mode |= MU_LOBBY_M_LOCAL_OWNER;
   const Rules& r = v.state.rules;

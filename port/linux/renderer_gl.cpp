@@ -14,6 +14,7 @@
 #ifdef MELEE_LINUX_UNLOCKED
 #include "renderer_presenter.h"
 #endif
+#include "../runtime/host/helper_exec.h"
 #include "gx_shader.h"
 #include "gx_texture.h"
 #include "pipeline_cache_store.h"
@@ -111,7 +112,13 @@ void run_tool(std::vector<std::string> args, const std::filesystem::path& log) {
     const auto exe = std::filesystem::read_symlink("/proc/self/exe", ec);
     if (!ec) {
       const auto candidate = exe.parent_path() / "bin" / args[0];
-      if (std::filesystem::is_regular_file(candidate, ec)) { shipped = candidate.string(); argv[0] = shipped.data(); }
+      if (std::filesystem::is_regular_file(candidate, ec)) {
+        std::string note;
+        const std::string problem = helper_exec::ensure_executable(candidate, "bin/" + args[0], &note);
+        if (!note.empty()) shader_log("opengl: %s", note.c_str());
+        if (!problem.empty()) { posix_spawn_file_actions_destroy(&files); throw std::runtime_error(problem); }
+        shipped = candidate.string(); argv[0] = shipped.data();
+      }
     }
   }
   pid_t child = 0;

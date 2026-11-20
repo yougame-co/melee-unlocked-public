@@ -398,6 +398,9 @@ uint8_t local_rank();
 enum class Leave { Quit, Lost, Over, Next };
 // A Friends lobby room is parked (close_room Next or Lost) for the lobby's next search to adopt.
 bool lobby_parked();
+// The refusal code of the Friends lobby's (or Doubles home's) last ticket ("" when it was given, or none was
+// asked for since the last search began): the select's closed line says why (slippi_online.cpp lobby_command).
+std::string lobby_refusal();
 // Leaves the room: the session is over (the game's online cleanup). Only Ranked reads `why`.
 void end_session(Leave why);
 

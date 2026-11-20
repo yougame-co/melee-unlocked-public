@@ -224,7 +224,46 @@ int main() {
     f.note = std::string("caf\xC3\xA9 ") + std::string(80, 'x');   // the menu font, one line
     out = screen_view(v, f);
     CHECK(std::strlen(out.note) == MU_LOBBY_NOTE - 1 && std::string(out.note).rfind("caf? x", 0) == 0);
-    CHECK(MU_LOBBY_VERSION == 6 && MU_LOBBY_VIEW_SIZE == 10 + 6 + MU_LOBBY_NOTE + 4 * MU_LOBBY_SEAT_SIZE);
+    CHECK(MU_LOBBY_VERSION == 7 && MU_LOBBY_VIEW_SIZE == 11 + 6 + MU_LOBBY_NOTE + 4 * MU_LOBBY_SEAT_SIZE);
+  }
+  // ---- why a closed lobby closed: the ticket's refusal code in plain words, else the site's words ----
+  {
+    std::string note;
+    CHECK(closed_why("test_build", "Test build not available.", &note) == MU_LOBBY_WHY_TEST_BUILD && note.empty());
+    CHECK(closed_why("consent", "", &note) == MU_LOBBY_WHY_TEST_BUILD);
+    CHECK(closed_why("build_offline", "", &note) == MU_LOBBY_WHY_OFFLINE);
+    CHECK(closed_why("branch_offline", "Online play for this test build is switched off.", &note) == MU_LOBBY_WHY_OFFLINE);
+    CHECK(closed_why("signed_out", "", &note) == MU_LOBBY_WHY_SIGNED_OUT);
+    CHECK(closed_why("", "", &note) == MU_LOBBY_WHY_NONE && note.empty());
+    CHECK(closed_why("", "Cancelled", &note) == MU_LOBBY_WHY_NONE);
+    // Any other code: the site's words when it said some (cut on a space to the note), else the code.
+    CHECK(closed_why("teams_lobby_off", "Teams parties are not available here yet.", &note) == MU_LOBBY_WHY_OTHER &&
+          note == "Teams parties are not available here yet.");
+    CHECK(closed_why("refused", "", &note) == MU_LOBBY_WHY_OTHER && note == "YouGame couldn't open the lobby (refused).");
+    CHECK(closed_why("matchmaking_paused", std::string(30, 'a') + " " + std::string(30, 'b'), &note) == MU_LOBBY_WHY_OTHER &&
+          note == std::string(30, 'a') + "...");
+    CHECK(closed_why("native_build_unavailable", "", &note) == MU_LOBBY_WHY_OTHER && note.size() <= MU_LOBBY_NOTE - 1 &&
+          note.substr(note.size() - 3) == "...");
+    // A failed search with no code still says why (a room that refused the connection).
+    CHECK(closed_why("", "YouGame refused the ticket", &note) == MU_LOBBY_WHY_OTHER && note == "YouGame refused the ticket");
+    // The view carries it only while armed and closed, and it survives the wire.
+    Control::View v;
+    ScreenFlags f; f.armed = true; f.closed_why = MU_LOBBY_WHY_OFFLINE;
+    CHECK(screen_view(v, f).closed_why == MU_LOBBY_WHY_NONE);   // not closed
+    f.closed = true;
+    MuLobbyView out = screen_view(v, f);
+    CHECK(out.block_hint == MU_LOBBY_HINT_CLOSED && out.closed_why == MU_LOBBY_WHY_OFFLINE);
+    unsigned char bytes[MU_LOBBY_VIEW_SIZE];
+    MuLobbyView back;
+    CHECK(mu_lobby_view_encode(&out, bytes, sizeof bytes) == MU_LOBBY_VIEW_SIZE && bytes[10] == MU_LOBBY_WHY_OFFLINE);
+    CHECK(mu_lobby_view_decode(bytes, sizeof bytes, &back) && back.closed_why == MU_LOBBY_WHY_OFFLINE);
+    bytes[10] = MU_LOBBY_WHY_COUNT;
+    CHECK(!mu_lobby_view_decode(bytes, sizeof bytes, &back));   // a reason this build doesn't know
+    f.armed = false;
+    CHECK(screen_view(v, f).closed_why == MU_LOBBY_WHY_NONE);
+    // NONE keeps the one CLOSED line; every other reason has a next step.
+    CHECK(mu_lobby_why_step(MU_LOBBY_WHY_NONE)[0] == 0 && mu_lobby_why_text(MU_LOBBY_WHY_OTHER)[0] == 0);
+    for (unsigned w = 1; w < MU_LOBBY_WHY_COUNT; ++w) CHECK(mu_lobby_why_step(w)[0] != 0);
   }
   // ---- the rules bytes: Stock's minutes may be 0 (no timer), Time's never ----
   {
@@ -238,7 +277,7 @@ int main() {
   }
   // Lineup state adds nine bytes per seat; new commands have exact lengths and ranges.
   {
-    CHECK(MU_LOBBY_VIEW_SIZE == 212);
+    CHECK(MU_LOBBY_VIEW_SIZE == 213);
     const unsigned char claim[] = {MU_LOBBY_OP_LOCAL_SEAT,1}, release[] = {MU_LOBBY_OP_LOCAL_SEAT,0};
     const unsigned char bad[] = {MU_LOBBY_OP_LOCAL_SEAT,2};
     const unsigned char hover[] = {MU_LOBBY_OP_LOCAL_HOVER,2,0,0};
@@ -308,6 +347,7 @@ int main() {
   };
   for (unsigned h = 0; h < MU_LOBBY_HINT_COUNT; ++h) CHECK(font_ok(mu_lobby_hint_text(h)));
   for (unsigned r = 0; r <= MU_LOBBY_ROUTE_UNKNOWN; ++r) CHECK(font_ok(mu_lobby_route_text(r)));
+  for (unsigned w = 0; w < MU_LOBBY_WHY_COUNT; ++w) CHECK(font_ok(mu_lobby_why_text(w)) && font_ok(mu_lobby_why_step(w)));
   std::printf("ok\n");
   return 0;
 }

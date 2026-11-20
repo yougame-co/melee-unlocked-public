@@ -8698,25 +8698,41 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
     // and the next start came back at the old one.
     if (settings_slider("Volume", &g_volume, 0, 100, "%d%%")) { host::audio_set_volume(g_volume); changed = true; }
     state.volume = g_volume;
+#ifdef _WIN32
     const char* audio_modes[] = {"Auto: Windows shared (recommended)", "Low latency: Windows shared", "WASAPI exclusive", "ASIO\xC2\xAE (audio interface)"};
+    const int audio_mode_count = 4;
+#else
+    // Linux and Mac play through SDL (PipeWire or PulseAudio, Core Audio): no exclusive mode and no ASIO.
+    // Mode 2 asks SDL for its smallest buffer; a saved ASIO choice already plays as Auto there.
+    const char* audio_modes[] = {"Auto (recommended)", "Low latency", "Lowest latency"};
+    const int audio_mode_count = 3;
+    if (options.audio_mode == 3) options.audio_mode = 0;
+#endif
     static const int mode_at_start = options.audio_mode;
-    if (settings_combo("Audio mode", &options.audio_mode, audio_modes, 4)) {
+    if (settings_combo("Audio mode", &options.audio_mode, audio_modes, audio_mode_count)) {
       if (options.audio_mode == 1) options.audio_buffer_ms = 30;
       host::audio_set_buffering(options.audio_mode, options.audio_buffer_ms);
       changed = true;
     }
+#ifdef _WIN32
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Auto and Low latency share the Windows output with other apps.\nAuto adjusts buffering and remembers it per device; Low latency keeps your selected software buffer fixed.\nWASAPI exclusive takes over the Windows output while the game runs.\nASIO uses an installed interface driver and its outputs 1 and 2; if it cannot start, Auto is used.\nThe fastest stable choice depends on the device and driver.");
+#else
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("All three share the system output with other apps.\nAuto adjusts buffering; Low latency keeps your selected software buffer fixed.\nLowest latency asks for the smallest buffer; on some devices it can crackle.");
+#endif
     if (options.audio_mode != mode_at_start) { ImGui::TextDisabled("Applies after restart."); restart_now_button("audio_mode"); }
+#ifdef _WIN32
     if (options.audio_mode >= 2)
       ImGui::TextWrapped("Exclusive and ASIO bypass the Windows app volume. Lower the game volume and your amp before switching.");
     // This dialog can enable the manually selected interface mode, so its official logo is
     // shown with the picker even before that mode is selected. Preserve the artwork's alpha
     // and aspect ratio; the same asset is packaged in ui_sources/vendor beside the game.
+    // ASIO is Windows only, so the logo and its notice are too.
     if (auto* logo = cosmetic_preview(ui_source_asset_path("vendor", "asio-compatible-logo-white.png"))) {
       const float logo_width = 140.0f;
       ImGui::Image(logo->GetTexRef(), ImVec2(logo_width, logo_width * logo->Height / logo->Width));
     }
     ImGui::TextDisabled("ASIO is a registered trademark of Steinberg Media Technologies GmbH.");
+#endif
     if (options.audio_mode == 3) {
       // ASIO: the interface's own driver, outputs 1 and 2. If it cannot start, the game uses Auto.
       static std::vector<std::string> drivers;
@@ -8775,17 +8791,24 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
       static bool listed = false;
       if (!listed) { devices = host::audio_list_devices(); listed = true; }
       static const std::string device_at_start = options.audio_device;
-      std::string current = "Windows default";
+#ifdef _WIN32
+      const char* default_device = "Windows default";
+#else
+      const char* default_device = "System default";
+#endif
+      std::string current = default_device;
       for (const auto& d : devices) if (d.id == options.audio_device) current = d.name;
       ImGui::BeginDisabled(options.audio_mode == 3);
       if (settings_begin_combo("Output device", current.c_str())) {
-        if (settings_widgets::Selectable("Windows default", options.audio_device.empty())) { options.audio_device.clear(); changed = true; }
+        if (settings_widgets::Selectable(default_device, options.audio_device.empty())) { options.audio_device.clear(); changed = true; }
         for (const auto& d : devices)
           if (settings_widgets::Selectable(d.name.c_str(), d.id == options.audio_device)) { options.audio_device = d.id; changed = true; }
         settings_end_combo();
       }
+#ifdef _WIN32
       if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("Used by Windows shared and WASAPI exclusive modes, and by Auto if ASIO cannot start.");
+#endif
       ImGui::EndDisabled();
       if (options.audio_device != device_at_start) { ImGui::TextDisabled("Applies after restart."); restart_now_button("audio_device"); }
     }

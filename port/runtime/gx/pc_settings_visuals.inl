@@ -70,6 +70,10 @@ static SettingsRow settings_row_begin(const char* label) {
   r.label = label ? label : "";
   if (g_search) {
     r.shown = settings_search_matches(label);
+    // A row the search leaves out submits no item, so the page's own IsItemHovered() check after it
+    // asked about the row before: hovering "YouGame in game" put up the hidden Early inputs tooltip.
+    // No last item here means that check answers no.
+    if (!r.shown) ImGui::SetLastItemData(0, ImGuiItemFlags_None, ImGuiItemStatusFlags_None, ImRect());
     if (r.shown && g_hidden > 0) {
       // Show it: stop hiding for this row, at the shown list's end.
       ImGui::EndDisabled();

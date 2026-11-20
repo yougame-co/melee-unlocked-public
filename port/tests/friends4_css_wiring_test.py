@@ -232,10 +232,29 @@ class Screen(unittest.TestCase):
         self.assertIn('if (s && i != mine && (v->flags & MU_LOBBY_F_KNOWN) && !doubles) {', texts)
         invite = body(self.inc, 'static void mu_f4_invite(int mine)')
         self.assertIn('unsigned char req = MU_LOBBY_OP_INVITE;', invite)
-        self.assertIn('mu_f4.view.seats[i].kind != MU_LOBBY_KIND_OPEN', invite)
+        self.assertIn('const unsigned kind = mu_f4.view.seats[i].kind;', invite)
+        self.assertIn('if (kind != MU_LOBBY_KIND_OPEN) {', invite)
         self.assertIn('else if (mu_f4.view.flags & MU_LOBBY_F_STARTED) why = "a match is being set up";', invite)
         self.assertIn('else if (mu_f4.view.flags & MU_LOBBY_F_INVITING) why = "the invite picker is already open";', invite)
-        self.assertIn('for (i = 0; why == NULL && i < MU_LOBBY_SEATS; ++i) {', invite)
+        self.assertIn('for (i = 0; i < MU_LOBBY_SEATS; ++i) {', invite)
+        # 122.43: a press on a door that sends nothing says why, once.
+        for reason in ('your own door', 'on the switch, not the card', 'not open: press its switch first'):
+            self.assertIn(reason, invite)
+        self.assertLess(invite.index('if (why) {'), invite.index('if (mu_f4_send(&req, 1)) {'))
+
+    def test_the_whole_card_but_its_switch_invites(self):
+        # 122.43: a tester's presses on the card's tab (y -4.6..0.2) beside the switch did nothing. The switch
+        # keeps Melee's own box (its x bounds, y -4.6..0.2); the rest of the column down past the label invites.
+        over = body(self.inc, 'static int mu_f4_over_door(int i, float x, float y)')
+        self.assertIn('if (y > -4.6f && y < 0.2f && x > mu_f4.toggle[i][0] && x < mu_f4.toggle[i][1]) return 2;', over)
+        self.assertIn('return y > -22.0f && y < 0.2f ? 1 : 0;', over)
+        self.assertLess(over.index('return 2;'), over.index('? 1 : 0;'))
+        # The label line sits inside that: SIS y 196 at the 0.1 font, above the hint band at 218.
+        make = body(self.inc, 'static void mu_f4_text_make(void)')
+        self.assertIn('const float y = 196.0f;', make)
+        self.assertIn('mu_f4.line[0] = HSD_SisLib_803A6B98(text, 0.0f, 218.0f, " ");', make)
+        wire = read('port/runtime/abi/mu_lobby_wire.h')
+        self.assertIn('case MU_LOBBY_HINT_PLAYERS: return "Set a door to open then press A on it to invite";', wire)
 
     def test_a_started_match_is_never_followed_back_to_the_stage_select(self):
         self.assertIn('!(mu_f4.view.flags & (MU_LOBBY_F_HOST | MU_LOBBY_F_STARTED)) && mu_f4.view.my_seat < MU_LOBBY_SEATS', self.inc)
@@ -250,8 +269,32 @@ class Screen(unittest.TestCase):
 
     def test_labels_stay_in_the_menu_font(self):
         line = body(self.inc, 'static void mu_f4_line(int line, const char* s)')
-        self.assertIn("c == '.' || (((mu_f4.view.mode & MU_LOBBY_M_SQUAD) || mu_f4.note >= MU_LOBBY_HINT_SQUAD_TWO) &&", line)
+        self.assertIn("c == '.' || (((mu_f4.view.mode & MU_LOBBY_M_SQUAD) || mu_f4.note >= MU_LOBBY_HINT_SQUAD_TWO ||", line)
+        self.assertIn("mu_f4.view.block_hint == MU_LOBBY_HINT_CLOSED) &&", line)
         self.assertNotIn('snprintf', self.inc)   # not in the decomp's MSL
+
+    def test_a_closed_lobby_says_why_and_what_next(self):
+        texts = body(self.inc, 'static void mu_f4_texts(int mine)')
+        self.assertIn('v->block_hint == MU_LOBBY_HINT_CLOSED && v->closed_why != MU_LOBBY_WHY_NONE', texts)
+        self.assertIn('mu_f4_line(0, v->closed_why == MU_LOBBY_WHY_OTHER ? v->note : mu_lobby_why_text(v->closed_why));', texts)
+        self.assertIn('mu_f4_line(1, mu_lobby_why_step(v->closed_why));', texts)
+        online = read('port/runtime/hle/slippi_online.cpp')
+        self.assertIn('yougame::lobby_refusal()', online)
+        self.assertIn('flags.closed_why = (unsigned char)lb::closed_why(', online)
+        link = read('port/runtime/hle/yougame_link.cpp')
+        self.assertIn('set_lobby_refusal(g_bridge_refusal);', link)
+
+
+class HelperExec(unittest.TestCase):
+    """A zip tool that drops file modes leaves bin/ helpers without +x: each runner fixes it or says how."""
+
+    def test_every_shipped_helper_runner_checks_exec(self):
+        helper = read('port/runtime/host/helper_exec.h')
+        self.assertIn('std::filesystem::perm_options::add', helper)
+        self.assertIn('unzip Melee Unlocked again with a tool that keeps file permissions, ', helper)
+        for path in ('port/linux/renderer_gl.cpp', 'port/linux/shader_translation.h',
+                     'port/runtime/gx/gx_vulkan.cpp'):
+            self.assertIn('helper_exec::ensure_executable(', read(path), path)
 
 
 class ReviewFixes(unittest.TestCase):

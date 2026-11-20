@@ -3097,6 +3097,24 @@ static bool lobby_command(const uint8_t* p, uint32_t n, std::vector<uint8_t>& q)
     flags.arm = g_lobby_arm;
     flags.note = lobby.note;
     flags.note_seq = lobby.note_seq;
+    if (flags.closed && lobby.armed) {
+      // Why it closed, on the select instead of only "The lobby closed": the ticket's refusal code (a failed
+      // search) and the search's own words (the site's, when it refused).
+      const std::string code = failed ? yougame::lobby_refusal() : std::string();
+      const std::string text = !g_forced_error.empty() ? g_forced_error
+                               : failed && g_matchmaking ? g_matchmaking->GetErrorMessage() : std::string();
+      std::string why_note;
+      flags.closed_why = (unsigned char)lb::closed_why(code, text, &why_note);
+      if (flags.closed_why == MU_LOBBY_WHY_OTHER) flags.note = why_note;
+      static std::string logged;   // once per reason
+      const std::string line = code + "|" + std::to_string(flags.closed_why) + "|" + why_note;
+      if (line != logged) {
+        logged = line;
+        if (flags.closed_why != MU_LOBBY_WHY_NONE)
+          host::log("friends lobby: closed (%s%s%s)", code.empty() ? "no code" : code.c_str(),
+                    why_note.empty() ? "" : ": ", why_note.c_str());
+      }
+    }
     const MuLobbyView v = lb::screen_view(cv, flags);
     q.resize(MU_LOBBY_VIEW_SIZE);
     return mu_lobby_view_encode(&v, q.data(), q.size()) == MU_LOBBY_VIEW_SIZE;

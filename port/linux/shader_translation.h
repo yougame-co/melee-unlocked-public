@@ -24,6 +24,7 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "../runtime/host/helper_exec.h"
 extern char** environ;
 namespace shader_translation {
 inline std::string read_text(const std::filesystem::path& path) {
@@ -45,7 +46,13 @@ inline void run_tool(std::vector<std::string> args, const std::filesystem::path&
   std::vector<std::string> candidates;
   std::error_code ec;
   const auto shipped = tools / args[0];
-  if (std::filesystem::is_regular_file(shipped, ec)) candidates.push_back(shipped.string());
+  if (std::filesystem::is_regular_file(shipped, ec)) {
+    std::string note;
+    const std::string problem = helper_exec::ensure_executable(shipped, shipped.string(), &note);
+    if (!note.empty()) std::fprintf(stderr, "Mac shaders: %s\n", note.c_str());
+    if (!problem.empty()) throw std::runtime_error(problem);
+    candidates.push_back(shipped.string());
+  }
   const std::string homebrew = "/opt/homebrew/bin/" + args[0];
   if (std::filesystem::is_regular_file(homebrew, ec)) candidates.push_back(homebrew);
   candidates.push_back(args[0]); // PATH is the final fallback.
