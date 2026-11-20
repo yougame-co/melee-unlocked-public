@@ -108,9 +108,10 @@ void set_warming(bool on);
 // picked), off puts it down. The arena's own thread applies it; any thread may call.
 void pip_adjust(bool on);
 bool pip_active();   // the two windows are laid out now (a small window is up)
-// The room's match while the player is not fighting: big on the select (PICTURE IN PICTURE makes it
-// small), as the setting says while away. The side bar's button toggles it (any thread); watch_layout
-// says how it shows now: 0 not laid out, 1 small, 2 big.
+// The room's match while the player is not fighting: as the settings say (room_watch on the select,
+// warmup_watch while away); on the select PICTURE IN PICTURE on it makes it small for that wait. The
+// side bar's button toggles it (any thread); watch_layout says how it shows now: 0 no match window,
+// 1 small, 2 big with this game small, 3 in its own window (this game as it is).
 void toggle_watch_layout();
 int watch_layout();
 // The Arena panel's right side bar card on the select: its bottom, a share of the window's height

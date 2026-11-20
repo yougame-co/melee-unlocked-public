@@ -318,6 +318,11 @@ struct RenderOptions {
   static bool& live_warmup_turn_instant() { static bool value = false; return value; }
   int warmup_watch = 1;
   static int& live_warmup_watch() { static int value = 1; return value; }
+  // room_watch: the room's match while watching on the room's character select: 0 in its own window,
+  // this game's window left as it is (the default, as before 0.9.218), 1 a small window over this
+  // game (picture in picture), 2 big, with this game in the small window.
+  int room_watch = 0;
+  static int& live_room_watch() { static int value = 0; return value; }
   int warmup_pip_size = 1;
   static int& live_warmup_pip_size() { static int value = 1; return value; }
   int warmup_pip_corner = 4;

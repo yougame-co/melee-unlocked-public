@@ -45,7 +45,7 @@ def main():
         files=len(files), markdown=[f for f in files if f.lower().endswith('.md')],
         has=dict((n, n in files) for n in ('melee_port.exe', 'melee_port_compat.exe', 'melee_source.exe',
                                           'melee_game.dll', 'melee_game.dbg', 'MeleeUnlockedLauncher.exe')),
-        bat_default_engine='melee_port.exe' if re.search(r'(?m)^melee_port\.exe ', bat) else 'unexpected')
+        bat_default_engine='melee_source.exe' if re.search(r'(?m)^set "GAME=melee_source\.exe"', bat) else 'unexpected')
 
     boots = {}
     for exe in ('melee_port.exe', 'melee_port_compat.exe', 'melee_source.exe'):

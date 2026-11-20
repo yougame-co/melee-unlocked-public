@@ -96,6 +96,7 @@ int gm_801A4BB8() { return 1; }
 void lock_in_and_search(int) { ++searches; } void load_code_entry() { ++setups; }
 void mu_slippi_cleanup_connections() { ++cleanups; }
 int mu_slippi_yougame_pick() { return 0; }   // the app: never a launcher YouGame row (upstream 0.9.97)
+const char* mu_test_getenv(const char*) { return nullptr; } int test_skip_code_entry; void OSReport(const char*, ...) {}   // upstream 0.9.220's test Start presses: off here
 void mu_slippi_yougame_restart_older() { std::abort(); }
 int mu_slippi_cmd(unsigned cmd,const void* p,unsigned,void*,unsigned,unsigned*) {
  if(cmd!=0xE7 || *(const u8*)p!=1)std::abort();++requests;return 0;

@@ -71,7 +71,7 @@ class StartupWindowWiringTest(unittest.TestCase):
     def test_first_frame_is_marked_where_ready_is_sent(self):
         for path, line in (("port/runtime/gx/gx_d3d12.cpp", "      yougame::parity::signals.presented(!test_only && SUCCEEDED(present_result) && frame.test_fill < 0);\n"
                                                              "      if (!test_only && SUCCEEDED(present_result) && frame.test_fill < 0) host::startup_first_frame();"),
-                           ("port/runtime/gx/gx_d3d11.cpp", "    yougame::parity::signals.presented(!test_only && SUCCEEDED(present_result) && frame.test_fill < 0);\r\n"
+                           ("port/runtime/gx/gx_d3d11.cpp", "    yougame::parity::signals.presented(!test_only && SUCCEEDED(present_result) && frame.test_fill < 0);\n"
                                                             "    if (!test_only && SUCCEEDED(present_result) && frame.test_fill < 0) host::startup_first_frame();"),
                            ("port/runtime/gx/gx_vulkan.cpp", "        yougame::parity::signals.presented(real_frame);\n"
                                                              "        if (real_frame) host::startup_first_frame();")):

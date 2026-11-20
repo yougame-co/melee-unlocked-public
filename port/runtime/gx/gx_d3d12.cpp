@@ -5576,7 +5576,7 @@ void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* override
   // the old set, so drop it and let the next draw rebuild what it needs.
   if (settings_ui_ && settings_textures_dirty()) { wait_gpu(); textures_.clear(); texture_sets_.clear(); }
   if (settings_ui_) { settings_set_game_aspect(output_aspect()); settings_set_hud_snapshot(frame); }
-  arena_panel::set_under_hand(settings_ui_ && frame.under_hand_command >= 0);   // drawn in the command loop
+  arena_panel::set_under_hand(settings_ui_ && frame.under_hand_command >= 0, 640.0f * (float)scale_);   // drawn in the command loop
   Stopwatch ui_sw;
   if (settings_ui_ && settings_ui_->begin(opts_)) {
     apply_fullscreen_mode();

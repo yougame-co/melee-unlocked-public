@@ -147,6 +147,8 @@ def main():
     ap.add_argument("--compare-only", action="store_true", help="check an earlier run's files again (nothing is started)")
     ap.add_argument("--looks", default="", help="panel look per member, e.g. 0,1,2 (0 corners+cards, 1 card, 2 split, 3 corners, 4 ring)")
     ap.add_argument("--extra", nargs=argparse.REMAINDER, default=[])
+    ap.add_argument("--press-start", action="store_true",
+                    help="the room does not lock fighters in: each member presses Start on the select itself (MELEE_TEST_ARENA_PRESS_START)")
     args = ap.parse_args()
     iso = require_iso(args.iso)
     exe = (args.bin / "melee_source.exe").resolve()
@@ -156,6 +158,8 @@ def main():
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, MELEE_NO_GC_ADAPTER="1", MELEE_ARENA_KEEP_LIVE="1")
+    if args.press_start:
+        env["MELEE_TEST_ARENA_PRESS_START"] = "1"
     if args.no_viewer:
         env["MELEE_ARENA_NO_VIEWER"] = "1"
     if args.lag_ms > 0:

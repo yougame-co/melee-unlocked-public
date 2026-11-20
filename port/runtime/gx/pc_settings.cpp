@@ -2530,6 +2530,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
       else if (key == "warmup_panel_style") options.warmup_panel_style = std::clamp(std::atoi(value.c_str()), 0, 2);
       else if (key == "warmup_turn_instant") options.warmup_turn_instant = value == "1";
       else if (key == "warmup_watch") options.warmup_watch = std::clamp(std::atoi(value.c_str()), 0, 2);
+      else if (key == "room_watch") options.room_watch = std::clamp(std::atoi(value.c_str()), 0, 2);
       else if (key == "warmup_pip_size") options.warmup_pip_size = std::clamp(std::atoi(value.c_str()), 0, 2);
       else if (key == "warmup_pip_corner") options.warmup_pip_corner = std::clamp(std::atoi(value.c_str()), 0, 4);
       else if (key == "warmup_pip_cx") options.warmup_pip_cx = std::clamp((float)std::atof(value.c_str()), 0.0f, 1.0f);
@@ -2806,6 +2807,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   RenderOptions::live_warmup_panel_style() = options.warmup_panel_style;
   RenderOptions::live_warmup_turn_instant() = options.warmup_turn_instant;
   RenderOptions::live_warmup_watch() = options.warmup_watch;
+  RenderOptions::live_room_watch() = options.room_watch;
   RenderOptions::live_warmup_pip_size() = options.warmup_pip_size;
   RenderOptions::live_warmup_pip_corner() = options.warmup_pip_corner;
   RenderOptions::live_warmup_pip_cx().store(options.warmup_pip_cx);
@@ -4266,7 +4268,7 @@ static void draw_spectate_view_selector() {
   }
   if (test_view >= 0 && now - shown_at >= test_secs) { pick_spectate_view(test_view); test_view = -1; }
   // Test: MELEE_TEST_SPECTATE_ACTION=<button>@<seconds>: that button of the list (1 WARM UP, 2 PICTURE IN
-  // PICTURE, 3 FULL SIZE) pressed once, that long after the window was first laid out big (1, 2) or small (3).
+  // PICTURE, 3 FULL SIZE) pressed once, that long after the window first showed that button.
   static int test_action = -2, action_secs = 0;
   static double laid_at = -1.0;
   if (test_action == -2) {
@@ -4275,7 +4277,9 @@ static void draw_spectate_view_selector() {
       if (std::sscanf(t, "%d@%d", &test_action, &action_secs) != 2) test_action = -1;
   }
   if (test_action > 0) {
-    const bool layout_for_it = host::window_pip_mode() == (test_action == 3 ? 1 : 2);
+    // 1 and 2 are on the big window and on the room's match in its own window; 3 on the small one.
+    const int pip_mode = host::window_pip_mode();
+    const bool layout_for_it = test_action == 3 ? pip_mode == 1 : pip_mode == 2 || (pip_mode == 0 && host::options.spectate_owner != 0);
     if (layout_for_it && laid_at < 0.0) laid_at = now;
     if (layout_for_it && now - laid_at >= action_secs) {
       host::window_report_spectate_action(test_action);
@@ -4354,13 +4358,16 @@ static void draw_spectate_view_selector() {
   const float u = std::clamp(h / 720.0f, 0.8f, 3.0f);
   // Laid out big by the room's game (picture in picture's big half): its buttons under the views.
   const bool big = host::window_pip_mode() == 2;
-  const bool over = mouse_in && io.MousePos.x < 200.0f * u && io.MousePos.y < (big ? 170.0f : 100.0f) * u;
+  // The room's match in its own window (the default) has the same two buttons: picture in picture and
+  // the warm-up are a click away, never forced.
+  const bool buttons = big || host::options.spectate_owner != 0;
+  const bool over = mouse_in && io.MousePos.x < 200.0f * u && io.MousePos.y < (buttons ? 170.0f : 100.0f) * u;
   const float since = (float)std::min(now - shown_at - 7.0, now - moved_at - 2.5);   // > 0: time to hide
   static float a = 1.0f;
   const float want = (since < 0.0f || over) ? 1.0f : 0.0f;
   a += (want - a) * std::min(1.0f, io.DeltaTime * 8.0f);
   if (a < 0.02f) return;
-  if (big) draw_list(u, a, {{"WARM UP", 1}, {"PICTURE IN PICTURE", 2}});
+  if (buttons) draw_list(u, a, {{"WARM UP", 1}, {"PICTURE IN PICTURE", 2}});
   else draw_list(u, a, {});
 }
 
@@ -5047,6 +5054,7 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
        << "\nwarmup_button " << (options.warmup_button ? 1 : 0) << "\nwarmup_panel_style " << options.warmup_panel_style
        << "\nwarmup_turn_instant " << (options.warmup_turn_instant ? 1 : 0)
        << "\nwarmup_watch " << options.warmup_watch
+       << "\nroom_watch " << options.room_watch
        << "\nwarmup_pip_size " << options.warmup_pip_size
        << "\nwarmup_pip_corner " << options.warmup_pip_corner
        << "\nwarmup_pip_cx " << options.warmup_pip_cx << "\nwarmup_pip_cy " << options.warmup_pip_cy
@@ -10357,15 +10365,34 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         static const char* const kWatch[] = {"Not shown (score only)", "Small window over your game", "Big, your game in the small window"};
         static const char* const kSize[] = {"Small", "Medium", "Large"};
         static const char* const kCorner[] = {"Top right", "Bottom right", "Bottom left", "Top left", "Right side bar"};
+        // The room's match while you watch on the room's character select: in its own window (your game
+        // as it is), picture in picture, or big with your game small.
+        static const char* const kRoomWatch[] = {"Its own window (your game stays as it is)", "Picture in picture (small window over your game)",
+                                                 "Big, your game in the small window"};
+        {
+          // Screenshot tooling (MELEE_SETTINGS_SCROLL_TO=room_watch): these rows stay in view (the page
+          // puts its remembered place back after it opens, so once is not enough here).
+          static const char* const target = std::getenv("MELEE_SETTINGS_SCROLL_TO");
+          if (target && std::strcmp(target, "room_watch") == 0) ImGui::SetScrollHereY(0.3f);
+        }
         ImGui::SetNextItemWidth(300.0f);
-        if (ImGui::Combo("Arena: the room's match while you're away", &options.warmup_watch, kWatch, 3)) {
+        if (settings_combo("Arena: the room's match on the character select", &options.room_watch, kRoomWatch, 3)) {
+          RenderOptions::live_room_watch() = options.room_watch;
+          changed = true;
+        }
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Waiting for your turn on the room's character select, the room's match opens in its own\n"
+                            "window and your game stays as it is. Picture in picture puts the match in a small window\n"
+                            "over your game instead; Big fills the screen with the match and makes your game small.\n"
+                            "PICTURE IN PICTURE on the match window (or A on that button in the side bar) switches\n"
+                            "for the wait you are in.");
+        ImGui::SetNextItemWidth(300.0f);
+        if (settings_combo("Arena: the room's match while you're away", &options.warmup_watch, kWatch, 3)) {
           RenderOptions::live_warmup_watch() = options.warmup_watch;
           changed = true;
         }
         if (ImGui::IsItemHovered())
-          ImGui::SetTooltip("Watching on the room's character select, the match starts full size: PICTURE IN PICTURE\n"
-                            "on it (or A on that button in the side bar) makes it small so you can do anything else.\n"
-                            "Warming up or in any other mode, the match plays as chosen here: in a small window over\n"
+          ImGui::SetTooltip("Warming up or in any other mode, the match plays as chosen here: in a small window over\n"
                             "your game, or big with your game in the small window. Not shown: no window, the panel's\n"
                             "score only. Drag the small window anywhere, or pull its edges to size it.");
         ImGui::SetNextItemWidth(140.0f);
@@ -10385,7 +10412,7 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
         }
         static const char* const kView[] = {"Standard", "Lab view", "Light (simple shapes, cheapest)"};
         ImGui::SetNextItemWidth(300.0f);
-        if (ImGui::Combo("Arena: the room's match view", &options.spectate_view, kView, 3)) {
+        if (settings_combo("Arena: the room's match view", &options.spectate_view, kView, 3)) {
           RenderOptions::live_spectate_view() = options.spectate_view;
           changed = true;
         }

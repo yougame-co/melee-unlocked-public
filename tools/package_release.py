@@ -179,7 +179,11 @@ if not exist "%ISO%" (
   pause
   exit /b 1
 )
-melee_port.exe --iso "%ISO%" --settings-path "%~dp0port-settings.ini" --sys-dir "%~dp0Sys" --user-dir "%~dp0User\\Slippi" --replay-dir "%~dp0Replays" --card-dir "%~dp0User\\GC\\CardA" --threaded-renderer
+rem The Source Port (melee_source.exe with melee_game.dll); the Static Recomp when it is not in this folder.
+set "GAME=melee_source.exe"
+if not exist "%~dp0melee_source.exe" set "GAME=melee_port.exe"
+if not exist "%~dp0melee_game.dll" set "GAME=melee_port.exe"
+"%GAME%" --iso "%ISO%" --settings-path "%~dp0port-settings.ini" --sys-dir "%~dp0Sys" --user-dir "%~dp0User\\Slippi" --replay-dir "%~dp0Replays" --card-dir "%~dp0User\\GC\\CardA" --threaded-renderer
 if errorlevel 1 pause
 """
 

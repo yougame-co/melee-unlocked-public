@@ -199,6 +199,7 @@ bool in_ring_of(const std::array<uint8_t, kRingMax>& ring, uint8_t id) {
   return false;
 }            // test rooms: when this member began waiting for its viewer
 std::string g_pair_code;                  // the opponent this game last searched for
+uint32_t g_pair_games = 0;                // the room's finished games when that pairing was counted
 std::array<int, kMaxMembers> g_ping{};
 std::string g_status;
 bool g_live = false;
@@ -525,9 +526,11 @@ struct Pip {
 };
 Pip g_pip;
 std::atomic<int> g_pip_adjust_req{0};   // 1 pick the small window with the controller, 2 let it go
-// Watching on the room's character select: the match big (2) by default, small (1) once the player
-// asks (PICTURE IN PICTURE on it, or the side bar's button); big again for each new wait.
-std::atomic<int> g_watch_layout{2};
+// Watching on the room's character select: the match as the setting says (room_watch: 0 its own
+// window, 1 small, 2 big), or as the player asked for this wait (PICTURE IN PICTURE on it, or the
+// side bar's button). -1: the setting; the setting again for each new wait.
+std::atomic<int> g_watch_layout{-1};
+std::atomic<bool> g_watch_open{false};  // the room's match window is up while this player watches
 std::atomic<int> g_watch_toggle{0};     // the side bar's button pressed (any thread): 1 toggle
 // The right side bar's top card on the select (arena_panel): its bottom as a share of the window's
 // height, and when it was said (ms); the small window sits under it there.
@@ -608,18 +611,27 @@ void pip_tick() {
     event("WARM UP pressed on the match window");
     native_practice::submit_warmup();
   }
+  // On the select: the setting, or this wait's own choice. "Full size" there is what the setting calls
+  // it: the match's own window (0, the default), or big with this game small (2).
+  const int room = std::clamp(gx::RenderOptions::live_room_watch(), 0, 2);
+  const int full = g_warming ? 2 : room == 2 ? 2 : 0;
+  int on_select_layout = g_watch_layout.load();
+  if (on_select_layout < 0) on_select_layout = room;
   if (action == 2 || action == 3 || g_watch_toggle.exchange(0)) {
-    const int to = action == 2 ? 1 : action == 3 ? 2 : (g_warming ? gx::RenderOptions::live_warmup_watch() : g_watch_layout.load()) == 2 ? 1 : 2;
+    const int now = g_warming ? gx::RenderOptions::live_warmup_watch() : on_select_layout;
+    const int to = action == 2 ? 1 : action == 3 ? full : now == 1 ? full : 1;
     // Away (warming up, another mode) the setting says how it shows, so the choice is the setting's;
     // on the select it is this wait's own.
     if (g_warming) gx::RenderOptions::live_warmup_watch() = to;
-    else g_watch_layout.store(to);
-    event("the room's match %s (%s)", to == 1 ? "small: picture in picture" : "full size", g_warming ? "while away" : "on the select");
+    else { g_watch_layout.store(to); on_select_layout = to; }
+    event("the room's match %s (%s)", to == 1 ? "small: picture in picture" : to == 2 ? "full size" : "in its own window",
+          g_warming ? "while away" : "on the select");
   }
   // Called for the turn: the windows go back at once, so the countdown shows full size; and the next
   // wait starts big again.
   const int setting = std::clamp(gx::RenderOptions::live_warmup_watch(), 0, 2);
-  if (turn_called()) g_watch_layout.store(2);
+  if (turn_called()) g_watch_layout.store(-1);
+  g_watch_open.store(viewer_running() && !turn_called() && setting != 0);
   if (!setting && viewer_running()) {   // turned to "Not shown": the window goes (it opens again when turned back on)
     pip_restore("the match window is off");
     close_viewer();
@@ -627,8 +639,12 @@ void pip_tick() {
     event("viewer closed: the room's match is not shown");
     return;
   }
-  const int want = viewer_running() && !turn_called() && setting ? (g_warming ? setting : g_watch_layout.load()) : 0;
-  if (!want) { pip_restore(!viewer_running() ? "no match window now" : turn_called() ? "this player's turn" : "the match window is off"); return; }
+  const int want = viewer_running() && !turn_called() && setting ? (g_warming ? setting : on_select_layout) : 0;
+  if (!want) {
+    pip_restore(!viewer_running() ? "no match window now" : turn_called() ? "this player's turn"
+                : setting ? "the match in its own window" : "the match window is off");
+    return;
+  }
   // The viewer's game window, found by its process (it takes a moment to open). A new one (the
   // room's next game) gets the layout afresh.
   if (!g_pip.viewer || !IsWindow((HWND)g_pip.viewer)) {
@@ -1165,6 +1181,13 @@ bool target(Target& t) {
 
 // Tests: MELEE_TEST_ARENA_AUTOLOCK=1 locks a real room's connected pair in at once (test rooms do it
 // always), with the character picked on the select, so hidden games play their matches.
+// Tests: MELEE_TEST_ARENA_PRESS_START=1 keeps a test room from locking its fighters in: each one locks in
+// with Start on the select, as players do (the select presses it, shim/mu_slippi_css.c), so the select's own Start path is covered.
+bool test_press_start() {
+  static const bool on = [] { const char* v = host::test_env::getenv("MELEE_TEST_ARENA_PRESS_START"); return v && *v == '1'; }();
+  return on;
+}
+
 bool test_autolock() {
   static const bool on = [] { const char* v = host::test_env::getenv("MELEE_TEST_ARENA_AUTOLOCK"); return v && *v == '1'; }();
   return on;
@@ -1184,6 +1207,11 @@ void steer_match() {
   const bool ours = st.mode == Matchmaking::DIRECT || st.mode == Matchmaking::TEAMS;
   Target t;
   if (!target(t)) {
+    // Out of the ring: the next pair this member plays is a new one, even against the same opponent
+    // as before. Kept, a member who sat out and came back against their last opponent took it for a
+    // rematch on their side only, and kept the winner and loser of a game long gone (or none at all,
+    // after a Start pressed while watching): their Start then did nothing on the select.
+    g_pair_code.clear();
     g_status = ring_slot(g_room, g_self) >= 0 ? "Waiting for another player" : "Watching";
     if (searching && ours && online::in_online_menus()) {
       event("out of the ring: leaving the match with %s", st.code.c_str());
@@ -1207,7 +1235,8 @@ void steer_match() {
   }
   if (searching) {
     g_status = st.state == (int)Matchmaking::CONNECTION_SUCCESS ? "Ready to fight " + t.label : "Connecting to " + t.label;
-    if (g_test.on && st.state == (int)Matchmaking::CONNECTION_SUCCESS && !st.local_ready && online::arena_lock_in(g_test.character, 0))
+    if (g_test.on && !test_press_start() && st.state == (int)Matchmaking::CONNECTION_SUCCESS && !st.local_ready &&
+        online::arena_lock_in(g_test.character, 0))
       event("locked in for %s", t.code.c_str());
     uint8_t picked = 2, colour = 0;
     if (!g_test.on && test_autolock() && st.state == (int)Matchmaking::CONNECTION_SUCCESS && !st.local_ready) {
@@ -1244,9 +1273,19 @@ void steer_match() {
   }
   std::string pairing = t.code;
   for (uint8_t id : t.others) pairing += "/" + std::to_string(id);
-  if (pairing != g_pair_code) { online::arena_note_new_pairing(); g_pair_code = pairing; }
+  // A new pairing: other opponents than last time, or the same ones with a fighter who came into the
+  // ring since this pairing was counted (tenure 0: no game finished there yet). The room is the same on
+  // every member's PC, so both sides of a pair count it alike. A rematch of fighters who stayed keeps
+  // its winner and loser.
+  bool newcomer = false;
+  for (int s = 0; s < ring_size(g_room); ++s) newcomer |= g_room.ring[s] != kNone && g_room.tenure[s] == 0;
+  if (pairing != g_pair_code || (newcomer && g_room.games != g_pair_games)) {
+    online::arena_note_new_pairing();
+    g_pair_code = pairing;
+    g_pair_games = g_room.games;
+  }
   std::string error;
-  const bool locked = g_test.on;
+  const bool locked = g_test.on && !test_press_start();
   if (online::arena_start_search(t.mode, t.code, locked, g_test.character, 0, t.team, &error)) {
     event("searching for %s (%s)", t.code.c_str(), t.mode == Matchmaking::TEAMS ? "doubles" : "singles");
     g_status = "Connecting to " + t.label;
@@ -1700,7 +1739,7 @@ bool warmup_ok(std::string* why) {
 void pip_adjust(bool on) { g_pip_adjust_req.store(on ? 1 : 2); }
 bool pip_active() { return g_pip_up.load(); }
 void toggle_watch_layout() { g_watch_toggle.store(1); }
-int watch_layout() { return g_pip_up.load() ? g_pip.applied : 0; }
+int watch_layout() { return g_pip_up.load() ? g_pip.applied : g_watch_open.load() ? 3 : 0; }
 void note_side_card_bottom(float share) {
   g_card_bottom.store(share);
   g_card_bottom_ms.store(now_ms());

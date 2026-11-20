@@ -1756,7 +1756,7 @@ class VulkanBackend final : public Backend {
       const bool old_vsync = opts_.vsync;
       // With a shader preset the Coming soon stickers go into the picture, under the preset (as Direct3D).
       coming_soon_overlay::set_in_picture(shader_was_on_ && imgui_picture_pipeline_ != VK_NULL_HANDLE);
-      arena_panel::set_under_hand(frame.under_hand_command >= 0 && !card_failed_);   // drawn in the command loop
+      arena_panel::set_under_hand(frame.under_hand_command >= 0 && !card_failed_, 640.0f * (float)scale_);   // drawn in the command loop
       if (settings_frame(settings_state_, opts_)) {
         apply_fullscreen_mode();
         if (opts_.vsync != old_vsync) swapchain_dirty_ = true;

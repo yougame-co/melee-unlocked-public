@@ -52,7 +52,10 @@ void frame(const Frame& f);
 // Out of a room, the Arena card under the hands: the renderer says before the overlay frame whether
 // this game frame has the native select's mark (gx Frame::under_hand_command) and it will draw the
 // card there. Without it the card is drawn over the window as everything else.
-void set_under_hand(bool on);
+// efb_width: the game picture's width in the renderer's internal pixels (640 times the internal
+// scale), 0 when unknown. Below about 0.6 of the picture's window width the card stays over the
+// window: drawn into so few pixels its small text broke up (internal resolution 1x on a large window).
+void set_under_hand(bool on, float efb_width = 0.0f);
 // The card's ImGui lists for the renderer to draw into its picture at the mark, built in the
 // current ImGui frame. The game picture lands on (x, y, w, h) of a target of target_w x target_h
 // pixels. False when the card was not drawn into the picture this frame.

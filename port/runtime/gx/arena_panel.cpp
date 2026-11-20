@@ -173,6 +173,7 @@ struct Under {
   ImGuiContext* context = nullptr;   // the list's ImGui context (the panel makes a new one when HDR switches)
   int frame = -1;
   ImVec2 pos, size;              // the game picture in the window
+  float efb_width = 0.0f;        // the picture's width in internal pixels (set_under_hand), 0 unknown
 } g_under;
 // Starts this frame's list over the game picture and makes it the target of the drawing.
 void begin_under(float x0, float y0, float x1, float y1) {
@@ -960,7 +961,7 @@ void press(Do what, const View& v) {
     }
     case Do::Leave: leave_panel(); break;
     case Do::Pip:
-      host::log("arena panel: %s pressed", ar::watch_layout() == 2 ? kPipSmall : kPipBig);
+      host::log("arena panel: %s pressed", ar::watch_layout() == 1 ? kPipBig : kPipSmall);
       ar::toggle_watch_layout();
       break;
     case Do::Warmup:
@@ -1323,7 +1324,7 @@ void draw_combined(const Bars& b, const View& v, bool corners_look) {
   std::vector<std::pair<char, std::string>> right = {x_action(v)};
   const Role role = ar::role(r, v.self);
   // Watching with the room's match window up: A on this makes it small (picture in picture) or full size.
-  if (role != Role::Fighter && ar::watch_layout() != 0) right.insert(right.begin(), {'A', ar::watch_layout() == 2 ? kPipSmall : kPipBig});
+  if (role != Role::Fighter && ar::watch_layout() != 0) right.insert(right.begin(), {'A', ar::watch_layout() == 1 ? kPipBig : kPipSmall});
   if (g.side == 2 && role != Role::Fighter && r.asker == ar::kNone) right.push_back({'A', "Ask to play next"});
   if (g.side == 2 && r.members.size() >= 4 && !r.switch_pending) right.push_back({'R', r.doubles ? "Back to singles" : "Doubles"});
   if (g.side == 2) right.push_back({'B', "Close"});
@@ -1613,7 +1614,8 @@ void draw_not_in_room(const Bars& b, const View& v) {
   // drawn over the window, spill_under). Elsewhere (in the bar beside a 4:3 picture in a wide
   // window, other scenes, the Static Recomp) over the window as before.
   struct EndUnder { ~EndUnder() { end_under(); } } end_under_at_return;
-  if (g_under.wanted && x < b.px1 && x + tw > b.px0) begin_under(b.px0, b.y0, b.px1, b.y1);
+  const bool sharp_enough = g_under.efb_width <= 0.0f || g_under.efb_width >= 0.6f * (b.px1 - b.px0);
+  if (g_under.wanted && sharp_enough && x < b.px1 && x + tw > b.px0) begin_under(b.px0, b.y0, b.px1, b.y1);
   if (!v.notice.empty()) {   // a full room said no: the reason, above the card
     const Ink nk{Face::Bold, 11, kWhite};
     std::vector<std::string> lines = wrap(nk, v.notice, tw);
@@ -1695,7 +1697,7 @@ void check_text(const Bars& b) {
 
 void set_fonts(const Fonts& fonts) { g_fonts = fonts; }
 
-void set_under_hand(bool on) { g_under.wanted = on; }
+void set_under_hand(bool on, float efb_width) { g_under.wanted = on; g_under.efb_width = efb_width; }
 
 bool under_hand_draw_data(ImDrawData* out, float x, float y, float w, float h, float target_w, float target_h) {
   if (!under_this_frame() || g_under.size.x <= 0 || g_under.size.y <= 0 || w <= 0 || h <= 0) return false;

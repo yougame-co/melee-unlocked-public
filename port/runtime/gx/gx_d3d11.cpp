@@ -2196,7 +2196,7 @@ void D3D11Backend::submit_frame(const Frame& frame, const DrawMatrices* override
   } float_environment;
 #ifdef GX_PC_SETTINGS
   if (settings_ui_) { settings_set_game_aspect(output_aspect()); settings_set_hud_snapshot(frame); }
-  arena_panel::set_under_hand(settings_ui_ && frame.under_hand_command >= 0);   // drawn in the command loop
+  arena_panel::set_under_hand(settings_ui_ && frame.under_hand_command >= 0, 640.0f * (float)scale_);   // drawn in the command loop
   if (settings_ui_ && settings_ui_->begin(opts_)) {
     apply_fullscreen_mode();
     if (pick_scale() != scale_) { host::log("d3d11: dropping %zu EFB copy textures, internal scale %d -> %d", efb_copies_.size(), scale_, pick_scale()); efb_copies_.clear(); create_efb(); }

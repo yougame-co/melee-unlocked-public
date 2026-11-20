@@ -531,10 +531,21 @@ void start_search(MatchMode mode, const std::string& connect_code) {
 bool warmup_enter(int port);
 bool warmup_request_back(const char* why);
 int warmup_button_port();
+bool wait_practice_possible(MatchMode* mode, std::string* code);
+void wait_practice_go(int port, MatchMode mode, const std::string& code);
 
 void process_command(Command command) {
   switch (command.kind) {
-    case CommandKind::Warmup: warmup_enter(warmup_button_port()); break;
+    case CommandKind::Warmup: {
+      // Connected (or waiting in a room): the warm-up room. Nobody connected yet in Direct or Teams:
+      // Training while the search for the code goes on, as L and R held do there.
+      const int port = warmup_button_port();
+      MatchMode mode = MatchMode::None;
+      std::string code;
+      if (wait_practice_possible(&mode, &code)) wait_practice_go(port, mode, code);
+      else warmup_enter(port);
+      break;
+    }
     case CommandKind::WarmupReturn: warmup_request_back(command.text.empty() ? "the player asked" : command.text.c_str()); break;
     case CommandKind::StartUnranked:
       start_search(MatchMode::Unranked, {});
@@ -638,6 +649,17 @@ void publish_snapshot() {
     w.offered = on_select && !g_warmup.active() &&
                 (w.enabled || (link.link_up && (link.mode == 2 || link.mode == 3)) || slippi::arena::in_room());
     w.why = w.enabled ? std::string() : why;
+    // Nobody connected yet in Direct or Teams (searching for the code, or about to): the button goes
+    // to Training and the search carries on from there (wait_practice_go), as L and R held do.
+    {
+      MatchMode wait_mode = MatchMode::None;
+      std::string wait_code;
+      if (!w.enabled && wait_practice_possible(&wait_mode, &wait_code)) {
+        w.offered = true;
+        w.enabled = true;
+        w.why.clear();
+      }
+    }
     w.active = g_warmup.active();
     w.stage = (int)g_warmup.stage();
     w.arena = g_warmup.active() ? g_warmup.kind() == warmup::Kind::Arena : arena;
@@ -804,6 +826,64 @@ bool online_select_pick(PracticeConfig* out) {
   out->players[0].character = character;
   out->players[0].costume = costume;
   return true;
+}
+
+// Direct or Teams on the online character select with nobody connected yet, outside a room: the
+// player may practise while the code's player is searched for. The code is the one being searched
+// for, or the last one used; with none there is nothing to search and so nothing to offer.
+bool wait_practice_possible(MatchMode* mode, std::string* code) {
+  if (g_lifecycle.phase() != Phase::Idle || g_auto_search != MatchMode::None || g_warmup.active() || !is_online_scene() ||
+      current_minor() != 0 || slippi::playback::enabled() || slippi::online::is_online_match() || slippi::arena::in_room())
+    return false;
+  const MatchMode m = (MatchMode)online_mode();
+  if (m != MatchMode::Direct && m != MatchMode::Teams) return false;
+  if (slippi::online::warmup_link().link_up) return false;   // connected: the warm-up room's own rules
+  std::string error;
+  const std::string last = slippi::online::direct_code_for_practice();
+  if (!(m == MatchMode::Teams ? normalize_teams_code(last, code, &error) : normalize_direct_code(last, code, &error))) return false;
+  *mode = m;
+  return true;
+}
+
+// From the online character select to Training, and the search (Unranked, or Direct or Teams for
+// `code`) starts again by itself once the Training match is running.
+void wait_practice_go(int port, MatchMode mode, const std::string& code) {
+  uint8_t character = 0, costume = 0;
+  bool picked = slippi::online::local_css_selection(&character, &costume);
+  // Not locked in yet: the coin's own pick, as the select says it every frame (the room's portraits).
+  if (!picked) picked = slippi::arena::css_pick(&character, &costume) && character < 26;
+  if (!picked) {   // the character select writes the pick into the match's player slots as it is made
+    const PracticeConfig css = capture_practice();
+    const SavedPlayer& p = css.players[css.local_slot];
+    host::log("native practice: character select slot %d: state %u character %u costume %u",
+              css.local_slot, p.state, p.character, p.costume);
+    if (css.valid && p.character < 26) { character = (uint8_t)p.character; costume = p.costume; picked = true; }
+  }
+  slippi::online::native_cleanup_match();   // the character select's own search, if one runs
+  if (picked) {
+    g_practice = {};
+    g_practice.valid = true;
+    g_practice.local_slot = 0;
+    g_practice.controller_port = port;
+    g_practice.players[0].active = true;
+    g_practice.players[0].character = character;
+    g_practice.players[0].costume = costume;
+    write_event_backup();
+    // Straight into a Training match with that character (the menus are pressed through, as the
+    // warm-up room does; the stage is the last legal one, or Final Destination), so the search starts
+    // again without the player picking anything twice. Their own input on those menus takes over.
+    set_training_pick(0, character, costume);
+  }
+  g_enter_training = picked;   // nothing picked yet: Training's own character select, as before
+  g_enter_port = port;
+  g_enter_ticks = 0;
+  g_enter_seen_select = false;
+  g_auto_search = mode;
+  g_auto_code = code;
+  g_auto_ticks = 0;
+  request_major(kTrainingMajor);
+  host::log("native practice: from the online character select to Training, then %s search%s",
+            match_mode_name(mode), picked ? "" : " (no character picked yet)");
 }
 
 // Can the player go now: a connected pair (Direct, Teams) or an arena room's wait. `why` when not.
@@ -1750,6 +1830,22 @@ void tick() {
       }
     }
   }
+  // Tests: MELEE_TEST_WAIT_PRACTICE=<frames>: the WARM UP button pressed once (its command), that many
+  // frames after it was first offered with nobody connected (Direct, Teams).
+  {
+    static const char* spec = host::test_env::getenv("MELEE_TEST_WAIT_PRACTICE");
+    static uint32_t ticks = 0;
+    static bool done = false;
+    if (spec && !done) {
+      MatchMode mode = MatchMode::None;
+      std::string code;
+      if (wait_practice_possible(&mode, &code) && ++ticks >= (uint32_t)std::atoi(spec)) {
+        done = true;
+        host::log("wait-practice test: WARM UP pressed (%s, code %s)", match_mode_name(mode), code.c_str());
+        process_command({CommandKind::Warmup, {}});
+      }
+    }
+  }
   // L+R held on Slippi's online character select in Unranked (not with A or Start, so L+R+A+Start
   // still resets): go to Training to warm up, and the Unranked search starts again by itself once
   // the Training match is running. A third of a second of holding, so brushing both triggers does
@@ -1802,32 +1898,8 @@ void tick() {
       }
     }
     if (lr_ticks == 20) {
-      uint8_t character = 0, costume = 0;
-      bool picked = slippi::online::local_css_selection(&character, &costume);
-      if (!picked) {   // the character select writes the pick into the match's player slots as it is made
-        const PracticeConfig css = capture_practice();
-        const SavedPlayer& p = css.players[css.local_slot];
-        host::log("native practice: character select slot %d: state %u character %u costume %u",
-                  css.local_slot, p.state, p.character, p.costume);
-        if (css.valid && p.character < 26) { character = (uint8_t)p.character; costume = p.costume; picked = true; }
-      }
-      slippi::online::native_cleanup_match();   // the character select's own search, if one runs
-      if (picked) {
-        g_practice = {};
-        g_practice.valid = true;
-        g_practice.local_slot = 0;
-        g_practice.controller_port = lr_port;
-        g_practice.players[0].active = true;
-        g_practice.players[0].character = character;
-        g_practice.players[0].costume = costume;
-        write_event_backup();
-      }
-      g_auto_search = lr_mode;
-      g_auto_code = lr_code;
-      g_auto_ticks = 0;
-      request_major(kTrainingMajor);
-      host::log("native practice: L+R on the online character select; Training, then %s search%s",
-                match_mode_name(lr_mode), picked ? "" : " (no character picked yet)");
+      host::log("native practice: L+R on the online character select");
+      wait_practice_go(lr_port, lr_mode, lr_code);
     }
   }
   if (g_auto_search != MatchMode::None) {
