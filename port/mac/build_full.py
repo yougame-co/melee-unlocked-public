@@ -43,6 +43,8 @@ def main():
     parser.add_argument('--yougame-mac-tray-from', help='First shipped Mac YouGame Staging version supporting --yougame-tray (X.Y.Z)')
     parser.add_argument('--yougame-mac-prod-tray-from', help='First shipped Mac YouGame (production) version supporting --yougame-tray (X.Y.Z)')
     parser.add_argument('--yougame-start-staging', action='store_true', help='test builds: start and link YouGame Staging instead of YouGame')
+    parser.add_argument('--yougame-in-game-default', action='store_true',
+                        help='"YouGame in game" on by default (YouGame\'s published builds; CMake MELEE_YOUGAME_IN_GAME_DEFAULT)')
     # Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
     parser.add_argument('--squad-strike', action='store_true',
                         default=squad_env(),
@@ -112,6 +114,7 @@ def main():
         cpp += [f'-DMELEE_YOUGAME_MAC_PROD_TRAY_FROM="{args.yougame_mac_prod_tray_from}"']
     if args.yougame_start_staging:
         cpp += ['-DMELEE_YOUGAME_START_STAGING=1']
+    cpp += [f'-DMELEE_YOUGAME_IN_GAME_DEFAULT={1 if args.yougame_in_game_default else 0}']
     if args.squad_strike:
         cpp += ['-DMU_SQUAD=1']
     for p in ['port/linux/compat','port/linux','port/app','port/runtime/ppc','port/runtime/hle','port/runtime/host',

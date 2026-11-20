@@ -68,6 +68,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <map>
 #include <memory>
@@ -228,6 +230,21 @@ Stdio g_io;
 // pushes go through g_io and handle_app_line exactly as in stdio mode; only the writes differ.
 // g_io.eof is true whenever no channel connection is open.
 std::atomic<bool> g_channel_allowed{false};          // start(): nothing started this game
+// "YouGame in game" (yougame_link.h in_game, docs/yougame-hook.md): the local channel is looked for only
+// while it is on. The build's default applies until the player sets it (settings.ini yougame_in_game).
+// kInGameBuildTag is the only copy of its text in the binary: release kits search the exe for
+// "yougame-in-game-default=on" and refuse a published build without it.
+#if defined(MELEE_YOUGAME_IN_GAME_DEFAULT) && MELEE_YOUGAME_IN_GAME_DEFAULT
+constexpr bool kInGameDefault = true;
+const char kInGameBuildTag[] = "yougame-in-game-default=on";
+#else
+constexpr bool kInGameDefault = false;
+const char kInGameBuildTag[] = "yougame-in-game-default=off";
+#endif
+std::atomic<int> g_in_game_saved{-1};                // -1 no line in settings.ini (the build default), 0 off, 1 on
+std::mutex g_in_game_mutex;
+std::string g_in_game_path;                          // g_in_game_mutex: the settings file (pc_settings' load)
+bool in_game_on() { const int saved = g_in_game_saved.load(); return saved < 0 ? kInGameDefault : saved == 1; }
 std::mutex g_channel_mutex;
 std::shared_ptr<channel::Connection> g_channel;      // g_channel_mutex; set while probing and while up
 std::atomic<bool> g_channel_up{false};               // verified and hello answered
@@ -2110,7 +2127,7 @@ bool probe_channel(bool quiet = false) {
 // Starts a probe on its own thread unless one is running or a channel is up. Without `force`, at most
 // one every 5 s (the Online menu's retries).
 bool start_channel_probe(bool force, bool quiet) {
-  if (!g_channel_allowed || g_channel_up) return false;
+  if (!g_channel_allowed || !in_game_on() || g_channel_up) return false;   // every probe comes through here
   {
     std::lock_guard<std::mutex> lock(g_channel_mutex);
     if (!g_channel_retry.allow(now_ms()) && !force) return false;
@@ -3009,14 +3026,13 @@ bool launcher() {
 }
 bool channel_connected() { return g_channel_up; }
 static std::atomic<bool> g_automated_run{false};
-void start_channel(bool automated) {
-  if (automated) g_automated_run = true;
+static std::atomic<bool> g_channel_started{false};   // start_channel ran (the game, never the settings window)
+namespace {
+// The first probe and the 4 s look, once per run: at game start with "YouGame in game" on, or when the
+// player turns it on later (in_game::set).
+void start_channel_watch() {
   static std::once_flag once;
-  std::call_once(once, [automated] {
-    if (!g_channel_allowed) return;
-    // Bare test runs never reach a YouGame app on the machine they run on, unless the run asks.
-    if (host::test_env::getenv("MELEE_NO_YOUGAME_CHANNEL")) { g_channel_allowed = false; return; }
-    if (automated && !host::test_env::getenv("MELEE_TEST_YOUGAME_CHANNEL")) { g_channel_allowed = false; return; }
+  std::call_once(once, [] {
     start_channel_probe(true);
     // A YouGame app started after the game (Get YouGame in the start window, or opened by hand) is found
     // without a restart: look again every 4 s while no channel is up. A look is a loopback connect that
@@ -3030,6 +3046,74 @@ void start_channel(bool automated) {
     }).detach();
   });
 }
+}  // namespace
+void start_channel(bool automated) {
+  if (automated) g_automated_run = true;
+  static std::once_flag once;
+  std::call_once(once, [automated] {
+    // Bare test runs never reach a YouGame app on the machine they run on, unless the run asks.
+    if (g_channel_allowed && host::test_env::getenv("MELEE_NO_YOUGAME_CHANNEL")) g_channel_allowed = false;
+    if (g_channel_allowed && automated && !host::test_env::getenv("MELEE_TEST_YOUGAME_CHANNEL")) g_channel_allowed = false;
+    const int saved = g_in_game_saved.load();
+    host::log("yougame in game: %s (%s)%s [%s]", in_game_on() ? "on" : "off",
+              saved >= 0 ? "setting" : kInGameDefault ? "build default on" : "build default off",
+              g_channel_allowed ? "" : ", not used: the app or launcher started this game, or a test run", kInGameBuildTag);
+    g_channel_started = true;
+  });
+  // Off: nothing looks for YouGame until the player turns it on (a YouGame row of the Online menu, Settings).
+  if (g_channel_allowed && in_game_on()) start_channel_watch();
+}
+namespace in_game {
+void loaded(int saved, const std::string& settings_path) {
+  g_in_game_saved = saved < 0 ? -1 : saved ? 1 : 0;
+  std::lock_guard<std::mutex> lock(g_in_game_mutex);
+  g_in_game_path = settings_path;
+}
+int saved() { return g_in_game_saved.load(); }
+bool on() { return in_game_on(); }
+bool applies() { return g_channel_allowed.load(); }
+void set(bool turn_on, const char* why) {
+  const int before = g_in_game_saved.exchange(turn_on ? 1 : 0);
+  host::log("yougame in game: %s (%s)%s", turn_on ? "on" : "off", why, before == (turn_on ? 1 : 0) ? ", unchanged" : "");
+  // Saved off the caller's frame. Only this line of settings.ini changes (as consume_lag_test_launch does);
+  // the settings panel's own save writes it back from saved(). The latest choice is what lands.
+  std::thread([] {
+    std::lock_guard<std::mutex> lock(g_in_game_mutex);
+    if (g_in_game_path.empty()) return;   // no settings file this run (a test run): this run only
+    const int value = g_in_game_saved.load();
+    const std::filesystem::path file = std::filesystem::u8path(g_in_game_path);
+    std::string text, line;
+    bool found = false;
+    {
+      std::ifstream in(file);
+      while (std::getline(in, line)) {
+        if (line.rfind("yougame_in_game", 0) == 0) { line = "yougame_in_game " + std::to_string(value); found = true; }
+        text += line;
+        text += '\n';
+      }
+    }
+    if (!found) text += "yougame_in_game " + std::to_string(value) + "\n";
+    std::filesystem::path temporary = file;
+    temporary += ".yougame.tmp";
+    std::ofstream out(temporary);   // text mode, as the settings panel writes the file
+    out << text;
+    out.close();
+    std::error_code ec;
+    if (out.good()) {
+      // An antivirus scan or the search indexer can hold the old file for a moment: a few short retries.
+      for (int attempt = 0; attempt < 12; ++attempt) {
+        std::filesystem::rename(temporary, file, ec);
+        if (!ec) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5 + attempt * 3));
+      }
+    }
+    if (!out.good() || ec) { std::error_code ignored; std::filesystem::remove(temporary, ignored); }
+    host::log(out.good() && !ec ? "yougame in game: saved" : "yougame in game: could not be saved");
+  }).detach();
+  // On, in the game (never the settings window, which holds no connection): look for YouGame now.
+  if (turn_on && g_channel_started.load()) start_channel(g_automated_run.load());
+}
+}  // namespace in_game
 namespace {
 // Hidden and headless runs (agent copies, tests) never open a browser or an app on the machine they run on.
 // So do labelled AGENT TEST copies and runs with the channel off (MELEE_NO_YOUGAME_CHANNEL, the app started it).
@@ -3235,8 +3319,9 @@ int run_start_hook(const char* why, bool automated, int ask) {
 namespace { void reach_open(); void reach_ask_on_use(); }
 
 void start_hook_at_boot(bool automated) {
-  // The app started this game (its rows are open from the start), or a build without the hook.
-  if (active() || g_launcher || !coming_soon_build()) return;
+  // The app started this game (its rows are open from the start), or a build without the hook. "YouGame in
+  // game" off: nothing at start (no app started in the tray); a YouGame row of the Online menu turns it on.
+  if (active() || g_launcher || !coming_soon_build() || !in_game_on()) return;
   // Never a window at launch: an installed YouGame starts quietly in the tray; the ask waits for a press.
   run_start_hook("game start", automated, YG_START_ASK_LATER);
 }
@@ -3244,7 +3329,7 @@ void start_hook_at_boot(bool automated) {
 void online_menu_opened() {
   // Never waits: this runs on the game's frame. A host found now opens the rows on the next visit.
   start_channel_probe(false);
-  if (!coming_soon()) return;
+  if (!coming_soon() || !in_game_on()) return;   // off: nothing opens until a YouGame row is pressed
 #if defined(_WIN32) || defined(__APPLE__)
   return;   // the start hook ran at game start; the client window is never opened from here
 #endif
@@ -3273,6 +3358,9 @@ void first_row_picked() {
   // asks (reach_ask_on_use: Get YouGame / Open YouGame / Play offline), once per press, never remembered.
   // Linux, where the hook has no window: the "Play online with YouGame" panel (reach_open). The menu
   // still continues into the row once YouGame answers.
+  // "YouGame in game" off (the build's default, or the player's choice): this press turns it on, saved in
+  // settings.ini, and starts looking for YouGame now; then the same flow as always, never a dead end.
+  if (!in_game_on()) in_game::set(true, "Online menu");
   if (g_channel_up.load()) return;
 #if defined(_WIN32) || defined(__APPLE__)
   reach_ask_on_use();
@@ -4077,7 +4165,7 @@ void input_kind(const char* kind) {
   }).detach();
 }
 bool channel_menu_key(const char* kind) {
-  if (g_stdio || !g_channel_allowed) return false;
+  if (g_stdio || !g_channel_allowed || !in_game_on()) return false;   // off: the key stays the game's
   const bool pad = kind && std::string(kind) != "keys";
   // Start with Down held stays the game's (a crouch pause) when no YouGame is there to ask.
   if (pad && !g_channel_up.load()) return false;

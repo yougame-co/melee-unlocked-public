@@ -75,7 +75,21 @@ bool available();
 // logging_ready); `automated` (--hidden/--headless) runs never probe unless MELEE_TEST_YOUGAME_CHANNEL=1,
 // and MELEE_NO_YOUGAME_CHANNEL=1 turns it off. While a verified channel is up, launcher() and
 // available() are true and coming_soon() is false, so the YouGame rows open as under the launcher.
+// Probes only while "YouGame in game" (in_game below) is on; logs "yougame in game: ..." once.
 void start_channel(bool automated);
+// "YouGame in game" (docs/yougame-hook.md): a game nothing started uses the local channel only while this
+// player setting is on. settings.ini "yougame_in_game 0|1"; no line: the build's default (CMake
+// MELEE_YOUGAME_IN_GAME_DEFAULT, OFF in the source). A game the app or the launcher started never uses it.
+namespace in_game {
+// The settings file's line at each settings load (-1: no line) and the file it is kept in (pc_settings).
+void loaded(int saved, const std::string& settings_path);
+int saved();       // what settings.ini keeps: -1 (no line, the build default), 0 or 1
+bool on();         // in effect: the player's choice, else the build default
+bool applies();    // false when the app or the launcher started this game, or a test run: no local channel
+// The player turned it on (a YouGame row of the Online menu, Settings) or off (Settings). Saved to
+// settings.ini at once. On: looks for YouGame now (start_channel's probe and 4 s look), no restart.
+void set(bool on, const char* why);
+}  // namespace in_game
 // The Online menu opened: probe again (at most once every 5 s). Never waits; returns at once.
 void online_menu_opened();
 // The online menu's first row while YouGame is not found (coming_soon()). When the YouGame app is

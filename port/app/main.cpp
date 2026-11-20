@@ -1932,11 +1932,6 @@ static int melee_main(int argc, char** argv) {
   } else host::log("timing: sandbox appcontainer unknown (%lu)", (unsigned long)GetLastError());
 #endif
   yougame::relay_pads::logging_ready();
-  // Started on its own: look for a running YouGame app on a background thread (yougame_channel.h). The
-  // settings window's standby process never does: only the game holds a connection.
-  if (!settings_window_only) yougame::start_channel(automated);
-  // YouGame's start hook, before the game window exists (its window must never sit behind ours).
-  if (!settings_window_only) yougame::start_hook_at_boot(automated);
   gfx.pc_settings = !automated;
   // In YouGame's player box the app reports a stop from the exit code; a dialog there only kept the
   // process alive behind the frozen picture (yougame_mode_policy.h). The report files are still written.
@@ -1974,6 +1969,12 @@ static int melee_main(int argc, char** argv) {
     gx::load_pc_settings(gfx, o.volume);
     gfx.settings_open = false;
   }
+  // Started on its own: look for a running YouGame app on a background thread (yougame_channel.h), once
+  // the settings are read ("YouGame in game", settings.ini yougame_in_game). The settings window's standby
+  // process never does: only the game holds a connection.
+  if (!settings_window_only) yougame::start_channel(automated);
+  // YouGame's start hook, before the game window exists (its window must never sit behind ours).
+  if (!settings_window_only) yougame::start_hook_at_boot(automated);
 #ifdef YOUGAME_AGENT_TEST_HOOK
   // Staging test builds only (CMake YOUGAME_AGENT_TEST_HOOK, off by default): app test defaults use the
   // same option paths as flags, after saved settings and before CLI.

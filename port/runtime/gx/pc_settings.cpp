@@ -2279,6 +2279,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   bool gecko_chosen = false;           // the panel has saved a choice (even "none")
   int saved_lcancel_flash = -1, saved_lcancel_success = -1;
   int saved_vsync_yougame = -1, saved_showfps_yougame = -1;   // -1: never saved inside YouGame
+  int yougame_in_game = -1;   // "YouGame in game" (yougame_link.h in_game): -1 no line, the build's default
   bool vsync_seen = false, showfps_seen = false;
   bool lowspec_look = false;   // "lowspec_look 1": written by builds that migrate Low spec to the image only
   int dlss5_defaults_version = 0;   // 2 from 0.9.60: NVIDIA's own DLSS 5 defaults
@@ -2328,6 +2329,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
     while (!value.empty() && (value.back() == '\r' || value.back() == ' ' || value.back() == '\t')) value.pop_back();
     if (key == "truewsfit") { truewsfit_seen = true; continue; }
     if (value.empty()) continue;
+    if (key == "yougame_in_game") { yougame_in_game = value == "1" ? 1 : value == "0" ? 0 : -1; continue; }
     if (source_port::mods::parse_choice(key, value, &options.mod_choices)) continue;
     if (load_rtx_key(key, value)) continue;
     try {
@@ -2700,6 +2702,7 @@ void load_pc_settings(RenderOptions& options, int& volume) {
   // A controller saved before L and R were split into the click and the travel keeps playing as it
   // did. After the whole file, since a binding and its level can come in either order.
   split_old_trigger_tables();
+  yougame::in_game::loaded(yougame_in_game, options.settings_path);
   // Inside YouGame (yougame::start() has run before any settings load), V-Sync and the FPS counter
   // follow their own keys; outside it the old keys, unchanged.
 #ifdef _WIN32
@@ -5085,6 +5088,8 @@ static bool write_settings_file_impl(const SettingsState& state, const RenderOpt
   if (options.te_menu_music) file << "\nte_menu_music " << options.te_menu_music;
   if (!source_port::hackpack::settings_are_default()) file << "\nhp_settings " << source_port::hackpack::settings_text();
   { char te[16]; std::snprintf(te, sizeof te, "%X", options.te_options); file << "\nte_options " << te; }
+  // "YouGame in game": only once the player has set it; no line keeps the build's default.
+  if (yougame::in_game::saved() >= 0) file << "\nyougame_in_game " << yougame::in_game::saved();
   // One line per pack that is switched off. Without this the loader parsed "texpackoff" but
   // nothing ever wrote it, so switching a pack off lasted only until the next launch. The
   // loader reads the name to end of line, so a name with spaces in it round-trips.
@@ -10275,6 +10280,15 @@ bool settings_frame(SettingsState& state, RenderOptions& options) {
 #ifndef MELEE_NO_SLIPPI
     settings_section("Online");
     {
+      // "YouGame in game" (docs/yougame-hook.md): this game connects to the YouGame app on this computer.
+      // Not shown in a game the app or the launcher started (it is YouGame there either way).
+      if (yougame::in_game::applies()) {
+        bool in_game = yougame::in_game::on();
+        if (settings_toggle("YouGame in game", &in_game)) yougame::in_game::set(in_game, "Settings");
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("Connects this game to the YouGame app on this computer: YouGame's online rows,\n"
+                            "friends and its button over the game. On takes effect now; off, at the next start.");
+      }
       // Early inputs (host/early_input.h): the other player's game learns of a press up to a frame
       // sooner, so it guesses right more often and rolls back less. Only between two Melee Unlocked
       // players who both have it on; a Slippi Dolphin opponent is never sent anything new.

@@ -219,6 +219,8 @@ add_test(NAME port_yougame_channel COMMAND port_yougame_channel_test "${CMAKE_CU
 set_tests_properties(port_yougame_channel PROPERTIES TIMEOUT 30)
 add_test(NAME port_yougame_channel_wiring COMMAND "${Python3_EXECUTABLE}" -B
   "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_channel_wiring_test.py" "${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME port_yougame_in_game_wiring COMMAND "${Python3_EXECUTABLE}" -B
+  "${CMAKE_CURRENT_SOURCE_DIR}/port/tests/yougame_in_game_wiring_test.py")
 add_executable(port_yougame_search_test port/tests/yougame_search_test.cpp)
 target_include_directories(port_yougame_search_test PRIVATE port/runtime/hle port/third_party)
 target_compile_features(port_yougame_search_test PRIVATE cxx_std_17)
@@ -455,6 +457,15 @@ if(NOT "${MELEE_YOUGAME_PROD_TRAY_FROM}" STREQUAL "")
 endif()
 if(MELEE_YOUGAME_COMING_SOON)
   add_compile_definitions(MELEE_YOUGAME_COMING_SOON=1)
+endif()
+# "YouGame in game" (docs/yougame-hook.md): a game the player started connects to a running YouGame app only
+# while this player setting is on. This is its default until the player sets it: OFF here, so another team's
+# build stays dormant. YouGame's own published builds pass -DMELEE_YOUGAME_IN_GAME_DEFAULT=ON.
+option(MELEE_YOUGAME_IN_GAME_DEFAULT "Default of the player setting \"YouGame in game\" (YouGame's published builds: ON)" OFF)
+if(MELEE_YOUGAME_IN_GAME_DEFAULT)
+  add_compile_definitions(MELEE_YOUGAME_IN_GAME_DEFAULT=1)
+else()
+  add_compile_definitions(MELEE_YOUGAME_IN_GAME_DEFAULT=0)
 endif()
 # A YouGame build carries the YouGame plugin; upstream's releases don't. The launcher's update check reads upstream's
 # release list, so in a YouGame build it would offer to replace this build with one that has no plugin. Off here.
