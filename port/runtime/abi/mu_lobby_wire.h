@@ -210,8 +210,8 @@ static inline const char* mu_lobby_hint_text(unsigned hint)
     case MU_LOBBY_HINT_PRESS_START: return "Press START to pick a stage";
     case MU_LOBBY_HINT_WAIT_HOST: return "Waiting for the host to start";
     case MU_LOBBY_HINT_PICK: return "Everyone needs to pick a fighter";
-    case MU_LOBBY_HINT_PLAYERS: return "Needs at least 2 players";
-    case MU_LOBBY_HINT_HUMANS: return "Needs at least 2 people";
+    case MU_LOBBY_HINT_PLAYERS: return "Press A on an open door to invite a friend";
+    case MU_LOBBY_HINT_HUMANS: return "Needs 2 people. A on an open door invites";
     case MU_LOBBY_HINT_TEAMS: return "Put players on two teams";
     case MU_LOBBY_HINT_NOT_READY: return "Waiting for every game to be ready";
     case MU_LOBBY_HINT_MISMATCH: return "Someone has a different version";
